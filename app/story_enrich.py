@@ -1082,31 +1082,31 @@ def _target_units_from_duration(
     duration_sec: float | None,
     *,
     sec_per_unit: float | None = None,
-) -> Tuple[int, int]:
+) -> tuple[int, int]:
     """
     곡 길이→목표 컷수 범위 산출.
-    - 기본: 구간별 sec_per_unit 가이드
-      * ≤30s : 2.4 s/unit
-      * ≤90s : 3.2 s/unit
-      * ≤240s: 4.2 s/unit
-      * >240s: 5.0 s/unit
-    - 15% 가변 범위
     """
-    if not duration_sec or duration_sec <= 0:
+    if duration_sec is None or duration_sec <= 0.0:
         return (8, 10)
 
-    s_per = sec_per_unit or (
-        2.4 if duration_sec <= 30 else
-        3.2 if duration_sec <= 90 else
-        4.2 if duration_sec <= 240 else
-        5.0
+    s_per = (
+        float(sec_per_unit)
+        if sec_per_unit is not None
+        else (
+            2.4 if duration_sec <= 30.0
+            else 3.2 if duration_sec <= 90.0
+            else 4.2 if duration_sec <= 240.0
+            else 5.0
+        )
     )
-    base = max(8, duration_sec / s_per)
+
+    base = max(8.0, duration_sec / s_per)  # float로 통일
     low = max(8, int(round(base * 0.85)))
     high = min(120, int(round(base * 1.15)))
     if low > high:
         low, high = high, low
     return (low, high)
+
 
 
 def _fit_to_target_count(units: List[str], target_min: int, target_max: int) -> List[str]:

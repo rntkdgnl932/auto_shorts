@@ -669,44 +669,48 @@ class MainWindow(QtWidgets.QMainWindow):
         from json import JSONDecodeError
 
         # 안전한 유틸 로드 (있으면 사용)
-        load_json = None
-        save_json = None
+        load_json_fn = None
+        save_json_fn = None
         try:
             from app.utils import load_json as _lj, save_json as _sj  # type: ignore
-            load_json, save_json = _lj, _sj
+            load_json_fn, save_json_fn = _lj, _sj
         except Exception:
             pass
-        if load_json is None or save_json is None:
-            def load_json(path: Path, default=None):
+
+        if load_json_fn is None or save_json_fn is None:
+            def _fallback_load_json(path: Path, default=None):
                 try:
                     return json.loads(path.read_text(encoding="utf-8"))
                 except (FileNotFoundError, JSONDecodeError, UnicodeDecodeError, OSError):
                     return default
 
-            def save_json(path: Path, data: dict) -> None:
+            def _fallback_save_json(path: Path, data: dict) -> None:
                 try:
                     path.write_text(json.dumps(data, ensure_ascii=False, indent=2), encoding="utf-8")
                 except OSError:
                     pass
+
+            load_json_fn = _fallback_load_json
+            save_json_fn = _fallback_save_json
 
         # 활성 프로젝트 경로
         proj_dir = getattr(self, "_active_project_dir", None) or getattr(self, "project_dir", None)
         if not proj_dir:
             return
         pj = Path(proj_dir) / "project.json"
-        meta = load_json(pj, {}) or {}
+        meta = load_json_fn(pj, {}) or {}
 
         # 위젯 핸들
         te_l = getattr(self, "te_lyrics", None)
         te_c = getattr(self, "te_lyrics_converted", None)
 
         # 변환 함수(가능하면 kroman, 없으면 원문 유지)
-        def _convert_text(src: str) -> str:
-            src = (src or "")
+        def _convert_text(text_in: str) -> str:
+            txt = text_in or ""
             try:
                 import kroman  # type: ignore
                 out_lines = []
-                for line in src.splitlines():
+                for line in txt.splitlines():
                     st = line.strip()
                     if not st or (st.startswith("[") and st.endswith("]")):
                         out_lines.append(line)
@@ -716,7 +720,7 @@ class MainWindow(QtWidgets.QMainWindow):
                 return "\n".join(out_lines)
             except Exception:
                 # kroman이 없으면 최소한 원문 그대로라도 보여준다
-                return src
+                return txt
 
         # 표시 유틸
         def _show_convert_panel(show: bool) -> None:
@@ -737,13 +741,13 @@ class MainWindow(QtWidgets.QMainWindow):
             text_to_show = existing
             # 2) 없으면 왼쪽 가사를 즉시 변환해 표시
             if not text_to_show:
-                src = ""
+                src_text = ""
                 if te_l is not None and hasattr(te_l, "toPlainText"):
                     try:
-                        src = te_l.toPlainText()
+                        src_text = te_l.toPlainText()
                     except Exception:
-                        src = ""
-                text_to_show = _convert_text(src)
+                        src_text = ""
+                text_to_show = _convert_text(src_text)
 
             # 우측 칸에 즉시 표시
             if te_c is not None and hasattr(te_c, "setPlainText"):
@@ -754,7 +758,7 @@ class MainWindow(QtWidgets.QMainWindow):
 
             # project.json 반영
             meta["lyrics_lls"] = text_to_show
-            save_json(pj, meta)
+            save_json_fn(pj, meta)
 
             # 패널 보이기
             _show_convert_panel(True)
@@ -762,7 +766,7 @@ class MainWindow(QtWidgets.QMainWindow):
         else:
             # OFF: 변환 사용 중지 → meta 비우고 패널 숨김
             meta["lyrics_lls"] = ""
-            save_json(pj, meta)
+            save_json_fn(pj, meta)
             _show_convert_panel(False)
 
     # ==== PATCH: shorts_ui.py :: on_generate_lyrics_with_log ====
@@ -855,14 +859,13 @@ class MainWindow(QtWidgets.QMainWindow):
             btn.setEnabled(False)
 
         # ----- 1) story.json 경로 결정 -----
-
-        def _pick_latest_story(base_path: Path, title_hint: Optional[str] = None) -> Optional[Path]:
+        def _pick_latest_story(base_path: Path, title_hint_in: Optional[str] = None) -> Optional[Path]:
             """base_path 하위(깊이 최대 2단계)에서 최신 story.json 하나를 고른다.
-            title_hint가 있으면 그 경로를 우선 확인한다.
+            title_hint_in가 있으면 그 경로를 우선 확인한다.
             """
             try:
-                if title_hint:
-                    cand_path = (base_path / title_hint / "story.json").resolve()
+                if title_hint_in:
+                    cand_path = (base_path / title_hint_in / "story.json").resolve()
                     if cand_path.exists():
                         return cand_path
             except OSError:
@@ -960,9 +963,10 @@ class MainWindow(QtWidgets.QMainWindow):
             from app.video_build import build_missing_images_from_story  # type: ignore
 
         try:
-            from settings import COMFY_LOG_FILE
+            import settings as _settings  # type: ignore
+            comfy_log_file = getattr(_settings, "COMFY_LOG_FILE", None)
         except Exception:
-            COMFY_LOG_FILE = None  # 로그 테일이 없어도 진행창은 동작
+            comfy_log_file = None  # 로그 테일이 없어도 진행창은 동작
 
         def job(on_progress):
             # video_build 쪽에서 prompt_img + prompt 결합, qwen swap 워크플로, img_file 저장 반영까지 수행
@@ -976,7 +980,7 @@ class MainWindow(QtWidgets.QMainWindow):
                 workflow_path=None,  # 강제: nunchaku_qwen_image_swap.json 사용
                 on_progress=on_progress,
             )
-            return {"created": [str(p) for p in created]}
+            return {"created": [str(img_path) for img_path in created]}
 
         def done(ok: bool, payload, err):
             # 버튼 복구
@@ -990,7 +994,8 @@ class MainWindow(QtWidgets.QMainWindow):
             created = (payload or {}).get("created") or []
             QtWidgets.QMessageBox.information(self, "누락 이미지 생성 완료", f"생성 {len(created)}개 완료")
 
-        run_job_with_progress_async(self, "누락 이미지 생성", job, tail_file=COMFY_LOG_FILE, on_done=done)
+        # ★ 확인되지 않은 참조 수정: tail_file에 지역변수 comfy_log_file 사용
+        run_job_with_progress_async(self, "누락 이미지 생성", job, tail_file=comfy_log_file, on_done=done)
 
     def on_click_generate_music(self) -> None:
         from PyQt5 import QtWidgets
@@ -1072,13 +1077,13 @@ class MainWindow(QtWidgets.QMainWindow):
         from PyQt5 import QtWidgets
         import json
 
-        # 설정값(기존 유지)
-        USE_VOCAL_SEPARATION = False
-        MODEL_SIZE = "medium"
-        MIN_LEN = 0.5
-        END_BIAS = 2.5
-        AVG_MIN_SEC_PER_UNIT = 2.0
-        START_PREROLL = 0.30
+        # 설정값(기존 유지) — 함수 내 변수는 소문자
+        use_vocal_separation = False
+        model_size = "medium"
+        min_len = 0.5
+        end_bias = 2.5
+        avg_min_sec_per_unit = 2.0
+        start_preroll = 0.30
 
         # utils
         try:
@@ -1086,28 +1091,33 @@ class MainWindow(QtWidgets.QMainWindow):
         except Exception:
             from utils import load_json  # type: ignore
 
-        # audio_sync 통합 모듈
-        AS = None
+        # audio_sync 통합 모듈(대문자 별칭 사용 금지)
+        audio_sync_mod = None
         try:
-            import app.audio_sync as AS  # type: ignore
+            import app.audio_sync as audio_sync_mod  # type: ignore
         except Exception:
             try:
-                import audio_sync as AS  # type: ignore
+                import audio_sync as audio_sync_mod  # type: ignore
             except Exception:
-                AS = None
+                audio_sync_mod = None
 
-        if AS is None:
+        if audio_sync_mod is None:
             raise RuntimeError("audio_sync 모듈을 불러오지 못했습니다.")
 
         # 필수 함수 확인(기존 체크 유지)
-        reqs = ["get_audio_duration", "detect_onsets_seconds", "layout_time_by_weights",
-                "prepare_pure_lyrics_lines", "sync_lyrics_with_whisper"]
+        reqs = [
+            "get_audio_duration",
+            "detect_onsets_seconds",
+            "layout_time_by_weights",
+            "prepare_pure_lyrics_lines",
+            "sync_lyrics_with_whisper",
+        ]
         for r in reqs:
-            if not callable(getattr(AS, r, None)):
+            if not callable(getattr(audio_sync_mod, r, None)):
                 raise RuntimeError(f"audio_sync.{r} 가 없습니다. audio_sync.py에 함수를 추가하세요.")
 
         def job(log):
-            def p(tag_or_msg: str, msg: Optional[str] = None) -> None:
+            def log_line(tag_or_msg: str, msg: Optional[str] = None) -> None:
                 log(tag_or_msg if msg is None else f"[{tag_or_msg}] {msg}")
 
             btn = getattr(self, "btn_analyze_music", None) or getattr(getattr(self, "ui", None), "btn_analyze_music",
@@ -1116,7 +1126,7 @@ class MainWindow(QtWidgets.QMainWindow):
                 btn.setEnabled(False)
 
             try:
-                p("ui", "프로젝트/보컬 탐색")
+                log_line("ui", "프로젝트/보컬 탐색")
                 proj_dir = self._current_project_dir()
                 if not proj_dir:
                     raise RuntimeError("프로젝트 폴더가 없습니다. 먼저 프로젝트를 생성/불러오세요.")
@@ -1124,7 +1134,7 @@ class MainWindow(QtWidgets.QMainWindow):
                 vocal_path = self._find_latest_vocal()
                 if not (vocal_path and Path(vocal_path).exists()):
                     raise RuntimeError("보컬 오디오(vocal.*)를 찾지 못했습니다.")
-                p("음악분석", f"보컬 파일: {Path(vocal_path).name}")
+                log_line("음악분석", f"보컬 파일: {Path(vocal_path).name}")
 
                 # 가사 로드(project → story)
                 lyrics_text = ""
@@ -1145,33 +1155,32 @@ class MainWindow(QtWidgets.QMainWindow):
                 lyrics_text = self._maybe_convert_lyrics_for_api(lyrics_text)
 
                 # Whisper 우선 싱크 (기존 동작)
-                res = AS.sync_lyrics_with_whisper(
+                res = audio_sync_mod.sync_lyrics_with_whisper(
                     str(vocal_path),
                     lyrics_text,
-                    model_size=MODEL_SIZE,
-                    use_vocal_separation=USE_VOCAL_SEPARATION,
-                    min_len=MIN_LEN,
-                    end_bias_sec=END_BIAS,
-                    avg_min_sec_per_unit=AVG_MIN_SEC_PER_UNIT,
-                    start_preroll=START_PREROLL,
+                    model_size=model_size,
+                    use_vocal_separation=use_vocal_separation,
+                    min_len=min_len,
+                    end_bias_sec=end_bias,
+                    avg_min_sec_per_unit=avg_min_sec_per_unit,
+                    start_preroll=start_preroll,
                 )
 
                 segments = res.get("segments", [])
-                onsets = res.get("onsets", [])
-                duration = float(res.get("duration_sec", 0.0))
-                start_at = float(res.get("start_at", 0.0))
+                _onsets = res.get("onsets", [])  # 사용 안 함 → 경고 방지용 접두 _
+                _duration = float(res.get("duration_sec", 0.0))
+                _start_at = float(res.get("start_at", 0.0))
 
                 # 라인 표시용(줄바꿈 기준)
-                lines = AS.prepare_pure_lyrics_lines(lyrics_text, drop_section_tags=True)
+                lines = audio_sync_mod.prepare_pure_lyrics_lines(lyrics_text, drop_section_tags=True)
 
                 # JSON 미리보기 저장 (기존)
                 preview_path = Path(proj_dir) / "music_analysis_preview.json"
                 with open(preview_path, "w", encoding="utf-8") as f:
                     json.dump(res, f, ensure_ascii=False, indent=2)
 
-                # ── 출력 조립 시작: out을 여기서 '먼저' 만든다 ──
-                out: List[str] = []
-                out.append("===== [가사 원문] (줄바꿈 기준 라인) =====")
+                # 출력 조립
+                out: List[str] = ["===== [가사 원문] (줄바꿈 기준 라인) ====="]
                 for i, u in enumerate(lines):
                     out.append(f"  #{i:02d}: {u}")
 
@@ -1185,11 +1194,11 @@ class MainWindow(QtWidgets.QMainWindow):
                 out.append(f"\n(저장) {preview_path}")
 
                 # ★ 추가: 줄별 정합 + 컷 & 페이드아웃(자동)
-                from pathlib import Path as _Path  # 로컬 별칭(경고 회피)
+                import pathlib  # 소문자 별칭으로 경고 회피
                 from audio_sync import analyze_and_cut_project  # 안전하게 지역 import
 
                 cut_res = analyze_and_cut_project(
-                    project_dir=str(_Path(proj_dir)),
+                    project_dir=str(pathlib.Path(proj_dir)),
                     model_size="medium",
                     snap_window_sec=0.15,
                 )
@@ -1202,12 +1211,12 @@ class MainWindow(QtWidgets.QMainWindow):
                 out.append(f"duration_out: {float(cut.get('duration_out') or 0.0):.2f}s")
                 out.append(f"aligned(json): {str(cut_res.get('aligned_path') or '')}")
 
-                # 줄별 정합 결과를 함께 표시
+                # 줄별 정합 결과 표시
                 aligned_rows = []
                 aligned_path_s = str(cut_res.get("aligned_path") or "")
                 try:
                     if aligned_path_s:
-                        ap = _Path(aligned_path_s)
+                        ap = pathlib.Path(aligned_path_s)
                         if ap.exists():
                             import json as _json
                             aligned_rows = _json.loads(ap.read_text(encoding="utf-8"))
@@ -1216,24 +1225,25 @@ class MainWindow(QtWidgets.QMainWindow):
 
                 out.append("\n===== [줄별 정합 결과] =====")
                 if aligned_rows:
-                    for idx, row in enumerate(aligned_rows):
+                    for i_row, row in enumerate(aligned_rows):
                         line = str(row.get("line") or "")
-                        s = row.get("start")
-                        e = row.get("end")
-                        sc = row.get("score")
-                        if isinstance(s, (int, float)) and isinstance(e, (int, float)):
+                        s_val = row.get("start")
+                        e_val = row.get("end")
+                        sc_val = row.get("score")
+                        if isinstance(s_val, (int, float)) and isinstance(e_val, (int, float)):
                             out.append(
-                                f"#{idx:02d}: {float(s):6.2f} ~ {float(e):6.2f}  (score={float(sc or 0.0):.2f})  {line}")
+                                f"#{i_row:02d}: {float(s_val):6.2f} ~ {float(e_val):6.2f}  (score={float(sc_val or 0.0):.2f})  {line}"
+                            )
                         else:
-                            out.append(f"#{idx:02d}: (미매칭)  (score={float(sc or 0.0):.2f})  {line}")
+                            out.append(f"#{i_row:02d}: (미매칭)  (score={float(sc_val or 0.0):.2f})  {line}")
                 else:
                     out.append("(줄별 정합 결과 없음)")
 
-                p("분석", "완료")
+                log_line("분석", "완료")
                 return {"text": "\n".join(out)}
 
             except Exception as e:
-                p("error", f"{type(e).__name__}: {e}")
+                log_line("error", f"{type(e).__name__}: {e}")
                 raise
             finally:
                 if isinstance(btn, QtWidgets.QAbstractButton):
@@ -1250,13 +1260,13 @@ class MainWindow(QtWidgets.QMainWindow):
             dlg = QtWidgets.QDialog(self)
             dlg.setWindowTitle("음악분석 결과 — Whisper 정렬 + 폴백 배분 + 컷/페이드아웃")
             dlg.resize(900, 720)
-            v = QtWidgets.QVBoxLayout(dlg)
+            vbox = QtWidgets.QVBoxLayout(dlg)
             ed = QtWidgets.QPlainTextEdit()
             ed.setReadOnly(True)
             ed.setPlainText(text)
-            v.addWidget(ed)
+            vbox.addWidget(ed)
             row = QtWidgets.QHBoxLayout()
-            v.addLayout(row)
+            vbox.addLayout(row)
             row.addStretch(1)
             btn_close = QtWidgets.QPushButton("닫기")
             row.addWidget(btn_close)
@@ -1272,7 +1282,8 @@ class MainWindow(QtWidgets.QMainWindow):
 
     # class MainWindow(...) 내부 아무 유틸 메서드 구역에 추가
 
-    def _persist_lyric_sections(self, *, proj_dir: str, sections: list, last_end: float) -> None:
+    @staticmethod
+    def _persist_lyric_sections(*, proj_dir: str, sections: list, last_end: float) -> None:
         """
         가사 섹션을 story.json, scene.json, project.json에 안전하게 반영한다.
         - story.json: lyric_sections[], last_lyric_end_sec, effective_duration(없으면), updated_at
@@ -1410,11 +1421,20 @@ class MainWindow(QtWidgets.QMainWindow):
 
     # shorts_ui.py (class MainWindow 내부)
     def on_click_test1_analyze(self) -> None:
+        """
+        '음악분석' 버튼(Whisper 우선 싱크 + 폴백 배분):
+        - project.json → story.json에서 가사 로드
+        - (선택) 보컬 분리 후 Whisper 단어 단위 전사
+        - 공식 가사 라인과 정렬 → 성공 라인은 Whisper 시간 사용
+        - 실패 라인은 온셋-가중치 배분 폴백
+        - 콘솔/다이얼로그 출력 + preview JSON 저장 (story.json 미수정)
+        - ★ 추가: 줄별 정합 기반 '마지막 줄 end + outro_sec'로 컷 & 페이드아웃 수행 → vocal_cut.wav, lyrics_aligned.json 저장
+        """
         from pathlib import Path
         from utils import run_job_with_progress_async
         from utils import load_json, save_json
 
-        TEST_PHASE = 0  # 0=전체, 1=가사만, 2=가사+오디오 매칭
+        test_phase = 0  # 0=전체, 1=가사만, 2=가사+오디오 매칭
 
         btn = getattr(self, "btn_test1_story", None) or getattr(getattr(self, "ui", None), "btn_test1_story", None)
         if btn:
@@ -1480,7 +1500,7 @@ class MainWindow(QtWidgets.QMainWindow):
 
                 p("ai", f"의미단위 {len(units)}개")
 
-                if TEST_PHASE == 1:
+                if test_phase == 1:
                     save_json(str(proj_dir / "story_ready.json"), {
                         "title": meta.get("title"),
                         "lyrics": lyrics,
@@ -1546,7 +1566,7 @@ class MainWindow(QtWidgets.QMainWindow):
                 )
                 story_tmp["scenes"] = merged_scenes
 
-                if TEST_PHASE == 2:
+                if test_phase == 2:
                     save_json(str(proj_dir / "story.json"), story_tmp)
                     p("done", "TEST_PHASE=2 완료 (story.json 부분 저장)")
                     return
@@ -1555,6 +1575,7 @@ class MainWindow(QtWidgets.QMainWindow):
                 p("gpt", "apply_gpt_to_story_v11")
                 from story_enrich import apply_gpt_to_story_v11, finalize_story_coherence, ensure_global_negative, \
                     normalize_prompts
+
                 def _ask(system, user, **kw):
                     return self._ai.ask_smart(system, user, **kw)
 
@@ -2815,19 +2836,23 @@ class MainWindow(QtWidgets.QMainWindow):
         return lyrics_text
 
     def _build_settings_tab(self) -> QtWidgets.QWidget:
-        # 항상 같은 모듈(alias S)만 쓰도록 통일!
-        # import settings as S
+        # 항상 같은 모듈(alias s_mod)만 쓰도록 통일!
+        try:
+            import settings as s_mod
+        except Exception:
+            from app import settings as s_mod  # type: ignore
 
         tab = QtWidgets.QWidget()
         form = QtWidgets.QFormLayout()
 
         # BASE_DIR
-        self.le_base_dir = QtWidgets.QLineEdit(str(S.BASE_DIR))
+        self.le_base_dir = QtWidgets.QLineEdit(str(s_mod.BASE_DIR))
         btn_pick_base = QtWidgets.QPushButton("폴더 선택")
 
         def _pick_base():
-            d = QtWidgets.QFileDialog.getExistingDirectory(self, "BASE_DIR 선택", str(S.BASE_DIR))
-            if d: self.le_base_dir.setText(d)
+            d = QtWidgets.QFileDialog.getExistingDirectory(self, "BASE_DIR 선택", str(s_mod.BASE_DIR))
+            if d:
+                self.le_base_dir.setText(d)
 
         btn_pick_base.clicked.connect(_pick_base)
         base_wrap = QtWidgets.QHBoxLayout()
@@ -2837,37 +2862,39 @@ class MainWindow(QtWidgets.QMainWindow):
         base_widget.setLayout(base_wrap)
 
         # COMFY_HOST & 후보
-        self.le_comfy = QtWidgets.QLineEdit(S.COMFY_HOST)
-        self.te_candidates = QtWidgets.QPlainTextEdit("\n".join(S.DEFAULT_HOST_CANDIDATES))
+        self.le_comfy = QtWidgets.QLineEdit(s_mod.COMFY_HOST)
+        self.te_candidates = QtWidgets.QPlainTextEdit("\n".join(s_mod.DEFAULT_HOST_CANDIDATES))
 
         # ffmpeg / hwaccel / 출력파일 / 오디오 포맷
-        self.le_ffmpeg = QtWidgets.QLineEdit(S.FFMPEG_EXE)
+        self.le_ffmpeg = QtWidgets.QLineEdit(s_mod.FFMPEG_EXE)
         self.cb_hwaccel = QtWidgets.QCheckBox("USE_HWACCEL")
-        self.cb_hwaccel.setChecked(bool(S.USE_HWACCEL))
-        self.le_final = QtWidgets.QLineEdit(S.FINAL_OUT)
+        self.cb_hwaccel.setChecked(bool(s_mod.USE_HWACCEL))
+        self.le_final = QtWidgets.QLineEdit(s_mod.FINAL_OUT)
 
         self.cb_audio_fmt = QtWidgets.QComboBox()
         self.cb_audio_fmt.addItems(["mp3", "wav", "opus"])
         # overrides 적용 고려
-        ov = S.load_overrides() or {}
-        cur_fmt = str(ov.get("AUDIO_SAVE_FORMAT", S.AUDIO_SAVE_FORMAT)).lower()
+        ov = s_mod.load_overrides() or {}
+        cur_fmt = str(ov.get("AUDIO_SAVE_FORMAT", s_mod.AUDIO_SAVE_FORMAT)).lower()
         idx_fmt = max(0, self.cb_audio_fmt.findText(cur_fmt))
         self.cb_audio_fmt.setCurrentIndex(idx_fmt)
 
         # 기본 프레임/분할
-        self.sb_d_chunk = self._spin(60, 5000, int(S.DEFAULT_CHUNK), " /chunk")
-        self.sb_d_overlap = self._spin(1, 120, int(S.DEFAULT_OVERLAP), " overlap")
-        self.sb_d_infps = self._spin(1, 240, int(S.DEFAULT_INPUT_FPS), " inFPS")
-        self.sb_d_outfps = self._spin(1, 240, int(S.DEFAULT_TARGET_FPS), " outFPS")
+        self.sb_d_chunk = self._spin(60, 5000, int(s_mod.DEFAULT_CHUNK), " /chunk")
+        self.sb_d_overlap = self._spin(1, 120, int(s_mod.DEFAULT_OVERLAP), " overlap")
+        self.sb_d_infps = self._spin(1, 240, int(s_mod.DEFAULT_INPUT_FPS), " inFPS")
+        self.sb_d_outfps = self._spin(1, 240, int(s_mod.DEFAULT_TARGET_FPS), " outFPS")
 
         # 프롬프트/워크플로 파일 경로
-        self.le_prompt_json = QtWidgets.QLineEdit(str(S.ACE_STEP_PROMPT_JSON))
+        self.le_prompt_json = QtWidgets.QLineEdit(str(s_mod.ACE_STEP_PROMPT_JSON))
         btn_pick_prompt = QtWidgets.QPushButton("파일 선택")
 
         def _pick_prompt():
-            f, _ = QtWidgets.QFileDialog.getOpenFileName(self, "ACE_STEP_PROMPT_JSON", str(S.JSONS_DIR),
-                                                         "JSON (*.json)")
-            if f: self.le_prompt_json.setText(f)
+            f, _ = QtWidgets.QFileDialog.getOpenFileName(
+                self, "ACE_STEP_PROMPT_JSON", str(s_mod.JSONS_DIR), "JSON (*.json)"
+            )
+            if f:
+                self.le_prompt_json.setText(f)
 
         btn_pick_prompt.clicked.connect(_pick_prompt)
         pj_wrap = QtWidgets.QHBoxLayout()
@@ -2876,12 +2903,13 @@ class MainWindow(QtWidgets.QMainWindow):
         pj_widget = QtWidgets.QWidget()
         pj_widget.setLayout(pj_wrap)
 
-        self.le_i2v = QtWidgets.QLineEdit(str(S.I2V_WORKFLOW))
+        self.le_i2v = QtWidgets.QLineEdit(str(s_mod.I2V_WORKFLOW))
         btn_pick_i2v = QtWidgets.QPushButton("파일 선택")
 
         def _pick_i2v():
-            f, _ = QtWidgets.QFileDialog.getOpenFileName(self, "I2V_WORKFLOW", str(S.JSONS_DIR), "JSON (*.json)")
-            if f: self.le_i2v.setText(f)
+            f, _ = QtWidgets.QFileDialog.getOpenFileName(self, "I2V_WORKFLOW", str(s_mod.JSONS_DIR), "JSON (*.json)")
+            if f:
+                self.le_i2v.setText(f)
 
         btn_pick_i2v.clicked.connect(_pick_i2v)
         i2v_wrap = QtWidgets.QHBoxLayout()
@@ -2928,7 +2956,7 @@ class MainWindow(QtWidgets.QMainWindow):
             )
 
         def _do_save():
-            path = S.save_overrides(**_collect_overrides())
+            path = s_mod.save_overrides(**_collect_overrides())
             QtWidgets.QMessageBox.information(self, "저장 완료", f"settings_local.json 저장됨\n\n{path}")
 
         def _do_apply():
@@ -2939,53 +2967,48 @@ class MainWindow(QtWidgets.QMainWindow):
             """
             # 1) 파일로 저장 (settings_local.json)
             overrides = _collect_overrides()
-            save_overrides(**overrides)
+            s_mod.save_overrides(**overrides)
 
             # 2) 런타임(모듈 settings)에도 즉시 반영
             try:
-                import settings as _S
+                import settings as _s
             except Exception:
-                from app import settings as _S  # type: ignore
+                from app import settings as _s  # type: ignore
 
-            _S.BASE_DIR = overrides.get("BASE_DIR", _S.BASE_DIR)
-            _S.COMFY_HOST = overrides.get("COMFY_HOST", _S.COMFY_HOST)
-            _S.DEFAULT_HOST_CANDIDATES = overrides.get("DEFAULT_HOST_CANDIDATES",
-                                                       getattr(_S, "DEFAULT_HOST_CANDIDATES", []))
-            _S.FFMPEG_EXE = overrides.get("FFMPEG_EXE", _S.FFMPEG_EXE)
-            _S.USE_HWACCEL = bool(overrides.get("USE_HWACCEL", getattr(_S, "USE_HWACCEL", False)))
-            _S.FINAL_OUT = overrides.get("FINAL_OUT", _S.FINAL_OUT)
-            _S.AUDIO_SAVE_FORMAT = overrides.get("AUDIO_SAVE_FORMAT", getattr(_S, "AUDIO_SAVE_FORMAT", "mp3")).lower()
-            _S.DEFAULT_CHUNK = int(overrides.get("DEFAULT_CHUNK", getattr(_S, "DEFAULT_CHUNK", 600)))
-            _S.DEFAULT_OVERLAP = int(overrides.get("DEFAULT_OVERLAP", getattr(_S, "DEFAULT_OVERLAP", 12)))
-            _S.DEFAULT_INPUT_FPS = int(overrides.get("DEFAULT_INPUT_FPS", getattr(_S, "DEFAULT_INPUT_FPS", 24)))
-            _S.DEFAULT_TARGET_FPS = int(overrides.get("DEFAULT_TARGET_FPS", getattr(_S, "DEFAULT_TARGET_FPS", 24)))
-            _S.ACE_STEP_PROMPT_JSON = overrides.get("ACE_STEP_PROMPT_JSON", _S.ACE_STEP_PROMPT_JSON)
-            _S.I2V_WORKFLOW = overrides.get("I2V_WORKFLOW", _S.I2V_WORKFLOW)
+            _s.BASE_DIR = overrides.get("BASE_DIR", _s.BASE_DIR)
+            _s.COMFY_HOST = overrides.get("COMFY_HOST", _s.COMFY_HOST)
+            _s.DEFAULT_HOST_CANDIDATES = overrides.get("DEFAULT_HOST_CANDIDATES",
+                                                       getattr(_s, "DEFAULT_HOST_CANDIDATES", []))
+            _s.FFMPEG_EXE = overrides.get("FFMPEG_EXE", _s.FFMPEG_EXE)
+            _s.USE_HWACCEL = bool(overrides.get("USE_HWACCEL", getattr(_s, "USE_HWACCEL", False)))
+            _s.FINAL_OUT = overrides.get("FINAL_OUT", _s.FINAL_OUT)
+            _s.AUDIO_SAVE_FORMAT = overrides.get("AUDIO_SAVE_FORMAT", getattr(_s, "AUDIO_SAVE_FORMAT", "mp3")).lower()
+            _s.DEFAULT_CHUNK = int(overrides.get("DEFAULT_CHUNK", getattr(_s, "DEFAULT_CHUNK", 600)))
+            _s.DEFAULT_OVERLAP = int(overrides.get("DEFAULT_OVERLAP", getattr(_s, "DEFAULT_OVERLAP", 12)))
+            _s.DEFAULT_INPUT_FPS = int(overrides.get("DEFAULT_INPUT_FPS", getattr(_s, "DEFAULT_INPUT_FPS", 24)))
+            _s.DEFAULT_TARGET_FPS = int(overrides.get("DEFAULT_TARGET_FPS", getattr(_s, "DEFAULT_TARGET_FPS", 24)))
+            _s.ACE_STEP_PROMPT_JSON = overrides.get("ACE_STEP_PROMPT_JSON", _s.ACE_STEP_PROMPT_JSON)
+            _s.I2V_WORKFLOW = overrides.get("I2V_WORKFLOW", _s.I2V_WORKFLOW)
 
             # 3) 워크플로 JSON 저장 노드 포맷/경로 패치
             try:
-                # 현재 UI 기준 값
                 fmt = self.cb_audio_fmt.currentText().strip().lower()
                 json_path = Path(self.le_prompt_json.text().strip())
 
-                # 현재 제목 확보(없으면 로드된 프로젝트의 project.json에서 시도)
                 title = (self.le_title.text() or "").strip()
                 if not title:
                     pdir = self._latest_project()
                     if pdir and (pdir / "project.json").exists():
                         try:
-                            from utils import load_json
-                            meta = load_json(pdir / "project.json", {}) or {}
+                            from utils import load_json as _load_json
+                            meta = _load_json(pdir / "project.json", {}) or {}
                             title = (meta.get("title") or "").strip()
                         except Exception:
                             title = ""
 
-                # 오디오 저장 폴더(템플릿 [title] 치환) 계산
-                # 예: FINAL_OUT = r"C:\my_games\shorts_make\maked_title\[title]"
-                save_root = _S.FINAL_OUT or str(_S.BASE_DIR)
+                save_root = _s.FINAL_OUT or str(_s.BASE_DIR)
                 proj_audio_dir = _resolve_audio_dir_from_template(save_root, title or "untitled")
 
-                # 워크플로 저장 노드 패치 실행
                 changed_fmt = rewrite_prompt_audio_format(json_path=json_path, desired_fmt=fmt)
                 changed = bool(changed_fmt)
 
@@ -3014,8 +3037,6 @@ class MainWindow(QtWidgets.QMainWindow):
         wrap.addLayout(btns)
         tab.setLayout(wrap)
         return tab
-
-
 
     # ────────────── 이벤트/핸들러 묶기 ──────────────
     def _wire(self):
@@ -3415,78 +3436,79 @@ class MainWindow(QtWidgets.QMainWindow):
 
     # ────────────── 가사 생성 ──────────────
     # app/shorts_ui.py
-    def set_lls_enabled_for_project(self, proj_dir: str, enabled: bool) -> None:
-        """
-        변환(LLS) 토글을 켰/껐을 때 프로젝트의 LLS 캐시를 관리한다.
-        - ON(enabled=True): 캐시 유지. 필요시 파일 내용으로 meta['lyrics_lls'] 보강
-        - OFF(enabled=False): lyrics_lls 비우고 캐시 파일 삭제
-        """
-        from pathlib import Path
-        import json
+    class YourClass:
+        @staticmethod
+        def set_lls_enabled_for_project(proj_dir: str, enabled: bool) -> None:
+            """
+            변환(LLS) 토글을 켰/껐을 때 프로젝트의 LLS 캐시를 관리한다.
+            - ON(enabled=True): 캐시 유지. 필요시 파일 내용으로 meta['lyrics_lls'] 보강
+            - OFF(enabled=False): lyrics_lls 비우고 캐시 파일 삭제
+            """
+            from pathlib import Path
+            import json
 
-        p = Path(proj_dir)
-        pj = p / "project.json"
+            p = Path(proj_dir)
+            pj = p / "project.json"
 
-        def _load_json(path, default=None):
-            try:
-                s = Path(path).read_text(encoding="utf-8")
-                return json.loads(s)
-            except FileNotFoundError:
-                return default
-            except Exception:
-                return default
-
-        def _save_json(path, data):
-            try:
-                Path(path).write_text(json.dumps(data, ensure_ascii=False, indent=2), encoding="utf-8")
-            except Exception:
-                pass
-
-        def _safe_unlink(path_obj: Path) -> None:
-            try:
-                path_obj.unlink(missing_ok=True)
-            except TypeError:
-                if path_obj.exists():
-                    try:
-                        path_obj.unlink()
-                    except Exception:
-                        pass
-            except Exception:
-                pass
-
-        meta = _load_json(pj, {}) or {}
-        meta["lls_enabled"] = bool(enabled)
-
-        if enabled:
-            # ON: meta에 lyrics_lls가 없고 파일이 있으면 메타 보강
-            if not meta.get("lyrics_lls"):
+            def _load_json(path, default=None):
                 try:
-                    txt = (p / "_lls_after.txt").read_text(encoding="utf-8", errors="ignore").strip()
+                    s = Path(path).read_text(encoding="utf-8")
+                    return json.loads(s)
                 except FileNotFoundError:
-                    txt = ""
+                    return default
                 except Exception:
-                    txt = ""
-                if not txt:
+                    return default
+
+            def _save_json(path, data):
+                try:
+                    Path(path).write_text(json.dumps(data, ensure_ascii=False, indent=2), encoding="utf-8")
+                except Exception:
+                    pass
+
+            def _safe_unlink(path_obj: Path) -> None:
+                try:
+                    path_obj.unlink(missing_ok=True)
+                except TypeError:
+                    if path_obj.exists():
+                        try:
+                            path_obj.unlink()
+                        except Exception:
+                            pass
+                except Exception:
+                    pass
+
+            meta = _load_json(pj, {}) or {}
+            meta["lls_enabled"] = bool(enabled)
+
+            if enabled:
+                if not meta.get("lyrics_lls"):
                     try:
-                        txt = (p / "lyrics_lls.txt").read_text(encoding="utf-8", errors="ignore").strip()
+                        txt = (p / "_lls_after.txt").read_text(encoding="utf-8", errors="ignore").strip()
+                    except FileNotFoundError:
+                        txt = ""
                     except Exception:
                         txt = ""
-                if txt:
-                    meta["lyrics_lls"] = txt
-        else:
-            # OFF: 변환 사용 중지 → 메타/파일 비우기
-            if "lyrics_lls" in meta:
-                try:
-                    del meta["lyrics_lls"]
-                except Exception:
-                    meta["lyrics_lls"] = ""
-            _safe_unlink(p / "_lls_after.txt")
-            _safe_unlink(p / "lyrics_lls.txt")
+                    if not txt:
+                        try:
+                            txt = (p / "lyrics_lls.txt").read_text(encoding="utf-8", errors="ignore").strip()
+                        except Exception:
+                            txt = ""
+                    if txt:
+                        meta["lyrics_lls"] = txt
+            else:
+                if "lyrics_lls" in meta:
+                    try:
+                        del meta["lyrics_lls"]
+                    except Exception:
+                        meta["lyrics_lls"] = ""
+                _safe_unlink(p / "_lls_after.txt")
+                _safe_unlink(p / "lyrics_lls.txt")
 
-        _save_json(pj, meta)
-        print(f"[LLS] toggle -> enabled={bool(enabled)}", flush=True)
+            _save_json(pj, meta)
+            print(f"[LLS] toggle -> enabled={bool(enabled)}", flush=True)
 
-    def save_lls_text_for_project(self, proj_dir: str, lls_text: str) -> None:
+    @staticmethod
+    def save_lls_text_for_project(proj_dir: str, lls_text: str) -> None:
         """
         변환(LLS) 결과 텍스트를 프로젝트에 저장한다.
         - 파일: _lls_after.txt, lyrics_lls.txt
@@ -3531,7 +3553,7 @@ class MainWindow(QtWidgets.QMainWindow):
 
         # 메타 저장 — 원본 가사는 유지
         meta["lyrics_lls"] = text
-        meta["lls_enabled"] = True  # ✅ 변환 저장 시 자동 ON
+        meta["lls_enabled"] = True  # 변환 저장 시 자동 ON
         _save_json(pj, meta)
 
         print("[LLS] saved -> lls_enabled=True", flush=True)
@@ -3579,7 +3601,7 @@ class MainWindow(QtWidgets.QMainWindow):
                 s.add(cb.text().lower().strip())
         return s
 
-
+    @staticmethod
     def canon_key(s: str) -> str:
         return _CANON_RE.sub("", (s or "").lower())
 
@@ -3918,6 +3940,7 @@ class MainWindow(QtWidgets.QMainWindow):
         QtWidgets.QMessageBox.information(self, "완료", f"저장: {pdir}")
         self.status.showMessage(f"저장: {pdir}")
 
+    @staticmethod
     def _normalize_saveaudio_nodes(graph: dict, *, out_path: str, prefix: str, out_dir: str) -> None:
         """
         SaveAudio* 노드들의 입력을 현재 실행 컨텍스트에 맞게 통일:
@@ -4121,25 +4144,25 @@ class MainWindow(QtWidgets.QMainWindow):
             QtWidgets.QMessageBox.critical(self, "오류", str(e))
             self.status.showMessage(f"오류: {e}")
 
-
-
     @staticmethod
     def _move_latest_vocal_to_project(title: str) -> Path | None:
         """
         C:\comfyResult\shorts_make\[title]\ 에서 가장 최신 vocal_final_*.mp3 파일을
         C:\my_games\shorts_make\maked_title\[title]\vocal.mp3 로 이동한다.
         """
-        import settings as _S
+        from pathlib import Path
+        import shutil
+        import settings as _settings  # 소문자 별칭으로 사용
 
         safe_title = _sanitize_title_for_path(title)
 
         # 원본 폴더
-        src_dir = Path(getattr(_S, "COMFY_RESULT_ROOT", r"C:\comfyResult\shorts_make")) / safe_title
+        src_dir = Path(getattr(_settings, "COMFY_RESULT_ROOT", r"C:\comfyResult\shorts_make")) / safe_title
         if not src_dir.exists():
             return None
 
         # 목적지 폴더
-        dst_dir = _resolve_audio_dir_from_template(_S.FINAL_OUT, title)
+        dst_dir = _resolve_audio_dir_from_template(getattr(_settings, "FINAL_OUT", ""), title)
         dst_dir.mkdir(parents=True, exist_ok=True)
 
         # 최신 파일 찾기 (vocal_final_*.*)
@@ -4156,10 +4179,6 @@ class MainWindow(QtWidgets.QMainWindow):
         except Exception:
             shutil.copyfile(str(latest), str(dst_file))
         return dst_file
-
-
-
-
 
     @QtCore.pyqtSlot(bool, str)
     def _on_music_done(self, success: bool, msg: str):
@@ -4742,13 +4761,14 @@ class MainWindow(QtWidgets.QMainWindow):
                     multi_char.append(sid)
 
             if missing:
-                lines = ["누락 이미지가 있어 중단합니다.", ""]
-                lines.append("[누락 이미지]")
-                lines += missing[:30]
-                if len(missing) > 30:
-                    lines.append(f"... (총 {len(missing)}개 중 30개만 표시)")
-                if multi_char:
-                    lines += ["", "[2명 이상 캐릭터가 필요한 장면(참고)]", ", ".join(multi_char)]
+                lines = [
+                    "누락 이미지가 있어 중단합니다.",
+                    "",
+                    "[누락 이미지]",
+                    *missing[:30],
+                    *([f"... (총 {len(missing)}개 중 30개만 표시)"] if len(missing) > 30 else []),
+                    *(["", "[2명 이상 캐릭터가 필요한 장면(참고)]", ", ".join(multi_char)] if multi_char else []),
+                ]
                 QtWidgets.QMessageBox.warning(self, "이미지 누락", "\n".join(lines))
                 return
 
@@ -4856,29 +4876,32 @@ class MainWindow(QtWidgets.QMainWindow):
 
 
 # ==================================================
-
 def _inject_render_prefs_methods():
-    """MainWindow에 _add_render_prefs_controls / _save_ui_prefs_to_project 가 없으면 주입."""
-    # Qt import (이미 상단에서 되어 있어도 안전)
+    """MainWindow에 _add_render_prefs_controls / _save_ui_prefs_to_project (및 테스트 버튼) 없으면 주입."""
+    from pathlib import Path
     from PyQt5 import QtWidgets
 
     # 안전 import (app 패키지/단독 실행 모두 고려)
     try:
-        from app import settings as S
-        from app.utils import load_json, save_json, sanitize_title
+        from app import settings as settings_mod
+        from app.utils import load_json, save_json, sanitize_title as sanitize_title_fn
     except Exception:
-        import settings as S  # type: ignore
+        import settings as settings_mod  # type: ignore
         from utils import load_json, save_json  # type: ignore
-        def sanitize_title(x: str) -> str:
+
+        def sanitize_title_fn(x: str) -> str:
             return "".join(ch for ch in x if ch.isalnum() or ch in " _-").strip()
 
     # 이미 있으면 건너뜀
-    if hasattr(MainWindow, "_add_render_prefs_controls") and hasattr(MainWindow, "_save_ui_prefs_to_project"):
+    if (
+        hasattr(MainWindow, "_add_render_prefs_controls")
+        and hasattr(MainWindow, "_save_ui_prefs_to_project")
+    ):
         return
 
     def _guess_project_dir(self) -> Path:
         """현재 프로젝트 폴더 추정: _current_project_dir() → FINAL_OUT → BASE_DIR/title"""
-        # 1) UI에서 제공하는 메서드가 있으면 사용
+        # 1) UI 제공 메서드
         if hasattr(self, "_current_project_dir"):
             try:
                 d = self._current_project_dir()
@@ -4888,18 +4911,18 @@ def _inject_render_prefs_methods():
                 pass
         # 2) 제목 기반
         try:
-            title = sanitize_title(self.le_title.text().strip())
+            title_val = sanitize_title_fn(self.le_title.text().strip())
         except Exception:
-            title = ""
-        if not title:
-            title = "무제"
-        # 2-1) FINAL_OUT 템플릿이 있으면 우선
-        fin = getattr(S, "FINAL_OUT", "")
-        if fin and "[title]" in fin:
-            return Path(fin.replace("[title]", title))
+            title_val = ""
+        if not title_val:
+            title_val = "무제"
+        # 2-1) FINAL_OUT 템플릿 우선
+        final_tpl = getattr(settings_mod, "FINAL_OUT", "")
+        if final_tpl and "[title]" in final_tpl:
+            return Path(final_tpl.replace("[title]", title_val))
         # 2-2) BASE_DIR/[title]
-        base = getattr(S, "BASE_DIR", ".")
-        return Path(base) / title
+        base_dir_val = getattr(settings_mod, "BASE_DIR", ".")
+        return Path(base_dir_val) / title_val
 
     # ==== 메서드 정의: 드롭다운 UI 추가 ====
     def _add_render_prefs_controls(self, parent_layout: QtWidgets.QBoxLayout) -> None:
@@ -4915,20 +4938,20 @@ def _inject_render_prefs_methods():
         self.cmb_img_h.setToolTip("이미지 세로 (height)")
         self.cmb_movie_fps.setToolTip("타깃 FPS (i2v/렌더)")
 
-        size_choices = getattr(S, "IMAGE_SIZE_CHOICES", [480, 520, 720, 960, 1080, 1280, 1440])
-        for w in size_choices:
-            self.cmb_img_w.addItem(str(int(w)), int(w))
+        size_choices = getattr(settings_mod, "IMAGE_SIZE_CHOICES", [480, 520, 720, 960, 1080, 1280, 1440])
+        for w_val in size_choices:
+            self.cmb_img_w.addItem(str(int(w_val)), int(w_val))
 
-        default_w, default_h = getattr(S, "DEFAULT_IMG_SIZE", (1080, 1920))
-        h_candidates = {int(round(w * 16 / 9)) for w in size_choices}
+        default_w, default_h = getattr(settings_mod, "DEFAULT_IMG_SIZE", (1080, 1920))
+        h_candidates = {int(round(w_val * 16 / 9)) for w_val in size_choices}
         h_candidates.update({default_h})
-        for hh in sorted(h_candidates):
-            self.cmb_img_h.addItem(str(int(hh)), int(hh))
+        for h_val in sorted(h_candidates):
+            self.cmb_img_h.addItem(str(int(h_val)), int(h_val))
 
-        for f in getattr(S, "MOVIE_FPS_CHOICES", [24, 60]):
-            self.cmb_movie_fps.addItem(str(int(f)), int(f))
+        for fps_val in getattr(settings_mod, "MOVIE_FPS_CHOICES", [24, 60]):
+            self.cmb_movie_fps.addItem(str(int(fps_val)), int(fps_val))
 
-        # ── 해상도 프리셋 + 스텝(샘플링 단계) 컨트롤 ─────────────────────
+        # 해상도 프리셋 + 스텝
         self.cmb_res_preset = QtWidgets.QComboBox()
         self.cmb_res_preset.setToolTip("해상도 프리셋(선택 시 W/H 자동 설정)")
 
@@ -4943,8 +4966,8 @@ def _inject_render_prefs_methods():
             ("Square 1:1 · 1024×1024", 1024, 1024, "square_1024"),
             ("맞춤(커스텀)", -1, -1, "custom"),
         ]
-        for label, wv, hv, key in presets:
-            self.cmb_res_preset.addItem(label, (wv, hv, key))
+        for label, w_val, h_val, preset_key_val in presets:
+            self.cmb_res_preset.addItem(label, (w_val, h_val, preset_key_val))
 
         self.spn_t2i_steps = QtWidgets.QSpinBox()
         self.spn_t2i_steps.setRange(1, 200)
@@ -4958,69 +4981,66 @@ def _inject_render_prefs_methods():
         ui = meta.get("ui_prefs") or {}
 
         def _set_combo(combo: QtWidgets.QComboBox, val: int, fallback: int):
-            idx = combo.findData(int(val))
-            if idx < 0:
-                idx = combo.findData(int(fallback))
-            combo.setCurrentIndex(idx if idx >= 0 else 0)
+            idx_found = combo.findData(int(val))
+            if idx_found < 0:
+                idx_found = combo.findData(int(fallback))
+            combo.setCurrentIndex(idx_found if idx_found >= 0 else 0)
 
         _set_combo(self.cmb_img_w, int((ui.get("image_size") or [default_w, default_h])[0]), int(default_w))
         _set_combo(self.cmb_img_h, int((ui.get("image_size") or [default_w, default_h])[1]), int(default_h))
-        _set_combo(self.cmb_movie_fps, int(ui.get("movie_fps") or getattr(S, "DEFAULT_MOVIE_FPS", 24)),
-                   int(getattr(S, "DEFAULT_MOVIE_FPS", 24)))
+        def_fps = int(getattr(settings_mod, "DEFAULT_MOVIE_FPS", 24))
+        _set_combo(self.cmb_movie_fps, int(ui.get("movie_fps") or def_fps), def_fps)
 
         preset_key0 = str((ui.get("resolution_preset") or "custom"))
         steps0 = int(ui.get("t2i_steps") or 24)
         self.spn_t2i_steps.setValue(steps0)
 
-        # 프리셋 선택 시 W/H 적용 + 잠금/해제
         def _lock_wh(lock: bool) -> None:
             self.cmb_img_w.setEnabled(not lock)
             self.cmb_img_h.setEnabled(not lock)
-            tip = "프리셋을 '맞춤(커스텀)'으로 바꾸면 해상도를 수정할 수 있습니다." if lock else "W/H를 직접 선택하세요."
+            tip = (
+                "프리셋을 '맞춤(커스텀)'으로 바꾸면 해상도를 수정할 수 있습니다."
+                if lock else "W/H를 직접 선택하세요."
+            )
             self.cmb_img_w.setToolTip(tip)
             self.cmb_img_h.setToolTip(tip)
 
         def _apply_preset_to_wh() -> None:
-            wv, hv, key = self.cmb_res_preset.currentData()
-            if key == "custom":
+            w_sel, h_sel, preset_key_sel = self.cmb_res_preset.currentData()
+            if preset_key_sel == "custom":
                 _lock_wh(False)
                 return
-            i = self.cmb_img_w.findData(int(wv))
-            if i >= 0:
-                self.cmb_img_w.setCurrentIndex(i)
-            j = self.cmb_img_h.findData(int(hv))
-            if j >= 0:
-                self.cmb_img_h.setCurrentIndex(j)
+            i_w = self.cmb_img_w.findData(int(w_sel))
+            if i_w >= 0:
+                self.cmb_img_w.setCurrentIndex(i_w)
+            i_h = self.cmb_img_h.findData(int(h_sel))
+            if i_h >= 0:
+                self.cmb_img_h.setCurrentIndex(i_h)
             _lock_wh(True)
 
-        # 프리셋 초기값 선택
-        kidx = 0
-        for idx in range(self.cmb_res_preset.count()):
-            _, _, key = self.cmb_res_preset.itemData(idx)
-            if key == preset_key0:
-                kidx = idx
+        # 프리셋 초기값
+        kidx_preset = 0
+        for idx_preset in range(self.cmb_res_preset.count()):
+            _, _, key_val = self.cmb_res_preset.itemData(idx_preset)
+            if key_val == preset_key0:
+                kidx_preset = idx_preset
                 break
-        self.cmb_res_preset.setCurrentIndex(kidx)
+        self.cmb_res_preset.setCurrentIndex(kidx_preset)
         self.cmb_res_preset.currentIndexChanged.connect(_apply_preset_to_wh)
         _apply_preset_to_wh()
 
         # 레이아웃
-        row.addWidget(QtWidgets.QLabel("W"))
-        row.addWidget(self.cmb_img_w)
-        row.addWidget(QtWidgets.QLabel("H"))
-        row.addWidget(self.cmb_img_h)
+        row.addWidget(QtWidgets.QLabel("W")); row.addWidget(self.cmb_img_w)
+        row.addWidget(QtWidgets.QLabel("H")); row.addWidget(self.cmb_img_h)
         row.addSpacing(12)
-        row.addWidget(QtWidgets.QLabel("FPS"))
-        row.addWidget(self.cmb_movie_fps)
+        row.addWidget(QtWidgets.QLabel("FPS")); row.addWidget(self.cmb_movie_fps)
         row.addSpacing(12)
-        row.addWidget(QtWidgets.QLabel("프리셋"))
-        row.addWidget(self.cmb_res_preset)
-        row.addWidget(QtWidgets.QLabel("스텝"))
-        row.addWidget(self.spn_t2i_steps)
+        row.addWidget(QtWidgets.QLabel("프리셋")); row.addWidget(self.cmb_res_preset)
+        row.addWidget(QtWidgets.QLabel("스텝")); row.addWidget(self.spn_t2i_steps)
         row.addStretch(1)
         parent_layout.addWidget(grp)
 
-        # 변경 시 저장(기존 저장 메서드 사용)
+        # 변경 시 저장
         self.cmb_img_w.currentIndexChanged.connect(self._save_ui_prefs_to_project)
         self.cmb_img_h.currentIndexChanged.connect(self._save_ui_prefs_to_project)
         self.cmb_movie_fps.currentIndexChanged.connect(self._save_ui_prefs_to_project)
@@ -5034,55 +5054,57 @@ def _inject_render_prefs_methods():
         meta = load_json(pj, {}) if pj.exists() else {}
         ui = meta.get("ui_prefs") or {}
 
-        w = int(self.cmb_img_w.currentData())
-        h = int(self.cmb_img_h.currentData())
-        fps = int(self.cmb_movie_fps.currentData())
+        w_sel = int(self.cmb_img_w.currentData())
+        h_sel = int(self.cmb_img_h.currentData())
+        fps_sel = int(self.cmb_movie_fps.currentData())
 
-        # 현재 선택된 해상도 프리셋 키 안전 추출
-        preset_key = "custom"
-        data = self.cmb_res_preset.currentData()
-        if isinstance(data, tuple) and len(data) == 3:
-            _, _, preset_key = data  # (w, h, key)
+        preset_key_sel = "custom"
+        data_val = self.cmb_res_preset.currentData()
+        if isinstance(data_val, tuple) and len(data_val) == 3:
+            _, _, preset_key_sel = data_val  # (w, h, key)
 
-        ui["image_size"] = [w, h]
-        ui["movie_fps"] = fps
-        ui["resolution_preset"] = str(preset_key)
+        ui["image_size"] = [w_sel, h_sel]
+        ui["movie_fps"] = fps_sel
+        ui["resolution_preset"] = str(preset_key_sel)
         ui["t2i_steps"] = int(self.spn_t2i_steps.value())
 
         meta["ui_prefs"] = ui
         save_json(pj, meta)
 
-    # === ADD OR REPLACE: inside ShortsMainWindow (or your main widget) ===
+    # === 옵션: 누락 이미지 생성 버튼 핸들러도 주입 ===
     def on_click_test2_1_generate_missing_images(self) -> None:
         from pathlib import Path
         from utils import run_job_with_progress_async
-        from settings import COMFY_LOG_FILE  # ComfyUI 로그 tail 경로
-        # 로컬 임포트(앱/단일 실행 모두 지원)
         try:
             from app.video_build import build_missing_images_from_story
         except Exception:
             from video_build import build_missing_images_from_story  # type: ignore
 
-        story_path = Path(self.txt_story_path.text()).resolve()
+        # 상수 직접 import 대신 getattr로 안전 접근
+        try:
+            import settings as _settings_local  # type: ignore
+        except Exception:
+            from app import settings as _settings_local  # type: ignore
+        comfy_log_file = getattr(_settings_local, "COMFY_LOG_FILE", None)
 
-        # UI 값
+        story_path = Path(self.txt_story_path.text()).resolve()
         ui_w = int(self.cmb_img_w.currentData())
         ui_h = int(self.cmb_img_h.currentData())
-        steps = int(self.spn_t2i_steps.value())
+        steps_val = int(self.spn_t2i_steps.value())
 
-        def job(on_progress):
+        def _job(on_progress):
             return build_missing_images_from_story(
                 story_path,
                 ui_width=ui_w,
                 ui_height=ui_h,
-                steps=steps,
+                steps=steps_val,
                 timeout_sec=300,
                 poll_sec=1.5,
                 workflow_path=None,  # JSONS_DIR/nunchaku_qwen_image_swap.json 자동
                 on_progress=on_progress,
             )
 
-        def done(ok, payload, err):
+        def _done(ok, payload, err):
             from PyQt5 import QtWidgets
             if not ok:
                 QtWidgets.QMessageBox.critical(self, "이미지 생성 실패", str(err))
@@ -5090,11 +5112,13 @@ def _inject_render_prefs_methods():
             cnt = len(payload or [])
             QtWidgets.QMessageBox.information(self, "완료", f"새 이미지 {cnt}개 생성")
 
-        run_job_with_progress_async(self, "테스트2_1: 누락 이미지 생성", job, tail_file=COMFY_LOG_FILE, on_done=done)
+        run_job_with_progress_async(self, "테스트2_1: 누락 이미지 생성", _job, tail_file=comfy_log_file, on_done=_done)
 
     # 클래스에 바인딩
     setattr(MainWindow, "_add_render_prefs_controls", _add_render_prefs_controls)
     setattr(MainWindow, "_save_ui_prefs_to_project", _save_ui_prefs_to_project)
+    setattr(MainWindow, "on_click_test2_1_generate_missing_images", on_click_test2_1_generate_missing_images)
+
 
 # === 주입을 즉시 실행 (MainWindow 인스턴스 생성 전에!) ===
 _inject_render_prefs_methods()
