@@ -1059,243 +1059,209 @@ class MainWindow(QtWidgets.QMainWindow):
 
     def on_click_analyze_music(self) -> None:
         """
-        '음악분석' 실행:
-        - project.json / story.json에서 가사 로드
-        - 보컬 파일 찾기
-        - Whisper(단어 타임스탬프, CPU) + 라인 정렬
-        - 요약 출력 + 컷/페이드아웃 실행
-        - story.json / scene.json 저장 시도
+        '음악분석' 버튼(Whisper 우선 싱크 + 폴백 배분):
+        - project.json → story.json에서 가사 로드
+        - (선택) 보컬 분리 후 Whisper 단어 단위 전사
+        - 공식 가사 라인과 정렬 → 성공 라인은 Whisper 시간 사용
+        - 실패 라인은 온셋-가중치 배분 폴백
+        - 콘솔/다이얼로그 출력 + preview JSON 저장 (story.json 미수정)
+        - ★ 추가: 줄별 정합 기반 '마지막 줄 end + outro_sec'로 컷 & 페이드아웃 수행 → vocal_cut.wav, lyrics_aligned.json 저장
         """
         from pathlib import Path
-        from typing import Optional, List, Any, Dict
+        from typing import Optional, List
         from PyQt5 import QtWidgets
         import json
 
-        use_vocal_separation = True
-        model_size = "large-v3"
-        min_len = 0.5
-        end_bias_sec = 2.5
-        avg_min_sec_per_unit = 2.0
-        start_preroll = 0.30
-        beam_size = 5
-        enable_vad_filter = False  # onnxruntime(Silero VAD) 경로 차단
+        # 설정값(기존 유지)
+        USE_VOCAL_SEPARATION = False
+        MODEL_SIZE = "medium"
+        MIN_LEN = 0.5
+        END_BIAS = 2.5
+        AVG_MIN_SEC_PER_UNIT = 2.0
+        START_PREROLL = 0.30
 
-        def _as_dict(x: Any) -> Dict[str, Any]:
-            if isinstance(x, dict):
-                return x
-            if isinstance(x, tuple) and x and isinstance(x[0], dict):
-                return x[0]
-            return {}
-
-        # audio_sync 안전 import
-        as_mod = None
-        try:
-            import app.audio_sync as as_mod  # type: ignore
-        except Exception:
-            try:
-                import audio_sync as as_mod  # type: ignore
-            except Exception as exc:
-                raise RuntimeError("audio_sync 모듈을 불러오지 못했습니다.") from exc
-
-        for name in ["get_audio_duration", "detect_onsets_seconds", "layout_time_by_weights",
-                     "prepare_pure_lyrics_lines", "sync_lyrics_with_whisper"]:
-            if not callable(getattr(as_mod, name, None)):
-                raise RuntimeError(f"audio_sync.{name} 가 없습니다. audio_sync.py에 함수를 추가하세요.")
-
+        # utils
         try:
             from app.utils import load_json  # type: ignore
         except Exception:
             from utils import load_json  # type: ignore
 
-        def job(log_cb):
+        # audio_sync 통합 모듈
+        AS = None
+        try:
+            import app.audio_sync as AS  # type: ignore
+        except Exception:
+            try:
+                import audio_sync as AS  # type: ignore
+            except Exception:
+                AS = None
+
+        if AS is None:
+            raise RuntimeError("audio_sync 모듈을 불러오지 못했습니다.")
+
+        # 필수 함수 확인(기존 체크 유지)
+        reqs = ["get_audio_duration", "detect_onsets_seconds", "layout_time_by_weights",
+                "prepare_pure_lyrics_lines", "sync_lyrics_with_whisper"]
+        for r in reqs:
+            if not callable(getattr(AS, r, None)):
+                raise RuntimeError(f"audio_sync.{r} 가 없습니다. audio_sync.py에 함수를 추가하세요.")
+
+        def job(log):
             def p(tag_or_msg: str, msg: Optional[str] = None) -> None:
-                log_cb(tag_or_msg if msg is None else f"[{tag_or_msg}] {msg}")
+                log(tag_or_msg if msg is None else f"[{tag_or_msg}] {msg}")
 
             btn = getattr(self, "btn_analyze_music", None) or getattr(getattr(self, "ui", None), "btn_analyze_music",
                                                                       None)
             if isinstance(btn, QtWidgets.QAbstractButton):
                 btn.setEnabled(False)
 
-            proj_dir = self._current_project_dir()
-            if not proj_dir:
-                raise RuntimeError("프로젝트 폴더를 찾을 수 없습니다.")
-
-            p("ui", "프로젝트/보컬 탐색")
-            vocal_path = self._find_latest_vocal()
-            if vocal_path is None:
-                extra: List[Path] = []
-                try:
-                    title = (self.le_title.text() or "").strip()
-                except Exception:
-                    title = ""
-                if title:
-                    out_dir = self._final_out_for_title(title)
-                    for ext in (".mp3", ".wav", ".m4a", ".flac", ".opus"):
-                        extra += list(out_dir.glob(f"vocal{ext}"))
-                    extra += list(out_dir.glob("vocal_final_*.*"))
-                if extra:
-                    vocal_path = max(extra, key=lambda pp: pp.stat().st_mtime if pp.exists() else -1.0)
-            if vocal_path is None:
-                raise RuntimeError("보컬 오디오(vocal.*)를 찾지 못했습니다.")
-            p("음악분석", f"보컬 파일: {Path(vocal_path).name}")
-
-            # 가사 로드
-            lyrics_text = ""
-            pj = Path(proj_dir) / "project.json"
-            if pj.exists():
-                any_proj = load_json(pj, {}) or {}
-                if isinstance(any_proj, dict):
-                    lyrics_text = str(any_proj.get("lyrics") or any_proj.get("lyric") or "")
-            if not lyrics_text:
-                sj = Path(proj_dir) / "story.json"
-                if sj.exists():
-                    try:
-                        story_obj = json.loads(sj.read_text(encoding="utf-8"))
-                        if isinstance(story_obj, dict):
-                            lyrics_text = str(story_obj.get("lyrics") or story_obj.get("lyric") or "")
-                    except Exception:
-                        pass
-            if not lyrics_text.strip():
-                raise RuntimeError("가사를 찾을 수 없습니다. project.json/story.json에 lyrics가 없습니다.")
-            lyrics_text = self._maybe_convert_lyrics_for_api(lyrics_text)
-
-            # 정렬 실행 (반환값 dict/tuple 안전 처리)
-            res_raw = as_mod.sync_lyrics_with_whisper(
-                str(vocal_path),
-                lyrics_text,
-                model_size=model_size,
-                use_vocal_separation=use_vocal_separation,
-                min_len=min_len,
-                end_bias_sec=end_bias_sec,
-                avg_min_sec_per_unit=avg_min_sec_per_unit,
-                start_preroll=start_preroll,
-                beam_size=beam_size,
-                vad_filter=enable_vad_filter,  # 반드시 False
-            )
-            res = _as_dict(res_raw)
-
-            segments = list(res.get("segments") or [])
-            onsets = list(res.get("onsets") or [])
             try:
-                duration = float(res.get("duration_sec", 0.0))
-            except (TypeError, ValueError):
-                duration = 0.0
-            try:
-                start_at = float(res.get("start_at", 0.0))
-            except (TypeError, ValueError):
-                start_at = 0.0
+                p("ui", "프로젝트/보컬 탐색")
+                proj_dir = self._current_project_dir()
+                if not proj_dir:
+                    raise RuntimeError("프로젝트 폴더가 없습니다. 먼저 프로젝트를 생성/불러오세요.")
 
-            lines_out: List[str] = []
-            lines_out.append("===== [Whisper 정렬 결과] =====")
-            lines_out.append(f"duration: {duration:.2f}s, start_at: {start_at:.2f}s")
-            if onsets:
-                lines_out.append(f"onsets: {len(onsets)}개")
-            if segments:
-                for idx, it in enumerate(segments):
-                    try:
-                        s, e, t = it
-                        fs = float(s)
-                        fe = float(e)
-                        tx = str(t)
-                    except Exception:
-                        fs = 0.0
-                        fe = 0.0
-                        tx = str(it)
-                    lines_out.append(f"#{idx:02d}: {fs:6.2f} ~ {fe:6.2f}  {tx}")
+                vocal_path = self._find_latest_vocal()
+                if not (vocal_path and Path(vocal_path).exists()):
+                    raise RuntimeError("보컬 오디오(vocal.*)를 찾지 못했습니다.")
+                p("음악분석", f"보컬 파일: {Path(vocal_path).name}")
 
-            # 컷/페이드아웃 실행 (dict/tuple 안전 처리)
-            from pathlib import Path as _Path
-            try:
-                from app.audio_sync import analyze_and_cut_project  # type: ignore
-            except Exception:
-                from audio_sync import analyze_and_cut_project  # type: ignore
+                # 가사 로드(project → story)
+                lyrics_text = ""
+                pj = Path(proj_dir) / "project.json"
+                if pj.exists():
+                    any_proj = load_json(pj, {}) or {}
+                    if isinstance(any_proj, dict):
+                        lyrics_text = str(any_proj.get("lyrics") or "").strip()
+                if not lyrics_text:
+                    sj = Path(proj_dir) / "story.json"
+                    if sj.exists():
+                        any_story = load_json(sj, {}) or {}
+                        if isinstance(any_story, dict):
+                            lyrics_text = str(any_story.get("lyrics") or "").strip()
+                if not lyrics_text:
+                    raise RuntimeError("가사를 찾을 수 없습니다. project.json/story.json에 lyrics가 없습니다.")
+                # 변환 ON이면 변환본으로 교체(OFF면 원본 유지)
+                lyrics_text = self._maybe_convert_lyrics_for_api(lyrics_text)
 
-            cut_raw = analyze_and_cut_project(
-                project_dir=str(_Path(proj_dir)),
-                model_size=model_size,
-                snap_window_sec=0.15,
-            )
-            cut_res = _as_dict(cut_raw)
-
-            cut = cut_res.get("cut") or {}
-            try:
-                last_end_val = float(cut_res.get("last_end") or 0.0)
-            except (TypeError, ValueError):
-                last_end_val = 0.0
-            aligned_path_s = str(cut_res.get("aligned_path") or "")
-
-            lines_out.append("\n===== [컷 & 페이드아웃 요약] =====")
-            lines_out.append(f"last_end: {last_end_val:.2f}s")
-            lines_out.append(f"outro_sec: {int(cut.get('outro_sec') or 0)}s")
-            try:
-                lines_out.append(f"cut_to: {float(cut.get('cut_to') or 0.0):.2f}s")
-            except (TypeError, ValueError):
-                lines_out.append("cut_to: 0.00s")
-            try:
-                lines_out.append(f"fade_sec: {float(cut.get('fade_sec') or 0.0):.2f}s")
-            except (TypeError, ValueError):
-                lines_out.append("fade_sec: 0.00s")
-            lines_out.append(f"output: {(cut.get('output') or '').strip()}")
-
-            # 줄별 정합 결과
-            aligned_rows = []
-            if aligned_path_s:
-                ap = _Path(aligned_path_s)
-                if ap.exists():
-                    try:
-                        import json as _json
-                        aligned_rows = _json.loads(ap.read_text(encoding="utf-8"))
-                    except (OSError, ValueError, json.JSONDecodeError):
-                        aligned_rows = []
-
-            lines_out.append("\n===== [줄별 정합 결과] =====")
-            if aligned_rows:
-                for idx, row in enumerate(aligned_rows):
-                    line = str(row.get("line") or "")
-                    st = row.get("start")
-                    et = row.get("end")
-                    sc = row.get("score")
-                    if isinstance(st, (int, float)) and isinstance(et, (int, float)):
-                        lines_out.append(
-                            f"#{idx:02d}: {float(st):6.2f} ~ {float(et):6.2f}  (score={float(sc or 0.0):.2f})  {line}")
-                    else:
-                        lines_out.append(f"#{idx:02d}: (미매칭)  (score={float(sc or 0.0):.2f})  {line}")
-            else:
-                lines_out.append("(줄별 정합 결과 없음)")
-
-            # 저장 시도
-            try:
-                self._persist_lyric_sections(
-                    proj_dir=str(Path(proj_dir)),
-                    sections=[
-                        {"start": float(s), "end": float(e), "text": str(t), "label": ""}
-                        for (s, e, t) in (segments or [])
-                    ],
-                    last_end=last_end_val
+                # Whisper 우선 싱크 (기존 동작)
+                res = AS.sync_lyrics_with_whisper(
+                    str(vocal_path),
+                    lyrics_text,
+                    model_size=MODEL_SIZE,
+                    use_vocal_separation=USE_VOCAL_SEPARATION,
+                    min_len=MIN_LEN,
+                    end_bias_sec=END_BIAS,
+                    avg_min_sec_per_unit=AVG_MIN_SEC_PER_UNIT,
+                    start_preroll=START_PREROLL,
                 )
-                lines_out.append("\n[저장] story.json / scene.json 반영 완료")
-            except Exception as exc:
-                lines_out.append(f"\n[저장 경고] 파일 기록 중 문제 발생: {type(exc).__name__}: {exc}")
 
-            return {"text": "\n".join(lines_out)}
+                segments = res.get("segments", [])
+                onsets = res.get("onsets", [])
+                duration = float(res.get("duration_sec", 0.0))
+                start_at = float(res.get("start_at", 0.0))
 
-        def done(success: bool, payload, err) -> None:
-            btn_local = getattr(self, "btn_analyze_music", None) or getattr(getattr(self, "ui", None),
-                                                                            "btn_analyze_music", None)
-            if isinstance(btn_local, QtWidgets.QAbstractButton):
-                btn_local.setEnabled(True)
+                # 라인 표시용(줄바꿈 기준)
+                lines = AS.prepare_pure_lyrics_lines(lyrics_text, drop_section_tags=True)
 
-            if not success:
+                # JSON 미리보기 저장 (기존)
+                preview_path = Path(proj_dir) / "music_analysis_preview.json"
+                with open(preview_path, "w", encoding="utf-8") as f:
+                    json.dump(res, f, ensure_ascii=False, indent=2)
+
+                # ── 출력 조립 시작: out을 여기서 '먼저' 만든다 ──
+                out: List[str] = []
+                out.append("===== [가사 원문] (줄바꿈 기준 라인) =====")
+                for i, u in enumerate(lines):
+                    out.append(f"  #{i:02d}: {u}")
+
+                out.append("\n===== [시간 매핑 결과] =====")
+                for seg in segments:
+                    a = float(seg["start"])
+                    b = float(seg["end"])
+                    t = str(seg["text"])
+                    out.append(f"{a:6.2f} ~ {b:6.2f}  {t}")
+
+                out.append(f"\n(저장) {preview_path}")
+
+                # ★ 추가: 줄별 정합 + 컷 & 페이드아웃(자동)
+                from pathlib import Path as _Path  # 로컬 별칭(경고 회피)
+                from audio_sync import analyze_and_cut_project  # 안전하게 지역 import
+
+                cut_res = analyze_and_cut_project(
+                    project_dir=str(_Path(proj_dir)),
+                    model_size="medium",
+                    snap_window_sec=0.15,
+                )
+
+                cut = cut_res.get("cut") or {}
+                out.append("\n===== [컷 & 페이드아웃 요약] =====")
+                out.append(f"last_end: {float(cut_res.get('last_end') or 0.0):.2f}s")
+                out.append(f"outro_sec: {int(cut.get('outro_sec') or 0)}s")
+                out.append(f"output: {str(cut.get('out') or '')}")
+                out.append(f"duration_out: {float(cut.get('duration_out') or 0.0):.2f}s")
+                out.append(f"aligned(json): {str(cut_res.get('aligned_path') or '')}")
+
+                # 줄별 정합 결과를 함께 표시
+                aligned_rows = []
+                aligned_path_s = str(cut_res.get("aligned_path") or "")
                 try:
-                    msg = f"{type(err).__name__}: {err}"
+                    if aligned_path_s:
+                        ap = _Path(aligned_path_s)
+                        if ap.exists():
+                            import json as _json
+                            aligned_rows = _json.loads(ap.read_text(encoding="utf-8"))
                 except Exception:
-                    msg = "분석 중 오류가 발생했습니다."
-                QtWidgets.QMessageBox.critical(self, "음악분석 실패", msg)
-                return
+                    aligned_rows = []
 
+                out.append("\n===== [줄별 정합 결과] =====")
+                if aligned_rows:
+                    for idx, row in enumerate(aligned_rows):
+                        line = str(row.get("line") or "")
+                        s = row.get("start")
+                        e = row.get("end")
+                        sc = row.get("score")
+                        if isinstance(s, (int, float)) and isinstance(e, (int, float)):
+                            out.append(
+                                f"#{idx:02d}: {float(s):6.2f} ~ {float(e):6.2f}  (score={float(sc or 0.0):.2f})  {line}")
+                        else:
+                            out.append(f"#{idx:02d}: (미매칭)  (score={float(sc or 0.0):.2f})  {line}")
+                else:
+                    out.append("(줄별 정합 결과 없음)")
+
+                p("분석", "완료")
+                return {"text": "\n".join(out)}
+
+            except Exception as e:
+                p("error", f"{type(e).__name__}: {e}")
+                raise
+            finally:
+                if isinstance(btn, QtWidgets.QAbstractButton):
+                    btn.setEnabled(True)
+
+        def done(ok: bool, payload, err):
+            from PyQt5 import QtWidgets
+            if not ok:
+                QtWidgets.QMessageBox.critical(self, "음악분석 실패", str(err))
+                return
             text = (payload or {}).get("text", "")
-            if text:
-                print("\n[음악분석 결과]\n" + text, flush=True)
+            print("\n[음악분석 결과]\n" + text, flush=True)
+
+            dlg = QtWidgets.QDialog(self)
+            dlg.setWindowTitle("음악분석 결과 — Whisper 정렬 + 폴백 배분 + 컷/페이드아웃")
+            dlg.resize(900, 720)
+            v = QtWidgets.QVBoxLayout(dlg)
+            ed = QtWidgets.QPlainTextEdit()
+            ed.setReadOnly(True)
+            ed.setPlainText(text)
+            v.addWidget(ed)
+            row = QtWidgets.QHBoxLayout()
+            v.addLayout(row)
+            row.addStretch(1)
+            btn_close = QtWidgets.QPushButton("닫기")
+            row.addWidget(btn_close)
+            btn_close.clicked.connect(dlg.accept)
+            dlg.exec_()
 
         try:
             from app.progress import run_job_with_progress_async  # type: ignore
@@ -3846,7 +3812,6 @@ class MainWindow(QtWidgets.QMainWindow):
                 pass
 
     from pathlib import Path
-    from typing import Union
 
     def _apply_project_meta(self, proj_dir: str) -> None:
         """

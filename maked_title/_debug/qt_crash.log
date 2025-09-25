@@ -24,3 +24,5 @@ Traceback (most recent call last):
     super().__init__(**kwargs)
 TypeError: Client.__init__() got an unexpected keyword argument 'follow_redirects'
 
+[2025-09-25 14:01:41] [QT] 3 None:0 QThread: Destroyed while thread is still running
+[2025-09-25 14:05:37] [QT] 3 None:0 QThread: Destroyed while thread is still running

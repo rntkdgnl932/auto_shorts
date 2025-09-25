@@ -1893,294 +1893,148 @@ def sync_lyrics_with_whisper(
     audio_path: str,
     lyrics_text: str,
     *,
-    model_size: str = "large-v3",
-    use_vocal_separation: bool = True,
+    model_size: str = "medium",
+    use_vocal_separation: bool = False,
     min_len: float = 0.5,
     end_bias_sec: float = 2.5,
     avg_min_sec_per_unit: float = 2.0,
     start_preroll: float = 0.30,
     beam_size: int = 5,
-    vad_filter: bool = True,  # 외부 시그니처 보존(내부에서는 강제로 False 적용)
-) -> dict:
+    vad_filter: bool = False,
+) -> Dict[str, Any]:
     """
-    라인 단위 가사 정렬(Whisper 단어 타임스탬프 기반, CPU 전용):
-      - 어떤 분기에서도 **반드시 dict**를 반환한다.
-      - faster-whisper는 **device='cpu', compute_type='int8'**로 고정.
-      - **vad_filter는 내부에서 항상 False**로 호출하여 onnxruntime(Silero VAD) 경로를 원천 차단.
-      - 라인→단어 시퀀스 정렬(경량 DP) + librosa RMS VAD 클램프 + 온셋 스냅 + 폴백 배분.
-    반환 dict 스키마:
+    1) (옵션) 보컬 분리
+    2) Whisper 단어 전사(가사 기반 initial_prompt)
+    3) 단어→가사 라인 정렬
+    4) 실패 라인만 온셋-가중치 배분(폴백)
+    반환:
       {
-        "segments": [(start: float, end: float, text: str), ...],
-        "onsets": [float, ...],
         "duration_sec": float,
-        "start_at": 0.0
+        "start_at": float,
+        "onsets": [float, ...],
+        "segments": [{"start": a, "end": b, "text": line}, ...],
+        "unused_lines": [...],
+        "debug": {...}
       }
     """
-    import re
-    from pathlib import Path
-    from typing import List, Tuple, Optional
-    import numpy as np
+    p = (audio_path or "").strip()
+    if not p or not os.path.isfile(p):
+        raise RuntimeError("오디오 파일이 없습니다.")
 
-    # 0) 필수 유틸 (기존에 존재하는 함수만 사용)
-    try:
-        duration_sec = float(get_audio_duration(audio_path))
-    except Exception:
-        duration_sec = 0.0
+    total_dur = float(get_audio_duration(p))
+    if not math.isfinite(total_dur) or total_dur <= 0:
+        raise RuntimeError("오디오 길이를 읽지 못했습니다.")
 
-    try:
-        onsets = list(detect_onsets_seconds(audio_path))
-    except Exception:
-        onsets = []
-
-    try:
-        raw_lines = list(prepare_pure_lyrics_lines(lyrics_text))
-    except Exception:
-        raw_lines = [(lyrics_text or "").strip()]
-
-    # 1) 라인 전처리
-    lines: List[str] = []
-    for ln in raw_lines:
-        s = (ln or "").strip()
-        s = re.sub(r"[·…“”\"'`]+", "", s)
-        if s:
-            lines.append(s)
-    if not lines:
-        return {
-            "segments": [],
-            "onsets": onsets,
-            "duration_sec": duration_sec,
-            "start_at": 0.0,
-        }
-
-    # 2) 입력 오디오(보컬 스템 우선). 실패해도 원본 사용
-    vocal_path = audio_path
+    # 1) (옵션) 보컬 분리
+    use_path = p
     if use_vocal_separation:
-        try:
-            if callable(globals().get("try_extract_vocals")):
-                vp = globals()["try_extract_vocals"](audio_path)  # type: ignore
-                if isinstance(vp, str) and Path(vp).exists():
-                    vocal_path = vp
-        except Exception:
-            vocal_path = audio_path
+        vp = separate_vocals_demucs(p)
+        if vp and os.path.isfile(vp):
+            use_path = vp
 
-    # 3) 토큰 정규화
-    def norm_token(s: str) -> str:
-        x = s.strip().lower()
-        x = re.sub(r"[^\w\s가-힣]", " ", x)
-        x = re.sub(r"\s+", " ", x)
-        return x
+    # 2) 가사 라인 정리 & initial_prompt 생성
+    lines = prepare_pure_lyrics_lines(lyrics_text, drop_section_tags=True)
+    if not lines:
+        raise RuntimeError("분할할 가사 라인이 없습니다.")
 
-    line_tokens: List[List[str]] = []
+    tokens: List[str] = []
     for ln in lines:
-        toks = [z for z in norm_token(ln).split() if z]
-        line_tokens.append(toks)
+        t = re.sub(r"[^0-9A-Za-z가-힣\s]", " ", ln)
+        for w in t.split():
+            if len(w) >= 2:
+                tokens.append(w)
+    uniq: List[str] = []
+    seen = set()
+    for w in tokens:
+        if w not in seen:
+            uniq.append(w); seen.add(w)
+    initial_prompt = " ".join(uniq[:80])  # 실제 길이/바이트 절삭은 transcribe_words에서 재확인
 
-    # 4) ASR: faster-whisper (CPU 전용, vad_filter=False 강제)
-    words: List[dict] = []
-    asr_fail = False
-    try:
-        from faster_whisper import WhisperModel  # type: ignore
-        import os
-        os.environ.setdefault("CUDA_VISIBLE_DEVICES", "")
-        model = WhisperModel(model_size, device="cpu", compute_type="int8")
-        segs, _ = model.transcribe(
-            vocal_path,
-            word_timestamps=True,
-            vad_filter=False,          # ← 내부 강제: onnxruntime 경로 차단
-            beam_size=int(beam_size),
-        )
-        for seg in (segs or []):
-            for w in (seg.words or []):
-                tok = (w.word or "").strip()
-                if tok:
-                    words.append({"tok": tok, "start": float(w.start or 0.0), "end": float(w.end or 0.0)})
-    except Exception:
-        asr_fail = True
-        words = []
+    # 3) Whisper 전사 (단어 타임스탬프 포함)
+    tr = transcribe_words(
+        use_path,
+        model_size=model_size,
+        initial_prompt=initial_prompt,
+        beam_size=beam_size,
+        vad_filter=vad_filter,
+    )
 
-    # 5) 단어 토큰 시퀀스 구성
-    word_tokens: List[Tuple[str, float, float]] = []
-    for w in words:
-        t = norm_token(w["tok"])
-        if t:
-            word_tokens.append((t, float(w["start"]), float(w["end"])))
+    # 온셋 검출
+    onsets = detect_onsets_seconds(p) or []
+    onsets = [float(t) for t in onsets if math.isfinite(float(t)) and t >= 0.0]
+    onsets.sort()
 
-    # 6) 경량 DP 기반 라인 정렬
-    aligned: List[Tuple[Optional[float], Optional[float], str, float]] = []
-    if word_tokens and line_tokens and not asr_fail:
-        wi = 0
-        n = len(word_tokens)
-        for idx, toks in enumerate(line_tokens):
-            if not toks:
-                aligned.append((None, None, lines[idx], 0.0))
-                continue
+    # 시작점: 첫 온셋 - preroll
+    start_at = max(0.0, (onsets[0] - start_preroll) if onsets else 0.0)
 
-            m = len(toks)
-            best_span = None
-            best_score = -1.0
+    final_segments: List[Tuple[float, float, str]] = []
+    unused: List[str] = []
 
-            max_window = min(n, wi + 300)
-            for k in range(wi, max_window):
-                matched = 0
-                j = k
-                tpos = 0
-                skips = 0
-                while j < n and tpos < m:
-                    if toks[tpos] == word_tokens[j][0]:
-                        matched += 1
-                        tpos += 1
-                        j += 1
-                    else:
-                        j += 1
-                        skips += 1
-                        if skips > 2 * m:
-                            break
-                if matched == 0:
-                    continue
-                match_ratio = matched / float(m)
-                span_len = j - k
-                penalty = max(0.0, (span_len - matched) / float(max(1, matched)))
-                score = match_ratio - 0.15 * penalty
-                if score > best_score:
-                    best_score = score
-                    st = word_tokens[k][1]
-                    et = word_tokens[j - 1][2]
-                    best_span = (st, et)
+    if tr and tr.get("words"):
+        # 단어 → 라인 정렬
+        aligned = align_words_to_lyrics_lines("\n".join(lines), tr["words"])
 
-            if best_span:
-                st, et = best_span
-                aligned.append((float(st), float(et), lines[idx], float(max(0.0, min(1.0, best_score)))))
-                wi = max(wi, next((p for p in range(wi, n) if word_tokens[p][1] >= st), wi))
+        # 성공 라인 수집
+        for st, et, txt in aligned:
+            if st is not None and et is not None and st < et:
+                final_segments.append((float(st), float(et), txt))
+
+        # 실패 라인 폴백 배분
+        missing_lines = [txt for st, et, txt in aligned if st is None or et is None]
+        if missing_lines:
+            spans = layout_time_by_weights(
+                missing_lines,
+                start_at,
+                total_dur,
+                onsets=onsets,
+                min_len=min_len,
+                end_bias_sec=end_bias_sec,
+                avg_min_sec_per_unit=avg_min_sec_per_unit,
+            )
+            for i, (a, b) in enumerate(spans):
+                final_segments.append((a, b, missing_lines[i]))
+
+        # 시간순 정렬 + 겹침 최소화
+        final_segments.sort(key=lambda x: x[0])
+        merged: List[Tuple[float, float, str]] = []
+        for a, b, t in final_segments:
+            if not merged:
+                merged.append((a, b, t))
             else:
-                aligned.append((None, None, lines[idx], 0.0))
-    else:
-        aligned = [(None, None, ln, 0.0) for ln in lines]
-
-    # 7) librosa RMS VAD로 경계 클램프
-    vad_bounds: List[Tuple[float, float]] = []
-    try:
-        import librosa
-        y, sr = librosa.load(vocal_path, sr=None, mono=True)
-        hop = 512
-        rms = librosa.feature.rms(y=y, hop_length=hop)[0]
-        times = librosa.frames_to_time(np.arange(len(rms)), sr=sr, hop_length=hop)
-        thr = float(np.percentile(rms, 60) * 0.6)
-        active = rms > thr
-        i = 0
-        while i < len(active):
-            if active[i]:
-                s = times[i]
-                while i < len(active) and active[i]:
-                    i += 1
-                e = times[min(i, len(times) - 1)]
-                if e - s >= 0.12:
-                    vad_bounds.append((float(s), float(e)))
-            else:
-                i += 1
-    except Exception:
-        vad_bounds = []
-
-    def clamp_to_bounds(st: float, et: float) -> Tuple[float, float]:
-        if not vad_bounds:
-            return st, et
-        best = None
-        best_d = 1e9
-        for s, e in vad_bounds:
-            if et < s:
-                d = s - et
-            elif st > e:
-                d = st - e
-            else:
-                d = 0.0
-            if d < best_d:
-                best_d = d
-                best = (s, e)
-        if not best:
-            return st, et
-        s, e = best
-        st2 = max(st, s)
-        et2 = min(et, e) if et > 0 else e
-        if et2 <= st2:
-            mid = (s + e) / 2.0
-            return max(s, mid - 0.2), min(e, mid + 0.2)
-        return st2, et2
-
-    # 8) 온셋 스냅
-    def snap(t: float, arr: List[float], tol: float = 0.12) -> float:
-        if not arr:
-            return t
-        cand = min(arr, key=lambda x: abs(x - t))
-        if abs(cand - t) <= tol:
-            return cand
-        return t
-
-    # 9) 후처리 + 폴백 배분
-    segments: List[Tuple[float, float, str]] = []
-    prev_end = 0.0
-    for st, et, text, score in aligned:
-        if isinstance(st, float) and isinstance(et, float):
-            st2, et2 = clamp_to_bounds(st, et)
-            st2 = max(0.0, st2 - float(start_preroll))
-            if onsets:
-                st2 = snap(st2, onsets, 0.12)
-                et2 = snap(et2, onsets, 0.12)
-            if et2 - st2 < float(min_len):
-                et2 = st2 + float(min_len)
-            if st2 < prev_end:
-                st2 = prev_end
-            if et2 > duration_sec + end_bias_sec:
-                et2 = min(duration_sec + end_bias_sec, st2 + max(min_len, 0.4))
-            segments.append((float(st2), float(et2), text))
-            prev_end = float(et2)
-        else:
-            st2 = prev_end
-            if onsets:
-                next_on = next((x for x in onsets if x > st2 + 0.2), None)
-                if next_on is not None:
-                    et2 = max(st2 + min_len, min(next_on + 0.3, st2 + 1.2))
+                pa, pb, pt = merged[-1]
+                if a <= pb:
+                    merged[-1] = (pa, max(pb, b), pt)
                 else:
-                    et2 = min(duration_sec + end_bias_sec, st2 + max(min_len, 0.8))
-            else:
-                et2 = min(duration_sec + end_bias_sec, st2 + max(min_len, 0.8))
-            if et2 <= st2:
-                et2 = st2 + float(min_len)
-            segments.append((float(st2), float(et2), text))
-            prev_end = float(et2)
+                    merged.append((a, b, t))
+        final_segments = merged
+    else:
+        # 전사 실패 → 전체 라인 일괄 배분
+        spans = layout_time_by_weights(
+            lines,
+            start_at,
+            total_dur,
+            onsets=onsets,
+            min_len=min_len,
+            end_bias_sec=end_bias_sec,
+            avg_min_sec_per_unit=avg_min_sec_per_unit,
+        )
+        for i, (a, b) in enumerate(spans):
+            final_segments.append((a, b, lines[i]))
 
-    # 평균 길이 하한 보장
-    if segments:
-        lens = [max(0.0, b - a) for a, b, _ in segments]
-        avg_len = float(np.mean(lens)) if lens else 0.0
-        target_min = float(avg_min_sec_per_unit)
-        if avg_len < target_min:
-            scale = (target_min / avg_len) if avg_len > 0 else 1.0
-            scale = float(min(1.6, max(1.0, scale)))
-            new_segments: List[Tuple[float, float, str]] = []
-            cur = 0.0
-            for a, b, t in segments:
-                dur = (b - a) * scale
-                a2 = max(cur, a)
-                b2 = min(duration_sec + end_bias_sec, a2 + dur)
-                if b2 - a2 < min_len:
-                    b2 = a2 + min_len
-                new_segments.append((float(a2), float(b2), t))
-                cur = float(b2)
-            segments = new_segments
-
-    # 첫 라인 프리롤 보정
-    if segments:
-        a0, b0, t0 = segments[0]
-        a0 = max(0.0, a0 - float(start_preroll))
-        segments[0] = (a0, b0, t0)
-
-    # 10) 어떤 경우에도 dict로 반환 (tuple 금지)
     return {
-        "segments": segments,
+        "duration_sec": float(total_dur),
+        "start_at": float(start_at),
         "onsets": onsets,
-        "duration_sec": duration_sec,
-        "start_at": 0.0,
+        "segments": [{"start": float(a), "end": float(b), "text": t} for a, b, t in final_segments],
+        "unused_lines": unused,
+        "debug": {
+            "used_audio_path": use_path,
+            "lines_count": len(lines),
+            "whisper_used": bool(tr and tr.get("words")),
+            "beam_size": int(max(1, beam_size)),
+            "vad_filter": bool(vad_filter),
+        },
     }
-
 
 
 
