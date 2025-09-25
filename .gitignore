@@ -1,7 +1,7 @@
 .idea
-.character
-.comfy_input
-.maked_title
+.character/
+.comfy_input/
+.maked_title/
 .playwright_profile
 dist
 mysettings
