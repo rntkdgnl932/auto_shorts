@@ -1,0 +1,51 @@
+[
+  {
+    "line": "소음 가득한 거리 위로",
+    "start": 0.0,
+    "end": 13.06,
+    "score": 0.6579999999999999,
+    "word_level": true
+  },
+  {
+    "line": "흐릿한 네온사인 불빛",
+    "start": 13.18,
+    "end": 13.78,
+    "score": 0.0,
+    "word_level": true
+  },
+  {
+    "line": "스쳐 가는 무표정한 얼굴들",
+    "start": 13.78,
+    "end": 14.22,
+    "score": 0.0,
+    "word_level": true
+  },
+  {
+    "line": "어지러운 밤의 멜로디",
+    "start": 14.34,
+    "end": 24.94,
+    "score": 0.6199999999999999,
+    "word_level": true
+  },
+  {
+    "line": "그 순간, 네 눈빛이 닿아",
+    "start": null,
+    "end": null,
+    "score": 0.0,
+    "word_level": true
+  },
+  {
+    "line": "멈춰버린 세상 속에서",
+    "start": null,
+    "end": null,
+    "score": 0.0,
+    "word_level": true
+  },
+  {
+    "line": "유일하게 빛나던 너",
+    "start": null,
+    "end": null,
+    "score": 0.0,
+    "word_level": true
+  }
+]

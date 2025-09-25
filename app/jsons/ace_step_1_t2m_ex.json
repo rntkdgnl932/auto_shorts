@@ -1,0 +1,134 @@
+{
+  "prompt": {
+    "40": {
+      "class_type": "CheckpointLoaderSimple",
+      "inputs": {
+        "ckpt_name": "ace_step_v1_3.5b.safetensors"
+      }
+    },
+    "74": {
+      "class_type": "LyricsLangSwitch",
+      "mode": "always",
+      "inputs": {
+        "lyrics": "",
+        "language": "Korean",
+        "threshold": 0.8
+      }
+    },
+    "14": {
+      "class_type": "TextEncodeAceStepAudio",
+      "inputs": {
+        "clip": [
+          "40",
+          1
+        ],
+        "tags": "",
+        "lyrics": [
+          "74",
+          0
+        ],
+        "lyrics_strength": 1.0
+      }
+    },
+    "44": {
+      "class_type": "ConditioningZeroOut",
+      "inputs": {
+        "conditioning": [
+          "14",
+          0
+        ]
+      }
+    },
+    "51": {
+      "class_type": "ModelSamplingSD3",
+      "inputs": {
+        "model": [
+          "40",
+          0
+        ],
+        "shift": 6.0
+      }
+    },
+    "50": {
+      "class_type": "LatentOperationTonemapReinhard",
+      "inputs": {
+        "multiplier": 1.15
+      }
+    },
+    "49": {
+      "class_type": "LatentApplyOperationCFG",
+      "inputs": {
+        "model": [
+          "51",
+          0
+        ],
+        "operation": [
+          "50",
+          0
+        ]
+      }
+    },
+    "17": {
+      "class_type": "EmptyAceStepLatentAudio",
+      "inputs": {
+        "batch_size": 1,
+        "seconds": 60
+      }
+    },
+    "52": {
+      "class_type": "KSampler",
+      "inputs": {
+        "model": [
+          "49",
+          0
+        ],
+        "positive": [
+          "14",
+          0
+        ],
+        "negative": [
+          "44",
+          0
+        ],
+        "latent_image": [
+          "17",
+          0
+        ],
+        "steps": 80,
+        "sampler_name": "er_sde",
+        "denoise": 0.9,
+        "scheduler": "linear_quadratic",
+        "cfg": 4.0,
+        "seed": 0
+      }
+    },
+    "18": {
+      "class_type": "VAEDecodeAudio",
+      "inputs": {
+        "samples": [
+          "52",
+          0
+        ],
+        "vae": [
+          "40",
+          2
+        ]
+      }
+    },
+    "59": {
+      "class_type": "SaveAudioMP3",
+      "inputs": {
+        "audio": [
+          "18",
+          0
+        ],
+        "filename_prefix": "C:\\my_games\\shorts_make\\maked_title\\가로등 아래 우리\\vocal",
+        "quality": "320",
+        "filename": "C:\\my_games\\shorts_make\\maked_title\\가로등 아래 우리\\vocal.mp3",
+        "output_path": "C:\\my_games\\shorts_make\\maked_title\\가로등 아래 우리",
+        "basename": "vocal",
+        "base_filename": "vocal"
+      }
+    }
+  }
+}

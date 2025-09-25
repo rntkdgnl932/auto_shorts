@@ -1,0 +1,189 @@
+{
+  "14": {
+    "inputs": {
+      "tags": "\"pop\",\n\"110 bpm\",\n    \"acoustic guitar\",\n    \"soft electric drums\",\n    \"electric bass\",\n    \"clean vocals\",\n    \"clear diction\",\n    \"warm emotional tone\",\n    \"melodic\",\n    \"balanced mixing\",\n    \"studio reverb light\"\t\n",
+      "lyrics": [
+        "74",
+        0
+      ],
+      "lyrics_strength": 0.9900000000000002,
+      "clip": [
+        "40",
+        1
+      ]
+    },
+    "class_type": "TextEncodeAceStepAudio",
+    "_meta": {
+      "title": "TextEncodeAceStepAudio"
+    }
+  },
+  "17": {
+    "inputs": {
+      "seconds": 60,
+      "batch_size": 1
+    },
+    "class_type": "EmptyAceStepLatentAudio",
+    "_meta": {
+      "title": "EmptyAceStepLatentAudio"
+    }
+  },
+  "18": {
+    "inputs": {
+      "samples": [
+        "52",
+        0
+      ],
+      "vae": [
+        "40",
+        2
+      ]
+    },
+    "class_type": "VAEDecodeAudio",
+    "_meta": {
+      "title": "오디오 VAE 디코드"
+    }
+  },
+  "40": {
+    "inputs": {
+      "ckpt_name": "ace_step_v1_3.5b.safetensors"
+    },
+    "class_type": "CheckpointLoaderSimple",
+    "_meta": {
+      "title": "체크포인트 로드"
+    }
+  },
+  "44": {
+    "inputs": {
+      "conditioning": [
+        "14",
+        0
+      ]
+    },
+    "class_type": "ConditioningZeroOut",
+    "_meta": {
+      "title": "조건 (0으로 출력)"
+    }
+  },
+  "49": {
+    "inputs": {
+      "model": [
+        "51",
+        0
+      ],
+      "operation": [
+        "50",
+        0
+      ]
+    },
+    "class_type": "LatentApplyOperationCFG",
+    "_meta": {
+      "title": "잠재 데이터 CFG 연산 (연산 적용)"
+    }
+  },
+  "50": {
+    "inputs": {
+      "multiplier": 1.0000000000000002
+    },
+    "class_type": "LatentOperationTonemapReinhard",
+    "_meta": {
+      "title": "잠재 데이터 연산 (톤맵 레인하르트)"
+    }
+  },
+  "51": {
+    "inputs": {
+      "shift": 5.000000000000001,
+      "model": [
+        "40",
+        0
+      ]
+    },
+    "class_type": "ModelSamplingSD3",
+    "_meta": {
+      "title": "모델 샘플링 (SD3)"
+    }
+  },
+  "52": {
+    "inputs": {
+      "seed": 1075430197111118,
+      "steps": 80,
+      "cfg": 5,
+      "sampler_name": "euler",
+      "scheduler": "simple",
+      "denoise": 1,
+      "model": [
+        "49",
+        0
+      ],
+      "positive": [
+        "14",
+        0
+      ],
+      "negative": [
+        "44",
+        0
+      ],
+      "latent_image": [
+        "17",
+        0
+      ]
+    },
+    "class_type": "KSampler",
+    "_meta": {
+      "title": "KSampler"
+    }
+  },
+  "74": {
+    "inputs": {
+      "lyrics": "[intro]\n\n[verse]\n노란 깃털 옷을 입고\n아장아장 걸어와\n세상에서 제일 귀여워\n\n[chorus]\n착한 우리 꼬꼬\n오늘도 기분 좋아\n작은 발로 콩콩콩",
+      "language": "Korean",
+      "threshold": 0.85
+    },
+    "class_type": "LyricsLangSwitch",
+    "_meta": {
+      "title": "ACE-Step Lyrics Language Switch"
+    }
+  },
+  "75": {
+    "inputs": {
+      "preview": "[intro]\n\n[verse]\n[ko]nolan gisteol os-eul ibgo\n[ko]ajang-ajang geol-eo-wa\n[ko]sesang-eseo je-il gwi-yeo-wo\n\n[chorus]\n[ko]chaghan uli kko-kko\n[ko]oneuldo gibun joh-a\n[ko]jag-eun ballo kongkongkong\n",
+      "source": [
+        "74",
+        0
+      ]
+    },
+    "class_type": "PreviewAny",
+    "_meta": {
+      "title": "미리보기 아무거나"
+    }
+  },
+  "78": {
+    "inputs": {
+      "filename_prefix": "audio/ComfyUI",
+      "audioUI": "",
+      "audio": [
+        "18",
+        0
+      ]
+    },
+    "class_type": "SaveAudio",
+    "_meta": {
+      "title": "오디오 저장"
+    }
+  },
+  "79": {
+    "inputs": {
+      "root_dir": "input",
+      "file": "lyric.txt",
+      "append": "overwrite",
+      "insert": true,
+      "text": [
+        "74",
+        0
+      ]
+    },
+    "class_type": "SaveText|pysssss",
+    "_meta": {
+      "title": "Save Text 🐍"
+    }
+  }
+}
