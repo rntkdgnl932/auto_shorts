@@ -1,0 +1,51 @@
+[
+  {
+    "line": "꺼져가는 가로등 아래",
+    "start": 1.44,
+    "end": 15.4,
+    "score": 0.194,
+    "word_level": true
+  },
+  {
+    "line": "희미해진 너의 실루엣",
+    "start": 15.52,
+    "end": 19.86517864803579,
+    "score": 0.0,
+    "word_level": true
+  },
+  {
+    "line": "잡으려 해도 닿지를 않아",
+    "start": 19.86517864803579,
+    "end": 25.000389777532632,
+    "score": 0.0,
+    "word_level": true
+  },
+  {
+    "line": "사라져 가는 온기만 남아",
+    "start": 25.000389777532632,
+    "end": 30.135600907029477,
+    "score": 0.0,
+    "word_level": true
+  },
+  {
+    "line": "시간은 멈춘 듯 고요하고",
+    "start": 30.25560090702948,
+    "end": 46.068390022675736,
+    "score": 0.6313333333333333,
+    "word_level": true
+  },
+  {
+    "line": "차가운 공기만 날 감싸네",
+    "start": 46.56,
+    "end": 57.4,
+    "score": 0.6833333333333332,
+    "word_level": true
+  },
+  {
+    "line": "이 밤의 끝에 뭐가 있을까",
+    "start": null,
+    "end": null,
+    "score": 0.0,
+    "word_level": true
+  }
+]

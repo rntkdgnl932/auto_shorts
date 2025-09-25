@@ -1,0 +1,176 @@
+{
+  "audio": "C:\\my_games\\shorts_make\\maked_title\\잔상\\vocal.wav",
+  "duration": 59.907,
+  "timeline": [
+    {
+      "section": "intro",
+      "label": "Intro",
+      "lines": [],
+      "start": 0.0,
+      "end": 5.0,
+      "duration": 5.0
+    },
+    {
+      "section": "verse",
+      "label": "verse",
+      "lines": [
+        "꺼져가는 가로등 아래",
+        "희미해진 너의 실루엣",
+        "잡으려 해도 닿지를 않아",
+        "사라져 가는 온기만 남아"
+      ],
+      "start": 5.0,
+      "end": 39.0,
+      "duration": 34.0
+    },
+    {
+      "section": "bridge",
+      "label": "bridge",
+      "lines": [
+        "시간은 멈춘 듯 고요하고",
+        "차가운 공기만 날 감싸네",
+        "이 밤의 끝에 뭐가 있을까"
+      ],
+      "start": 39.0,
+      "end": 59.907,
+      "duration": 20.907
+    }
+  ],
+  "segments": [
+    {
+      "label": "Intro",
+      "section": "intro",
+      "start": 0.0,
+      "end": 5.0,
+      "duration": 5.0,
+      "summary": "리듬 포인트 중심",
+      "lyric": ""
+    },
+    {
+      "label": "verse",
+      "section": "verse",
+      "start": 5.0,
+      "end": 9.25,
+      "duration": 4.25,
+      "summary": "감정 변주를 강조",
+      "lyric": "꺼져가는 가로등 아래 희미해진 너의 실루엣 잡으려 해도 닿지를 않아 사라져 가는 온기만 남아"
+    },
+    {
+      "label": "verse",
+      "section": "verse",
+      "start": 9.25,
+      "end": 13.5,
+      "duration": 4.25,
+      "summary": "감정 변주를 강조",
+      "lyric": "꺼져가는 가로등 아래 희미해진 너의 실루엣 잡으려 해도 닿지를 않아 사라져 가는 온기만 남아"
+    },
+    {
+      "label": "verse",
+      "section": "verse",
+      "start": 13.5,
+      "end": 17.75,
+      "duration": 4.25,
+      "summary": "감정 변주를 강조",
+      "lyric": "꺼져가는 가로등 아래 희미해진 너의 실루엣 잡으려 해도 닿지를 않아 사라져 가는 온기만 남아"
+    },
+    {
+      "label": "verse",
+      "section": "verse",
+      "start": 17.75,
+      "end": 22.0,
+      "duration": 4.25,
+      "summary": "감정 변주를 강조",
+      "lyric": "꺼져가는 가로등 아래 희미해진 너의 실루엣 잡으려 해도 닿지를 않아 사라져 가는 온기만 남아"
+    },
+    {
+      "label": "verse",
+      "section": "verse",
+      "start": 22.0,
+      "end": 26.25,
+      "duration": 4.25,
+      "summary": "감정 변주를 강조",
+      "lyric": "꺼져가는 가로등 아래 희미해진 너의 실루엣 잡으려 해도 닿지를 않아 사라져 가는 온기만 남아"
+    },
+    {
+      "label": "verse",
+      "section": "verse",
+      "start": 26.25,
+      "end": 30.5,
+      "duration": 4.25,
+      "summary": "감정 변주를 강조",
+      "lyric": "꺼져가는 가로등 아래 희미해진 너의 실루엣 잡으려 해도 닿지를 않아 사라져 가는 온기만 남아"
+    },
+    {
+      "label": "verse",
+      "section": "verse",
+      "start": 30.5,
+      "end": 34.75,
+      "duration": 4.25,
+      "summary": "감정 변주를 강조",
+      "lyric": "꺼져가는 가로등 아래 희미해진 너의 실루엣 잡으려 해도 닿지를 않아 사라져 가는 온기만 남아"
+    },
+    {
+      "label": "verse",
+      "section": "verse",
+      "start": 34.75,
+      "end": 39.0,
+      "duration": 4.25,
+      "summary": "감정 변주를 강조",
+      "lyric": "꺼져가는 가로등 아래 희미해진 너의 실루엣 잡으려 해도 닿지를 않아 사라져 가는 온기만 남아"
+    },
+    {
+      "label": "bridge",
+      "section": "bridge",
+      "start": 39.0,
+      "end": 42.484,
+      "duration": 3.484,
+      "summary": "감정 변주를 강조",
+      "lyric": "시간은 멈춘 듯 고요하고 차가운 공기만 날 감싸네 이 밤의 끝에 뭐가 있을까"
+    },
+    {
+      "label": "bridge",
+      "section": "bridge",
+      "start": 42.484,
+      "end": 45.969,
+      "duration": 3.485,
+      "summary": "감정 변주를 강조",
+      "lyric": "시간은 멈춘 듯 고요하고 차가운 공기만 날 감싸네 이 밤의 끝에 뭐가 있을까"
+    },
+    {
+      "label": "bridge",
+      "section": "bridge",
+      "start": 45.969,
+      "end": 49.453,
+      "duration": 3.484,
+      "summary": "감정 변주를 강조",
+      "lyric": "시간은 멈춘 듯 고요하고 차가운 공기만 날 감싸네 이 밤의 끝에 뭐가 있을까"
+    },
+    {
+      "label": "bridge",
+      "section": "bridge",
+      "start": 49.453,
+      "end": 52.938,
+      "duration": 3.485,
+      "summary": "감정 변주를 강조",
+      "lyric": "시간은 멈춘 듯 고요하고 차가운 공기만 날 감싸네 이 밤의 끝에 뭐가 있을까"
+    },
+    {
+      "label": "bridge",
+      "section": "bridge",
+      "start": 52.938,
+      "end": 56.422,
+      "duration": 3.484,
+      "summary": "감정 변주를 강조",
+      "lyric": "시간은 멈춘 듯 고요하고 차가운 공기만 날 감싸네 이 밤의 끝에 뭐가 있을까"
+    },
+    {
+      "label": "bridge",
+      "section": "bridge",
+      "start": 56.422,
+      "end": 59.907,
+      "duration": 3.485,
+      "summary": "감정 변주를 강조",
+      "lyric": "시간은 멈춘 듯 고요하고 차가운 공기만 날 감싸네 이 밤의 끝에 뭐가 있을까"
+    }
+  ]
+}

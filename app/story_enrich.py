@@ -184,6 +184,7 @@ def _segment_lyrics_for_scenes(record: dict, audio_info: dict=None, ai=None, lan
       - record["lyrics_sections"] = [{id, start, end, text}...]
       - record["scenes"][i]["lyric"] = 해당 구간과 겹치는 첫 가사 또는 ""
     """
+    #
     rec = deepcopy(record)
     # 1) 한 줄 가사 확보
     lyrics_text = " ".join((rec.get("lyrics") or "").split())
