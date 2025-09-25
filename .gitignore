@@ -1,0 +1,11 @@
+.idea
+.playwright_profile
+dist
+mysettings
+asd.png
+error_screenshot
+naver_cookies.json
+chromedriver
+LICENSE
+THIRD_PARTY_NOTICES
+.env
