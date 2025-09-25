@@ -4,7 +4,7 @@ import re
 from typing import List
 
 try:
-    from ai import AI
+    from utils import AI
 except Exception:
     from app.ai import AI  # type: ignore
 
@@ -104,15 +104,15 @@ _SECTION_PATTERNS = [
 
 # ─────────────────────────────────────────────────────────────
 SECTION_ONLY = re.compile(
-    r"^\s*\[(?:intro|verse|pre[- ]?chorus|chorus|bridge|outro|hook|coda|break|tag|interlude)(?:\s+\d+)?\]\s*$",
+    r"^\s*\[(?:intro|verse|pre[- ]?chorus|chorus|bridge|outro|hook|coda|break|tag|interlude)(?:\s+\d+)?]\s*$",
     re.IGNORECASE,
 )
 PAREN_ONLY  = re.compile(r"^\s*\(.+?\)\s*$")  # 줄 전체가 괄호 메모
 
 # 촬영/메모/지시문 + '사진이름 -> 컨셉' 류 라인들
 NOTE_LINE = re.compile(
-    r"^\s*\[?\s*(?:촬영|촹영)?\s*컨셉\s*메모\]?\s*$|"      # [촬영 컨셉 메모], (오타 '촹영' 포함)
-    r"^\s*\[?\s*촬영\s*메모\]?\s*$|"                        # [촬영 메모]
+    r"^\s*\[?\s*(?:촬영|촹영)?\s*컨셉\s*메모]?\s*$|"      # [촬영 컨셉 메모], (오타 '촹영' 포함)
+    r"^\s*\[?\s*촬영\s*메모]?\s*$|"                        # [촬영 메모]
     r"^\s*(?:메모|노트|note)\s*[:：]?\s*$|"                 # 메모/노트 라벨성 문구
     r"^\s*(?:scene|camera|shot)\b.*$|"                      # scene/camera/shot로 시작하는 지시문
     r"^\s*(?:bpm|key|tempo)\s*[:：].*$|"                    # bpm:/key:/tempo:
@@ -170,8 +170,6 @@ def normalize_sections(text: str) -> str:
 # ───────── 공개 API ─────────
 
 # 맨 위에 이미 import re 되어 있으면 생략
-# 맨 위에 이미 import re 되어 있으면 생략
-import re
 
 import re
 
@@ -195,7 +193,7 @@ def generate_title_lyrics_tags(
     """
     import json
     from typing import List
-    from ai import AI  # 기존 구조 유지
+    from utils import AI  # 기존 구조 유지
 
     def t(ev: str, msg: str):
         try:
@@ -295,11 +293,11 @@ def generate_title_lyrics_tags(
     # ---- 금지 섹션 제거/치환 ----
     # 1) 헤더만 있는 라인 패턴
     header_only = re.compile(
-        r"^\s*\[(?:intro|outro|pre[- ]?chorus|chorus|hook|coda|break|tag|interlude|verse|bridge)(?:\s+\d+)?\]\s*$",
+        r"^\s*\[(?:intro|outro|pre[- ]?chorus|chorus|hook|coda|break|tag|interlude|verse|bridge)(?:\s+\d+)?]\s*$",
         re.IGNORECASE,
     )
     # 2) 금지 헤더(섹션 전체 제거) 블록 추출
-    forbidden_heads = re.compile(r"^\s*\[(?:intro|outro|pre[- ]?chorus|chorus)\b[^\]]*\]\s*$", re.IGNORECASE)
+    forbidden_heads = re.compile(r"^\s*\[(?:intro|outro|pre[- ]?chorus|chorus)\b[^]]*]\s*$", re.IGNORECASE)
 
     lines = lyrics.splitlines()
     cleaned_lines: list[str] = []
@@ -325,12 +323,12 @@ def generate_title_lyrics_tags(
     # 혹시 모델이 헤더 없이 코러스 단어를 본문에 넣는 경우는 그대로 두되,
     # "[pre-chorus]"나 "[chorus]" 형식의 헤더는 위에서 모두 제거됨.
     # 일부 모델이 "[Chorus 1]" 등 변형을 쓸 수 있어 추가 방어:
-    chorus_head_pat = re.compile(r"^\s*\[(?:pre[- ]?chorus|chorus)(?:\s+\d+)?\]\s*$", re.IGNORECASE)
+    chorus_head_pat = re.compile(r"^\s*\[(?:pre[- ]?chorus|chorus)(?:\s+\d+)?]\s*$", re.IGNORECASE)
     lyrics = "\n".join("[verse]" if chorus_head_pat.match(x.strip()) else x for x in lyrics.splitlines())
 
     # ---- 기본 노이즈 정리 ----
     section_only = re.compile(
-        r"^\s*\[(?:verse|bridge)(?:\s+\d+)?\]\s*$",
+        r"^\s*\[(?:verse|bridge)(?:\s+\d+)?]\s*$",
         re.IGNORECASE,
     )
     paren_only = re.compile(r"^\s*\(.+?\)\s*$")

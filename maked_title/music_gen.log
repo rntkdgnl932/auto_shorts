@@ -247,3 +247,24 @@
 [MUSIC] VIEW-RESP type=output sf='shorts_make/잔상' status=200 bytes=6796281
 [MUSIC] DOWNLOADED C:\my_games\shorts_make\maked_title\잔상\vocal_final_00005_.flac size=6796281
 [MUSIC] LEAVE ACE-Step 완료 ✅ | - 프롬프트: C:\my_games\shorts_make\app\jsons\ace_step_1_t2m.json | - 길이:     60s | - 태그 수:  8 | - 저장:     C:\my_games\shorts_make\maked_title\잔상\vocal.wav
+[MUSIC] ENTER project_dir=C:\my_games\shorts_make\maked_title\도시의 리듬
+[MUSIC] HOST http://127.0.0.1:8188 | DESIRED_FMT wav
+[MUSIC] WAIT-START timeout=1800.0 poll=2.0
+[MUSIC] PING http://127.0.0.1:8188/system_stats
+[MUSIC] PING-RESP status=200
+[MUSIC] POST-/prompt url=http://127.0.0.1:8188/prompt nodes=13
+[MUSIC] POST-RESP ok=True status=200
+[MUSIC] PROMPT-ID 672e9ca0-ad66-4e39-8243-d87aa9c8aece
+[MUSIC] QUEUE pending=0 running=1
+[MUSIC] HIST-NO-ENTRY-YET
+[MUSIC] QUEUE pending=0 running=1
+[MUSIC] HIST-NO-ENTRY-YET
+[MUSIC] HIST-STATUS success | keys: ['prompt', 'outputs', 'status', 'meta']
+[MUSIC] HIST-STATUS-OBJ {'status_str': 'success', 'completed': True, 'messages': [['execution_start', {'prompt_id': '672e9ca0-ad66-4e39-8243-d87aa9c8aece', 'timestamp': 1758787181727}], ['execution_cached', {'nodes': ['40', '49', '50', '51'], 'prompt_id': '672e9ca0-ad66-4e39-8243-d87aa9c8aece', 'timestamp': 1758787181745}], ['execution_success', {'prompt_id': '672e9ca0-ad66-4e39-8243-d87aa9c8aece', 'timestamp': 1758787201723}]]}
+[MUSIC] HIST-OUTPUTS count=2
+[MUSIC] HIST-DONE elapsed=20.1s outputs=2
+[MUSIC] TRY-DOWNLOAD filename=vocal_final_00002_.flac subfolder=shorts_make/도시의 리듬 out_dir=C:\my_games\shorts_make\maked_title\도시의 리듬
+[MUSIC] VIEW-RESP type=audio sf='shorts_make/도시의 리듬' status=400 bytes=0
+[MUSIC] VIEW-RESP type=output sf='shorts_make/도시의 리듬' status=200 bytes=12363022
+[MUSIC] DOWNLOADED C:\my_games\shorts_make\maked_title\도시의 리듬\vocal_final_00002_.flac size=12363022
+[MUSIC] LEAVE ACE-Step 완료 ✅ | - 프롬프트: C:\my_games\shorts_make\app\jsons\ace_step_1_t2m.json | - 길이:     105s | - 태그 수:  15 | - 저장:     C:\my_games\shorts_make\maked_title\도시의 리듬\vocal.wav

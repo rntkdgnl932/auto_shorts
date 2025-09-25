@@ -36,7 +36,7 @@ try:
     from app.image_movie_docs import normalize_to_v11  # type: ignore
 except Exception:
     try:
-        from image_movie_docs import normalize_to_v11  # type: ignore
+        from video_build import normalize_to_v11  # type: ignore
     except Exception:
         def normalize_to_v11(story: dict) -> dict:  # type: ignore
             return story
@@ -52,7 +52,7 @@ from app.audio_sync import build_story_json  # ← story/analyze 사용
 try:
     from app.image_movie_docs import apply_intro_outro_to_story_json
 except ImportError:
-    from image_movie_docs import apply_intro_outro_to_story_json
+    from video_build import apply_intro_outro_to_story_json
 # shorts_ui.py (상단 import 구역에 추가)
 try:
     from app.utils import save_story_overwrite_with_prompts
@@ -61,7 +61,7 @@ except ImportError:
 import re
 _CANON_RE = re.compile(r"[^a-z0-9]+")
 try:
-    from ai import AI
+    from utils import AI
 except ImportError:
     from app.ai import AI  # type: ignore
 
@@ -92,8 +92,8 @@ except ImportError:
     from utils import sanitize_title, audio_duration_sec, load_json, save_json            # type: ignore
     from lyrics_gen import generate_title_lyrics_tags, create_project_files               # type: ignore
     from video_build import build_shots_with_i2v, xfade_concat, recalc_overlap                             # type: ignore
-    from music_gen import generate_music_with_acestep, rewrite_prompt_audio_format                         # type: ignore
-    from tag_norm import normalize_tags_to_english                                                          # type: ignore
+    from audio_sync import generate_music_with_acestep, rewrite_prompt_audio_format                         # type: ignore
+    from utils import normalize_tags_to_english                                                          # type: ignore
     from audio_sync import analyze_project                                                                  # type: ignore                                                   # type: ignore
 
 # ==== CRASH LOGGER (붙여넣기) ====
@@ -108,7 +108,7 @@ try:
     from app.progress import run_job_with_progress_async
 except ImportError:
     import settings  # type: ignore
-    from progress import run_job_with_progress_async  # type: ignore
+    from utils import run_job_with_progress_async  # type: ignore
 # ============================================================
 # PROMPT PIPE (self-contained) — paste into shorts_ui.py
 # - 외부 모듈/패키지 불필요 (표준 라이브러리만 사용)
@@ -287,10 +287,10 @@ from pathlib import Path
 # utils / music_gen 임포트 (프로젝트 구조에 따라 app. 접두사 유무 대응)
 try:
     from app.utils import load_json, save_json
-    from app.music_gen import generate_music_with_acestep
+    from app.audio_sync import generate_music_with_acestep
 except Exception:
     from utils import load_json, save_json
-    from music_gen import generate_music_with_acestep
+    from audio_sync import generate_music_with_acestep
 
 
 class MusicWorker(QtCore.QThread):
@@ -767,7 +767,7 @@ class MainWindow(QtWidgets.QMainWindow):
 
     # ==== PATCH: shorts_ui.py :: on_generate_lyrics_with_log ====
     def on_generate_lyrics_with_log(self) -> None:
-        from app.progress import run_job_with_progress_async
+        from app.utils import run_job_with_progress_async
         try:
             from app.lyrics_gen import generate_title_lyrics_tags
         except Exception:
@@ -953,7 +953,7 @@ class MainWindow(QtWidgets.QMainWindow):
             steps = 28
 
         # ----- 3) 진행창 + 비동기 작업 실행 -----
-        from progress import run_job_with_progress_async
+        from utils import run_job_with_progress_async
         try:
             from video_build import build_missing_images_from_story  # 로컬
         except Exception:
@@ -995,9 +995,9 @@ class MainWindow(QtWidgets.QMainWindow):
     def on_click_generate_music(self) -> None:
         from PyQt5 import QtWidgets
         try:
-            from app.progress import run_job_with_progress_async
+            from app.utils import run_job_with_progress_async
         except Exception:
-            from progress import run_job_with_progress_async  # type: ignore
+            from utils import run_job_with_progress_async  # type: ignore
 
         btn = getattr(self, "btn_music", None)
         if btn:
@@ -1010,9 +1010,9 @@ class MainWindow(QtWidgets.QMainWindow):
             except Exception:
                 from utils import load_json, save_json  # type: ignore
             try:
-                from app.music_gen import generate_music_with_acestep
+                from app.audio_sync import generate_music_with_acestep
             except Exception:
-                from music_gen import generate_music_with_acestep  # type: ignore
+                from audio_sync import generate_music_with_acestep  # type: ignore
 
             # ▶▶ 활성 프로젝트만 사용
             project_dir = self._get_active_project_dir()
@@ -1266,7 +1266,7 @@ class MainWindow(QtWidgets.QMainWindow):
         try:
             from app.progress import run_job_with_progress_async  # type: ignore
         except Exception:
-            from progress import run_job_with_progress_async  # type: ignore
+            from utils import run_job_with_progress_async  # type: ignore
 
         run_job_with_progress_async(self, "음악분석", job, tail_file=None, on_done=done)
 
@@ -1411,7 +1411,7 @@ class MainWindow(QtWidgets.QMainWindow):
     # shorts_ui.py (class MainWindow 내부)
     def on_click_test1_analyze(self) -> None:
         from pathlib import Path
-        from progress import run_job_with_progress_async
+        from utils import run_job_with_progress_async
         from utils import load_json, save_json
 
         TEST_PHASE = 0  # 0=전체, 1=가사만, 2=가사+오디오 매칭
@@ -1808,7 +1808,7 @@ class MainWindow(QtWidgets.QMainWindow):
                     apply_intro_outro_to_movie_json,
                 )
             except ImportError:
-                from image_movie_docs import (
+                from video_build import (
                     build_image_json, build_movie_json,
                     apply_intro_outro_to_story_json,
                     apply_intro_outro_to_image_json,
@@ -2554,7 +2554,17 @@ class MainWindow(QtWidgets.QMainWindow):
 
             _save_json(pj, meta)
 
-        btn.toggled.connect(_on_toggled)
+        # ── 여기만 변경: 정적 분석기 경고 방지용 안전 연결 ─────────────
+        sig = getattr(btn, "toggled", None)
+        try:
+            # pyqtSignal 인스턴스면 connect가 존재함
+            if hasattr(sig, "connect"):
+                sig.connect(_on_toggled)  # type: ignore[attr-defined]
+            else:
+                # 혹시라도 타입 추론 실패 시 런타임 연결 시도
+                btn.toggled.connect(_on_toggled)  # type: ignore[attr-defined]
+        except Exception:
+            pass
 
     def _build_lyrics_group_three_columns(self) -> QtWidgets.QGroupBox:
         """
@@ -3659,7 +3669,7 @@ class MainWindow(QtWidgets.QMainWindow):
         try:
             from app.tag_norm import normalize_tags_to_english  # type: ignore
         except Exception:
-            from tag_norm import normalize_tags_to_english  # type: ignore
+            from utils import normalize_tags_to_english  # type: ignore
         try:
             from app.lyrics_gen import create_project_files  # type: ignore
         except Exception:
@@ -4403,7 +4413,7 @@ class MainWindow(QtWidgets.QMainWindow):
                     apply_intro_outro_to_movie_json,
                 )
             except ImportError:
-                from image_movie_docs import (
+                from video_build import (
                     apply_intro_outro_to_story_json,
                     apply_intro_outro_to_image_json,
                     apply_intro_outro_to_movie_json,
@@ -5045,7 +5055,7 @@ def _inject_render_prefs_methods():
     # === ADD OR REPLACE: inside ShortsMainWindow (or your main widget) ===
     def on_click_test2_1_generate_missing_images(self) -> None:
         from pathlib import Path
-        from progress import run_job_with_progress_async
+        from utils import run_job_with_progress_async
         from settings import COMFY_LOG_FILE  # ComfyUI 로그 tail 경로
         # 로컬 임포트(앱/단일 실행 모두 지원)
         try:
