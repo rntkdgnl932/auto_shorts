@@ -1,0 +1,62 @@
+{
+  "title": "잔상",
+  "lyrics": "[verse]\n꺼져가는 가로등 아래\n희미해진 너의 실루엣\n잡으려 해도 닿지를 않아\n사라져 가는 온기만 남아\n[bridge]\n시간은 멈춘 듯 고요하고\n차가운 공기만 날 감싸네\n이 밤의 끝에 뭐가 있을까",
+  "prompt": "",
+  "created_at": "2025-09-25 11:11:24",
+  "time": 60,
+  "auto_tags": true,
+  "ace_tags": [],
+  "tags_in_use": [
+    "clean vocals",
+    "natural articulation",
+    "warm emotional tone",
+    "studio reverb light",
+    "clear diction",
+    "breath control",
+    "balanced mixing",
+    "soft female voice"
+  ],
+  "manual_tags": [],
+  "paths": {
+    "project_dir": "C:\\my_games\\shorts_make\\maked_title\\잔상",
+    "lyrics_txt": "C:\\my_games\\shorts_make\\maked_title\\잔상\\잔상(2025-09-25).txt",
+    "txt": "C:\\my_games\\shorts_make\\maked_title\\잔상\\잔상(2025-09-25).txt",
+    "audio_out": "C:\\my_games\\shorts_make\\maked_title\\잔상\\vocal.mp3",
+    "video_dir": "C:\\my_games\\shorts_make\\maked_title\\잔상\\clips",
+    "vocal": "C:\\my_games\\shorts_make\\maked_title\\잔상\\vocal.wav"
+  },
+  "i2v_plan": {
+    "input_fps": 60,
+    "target_fps": 60,
+    "base_chunk": 300,
+    "overlap": 12,
+    "upscale": {
+      "enabled": true,
+      "model": "RealESRGAN_x4plus"
+    }
+  },
+  "concepts": [],
+  "vocal_gender": "female",
+  "target_seconds": 60,
+  "lyrics_lls": "[verse]\n[ko]kkeojyeoganeun galodeung alae\n[ko]huimihaejin neo-ui sillu-es\n[ko]jab-eulyeo haedo dahjileul anh-a\n[ko]salajyeo ganeun ongiman nam-a\n[bridge]\n[ko]sigan-eun meomchun deus go-yohago\n[ko]chaga-un gonggiman nal gamssane\n[ko]i bam-ui kkeut-e mwoga iss-eulkka",
+  "audio": "C:\\my_games\\shorts_make\\maked_title\\잔상\\vocal.wav",
+  "comfy_debug": {
+    "host": "http://127.0.0.1:8188",
+    "prompt_json": "C:\\my_games\\shorts_make\\app\\jsons\\ace_step_1_t2m.json",
+    "prompt_seconds": 60,
+    "requested_format": "wav",
+    "requested_ext": ".wav",
+    "subfolder": "shorts_make/잔상"
+  },
+  "tags_effective": [
+    "clean vocals",
+    "natural articulation",
+    "warm emotional tone",
+    "studio reverb light",
+    "clear diction",
+    "breath control",
+    "balanced mixing",
+    "soft female voice"
+  ],
+  "lls_enabled": false
+}

@@ -1,0 +1,28 @@
+[2025-09-24 16:46:21] [PY EXC]
+Traceback (most recent call last):
+  File "C:\my_games\shorts_make\app\shorts_ui.py", line 4203, in _analysis_watchdog_tick
+    def _analysis_watchdog_tick(self):
+KeyboardInterrupt
+
+[2025-09-25 00:10:31] [PY EXC]
+Traceback (most recent call last):
+  File "C:\my_games\shorts_make\app\shorts_ui.py", line 5049, in <module>
+    main()
+  File "C:\my_games\shorts_make\app\shorts_ui.py", line 5043, in main
+    w = MainWindow()
+  File "C:\my_games\shorts_make\app\shorts_ui.py", line 433, in __init__
+    self._ai = AI()
+  File "C:\my_games\shorts_make\app\ai.py", line 167, in __init__
+    self._init_clients()
+  File "C:\my_games\shorts_make\app\ai.py", line 189, in _init_clients
+    self._openai = OpenAI(api_key=key)
+  File "C:\my_games\shorts_make\.venv\lib\site-packages\openai\_client.py", line 158, in __init__
+    super().__init__(
+  File "C:\my_games\shorts_make\.venv\lib\site-packages\openai\_base_client.py", line 864, in __init__
+    self._client = http_client or SyncHttpxClientWrapper(
+  File "C:\my_games\shorts_make\.venv\lib\site-packages\openai\_base_client.py", line 794, in __init__
+    super().__init__(**kwargs)
+TypeError: Client.__init__() got an unexpected keyword argument 'follow_redirects'
+
+[2025-09-25 14:01:41] [QT] 3 None:0 QThread: Destroyed while thread is still running
+[2025-09-25 14:05:37] [QT] 3 None:0 QThread: Destroyed while thread is still running

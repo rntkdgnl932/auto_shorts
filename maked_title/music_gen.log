@@ -1,0 +1,270 @@
+[MUSIC] ENTER project_dir=C:\my_games\shorts_make\maked_title\흐릿한 네온
+[MUSIC] HOST http://127.0.0.1:8188 | DESIRED_FMT wav
+[MUSIC] SAVE-NODE-EXT .wav
+[MUSIC] SUBMIT
+[MUSIC] WAIT-START timeout=1800.0 poll=2.0
+[MUSIC] PING http://127.0.0.1:8188/system_stats
+[MUSIC] PING-RESP status=200
+[MUSIC] POST-/prompt url=http://127.0.0.1:8188/prompt nodes=13
+[MUSIC] POST-RESP ok=True status=200
+[MUSIC] PROMPT-ID 28e47c6b-4be0-4772-b01f-f5f4096d6d0b
+[MUSIC] QUEUE pending=0 running=1
+[MUSIC] HIST-NO-ENTRY-YET
+[MUSIC] HIST-STATUS success | keys: ['prompt', 'outputs', 'status', 'meta']
+[MUSIC] HIST-STATUS-OBJ {'status_str': 'success', 'completed': True, 'messages': [['execution_start', {'prompt_id': '28e47c6b-4be0-4772-b01f-f5f4096d6d0b', 'timestamp': 1758696978873}], ['execution_cached', {'nodes': ['40', '49', '50', '51'], 'prompt_id': '28e47c6b-4be0-4772-b01f-f5f4096d6d0b', 'timestamp': 1758696978883}], ['execution_success', {'prompt_id': '28e47c6b-4be0-4772-b01f-f5f4096d6d0b', 'timestamp': 1758696990911}]]}
+[MUSIC] HIST-OUTPUTS count=2
+[MUSIC] HIST-DONE elapsed=12.1s outputs=2
+[MUSIC] TRY-DOWNLOAD filename=vocal_final_00001_.flac subfolder=shorts_make/흐릿한 네온 out_dir=C:\my_games\shorts_make\maked_title\흐릿한 네온
+[MUSIC] VIEW-RESP type=audio sf='shorts_make/흐릿한 네온' status=400 bytes=0
+[MUSIC] VIEW-RESP type=output sf='shorts_make/흐릿한 네온' status=200 bytes=7012537
+[MUSIC] DOWNLOADED C:\my_games\shorts_make\maked_title\흐릿한 네온\vocal_final_00001_.flac size=7012537
+[MUSIC] LEAVE ACE-Step 완료 ✅ | - 프롬프트: C:\my_games\shorts_make\app\jsons\ace_step_1_t2m.json | - 길이:     59s | - 태그 수:  15 | - 저장:     C:\my_games\shorts_make\maked_title\흐릿한 네온\vocal.wav
+[MUSIC] ENTER project_dir=C:\my_games\shorts_make\maked_title\흐릿한 네온
+[MUSIC] HOST http://127.0.0.1:8188 | DESIRED_FMT wav
+[MUSIC] WAIT-START timeout=1800.0 poll=2.0
+[MUSIC] PING http://127.0.0.1:8188/system_stats
+[MUSIC] PING-RESP status=200
+[MUSIC] POST-/prompt url=http://127.0.0.1:8188/prompt nodes=13
+[MUSIC] POST-RESP ok=True status=200
+[MUSIC] PROMPT-ID 0d7d00f3-8bed-4c60-878e-914c2fbbb395
+[MUSIC] QUEUE pending=0 running=1
+[MUSIC] HIST-NO-ENTRY-YET
+[MUSIC] HIST-STATUS success | keys: ['prompt', 'outputs', 'status', 'meta']
+[MUSIC] HIST-STATUS-OBJ {'status_str': 'success', 'completed': True, 'messages': [['execution_start', {'prompt_id': '0d7d00f3-8bed-4c60-878e-914c2fbbb395', 'timestamp': 1758698819385}], ['execution_cached', {'nodes': ['17', '40', '49', '50', '51'], 'prompt_id': '0d7d00f3-8bed-4c60-878e-914c2fbbb395', 'timestamp': 1758698819395}], ['execution_success', {'prompt_id': '0d7d00f3-8bed-4c60-878e-914c2fbbb395', 'timestamp': 1758698830936}]]}
+[MUSIC] HIST-OUTPUTS count=2
+[MUSIC] HIST-DONE elapsed=12.1s outputs=2
+[MUSIC] TRY-DOWNLOAD filename=vocal_final_00002_.flac subfolder=shorts_make/흐릿한 네온 out_dir=C:\my_games\shorts_make\maked_title\흐릿한 네온
+[MUSIC] VIEW-RESP type=audio sf='shorts_make/흐릿한 네온' status=400 bytes=0
+[MUSIC] VIEW-RESP type=output sf='shorts_make/흐릿한 네온' status=200 bytes=6498904
+[MUSIC] DOWNLOADED C:\my_games\shorts_make\maked_title\흐릿한 네온\vocal_final_00002_.flac size=6498904
+[MUSIC] LEAVE ACE-Step 완료 ✅ | - 프롬프트: C:\my_games\shorts_make\app\jsons\ace_step_1_t2m.json | - 길이:     59s | - 태그 수:  15 | - 저장:     C:\my_games\shorts_make\maked_title\흐릿한 네온\vocal.wav
+[MUSIC] ENTER project_dir=C:\my_games\shorts_make\maked_title\흐릿한 네온
+[MUSIC] HOST http://127.0.0.1:8188 | DESIRED_FMT wav
+[MUSIC] WAIT-START timeout=1800.0 poll=2.0
+[MUSIC] PING http://127.0.0.1:8188/system_stats
+[MUSIC] PING-RESP status=200
+[MUSIC] POST-/prompt url=http://127.0.0.1:8188/prompt nodes=13
+[MUSIC] POST-RESP ok=True status=200
+[MUSIC] PROMPT-ID e2666d71-9015-4568-ab88-587491066bb9
+[MUSIC] QUEUE pending=0 running=1
+[MUSIC] HIST-NO-ENTRY-YET
+[MUSIC] HIST-STATUS success | keys: ['prompt', 'outputs', 'status', 'meta']
+[MUSIC] HIST-STATUS-OBJ {'status_str': 'success', 'completed': True, 'messages': [['execution_start', {'prompt_id': 'e2666d71-9015-4568-ab88-587491066bb9', 'timestamp': 1758698884362}], ['execution_cached', {'nodes': ['17', '40', '49', '50', '51'], 'prompt_id': 'e2666d71-9015-4568-ab88-587491066bb9', 'timestamp': 1758698884372}], ['execution_success', {'prompt_id': 'e2666d71-9015-4568-ab88-587491066bb9', 'timestamp': 1758698895713}]]}
+[MUSIC] HIST-OUTPUTS count=2
+[MUSIC] HIST-DONE elapsed=12.1s outputs=2
+[MUSIC] TRY-DOWNLOAD filename=vocal_final_00003_.flac subfolder=shorts_make/흐릿한 네온 out_dir=C:\my_games\shorts_make\maked_title\흐릿한 네온
+[MUSIC] VIEW-RESP type=audio sf='shorts_make/흐릿한 네온' status=400 bytes=0
+[MUSIC] VIEW-RESP type=output sf='shorts_make/흐릿한 네온' status=200 bytes=6626273
+[MUSIC] DOWNLOADED C:\my_games\shorts_make\maked_title\흐릿한 네온\vocal_final_00003_.flac size=6626273
+[MUSIC] LEAVE ACE-Step 완료 ✅ | - 프롬프트: C:\my_games\shorts_make\app\jsons\ace_step_1_t2m.json | - 길이:     59s | - 태그 수:  15 | - 저장:     C:\my_games\shorts_make\maked_title\흐릿한 네온\vocal.wav
+[MUSIC] ENTER project_dir=C:\my_games\shorts_make\maked_title\흐릿한 네온
+[MUSIC] HOST http://127.0.0.1:8188 | DESIRED_FMT wav
+[MUSIC] WAIT-START timeout=1800.0 poll=2.0
+[MUSIC] PING http://127.0.0.1:8188/system_stats
+[MUSIC] PING-RESP status=200
+[MUSIC] POST-/prompt url=http://127.0.0.1:8188/prompt nodes=13
+[MUSIC] POST-RESP ok=True status=200
+[MUSIC] PROMPT-ID be4a3a84-57f2-4319-a1b7-0c8a194871c7
+[MUSIC] QUEUE pending=0 running=1
+[MUSIC] HIST-NO-ENTRY-YET
+[MUSIC] HIST-STATUS success | keys: ['prompt', 'outputs', 'status', 'meta']
+[MUSIC] HIST-STATUS-OBJ {'status_str': 'success', 'completed': True, 'messages': [['execution_start', {'prompt_id': 'be4a3a84-57f2-4319-a1b7-0c8a194871c7', 'timestamp': 1758698959831}], ['execution_cached', {'nodes': ['17', '40', '49', '50', '51'], 'prompt_id': 'be4a3a84-57f2-4319-a1b7-0c8a194871c7', 'timestamp': 1758698959841}], ['execution_success', {'prompt_id': 'be4a3a84-57f2-4319-a1b7-0c8a194871c7', 'timestamp': 1758698971338}]]}
+[MUSIC] HIST-OUTPUTS count=2
+[MUSIC] HIST-DONE elapsed=12.1s outputs=2
+[MUSIC] TRY-DOWNLOAD filename=vocal_final_00004_.flac subfolder=shorts_make/흐릿한 네온 out_dir=C:\my_games\shorts_make\maked_title\흐릿한 네온
+[MUSIC] VIEW-RESP type=audio sf='shorts_make/흐릿한 네온' status=400 bytes=0
+[MUSIC] VIEW-RESP type=output sf='shorts_make/흐릿한 네온' status=200 bytes=6217053
+[MUSIC] DOWNLOADED C:\my_games\shorts_make\maked_title\흐릿한 네온\vocal_final_00004_.flac size=6217053
+[MUSIC] LEAVE ACE-Step 완료 ✅ | - 프롬프트: C:\my_games\shorts_make\app\jsons\ace_step_1_t2m.json | - 길이:     59s | - 태그 수:  15 | - 저장:     C:\my_games\shorts_make\maked_title\흐릿한 네온\vocal.wav
+[MUSIC] ENTER project_dir=C:\my_games\shorts_make\maked_title\흐릿한 네온
+[MUSIC] HOST http://127.0.0.1:8188 | DESIRED_FMT wav
+[MUSIC] WAIT-START timeout=1800.0 poll=2.0
+[MUSIC] PING http://127.0.0.1:8188/system_stats
+[MUSIC] PING-RESP status=200
+[MUSIC] POST-/prompt url=http://127.0.0.1:8188/prompt nodes=13
+[MUSIC] POST-RESP ok=True status=200
+[MUSIC] PROMPT-ID fa0c9bce-3145-4a6c-b8e7-555a77f72787
+[MUSIC] QUEUE pending=0 running=1
+[MUSIC] HIST-NO-ENTRY-YET
+[MUSIC] HIST-STATUS success | keys: ['prompt', 'outputs', 'status', 'meta']
+[MUSIC] HIST-STATUS-OBJ {'status_str': 'success', 'completed': True, 'messages': [['execution_start', {'prompt_id': 'fa0c9bce-3145-4a6c-b8e7-555a77f72787', 'timestamp': 1758699588467}], ['execution_cached', {'nodes': ['14', '17', '40', '44', '49', '50', '51', '74', '75'], 'prompt_id': 'fa0c9bce-3145-4a6c-b8e7-555a77f72787', 'timestamp': 1758699588477}], ['execution_success', {'prompt_id': 'fa0c9bce-3145-4a6c-b8e7-555a77f72787', 'timestamp': 1758699599338}]]}
+[MUSIC] HIST-OUTPUTS count=2
+[MUSIC] HIST-DONE elapsed=12.1s outputs=2
+[MUSIC] TRY-DOWNLOAD filename=vocal_final_00005_.flac subfolder=shorts_make/흐릿한 네온 out_dir=C:\my_games\shorts_make\maked_title\흐릿한 네온
+[MUSIC] VIEW-RESP type=audio sf='shorts_make/흐릿한 네온' status=400 bytes=0
+[MUSIC] VIEW-RESP type=output sf='shorts_make/흐릿한 네온' status=200 bytes=6660477
+[MUSIC] DOWNLOADED C:\my_games\shorts_make\maked_title\흐릿한 네온\vocal_final_00005_.flac size=6660477
+[MUSIC] LEAVE ACE-Step 완료 ✅ | - 프롬프트: C:\my_games\shorts_make\app\jsons\ace_step_1_t2m.json | - 길이:     59s | - 태그 수:  15 | - 저장:     C:\my_games\shorts_make\maked_title\흐릿한 네온\vocal.wav
+[MUSIC] ENTER project_dir=C:\my_games\shorts_make\maked_title\흐릿한 네온
+[MUSIC] HOST http://127.0.0.1:8188 | DESIRED_FMT wav
+[MUSIC] WAIT-START timeout=1800.0 poll=2.0
+[MUSIC] PING http://127.0.0.1:8188/system_stats
+[MUSIC] PING-RESP status=200
+[MUSIC] POST-/prompt url=http://127.0.0.1:8188/prompt nodes=13
+[MUSIC] POST-RESP ok=True status=200
+[MUSIC] PROMPT-ID 5f412ae9-08bc-492d-a50d-c63014176b34
+[MUSIC] QUEUE pending=0 running=1
+[MUSIC] HIST-NO-ENTRY-YET
+[MUSIC] HIST-STATUS success | keys: ['prompt', 'outputs', 'status', 'meta']
+[MUSIC] HIST-STATUS-OBJ {'status_str': 'success', 'completed': True, 'messages': [['execution_start', {'prompt_id': '5f412ae9-08bc-492d-a50d-c63014176b34', 'timestamp': 1758700002477}], ['execution_cached', {'nodes': ['40', '49', '50', '51'], 'prompt_id': '5f412ae9-08bc-492d-a50d-c63014176b34', 'timestamp': 1758700002487}], ['execution_success', {'prompt_id': '5f412ae9-08bc-492d-a50d-c63014176b34', 'timestamp': 1758700014438}]]}
+[MUSIC] HIST-OUTPUTS count=2
+[MUSIC] HIST-DONE elapsed=12.1s outputs=2
+[MUSIC] TRY-DOWNLOAD filename=vocal_final_00006_.flac subfolder=shorts_make/흐릿한 네온 out_dir=C:\my_games\shorts_make\maked_title\흐릿한 네온
+[MUSIC] VIEW-RESP type=audio sf='shorts_make/흐릿한 네온' status=400 bytes=0
+[MUSIC] VIEW-RESP type=output sf='shorts_make/흐릿한 네온' status=200 bytes=6921451
+[MUSIC] DOWNLOADED C:\my_games\shorts_make\maked_title\흐릿한 네온\vocal_final_00006_.flac size=6921451
+[MUSIC] LEAVE ACE-Step 완료 ✅ | - 프롬프트: C:\my_games\shorts_make\app\jsons\ace_step_1_t2m.json | - 길이:     60s | - 태그 수:  15 | - 저장:     C:\my_games\shorts_make\maked_title\흐릿한 네온\vocal.wav
+[MUSIC] ENTER project_dir=C:\my_games\shorts_make\maked_title\흐릿한 네온
+[MUSIC] HOST http://127.0.0.1:8188 | DESIRED_FMT wav
+[MUSIC] WAIT-START timeout=1800.0 poll=2.0
+[MUSIC] PING http://127.0.0.1:8188/system_stats
+[MUSIC] PING-RESP status=200
+[MUSIC] POST-/prompt url=http://127.0.0.1:8188/prompt nodes=13
+[MUSIC] POST-RESP ok=True status=200
+[MUSIC] PROMPT-ID 8e64ece3-cb90-4f80-a9af-77849e81a97d
+[MUSIC] QUEUE pending=0 running=1
+[MUSIC] HIST-NO-ENTRY-YET
+[MUSIC] HIST-STATUS success | keys: ['prompt', 'outputs', 'status', 'meta']
+[MUSIC] HIST-STATUS-OBJ {'status_str': 'success', 'completed': True, 'messages': [['execution_start', {'prompt_id': '8e64ece3-cb90-4f80-a9af-77849e81a97d', 'timestamp': 1758700096582}], ['execution_cached', {'nodes': ['40', '49', '50', '51'], 'prompt_id': '8e64ece3-cb90-4f80-a9af-77849e81a97d', 'timestamp': 1758700096593}], ['execution_success', {'prompt_id': '8e64ece3-cb90-4f80-a9af-77849e81a97d', 'timestamp': 1758700106034}]]}
+[MUSIC] HIST-OUTPUTS count=2
+[MUSIC] HIST-DONE elapsed=10.1s outputs=2
+[MUSIC] TRY-DOWNLOAD filename=vocal_final_00007_.flac subfolder=shorts_make/흐릿한 네온 out_dir=C:\my_games\shorts_make\maked_title\흐릿한 네온
+[MUSIC] VIEW-RESP type=audio sf='shorts_make/흐릿한 네온' status=400 bytes=0
+[MUSIC] VIEW-RESP type=output sf='shorts_make/흐릿한 네온' status=200 bytes=4011406
+[MUSIC] DOWNLOADED C:\my_games\shorts_make\maked_title\흐릿한 네온\vocal_final_00007_.flac size=4011406
+[MUSIC] LEAVE ACE-Step 완료 ✅ | - 프롬프트: C:\my_games\shorts_make\app\jsons\ace_step_1_t2m.json | - 길이:     40s | - 태그 수:  8 | - 저장:     C:\my_games\shorts_make\maked_title\흐릿한 네온\vocal.wav
+[MUSIC] ENTER project_dir=C:\my_games\shorts_make\maked_title\잔상
+[MUSIC] HOST http://127.0.0.1:8188 | DESIRED_FMT wav
+[MUSIC] WAIT-START timeout=1800.0 poll=2.0
+[MUSIC] PING http://127.0.0.1:8188/system_stats
+[MUSIC] PING-RESP status=200
+[MUSIC] POST-/prompt url=http://127.0.0.1:8188/prompt nodes=13
+[MUSIC] POST-RESP ok=True status=200
+[MUSIC] PROMPT-ID a5573ab9-d5f9-4c32-981c-9bd3c1253b37
+[MUSIC] QUEUE pending=0 running=1
+[MUSIC] HIST-NO-ENTRY-YET
+[MUSIC] HIST-STATUS success | keys: ['prompt', 'outputs', 'status', 'meta']
+[MUSIC] HIST-STATUS-OBJ {'status_str': 'success', 'completed': True, 'messages': [['execution_start', {'prompt_id': 'a5573ab9-d5f9-4c32-981c-9bd3c1253b37', 'timestamp': 1758731593926}], ['execution_cached', {'nodes': ['40', '49', '50', '51'], 'prompt_id': 'a5573ab9-d5f9-4c32-981c-9bd3c1253b37', 'timestamp': 1758731593930}], ['execution_success', {'prompt_id': 'a5573ab9-d5f9-4c32-981c-9bd3c1253b37', 'timestamp': 1758731606147}]]}
+[MUSIC] HIST-OUTPUTS count=2
+[MUSIC] HIST-DONE elapsed=14.1s outputs=2
+[MUSIC] TRY-DOWNLOAD filename=vocal_final_00001_.flac subfolder=shorts_make/잔상 out_dir=C:\my_games\shorts_make\maked_title\잔상
+[MUSIC] VIEW-RESP type=audio sf='shorts_make/잔상' status=400 bytes=0
+[MUSIC] VIEW-RESP type=output sf='shorts_make/잔상' status=200 bytes=6418204
+[MUSIC] DOWNLOADED C:\my_games\shorts_make\maked_title\잔상\vocal_final_00001_.flac size=6418204
+[MUSIC] LEAVE ACE-Step 완료 ✅ | - 프롬프트: C:\my_games\shorts_make\app\jsons\ace_step_1_t2m.json | - 길이:     59s | - 태그 수:  14 | - 저장:     C:\my_games\shorts_make\maked_title\잔상\vocal.wav
+[MUSIC] ENTER project_dir=C:\my_games\shorts_make\maked_title\잔상
+[MUSIC] HOST http://127.0.0.1:8188 | DESIRED_FMT wav
+[MUSIC] WAIT-START timeout=1800.0 poll=2.0
+[MUSIC] PING http://127.0.0.1:8188/system_stats
+[MUSIC] PING-RESP status=200
+[MUSIC] POST-/prompt url=http://127.0.0.1:8188/prompt nodes=13
+[MUSIC] POST-RESP ok=True status=200
+[MUSIC] PROMPT-ID 228d7d89-d5d8-4604-ac79-2e3e6addebdb
+[MUSIC] QUEUE pending=0 running=1
+[MUSIC] HIST-NO-ENTRY-YET
+[MUSIC] HIST-STATUS success | keys: ['prompt', 'outputs', 'status', 'meta']
+[MUSIC] HIST-STATUS-OBJ {'status_str': 'success', 'completed': True, 'messages': [['execution_start', {'prompt_id': '228d7d89-d5d8-4604-ac79-2e3e6addebdb', 'timestamp': 1758731731013}], ['execution_cached', {'nodes': ['17', '40', '49', '50', '51'], 'prompt_id': '228d7d89-d5d8-4604-ac79-2e3e6addebdb', 'timestamp': 1758731731024}], ['execution_success', {'prompt_id': '228d7d89-d5d8-4604-ac79-2e3e6addebdb', 'timestamp': 1758731742697}]]}
+[MUSIC] HIST-OUTPUTS count=2
+[MUSIC] HIST-DONE elapsed=12.1s outputs=2
+[MUSIC] TRY-DOWNLOAD filename=vocal_final_00002_.flac subfolder=shorts_make/잔상 out_dir=C:\my_games\shorts_make\maked_title\잔상
+[MUSIC] VIEW-RESP type=audio sf='shorts_make/잔상' status=400 bytes=0
+[MUSIC] VIEW-RESP type=output sf='shorts_make/잔상' status=200 bytes=6212254
+[MUSIC] DOWNLOADED C:\my_games\shorts_make\maked_title\잔상\vocal_final_00002_.flac size=6212254
+[MUSIC] LEAVE ACE-Step 완료 ✅ | - 프롬프트: C:\my_games\shorts_make\app\jsons\ace_step_1_t2m.json | - 길이:     59s | - 태그 수:  14 | - 저장:     C:\my_games\shorts_make\maked_title\잔상\vocal.wav
+[MUSIC] ENTER project_dir=C:\my_games\shorts_make\maked_title\찰나의 빛
+[MUSIC] HOST http://127.0.0.1:8188 | DESIRED_FMT wav
+[MUSIC] WAIT-START timeout=1800.0 poll=2.0
+[MUSIC] PING http://127.0.0.1:8188/system_stats
+[MUSIC] PING-RESP status=200
+[MUSIC] POST-/prompt url=http://127.0.0.1:8188/prompt nodes=13
+[MUSIC] POST-RESP ok=True status=200
+[MUSIC] PROMPT-ID 41621885-b26e-4060-a602-fcfa69383793
+[MUSIC] QUEUE pending=0 running=1
+[MUSIC] HIST-NO-ENTRY-YET
+[MUSIC] HIST-STATUS success | keys: ['prompt', 'outputs', 'status', 'meta']
+[MUSIC] HIST-STATUS-OBJ {'status_str': 'success', 'completed': True, 'messages': [['execution_start', {'prompt_id': '41621885-b26e-4060-a602-fcfa69383793', 'timestamp': 1758731973485}], ['execution_cached', {'nodes': ['40', '49', '50', '51'], 'prompt_id': '41621885-b26e-4060-a602-fcfa69383793', 'timestamp': 1758731973495}], ['execution_success', {'prompt_id': '41621885-b26e-4060-a602-fcfa69383793', 'timestamp': 1758731985752}]]}
+[MUSIC] HIST-OUTPUTS count=2
+[MUSIC] HIST-DONE elapsed=14.2s outputs=2
+[MUSIC] TRY-DOWNLOAD filename=vocal_final_00005_.flac subfolder=shorts_make/찰나의 빛 out_dir=C:\my_games\shorts_make\maked_title\찰나의 빛
+[MUSIC] VIEW-RESP type=audio sf='shorts_make/찰나의 빛' status=400 bytes=0
+[MUSIC] VIEW-RESP type=output sf='shorts_make/찰나의 빛' status=200 bytes=6188204
+[MUSIC] DOWNLOADED C:\my_games\shorts_make\maked_title\찰나의 빛\vocal_final_00005_.flac size=6188204
+[MUSIC] LEAVE ACE-Step 완료 ✅ | - 프롬프트: C:\my_games\shorts_make\app\jsons\ace_step_1_t2m.json | - 길이:     57s | - 태그 수:  12 | - 저장:     C:\my_games\shorts_make\maked_title\찰나의 빛\vocal.wav
+[MUSIC] ENTER project_dir=C:\my_games\shorts_make\maked_title\잔상
+[MUSIC] HOST http://127.0.0.1:8188 | DESIRED_FMT wav
+[MUSIC] WAIT-START timeout=1800.0 poll=2.0
+[MUSIC] PING http://127.0.0.1:8188/system_stats
+[MUSIC] PING-RESP status=200
+[MUSIC] POST-/prompt url=http://127.0.0.1:8188/prompt nodes=13
+[MUSIC] POST-RESP ok=True status=200
+[MUSIC] PROMPT-ID dbb9b56f-6811-4303-9f84-26a91de6ec5f
+[MUSIC] QUEUE pending=0 running=1
+[MUSIC] HIST-NO-ENTRY-YET
+[MUSIC] HIST-STATUS success | keys: ['prompt', 'outputs', 'status', 'meta']
+[MUSIC] HIST-STATUS-OBJ {'status_str': 'success', 'completed': True, 'messages': [['execution_start', {'prompt_id': 'dbb9b56f-6811-4303-9f84-26a91de6ec5f', 'timestamp': 1758765873774}], ['execution_cached', {'nodes': ['40', '49', '50', '51'], 'prompt_id': 'dbb9b56f-6811-4303-9f84-26a91de6ec5f', 'timestamp': 1758765873784}], ['execution_success', {'prompt_id': 'dbb9b56f-6811-4303-9f84-26a91de6ec5f', 'timestamp': 1758765885806}]]}
+[MUSIC] HIST-OUTPUTS count=2
+[MUSIC] HIST-DONE elapsed=12.2s outputs=2
+[MUSIC] TRY-DOWNLOAD filename=vocal_final_00003_.flac subfolder=shorts_make/잔상 out_dir=C:\my_games\shorts_make\maked_title\잔상
+[MUSIC] VIEW-RESP type=audio sf='shorts_make/잔상' status=400 bytes=0
+[MUSIC] VIEW-RESP type=output sf='shorts_make/잔상' status=200 bytes=6086749
+[MUSIC] DOWNLOADED C:\my_games\shorts_make\maked_title\잔상\vocal_final_00003_.flac size=6086749
+[MUSIC] LEAVE ACE-Step 완료 ✅ | - 프롬프트: C:\my_games\shorts_make\app\jsons\ace_step_1_t2m.json | - 길이:     59s | - 태그 수:  14 | - 저장:     C:\my_games\shorts_make\maked_title\잔상\vocal.wav
+[MUSIC] ENTER project_dir=C:\my_games\shorts_make\maked_title\잔상
+[MUSIC] HOST http://127.0.0.1:8188 | DESIRED_FMT wav
+[MUSIC] WAIT-START timeout=1800.0 poll=2.0
+[MUSIC] PING http://127.0.0.1:8188/system_stats
+[MUSIC] PING-RESP status=200
+[MUSIC] POST-/prompt url=http://127.0.0.1:8188/prompt nodes=13
+[MUSIC] POST-RESP ok=True status=200
+[MUSIC] PROMPT-ID c46ae271-cdf6-4a75-93b3-db6d42f4dd44
+[MUSIC] QUEUE pending=0 running=1
+[MUSIC] HIST-NO-ENTRY-YET
+[MUSIC] HIST-STATUS success | keys: ['prompt', 'outputs', 'status', 'meta']
+[MUSIC] HIST-STATUS-OBJ {'status_str': 'success', 'completed': True, 'messages': [['execution_start', {'prompt_id': 'c46ae271-cdf6-4a75-93b3-db6d42f4dd44', 'timestamp': 1758766288950}], ['execution_cached', {'nodes': ['17', '40', '49', '50', '51'], 'prompt_id': 'c46ae271-cdf6-4a75-93b3-db6d42f4dd44', 'timestamp': 1758766288960}], ['execution_success', {'prompt_id': 'c46ae271-cdf6-4a75-93b3-db6d42f4dd44', 'timestamp': 1758766300668}]]}
+[MUSIC] HIST-OUTPUTS count=2
+[MUSIC] HIST-DONE elapsed=12.1s outputs=2
+[MUSIC] TRY-DOWNLOAD filename=vocal_final_00004_.flac subfolder=shorts_make/잔상 out_dir=C:\my_games\shorts_make\maked_title\잔상
+[MUSIC] VIEW-RESP type=audio sf='shorts_make/잔상' status=400 bytes=0
+[MUSIC] VIEW-RESP type=output sf='shorts_make/잔상' status=200 bytes=6306277
+[MUSIC] DOWNLOADED C:\my_games\shorts_make\maked_title\잔상\vocal_final_00004_.flac size=6306277
+[MUSIC] LEAVE ACE-Step 완료 ✅ | - 프롬프트: C:\my_games\shorts_make\app\jsons\ace_step_1_t2m.json | - 길이:     59s | - 태그 수:  8 | - 저장:     C:\my_games\shorts_make\maked_title\잔상\vocal.wav
+[MUSIC] ENTER project_dir=C:\my_games\shorts_make\maked_title\잔상
+[MUSIC] HOST http://127.0.0.1:8188 | DESIRED_FMT wav
+[MUSIC] WAIT-START timeout=1800.0 poll=2.0
+[MUSIC] PING http://127.0.0.1:8188/system_stats
+[MUSIC] PING-RESP status=200
+[MUSIC] POST-/prompt url=http://127.0.0.1:8188/prompt nodes=13
+[MUSIC] POST-RESP ok=True status=200
+[MUSIC] PROMPT-ID 8fba5ff3-3bc3-4e4c-bf30-3a9af244d424
+[MUSIC] QUEUE pending=0 running=1
+[MUSIC] HIST-NO-ENTRY-YET
+[MUSIC] HIST-STATUS success | keys: ['prompt', 'outputs', 'status', 'meta']
+[MUSIC] HIST-STATUS-OBJ {'status_str': 'success', 'completed': True, 'messages': [['execution_start', {'prompt_id': '8fba5ff3-3bc3-4e4c-bf30-3a9af244d424', 'timestamp': 1758766381271}], ['execution_cached', {'nodes': ['40', '49', '50', '51'], 'prompt_id': '8fba5ff3-3bc3-4e4c-bf30-3a9af244d424', 'timestamp': 1758766381280}], ['execution_success', {'prompt_id': '8fba5ff3-3bc3-4e4c-bf30-3a9af244d424', 'timestamp': 1758766393394}]]}
+[MUSIC] HIST-OUTPUTS count=2
+[MUSIC] HIST-DONE elapsed=14.1s outputs=2
+[MUSIC] TRY-DOWNLOAD filename=vocal_final_00005_.flac subfolder=shorts_make/잔상 out_dir=C:\my_games\shorts_make\maked_title\잔상
+[MUSIC] VIEW-RESP type=audio sf='shorts_make/잔상' status=400 bytes=0
+[MUSIC] VIEW-RESP type=output sf='shorts_make/잔상' status=200 bytes=6796281
+[MUSIC] DOWNLOADED C:\my_games\shorts_make\maked_title\잔상\vocal_final_00005_.flac size=6796281
+[MUSIC] LEAVE ACE-Step 완료 ✅ | - 프롬프트: C:\my_games\shorts_make\app\jsons\ace_step_1_t2m.json | - 길이:     60s | - 태그 수:  8 | - 저장:     C:\my_games\shorts_make\maked_title\잔상\vocal.wav
+[MUSIC] ENTER project_dir=C:\my_games\shorts_make\maked_title\도시의 리듬
+[MUSIC] HOST http://127.0.0.1:8188 | DESIRED_FMT wav
+[MUSIC] WAIT-START timeout=1800.0 poll=2.0
+[MUSIC] PING http://127.0.0.1:8188/system_stats
+[MUSIC] PING-RESP status=200
+[MUSIC] POST-/prompt url=http://127.0.0.1:8188/prompt nodes=13
+[MUSIC] POST-RESP ok=True status=200
+[MUSIC] PROMPT-ID 672e9ca0-ad66-4e39-8243-d87aa9c8aece
+[MUSIC] QUEUE pending=0 running=1
+[MUSIC] HIST-NO-ENTRY-YET
+[MUSIC] QUEUE pending=0 running=1
+[MUSIC] HIST-NO-ENTRY-YET
+[MUSIC] HIST-STATUS success | keys: ['prompt', 'outputs', 'status', 'meta']
+[MUSIC] HIST-STATUS-OBJ {'status_str': 'success', 'completed': True, 'messages': [['execution_start', {'prompt_id': '672e9ca0-ad66-4e39-8243-d87aa9c8aece', 'timestamp': 1758787181727}], ['execution_cached', {'nodes': ['40', '49', '50', '51'], 'prompt_id': '672e9ca0-ad66-4e39-8243-d87aa9c8aece', 'timestamp': 1758787181745}], ['execution_success', {'prompt_id': '672e9ca0-ad66-4e39-8243-d87aa9c8aece', 'timestamp': 1758787201723}]]}
+[MUSIC] HIST-OUTPUTS count=2
+[MUSIC] HIST-DONE elapsed=20.1s outputs=2
+[MUSIC] TRY-DOWNLOAD filename=vocal_final_00002_.flac subfolder=shorts_make/도시의 리듬 out_dir=C:\my_games\shorts_make\maked_title\도시의 리듬
+[MUSIC] VIEW-RESP type=audio sf='shorts_make/도시의 리듬' status=400 bytes=0
+[MUSIC] VIEW-RESP type=output sf='shorts_make/도시의 리듬' status=200 bytes=12363022
+[MUSIC] DOWNLOADED C:\my_games\shorts_make\maked_title\도시의 리듬\vocal_final_00002_.flac size=12363022
+[MUSIC] LEAVE ACE-Step 완료 ✅ | - 프롬프트: C:\my_games\shorts_make\app\jsons\ace_step_1_t2m.json | - 길이:     105s | - 태그 수:  15 | - 저장:     C:\my_games\shorts_make\maked_title\도시의 리듬\vocal.wav
