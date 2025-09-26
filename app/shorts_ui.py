@@ -1028,6 +1028,76 @@ class MainWindow(QtWidgets.QMainWindow):
             secs = int(self._current_seconds()) if hasattr(self, "_current_seconds") else 60
             pj = Path(project_dir) / "project.json"
             meta = load_json(pj, {}) or {}
+
+            # === TAG SYNC START ===
+            # UI 상태 → project.json 태그/길이 동기화 (자동/수동 규칙)
+            # - auto_tags: 자동태그 모드 여부
+            # - ace_tags: 최근 AI 제안 태그(자동 모드에서 사용)
+            # - tags_in_use: 자동 모드에서 UI로 보조 선택한 태그
+            # - manual_tags: 수동 모드에서 최종 보낼 태그
+            auto_on = False
+            cb_auto = getattr(self, "cb_auto_tags", None)
+            if cb_auto is not None and hasattr(cb_auto, "isChecked"):
+                try:
+                    auto_on = bool(cb_auto.isChecked())
+                except (AttributeError, ValueError):
+                    auto_on = False
+
+            # 수동 체크 태그 수집
+            picked_manual = []
+            if hasattr(self, "_collect_manual_checked_tags") and callable(self._collect_manual_checked_tags):
+                try:
+                    picked_manual = list(self._collect_manual_checked_tags() or [])
+                except (TypeError, ValueError):
+                    picked_manual = []
+            else:
+                # 백업 수집(체크박스 배열이 있는 경우)
+                for lst_name in ("cb_basic_vocal_list", "cb_style_checks", "cb_scene_checks", "cb_instr_checks",
+                                 "cb_tempo_checks"):
+                    lst = getattr(self, lst_name, None)
+                    if lst:
+                        try:
+                            for cb in lst:
+                                if getattr(cb, "isChecked", lambda: False)():
+                                    label = getattr(cb, "text", lambda: "")()
+                                    if label:
+                                        picked_manual.append(label)
+                        except (AttributeError, TypeError, ValueError):
+                            continue
+                # 배타 보컬 라디오
+                try:
+                    if getattr(self, "rb_vocal_female", None) and self.rb_vocal_female.isChecked():
+                        picked_manual.append("soft female voice")
+                    elif getattr(self, "rb_vocal_male", None) and self.rb_vocal_male.isChecked():
+                        picked_manual.append("soft male voice")
+                    elif getattr(self, "rb_vocal_mixed", None) and self.rb_vocal_mixed.isChecked():
+                        picked_manual.append("mixed vocals")
+                except (AttributeError, ValueError):
+                    pass
+
+            # 최근 AI 제안 태그(자동 모드에서 사용)
+            last_ai_tags = list(getattr(self, "_last_tags", []) or [])
+
+            # 길이도 meta에 반영(아래에서 다시 저장하므로 여기서 값만 세팅)
+            meta["time"] = int(secs)
+            meta["target_seconds"] = int(secs)
+
+            # 자동/수동 규칙 적용
+            if auto_on:
+                meta["auto_tags"] = True
+                # ace_tags: 새 제안이 있으면 갱신, 없으면 기존 유지
+                meta["ace_tags"] = last_ai_tags if last_ai_tags else list(meta.get("ace_tags", []) or [])
+                # tags_in_use: UI로 체크한 보조 태그(중복 제거)
+                meta["tags_in_use"] = list(dict.fromkeys(picked_manual))
+                # 수동 키는 남겨둬도 무방
+            else:
+                meta["auto_tags"] = False
+                # manual_tags만 사용(중복 제거)
+                meta["manual_tags"] = list(dict.fromkeys(picked_manual))
+
+            # 여기서는 저장하지 않고, 아래 원래 저장 지점에서 save_json 실행
+            # === TAG SYNC END ===
+
             meta["time"] = secs
             meta["target_seconds"] = secs
             save_json(pj, meta)
@@ -2271,6 +2341,13 @@ class MainWindow(QtWidgets.QMainWindow):
         self.te_prompt.setPlaceholderText("무드/키워드 입력")
         prompt_grp = self._group("프롬프트", self.te_prompt)
 
+        # ▼▼ 추가: 형제 그룹 2개(긍정/부정)
+        self.te_prompt_pos = QtWidgets.QTextEdit()
+        prompt_grp_pos = self._group("긍정 프롬프트(+)", self.te_prompt_pos)
+
+        self.te_prompt_neg = QtWidgets.QTextEdit()
+        prompt_grp_neg = self._group("부정 프롬프트(-)", self.te_prompt_neg)
+
         # 자동 태그 토글
         self.cb_auto_tags = QtWidgets.QCheckBox("태그 자동(가사 분위기 기반 추천)")
         self.cb_auto_tags.setChecked(True)
@@ -2383,7 +2460,16 @@ class MainWindow(QtWidgets.QMainWindow):
         main_tab = QtWidgets.QWidget()
         main_layout = QtWidgets.QVBoxLayout(main_tab)
         main_layout.addWidget(self.grp_len)
-        main_layout.addWidget(prompt_grp)
+
+        # (교체 전) main_layout.addWidget(prompt_grp)
+
+        # ▼▼ 교체: 3분할 가로 배치
+        row_prompts = QtWidgets.QHBoxLayout()
+        row_prompts.addWidget(prompt_grp)
+        row_prompts.addWidget(prompt_grp_pos)
+        row_prompts.addWidget(prompt_grp_neg)
+        main_layout.addLayout(row_prompts)
+
         main_layout.addWidget(self.cb_auto_tags)
         main_layout.addWidget(self.grp_vocal)
         main_layout.addWidget(self.grp_basic_vocal)
@@ -3065,14 +3151,138 @@ class MainWindow(QtWidgets.QMainWindow):
         self.btn_test3_concat.clicked.connect(self.on_test3_concat_segments)
 
     # ────────────── 토글/태그 유틸 ──────────────
-    def _toggle_manual_tag_widgets(self, enabled: bool):
-        # Basic_Vocal은 자동 ON이면 항상 포함 → 체크만 유지, 수정은 자동 OFF 때만 허용
-        for cb in self.cb_basic_vocal_list:
-            cb.setEnabled(enabled)
-        # 수동 카테고리
-        for lst in (self.cb_style_checks, self.cb_scene_checks, self.cb_instr_checks, self.cb_tempo_checks):
-            for cb in lst:
-                cb.setEnabled(enabled)
+    def _on_tags_changed(self, *_args) -> None:
+        """
+        태그(자동/수동, 보컬 성별, 개별 체크박스) 변경 시 즉시 project.json에 반영.
+        - project.json이 없으면 아무 것도 하지 않음(가사 생성 단계에서 저장됨)
+        - 자동 모드: ace_tags(최근 제안)와 tags_in_use(보조선택) 반영
+        - 수동 모드: manual_tags만 반영
+        - seconds/target_seconds 등 다른 필드는 건드리지 않음
+        """
+        from pathlib import Path
+        try:
+            from utils import load_json, save_json  # 우선 경로
+        except ImportError:
+            from app.utils import load_json, save_json  # 대체 경로
+
+        proj_dir = getattr(self, "project_dir", "") or ""
+        if not proj_dir:
+            return  # 프로젝트 파일이 아직 없음 → 가사 생성 시점에서 저장
+
+        pj = Path(proj_dir) / "project.json"
+        if not pj.exists():
+            return  # 아직 생성 전이면 건너뜀(요청한 정책)
+
+        meta = load_json(pj, {}) or {}
+
+        # 현재 UI 상태 수집(기존 유틸 사용)
+        # _gather_tag_state는 auto_tags/성별/수동체크 리스트를 포함해야 함
+        try:
+            state = self._gather_tag_state()  # type: ignore[attr-defined]
+        except Exception:
+            state = {}
+
+        auto_on = bool(state.get("auto_tags"))
+        manual_checked = state.get("manual_checked") or []
+
+        # 규칙: 자동 ON => ace_tags/tags_in_use, 자동 OFF => manual_tags
+        meta["auto_tags"] = auto_on
+
+        if auto_on:
+            # 최근 AI 제안 태그는 self._last_tags 보존 규칙에 따름(없으면 기존 값 유지)
+            last = getattr(self, "_last_tags", None)
+            if isinstance(last, (list, tuple)):
+                meta["ace_tags"] = list(last)
+            # 수동 보조 선택은 tags_in_use로 기록
+            meta["tags_in_use"] = list(manual_checked)
+            # 수동 목록은 혼동 방지 위해 비우거나 보존 중 하나를 선택해야 함
+            # 현재 로직 보존: manual_tags는 건드리지 않음(필요 시 이후 토글에서 사용)
+        else:
+            # 수동 모드에서는 manual_tags만 기록
+            meta["manual_tags"] = list(manual_checked)
+
+        save_json(pj, meta)
+        # 상태바가 있다면 사용자에게 저장 알림(선택적, 존재할 때만)
+        sb = getattr(self, "status", None)
+        if sb is not None and hasattr(sb, "showMessage"):
+            try:
+                sb.showMessage("태그 상태 저장됨", 2000)
+            except Exception:
+                pass
+
+    def _toggle_manual_tag_widgets(self, enabled: bool) -> None:
+        """
+        '수동 태그' 위젯들의 활성/비활성 토글.
+        - 기존 동작(위젯 enable/disable)은 그대로 유지
+        - 토글 직후 현재 태그 상태를 project.json에 '즉시' 반영
+        - 태그 관련 체크박스/라디오에 변경 이벤트를 1회만 바인딩(중복 연결 방지)
+        """
+        # 1) 기존 UI 토글 동작 유지
+        try:
+            for group in (
+                    getattr(self, "cb_basic_vocal_list", []),
+                    getattr(self, "cb_style_checks", []),
+                    getattr(self, "cb_scene_checks", []),
+                    getattr(self, "cb_instr_checks", []),
+                    getattr(self, "cb_tempo_checks", []),
+            ):
+                for cb in group:
+                    if hasattr(cb, "setEnabled"):
+                        cb.setEnabled(bool(enabled))
+        except Exception:
+            # 위젯이 아직 일부만 초기화된 초기 단계에서도 안전하게 넘어가도록 최소 범위 예외
+            return
+
+        # 2) 변경 이벤트 → 저장 핸들러 바인딩(최초 1회만)
+        #    - 없는 함수 호출 금지: 아래에서 정의하는 self._on_tags_changed를 사용
+        #    - 이미 연결되었는지 플래그로 확인
+        if not getattr(self, "_tags_signal_bound", False):
+            def _bind_cb_list(cbs):
+                for cb in cbs:
+                    # QCheckBox / QRadioButton 호환: stateChanged 또는 toggled 사용 가능
+                    if hasattr(cb, "stateChanged"):
+                        try:
+                            cb.stateChanged.connect(self._on_tags_changed)  # type: ignore[attr-defined]
+                        except Exception:
+                            pass
+                    if hasattr(cb, "toggled"):
+                        try:
+                            cb.toggled.connect(self._on_tags_changed)  # type: ignore[attr-defined]
+                        except Exception:
+                            pass
+
+            _bind_cb_list(getattr(self, "cb_basic_vocal_list", []))
+            _bind_cb_list(getattr(self, "cb_style_checks", []))
+            _bind_cb_list(getattr(self, "cb_scene_checks", []))
+            _bind_cb_list(getattr(self, "cb_instr_checks", []))
+            _bind_cb_list(getattr(self, "cb_tempo_checks", []))
+
+            # 자동 태그 토글 체크박스 및 보컬 성별 라디오도 저장에 영향 → 같이 바인딩
+            cb_auto = getattr(self, "cb_auto_tags", None)
+            if cb_auto is not None:
+                if hasattr(cb_auto, "toggled"):
+                    try:
+                        cb_auto.toggled.connect(self._on_tags_changed)  # type: ignore[attr-defined]
+                    except Exception:
+                        pass
+
+            for rb_name in ("rb_vocal_female", "rb_vocal_male", "rb_vocal_mixed"):
+                rb = getattr(self, rb_name, None)
+                if rb is not None and hasattr(rb, "toggled"):
+                    try:
+                        rb.toggled.connect(self._on_tags_changed)  # type: ignore[attr-defined]
+                    except Exception:
+                        pass
+
+            self._tags_signal_bound = True  # 중복 연결 방지
+
+        # 3) 토글 직후 즉시 저장(실시간 반영)
+        #    - 기존 규칙: auto ON → ace_tags/tags_in_use, auto OFF → manual_tags
+        try:
+            self._on_tags_changed()
+        except Exception:
+            # 저장 실패가 토글 동작 자체를 막지 않도록
+            pass
 
     def _apply_auto_tags_to_ui(self, tags: List[str]):
         """
@@ -3709,10 +3919,18 @@ class MainWindow(QtWidgets.QMainWindow):
             tags = [s.strip() for s in str(raw).split(",") if s.strip()]
 
         # 2) UI 채우기 (제목/가사)
-        if hasattr(self, "le_title"):
-            self.le_title.setText(title)
-        if hasattr(self, "te_lyrics"):
-            self.te_lyrics.setPlainText(lyrics)
+        try:
+            if hasattr(self, "le_title") and self.le_title is not None and hasattr(self.le_title, "setText"):
+                self.le_title.setText(title)
+        except Exception:
+            pass
+        try:
+            # 왼쪽: 원 가사
+            te_l = getattr(self, "te_lyrics", None) or getattr(getattr(self, "ui", None), "txt_lyrics", None)
+            if te_l is not None and hasattr(te_l, "setPlainText"):
+                te_l.setPlainText(lyrics)
+        except Exception:
+            pass
 
         # 3) 자동 태그(영문 정규화) + 수동 후보 안에서 picks 선택
         try:
@@ -3746,12 +3964,15 @@ class MainWindow(QtWidgets.QMainWindow):
         print("[TAGDBG] manual options:", allowed, flush=True)
         print("[TAGDBG] picks(final):", picks, flush=True)
 
+        # ✅ 자동태그가 '켜져 있을 때만' UI에 반영
         try:
-            if hasattr(self, "_apply_auto_tags_to_ui"):
-                self._apply_auto_tags_to_ui(picks)
+            if hasattr(self, "cb_auto_tags") and getattr(self.cb_auto_tags, "isChecked", lambda: False)():
+                if hasattr(self, "_apply_auto_tags_to_ui"):
+                    self._apply_auto_tags_to_ui(picks)
         except Exception as e:
             print("[TAGDBG] apply checks fail:", type(e).__name__, str(e), flush=True)
 
+        # 수동 UI 활성/비활성은 기존 규칙 유지
         if hasattr(self, "cb_auto_tags"):
             if self.cb_auto_tags.isChecked():
                 if hasattr(self, "_toggle_manual_tag_widgets"):
@@ -3822,9 +4043,15 @@ class MainWindow(QtWidgets.QMainWindow):
                 ]
                 if len(required) == 0:
                     fn()
-                else:
+                elif len(required) == 1:
                     fn(str(pdir))
-            except TypeError:
+                else:
+                    try:
+                        fn(str(pdir))
+                    except TypeError:
+                        # 어떤 형태든 실패하면 최후 보루
+                        self.project_dir = str(pdir)
+            except Exception:
                 # 어떤 형태든 실패하면 최후 보루
                 self.project_dir = str(pdir)
         else:
@@ -3842,6 +4069,7 @@ class MainWindow(QtWidgets.QMainWindow):
                 self.status.showMessage("가사 생성 완료")
             except Exception:
                 pass
+
 
     from pathlib import Path
 
