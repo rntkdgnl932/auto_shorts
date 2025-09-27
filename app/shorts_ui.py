@@ -78,7 +78,7 @@ try:
     from app.utils import sanitize_title, audio_duration_sec, load_json, save_json
     from app.lyrics_gen import generate_title_lyrics_tags, create_project_files
     from app.video_build import build_shots_with_i2v, xfade_concat, recalc_overlap
-    from app.music_gen import generate_music_with_acestep, rewrite_prompt_audio_format
+    from app.audio_sync import generate_music_with_acestep, rewrite_prompt_audio_format
     from app.tag_norm import normalize_tags_to_english
     from app.audio_sync import analyze_project
 except ImportError:
@@ -724,33 +724,45 @@ class MainWindow(QtWidgets.QMainWindow):
 
     def on_toggle_convert(self, checked: bool) -> None:
         """
-        변환(LLS) 토글:
-        - project.json의 lyrics_lls 갱신
-        - 오른쪽 변환 에디터(te_lyrics_converted)와 그 컨테이너를 토글 상태에 맞게 표시/갱신
-        - 원본 lyrics는 건드리지 않음
+        변환(LLS) 토글.
+        - 오른쪽 변환 패널/에디터는 '항상 보이기' 유지
+        - ON/OFF에 따라 '활성/비활성'만 전환 (위치 흔들림 없음)
+        - meta['lls_enabled']만 기록하고, 기존 변환 텍스트는 보존
         """
         from pathlib import Path
         import json
+        from json import JSONDecodeError
 
-        # 활성 프로젝트 경로 확보
+        # 프로젝트 경로
         proj_dir = None
         try:
-            proj_dir = getattr(self, "_get_active_project_dir", None)()  # prefer helper
+            proj_dir = getattr(self, "_get_active_project_dir", None)()
         except Exception:
             proj_dir = getattr(self, "_active_project_dir", None) or getattr(self, "project_dir", None)
         if not proj_dir:
             return
 
         pj = Path(proj_dir) / "project.json"
-        try:
-            meta = json.loads(pj.read_text(encoding="utf-8")) if pj.exists() else {}
-        except Exception:
-            meta = {}
 
-        # 에디터/컨테이너 위젯들
-        te_l = getattr(self, "te_lyrics", None)
-        te_c = getattr(self, "te_lyrics_converted", None)
-        # 변환 패널 컨테이너가 있다면(예: grp_convert / box_convert / frame_convert) 함께 토글
+        # 안전 로드/세이브
+        def _load(p: Path, default=None):
+            try:
+                return json.loads(p.read_text(encoding="utf-8"))
+            except (FileNotFoundError, JSONDecodeError, UnicodeDecodeError, OSError):
+                return default
+
+        def _save(p: Path, data: dict) -> None:
+            try:
+                p.write_text(json.dumps(data, ensure_ascii=False, indent=2), encoding="utf-8")
+            except Exception:
+                pass
+
+        meta = _load(pj, {}) or {}
+        meta["lls_enabled"] = bool(checked)
+        _save(pj, meta)
+
+        # 패널/에디터 핸들
+        te_conv = getattr(self, "te_lyrics_converted", None)
         panel = None
         for name in ("grp_convert", "box_convert", "frame_convert", "gb_convert", "w_convert"):
             w = getattr(self, name, None)
@@ -758,45 +770,21 @@ class MainWindow(QtWidgets.QMainWindow):
                 panel = w
                 break
 
-        # 현재 텍스트
-        raw_lyrics = ""
-        try:
-            if hasattr(te_l, "toPlainText"):
-                raw_lyrics = (te_l.toPlainText() or "").strip()
-        except Exception:
-            pass
-
-        converted_ui = ""
-        try:
-            if hasattr(te_c, "toPlainText"):
-                converted_ui = (te_c.toPlainText() or "").strip()
-        except Exception:
-            pass
-
-        # 토글 동작: project.json 갱신
-        meta["lls_enabled"] = bool(checked)
-        if checked:
-            # 변환칸이 비어있으면 그대로 비워둠(생성 단계에서 채워질 수 있음)
-            meta["lyrics_lls"] = converted_ui
-        else:
-            meta["lyrics_lls"] = ""
-
-        try:
-            pj.write_text(json.dumps(meta, ensure_ascii=False, indent=2), encoding="utf-8")
-        except Exception:
-            pass
-
-        # ── UI 표시/숨김 처리(핵심) ──
+        # 항상 보이기 유지
         try:
             if panel is not None and hasattr(panel, "setVisible"):
-                panel.setVisible(bool(checked))
-            if te_c is not None and hasattr(te_c, "setVisible"):
-                te_c.setVisible(bool(checked))
-            # ON인데 에디터가 비어 있고, meta에 기존 변환 텍스트가 있으면 표시에 반영
-            if checked and not converted_ui:
-                conv_meta = (meta.get("lyrics_lls") or "").strip()
-                if conv_meta and hasattr(te_c, "setPlainText"):
-                    te_c.setPlainText(conv_meta)
+                panel.setVisible(True)
+            if te_conv is not None and hasattr(te_conv, "setVisible"):
+                te_conv.setVisible(True)
+        except Exception:
+            pass
+
+        # 활성/비활성만 전환
+        try:
+            if panel is not None and hasattr(panel, "setEnabled"):
+                panel.setEnabled(bool(checked))
+            if te_conv is not None and hasattr(te_conv, "setEnabled"):
+                te_conv.setEnabled(bool(checked))
         except Exception:
             pass
 
@@ -852,115 +840,108 @@ class MainWindow(QtWidgets.QMainWindow):
 
     def on_convert_toggle(self, checked: bool) -> None:
         """
-        변환(LLS) 버튼 토글 시 즉시 우측 칸(te_lyrics_converted)에 변환 결과를 표시하고 project.json에 반영한다.
-        - ON  : 왼쪽 가사(te_lyrics)를 즉시 변환 → 오른쪽 칸에 setPlainText + 보이기 + meta['lyrics_lls'] 저장
-                 (이미 meta['lyrics_lls']가 있으면 그걸 우선 표시)
-        - OFF : 오른쪽 칸 숨김 + meta['lyrics_lls']=""
+        변환(LLS) 토글 - '창 숨김 없음' 정책:
+        - 항상 보이기 유지(setVisible(True))
+        - ON/OFF는 활성/비활성(setEnabled)만 전환
+        - meta['lls_enabled']만 기록, lyrics_lls는 보존
+        - kroman이 있으면 변환, 없으면 원문 유지
         """
         from pathlib import Path
         import json
         from json import JSONDecodeError
 
-        # 안전한 유틸 로드 (있으면 사용)
-        load_json_fn = None
-        save_json_fn = None
+        # 유틸 선호, 없으면 간단 폴백
         try:
             from app.utils import load_json as _lj, save_json as _sj  # type: ignore
             load_json_fn, save_json_fn = _lj, _sj
         except Exception:
-            pass
-
-        if load_json_fn is None or save_json_fn is None:
-            def _fallback_load_json(path: Path, default=None):
+            def load_json_fn(p: Path, default=None):
                 try:
-                    return json.loads(path.read_text(encoding="utf-8"))
+                    return json.loads(p.read_text(encoding="utf-8"))
                 except (FileNotFoundError, JSONDecodeError, UnicodeDecodeError, OSError):
                     return default
 
-            def _fallback_save_json(path: Path, data: dict) -> None:
+            def save_json_fn(p: Path, data: dict) -> None:
                 try:
-                    path.write_text(json.dumps(data, ensure_ascii=False, indent=2), encoding="utf-8")
-                except OSError:
+                    p.write_text(json.dumps(data, ensure_ascii=False, indent=2), encoding="utf-8")
+                except Exception:
                     pass
 
-            load_json_fn = _fallback_load_json
-            save_json_fn = _fallback_save_json
-
-        # 활성 프로젝트 경로
+        # 프로젝트 경로
         proj_dir = getattr(self, "_active_project_dir", None) or getattr(self, "project_dir", None)
         if not proj_dir:
             return
         pj = Path(proj_dir) / "project.json"
         meta = load_json_fn(pj, {}) or {}
 
-        # 위젯 핸들
+        # 위젯
         te_l = getattr(self, "te_lyrics", None)
         te_c = getattr(self, "te_lyrics_converted", None)
 
-        # 변환 함수(가능하면 kroman, 없으면 원문 유지)
-        def _convert_text(text_in: str) -> str:
-            txt = text_in or ""
+        # 컨테이너(있으면 같이 enable/visible)
+        panel = None
+        for name in ("grp_convert", "box_convert", "frame_convert", "gb_convert", "w_convert"):
+            w = getattr(self, name, None)
+            if w is not None:
+                panel = w
+                break
+
+        # 변환기(kroman이 있으면 사용)
+        def _convert(txt: str) -> str:
             try:
                 import kroman  # type: ignore
-                out_lines = []
-                for line in txt.splitlines():
-                    st = line.strip()
-                    if not st or (st.startswith("[") and st.endswith("]")):
-                        out_lines.append(line)
+                out = []
+                for line in (txt or "").splitlines():
+                    s = line.strip()
+                    if not s or (s.startswith("[") and s.endswith("]")):
+                        out.append(line)
                     else:
                         rom = kroman.parse(line).strip().replace("-", "")
-                        out_lines.append("[ko]" + rom)
-                return "\n".join(out_lines)
+                        out.append("[ko]" + rom)
+                return "\n".join(out)
             except Exception:
-                # kroman이 없으면 최소한 원문 그대로라도 보여준다
-                return txt
+                return txt or ""
 
-        # 표시 유틸
-        def _show_convert_panel(show: bool) -> None:
-            # 변환 패널 컨테이너가 있으면 같이 토글
-            for name in ("grp_convert", "box_convert", "frame_convert", "gb_convert", "w_convert"):
-                w = getattr(self, name, None)
-                if w is not None and hasattr(w, "setVisible"):
-                    w.setVisible(bool(show))
-            if te_c is not None and hasattr(te_c, "setVisible"):
-                te_c.setVisible(bool(show))
-
-        # 토글 상태 기록(선택)
+        # 상태 기록
         meta["lls_enabled"] = bool(checked)
 
         if checked:
-            # 1) meta에 기존 변환 가사가 있으면 그걸 우선 표시
-            existing = (meta.get("lyrics_lls") or "").strip()
-            text_to_show = existing
-            # 2) 없으면 왼쪽 가사를 즉시 변환해 표시
+            # 기존 lyrics_lls 우선, 없으면 즉시 변환
+            text_to_show = (meta.get("lyrics_lls") or "").strip()
             if not text_to_show:
-                src_text = ""
+                src = ""
                 if te_l is not None and hasattr(te_l, "toPlainText"):
                     try:
-                        src_text = te_l.toPlainText()
+                        src = te_l.toPlainText() or ""
                     except Exception:
-                        src_text = ""
-                text_to_show = _convert_text(src_text)
+                        src = ""
+                text_to_show = _convert(src)
+                meta["lyrics_lls"] = text_to_show
+                save_json_fn(pj, meta)
 
-            # 우측 칸에 즉시 표시
+            # 우측 텍스트 갱신
             if te_c is not None and hasattr(te_c, "setPlainText"):
                 try:
                     te_c.setPlainText(text_to_show)
                 except Exception:
                     pass
 
-            # project.json 반영
-            meta["lyrics_lls"] = text_to_show
-            save_json_fn(pj, meta)
-
-            # 패널 보이기
-            _show_convert_panel(True)
-
         else:
-            # OFF: 변환 사용 중지 → meta 비우고 패널 숨김
-            meta["lyrics_lls"] = ""
+            # OFF라도 텍스트/패널은 그대로 보존(정책: 숨기지 않음, 내용 유지)
             save_json_fn(pj, meta)
-            _show_convert_panel(False)
+
+        # 항상 보이기 + 활성/비활성만 전환
+        try:
+            if panel is not None and hasattr(panel, "setVisible"):
+                panel.setVisible(True)
+            if te_c is not None and hasattr(te_c, "setVisible"):
+                te_c.setVisible(True)
+            if panel is not None and hasattr(panel, "setEnabled"):
+                panel.setEnabled(bool(checked))
+            if te_c is not None and hasattr(te_c, "setEnabled"):
+                te_c.setEnabled(bool(checked))
+        except Exception:
+            pass
 
     # ==== PATCH: shorts_ui.py :: on_generate_lyrics_with_log ====
     def on_generate_lyrics_with_log(self) -> None:
@@ -1191,15 +1172,25 @@ class MainWindow(QtWidgets.QMainWindow):
         run_job_with_progress_async(self, "누락 이미지 생성", job, tail_file=comfy_log_file, on_done=done)
 
     def on_click_generate_music(self) -> None:
+        """음악 생성 버튼 핸들러 — 중복 실행 가드 추가(기능 불변)."""
         from PyQt5 import QtWidgets
         try:
             from app.utils import run_job_with_progress_async
         except Exception:
             from utils import run_job_with_progress_async  # type: ignore
 
+        # ===== 인플라이트 가드(추가) =====
+        if getattr(self, "_music_inflight", False):
+            print("[UI] music already running -> ignore", flush=True)
+            return
+        self._music_inflight = True
+
         btn = getattr(self, "btn_music", None)
         if btn:
-            btn.setEnabled(False)
+            try:
+                btn.setEnabled(False)
+            except Exception:
+                pass
 
         def job(progress):
             from pathlib import Path
@@ -1213,7 +1204,7 @@ class MainWindow(QtWidgets.QMainWindow):
                 from audio_sync import generate_music_with_acestep  # type: ignore
 
             # ▶▶ 활성 프로젝트만 사용
-            project_dir = self._get_active_project_dir()
+            project_dir = self._get_active_project_dir() if hasattr(self, "_get_active_project_dir") else None
             if not project_dir:
                 raise RuntimeError("프로젝트 폴더가 없습니다. 먼저 가사를 생성하거나 프로젝트를 불러오세요.")
 
@@ -1222,12 +1213,7 @@ class MainWindow(QtWidgets.QMainWindow):
             pj = Path(project_dir) / "project.json"
             meta = load_json(pj, {}) or {}
 
-            # === TAG SYNC START ===
-            # UI 상태 → project.json 태그/길이 동기화 (자동/수동 규칙)
-            # - auto_tags: 자동태그 모드 여부
-            # - ace_tags: 최근 AI 제안 태그(자동 모드에서 사용)
-            # - tags_in_use: 자동 모드에서 UI로 보조 선택한 태그
-            # - manual_tags: 수동 모드에서 최종 보낼 태그
+            # === TAG SYNC START === (기존 규칙 유지)
             auto_on = False
             cb_auto = getattr(self, "cb_auto_tags", None)
             if cb_auto is not None and hasattr(cb_auto, "isChecked"):
@@ -1236,7 +1222,6 @@ class MainWindow(QtWidgets.QMainWindow):
                 except (AttributeError, ValueError):
                     auto_on = False
 
-            # 수동 체크 태그 수집
             picked_manual = []
             if hasattr(self, "_collect_manual_checked_tags") and callable(self._collect_manual_checked_tags):
                 try:
@@ -1244,7 +1229,6 @@ class MainWindow(QtWidgets.QMainWindow):
                 except (TypeError, ValueError):
                     picked_manual = []
             else:
-                # 백업 수집(체크박스 배열이 있는 경우)
                 for lst_name in ("cb_basic_vocal_list", "cb_style_checks", "cb_scene_checks", "cb_instr_checks",
                                  "cb_tempo_checks"):
                     lst = getattr(self, lst_name, None)
@@ -1257,7 +1241,6 @@ class MainWindow(QtWidgets.QMainWindow):
                                         picked_manual.append(label)
                         except (AttributeError, TypeError, ValueError):
                             continue
-                # 배타 보컬 라디오
                 try:
                     if getattr(self, "rb_vocal_female", None) and self.rb_vocal_female.isChecked():
                         picked_manual.append("soft female voice")
@@ -1268,34 +1251,25 @@ class MainWindow(QtWidgets.QMainWindow):
                 except (AttributeError, ValueError):
                     pass
 
-            # 최근 AI 제안 태그(자동 모드에서 사용)
             last_ai_tags = list(getattr(self, "_last_tags", []) or [])
 
-            # 길이도 meta에 반영(아래에서 다시 저장하므로 여기서 값만 세팅)
             meta["time"] = int(secs)
             meta["target_seconds"] = int(secs)
 
-            # 자동/수동 규칙 적용
             if auto_on:
                 meta["auto_tags"] = True
-                # ace_tags: 새 제안이 있으면 갱신, 없으면 기존 유지
                 meta["ace_tags"] = last_ai_tags if last_ai_tags else list(meta.get("ace_tags", []) or [])
-                # tags_in_use: UI로 체크한 보조 태그(중복 제거)
                 meta["tags_in_use"] = list(dict.fromkeys(picked_manual))
-                # 수동 키는 남겨둬도 무방
             else:
                 meta["auto_tags"] = False
-                # manual_tags만 사용(중복 제거)
                 meta["manual_tags"] = list(dict.fromkeys(picked_manual))
-
-            # 여기서는 저장하지 않고, 아래 원래 저장 지점에서 save_json 실행
             # === TAG SYNC END ===
 
             meta["time"] = secs
             meta["target_seconds"] = secs
             save_json(pj, meta)
 
-            # ✅ 안전한 진행 콜백: dict 이외(bool/str 등)가 와도 처리
+            # 진행 콜백 안전 래핑(기존 유지)
             def forward(info) -> None:
                 try:
                     if isinstance(info, dict):
@@ -1303,10 +1277,8 @@ class MainWindow(QtWidgets.QMainWindow):
                         extra = {k: v for k, v in info.items() if k != "stage"}
                         progress({"msg": f"[{st}] {extra}"})
                     else:
-                        # dict 이 아니면 문자열로 강제 변환해 단순 로그로 표시
                         progress({"msg": f"[LOG] {str(info)}"})
                 except Exception:
-                    # 진행표시 실패는 UI에 치명적이지 않으므로 조용히 무시
                     pass
 
             out = generate_music_with_acestep(
@@ -1318,12 +1290,28 @@ class MainWindow(QtWidgets.QMainWindow):
             return out
 
         def on_done(ok: bool, _payload, err):
+            # 버튼 복원 + 인플라이트 해제는 finally 에서도 보장
             if btn:
-                btn.setEnabled(True)
+                try:
+                    btn.setEnabled(True)
+                except Exception:
+                    pass
             if not ok and err is not None:
                 QtWidgets.QMessageBox.warning(self, "음악 생성 오류", str(err))
+            # 인플라이트 해제
+            self._music_inflight = False
 
-        run_job_with_progress_async(self, "음악 생성 (ACE-Step)", job, on_done=on_done)
+        try:
+            run_job_with_progress_async(self, "음악 생성 (ACE-Step)", job, on_done=on_done)
+        except Exception as e:
+            # 예외 시에도 상태 복원
+            if btn:
+                try:
+                    btn.setEnabled(True)
+                except Exception:
+                    pass
+            self._music_inflight = False
+            QtWidgets.QMessageBox.warning(self, "음악 생성 오류", str(e))
 
     def on_click_analyze_music(self) -> None:
         """
@@ -2535,6 +2523,7 @@ class MainWindow(QtWidgets.QMainWindow):
 
         # ▼▼ 추가: 형제 그룹 2개(긍정/부정)
         self.te_prompt_pos = QtWidgets.QTextEdit()
+        self.te_prompt_pos.setPlainText("ace-step tag 추천해줘 : \n")
         prompt_grp_pos = self._group("긍정 프롬프트(+)", self.te_prompt_pos)
 
         self.te_prompt_neg = QtWidgets.QTextEdit()
@@ -2546,11 +2535,21 @@ class MainWindow(QtWidgets.QMainWindow):
         self.cb_auto_tags.toggled.connect(self._on_auto_toggle)
 
         # ai select 토글
-        self.btn_ai_toggle = QtWidgets.QToolButton()
+        self.btn_ai_toggle = QtWidgets.QToolButton(self)
         self.btn_ai_toggle.setCheckable(True)
-        self.btn_ai_toggle.setText("모드: GPT 우선")
-        self.btn_ai_toggle.setToolTip("클릭: Gemini만 사용 / 다시 클릭: GPT 우선(부족 시 Gemini 폴백)")
         self.btn_ai_toggle.toggled.connect(self.on_ai_toggle)
+
+        # 기본 상태를 'Gemini만 사용'으로 맞춘다
+        self.btn_ai_toggle.setChecked(True)
+
+        # 표시/툴팁을 기본 상태에 맞춰 즉시 동기화
+        try:
+            # on_ai_toggle(bool)이 버튼 텍스트/툴팁을 갱신한다면, 현재 상태로 한 번 호출
+            self.on_ai_toggle(self.btn_ai_toggle.isChecked())
+        except Exception:
+            # on_ai_toggle이 표시를 안 바꾼다면 안전하게 기본 표기를 직접 지정
+            self.btn_ai_toggle.setText("모드: Gemini만")
+            self.btn_ai_toggle.setToolTip("클릭: GPT 우선(부족 시 Gemini 폴백) / 다시 클릭: Gemini만 사용")
 
         # Vocal 선택
         self.grp_vocal = QtWidgets.QGroupBox("Vocal(배타 선택)")
