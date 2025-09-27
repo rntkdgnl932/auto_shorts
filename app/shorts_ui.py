@@ -22,7 +22,7 @@ print("GPU_LOCK:", os.getenv("CUDA_VISIBLE_DEVICES"), os.getenv("CT2_FORCE_CPU")
 
 import subprocess
 import json
-from typing import Optional
+from typing import Optional, Dict, Set
 import requests
 import shutil
 import sys
@@ -424,8 +424,14 @@ class ProgressLogDialog(QtWidgets.QDialog):
 
 # ──────────────────────────────── Main UI ─────────────────────────────────────
 class MainWindow(QtWidgets.QMainWindow):
-
-
+    _tag_sync_booted: bool = False
+    _tag_sync_inited: bool = False
+    _tag_boxes: Dict[str, QtWidgets.QCheckBox] = {}
+    _checked_tags: Set[str] = set()
+    _tag_save_timer: Optional[QtCore.QTimer] = None
+    _tag_watch_timer: Optional[QtCore.QTimer] = None
+    _tag_watch_last_path: Optional[str] = None
+    _tag_watch_last_mtime: Optional[float] = None
 
     def __init__(self):
         super().__init__()
@@ -496,6 +502,193 @@ class MainWindow(QtWidgets.QMainWindow):
         self._actions_bound = False  # ← 1회 바인딩 가드
         QtCore.QTimer.singleShot(0, self._bind_actions)
 
+    ######### ######### ######### #########
+    ######### 태그 실시간  반영  #########
+    ######### ######### ######### #########
+    @staticmethod
+    def _safe_connect(signal_obj, slot) -> None:
+        """
+        PyQt 신호(.connect) 안전 연결 헬퍼.
+        - signal_obj: QTimer.timeout, QCheckBox.stateChanged 등
+        - slot: 호출 가능한 콜러블
+        정적 메서드로 두어 '메서드가 static일 수 있습니다' 경고 제거.
+        """
+        try:
+            # 일부 정적 분석기가 pyqtSignal에 대해 connect 속성 해석을 못해 경고를 냄.
+            # getattr로 동적 접근하여 경고를 피하고, 런타임 안전성도 확보한다.
+            conn = getattr(signal_obj, "connect", None)
+            if callable(conn) and callable(slot):
+                conn(slot)
+        except Exception:
+            # 연결 실패해도 앱이 죽지 않도록 방어
+            pass
+
+    def showEvent(self, event):
+        """창이 표시될 때 태그 동기화를 부트스트랩한다. 기존 __init__/핸들러는 수정하지 않는다."""
+        super().showEvent(event)
+        if getattr(self, "_tag_sync_booted", False):
+            return
+        self._init_tag_sync()
+        self._sync_tags_from_project_json()
+        self._start_tag_watch()
+        self._tag_sync_booted = True
+
+    def _init_tag_sync(self) -> None:
+        """태그 체크박스 수집 및 시그널 연결(1회)."""
+        if getattr(self, "_tag_sync_inited", False):
+            return
+
+        self._tag_boxes: Dict[str, QtWidgets.QCheckBox] = self._collect_tag_checkboxes()
+        self._checked_tags: Set[str] = set()
+
+        # 저장 디바운스 타이머
+        self._tag_save_timer = QtCore.QTimer(self)
+        self._tag_save_timer.setSingleShot(True)
+        # self._tag_save_timer.timeout.connect(self._persist_checked_tags_now)  # ← 정적 경고 회피
+        self._safe_connect(self._tag_save_timer.timeout, self._persist_checked_tags_now)
+
+        # 체크 이벤트 연결(정적 경고 없이 안전 연결)
+        for label, cb in self._tag_boxes.items():
+            # lambda 캡처: lab=label로 고정
+            self._safe_connect(getattr(cb, "stateChanged", None),
+                               lambda _s, lab=label: self._on_tag_state_changed(lab))
+
+        self._tag_sync_inited = True
+
+    def _collect_tag_checkboxes(self) -> Dict[str, QtWidgets.QCheckBox]:
+        """
+        UI의 QCheckBox를 텍스트로 매칭한다(objectName 불필요). 비교는 소문자+trim 기준.
+        기존 UI 구조/텍스트를 변경하지 않는다.
+        """
+        allowed: Set[str] = {
+            # Vocal
+            "soft female voice", "soft male voice", "mixed vocals",
+            # Basic Vocal
+            "clean vocals", "natural articulation", "warm emotional tone",
+            "studio reverb light", "clear diction", "breath control", "balanced mixing",
+            # Style
+            "electronic", "rock", "pop", "funk", "soul", "cyberpunk",
+            "acid jazz", "edm", "soft electric drums", "melodic",
+            # Scene
+            "background music for parties", "radio broadcasts", "workout playlists",
+            # Instrument
+            "saxophone", "jazz", "piano", "violin", "acoustic guitar", "electric bass",
+            # Tempo/Pro
+            "110 bpm", "fast tempo", "slow tempo", "loops", "fills",
+        }
+
+        mapping: Dict[str, QtWidgets.QCheckBox] = {}
+        for cb in self.findChildren(QtWidgets.QCheckBox):
+            label_raw = (cb.text() or "").strip()
+            if not label_raw:
+                continue
+            if label_raw.lower() in allowed and label_raw not in mapping:
+                mapping[label_raw] = cb
+        return mapping
+
+    def _on_tag_state_changed(self, label: str) -> None:
+        cb = self._tag_boxes.get(label)
+        if cb is None:
+            return
+        if cb.isChecked():
+            self._checked_tags.add(label)
+        else:
+            self._checked_tags.discard(label)
+        self._persist_checked_tags_debounced()
+
+    def _sync_tags_from_project_json(self) -> None:
+        """project.json -> UI 체크 상태 동기화. 우선순위: checked_tags > tags_effective > []."""
+        try:
+            from app.utils import load_json
+        except Exception:
+            return
+
+        proj_dir = self._current_project_dir() if hasattr(self, "_current_project_dir") else None
+        if not proj_dir:
+            return
+
+        meta_path = Path(proj_dir) / "project.json"
+        meta = load_json(meta_path, {}) or {}
+
+        selected: List[str] = []
+        if isinstance(meta.get("checked_tags"), list):
+            selected = [str(x) for x in meta["checked_tags"]]
+        elif isinstance(meta.get("tags_effective"), list):
+            selected = [str(x) for x in meta["tags_effective"]]
+
+        self._checked_tags = set()
+        for label, cb in self._tag_boxes.items():
+            want = label in selected
+            cb.blockSignals(True)
+            cb.setChecked(want)
+            cb.blockSignals(False)
+            if want:
+                self._checked_tags.add(label)
+
+        if "checked_tags" not in meta:
+            meta["checked_tags"] = sorted(self._checked_tags)
+            self._persist_checked_tags_now(meta_override=meta)
+
+    def _persist_checked_tags_debounced(self, msec: int = 250) -> None:
+        if hasattr(self, "_tag_save_timer"):
+            self._tag_save_timer.start(msec)
+        else:
+            self._persist_checked_tags_now()
+
+    def _persist_checked_tags_now(self, *, meta_override: Optional[dict] = None) -> None:
+        try:
+            from app.utils import load_json, save_json
+        except Exception:
+            return
+
+        proj_dir = self._current_project_dir() if hasattr(self, "_current_project_dir") else None
+        if not proj_dir:
+            return
+
+        meta_path = Path(proj_dir) / "project.json"
+        meta = meta_override if meta_override is not None else (load_json(meta_path, {}) or {})
+        meta["checked_tags"] = sorted(self._checked_tags)
+        try:
+            save_json(meta_path, meta)
+        except Exception:
+            # 저장 실패해도 UI 동작 유지
+            pass
+
+    def get_checked_tags(self) -> List[str]:
+        """외부에서 현재 선택 태그를 읽을 때 사용."""
+        return sorted(self._checked_tags)
+
+    def _start_tag_watch(self) -> None:
+        self._tag_watch_last_path: Optional[str] = None
+        self._tag_watch_last_mtime: Optional[float] = None
+
+        self._tag_watch_timer = QtCore.QTimer(self)
+        self._tag_watch_timer.setInterval(1500)  # 1.5s
+        # self._tag_watch_timer.timeout.connect(self._tick_tag_watch)  # ← 정적 경고 회피
+        self._safe_connect(self._tag_watch_timer.timeout, self._tick_tag_watch)
+        self._tag_watch_timer.start()
+
+    def _tick_tag_watch(self) -> None:
+        proj_dir = self._current_project_dir() if hasattr(self, "_current_project_dir") else None
+        if not proj_dir:
+            return
+        meta_path = Path(proj_dir) / "project.json"
+        path_str = str(meta_path)
+        try:
+            mtime = meta_path.stat().st_mtime if meta_path.exists() else None
+        except OSError:
+            mtime = None
+
+        changed_path = (self._tag_watch_last_path != path_str)
+        changed_time = (mtime is not None and self._tag_watch_last_mtime != mtime)
+        if changed_path or changed_time:
+            self._sync_tags_from_project_json()
+        self._tag_watch_last_path = path_str
+        self._tag_watch_last_mtime = mtime
+
+    ######### ######### ######### #########
+    ######### ######### ######### #########
+    ######### ######### ######### #########
     def _bind_actions(self) -> None:
         if getattr(self, "_actions_bound", False):
             return
@@ -1350,7 +1543,6 @@ class MainWindow(QtWidgets.QMainWindow):
 
         run_job_with_progress_async(self, "음악분석", job, tail_file=None, on_done=done)
 
-    # class MainWindow(...) 내부 아무 유틸 메서드 구역에 추가
 
     @staticmethod
     def _persist_lyric_sections(*, proj_dir: str, sections: list, last_end: float) -> None:
