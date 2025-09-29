@@ -3490,6 +3490,774 @@ def generate_music_with_acestep(
     _dlog("LEAVE", summary.replace("\n", " | "))
     return summary
 
+######################분석 보완############################################
+def preprocess_for_analysis(src: str) -> str:
+    """
+    분석 친화 전처리:
+      - 48k/mono로 로드
+      - 약한 노이즈 리덕션
+      - 하모닉 우세화(보컬 강조)
+      - -16 LUFS 근사 정규화
+      - 16-bit WAV 임시 파일로 저장
+    실패 또는 의존성 부재 시 원본 경로 반환.
+    """
+    try:
+        from pathlib import Path
+        import numpy as np
+        import soundfile as sf
+        import librosa
+        import noisereduce as nr
+        import pyloudnorm as pyln
+
+        src_path = Path(src)
+        if not src_path.exists():
+            return src
+
+        y, sr = librosa.load(str(src_path), sr=48000, mono=True)
+        if y is None or y.size == 0:
+            return src
+
+        # 약한 노이즈 리덕션(stationary=False: 음악에 안전)
+        y = nr.reduce_noise(y=y, sr=sr, prop_decrease=0.3, stationary=False)
+
+        # 하모닉/퍼커시브 분리 후 보컬 쪽 비중 약간 높임
+        harm, perc = librosa.effects.hpss(y)
+        y = (harm * 0.9) + (perc * 0.1)
+
+        # -16 LUFS 정규화(EBU R128)
+        meter = pyln.Meter(sr)
+        loudness = meter.integrated_loudness(y)
+        y = pyln.normalize.loudness(y, loudness, -16.0)
+
+        # 소프트 클립으로 과도 피크 방지
+        y = np.clip(y, -0.98, 0.98)
+
+        out_path = src_path.with_suffix(".pre.wav")
+        sf.write(str(out_path), y, sr, subtype="PCM_16")
+        return str(out_path)
+    except ImportError:
+        # 의존성 없으면 원본 사용
+        return src
+    except Exception:
+        # 전처리 실패 시에도 원본 사용(분석 파이프는 계속 진행)
+        return src
+def demucs_vocals_drums(src: str) -> dict:
+    """
+    Demucs로 stems 분리 후 vocals/drums 경로 딕셔너리 반환.
+    - 실패/미설치 시 빈 dict 반환
+    - 호출부는 존재 여부만 검사해서 쓰도록 설계
+    """
+    try:
+        import sys
+        import subprocess
+        from pathlib import Path
+
+        src_path = Path(src)
+        if not src_path.exists():
+            return {}
+
+        # 출력 폴더: 원본과 같은 폴더 아래 demucs_out/
+        out_dir = src_path.parent / "demucs_out"
+        out_dir.mkdir(parents=True, exist_ok=True)
+
+        cmd = [sys.executable, "-m", "demucs", "-n", "htdemucs", "-o", str(out_dir), str(src_path)]
+        # demucs 실행 (에러 시 예외 발생 → 빈 dict 폴백)
+        subprocess.run(cmd, check=True)
+
+        # 결과: out_dir/model/songname/*.wav
+        # 여러 번 실행 가능하므로 가장 최근 파일을 고른다.
+        vocals = None
+        drums = None
+        latest_time = -1.0
+        for p in out_dir.rglob("*.wav"):
+            name = p.name.lower()
+            try:
+                t = p.stat().st_mtime
+            except OSError:
+                t = 0.0
+            if t >= latest_time:
+                latest_time = t
+                if "vocals" in name:
+                    vocals = p
+                if "drums" in name:
+                    drums = p
+
+        out = {}
+        if vocals and vocals.exists():
+            out["vocals"] = str(vocals)
+        if drums and drums.exists():
+            out["drums"] = str(drums)
+        return out
+    except ImportError:
+        return {}
+    except Exception:
+        return {}
+
+def detect_onsets_percussive_librosa(wav_path: str) -> list[float]:
+    """
+    퍼커시브(타격) 성분을 강조해 리듬 경계를 잡는 온셋 검출(리브로사만 사용).
+    - HPSS로 퍼커시브 분리 후 onset_detect
+    - backtrack 활성화(근접 트랜지언트로 스냅)
+    - 중복 제거 임계 10ms
+
+    설치 의존성: librosa, soundfile
+    실패 시: 빈 리스트 반환(호출부는 기존 온셋으로 폴백)
+    """
+    from pathlib import Path
+    try:
+        import numpy as np
+        import soundfile as sf
+        import librosa
+    except ImportError:
+        return []
+
+    p = Path(wav_path)
+    if not p.exists():
+        return []
+
+    try:
+        # sr=None: 원 샘플레이트 유지(정밀 타임스탬프에 유리)
+        y, sr = librosa.load(str(p), sr=None, mono=True)
+        if y is None or y.size == 0 or sr is None or sr <= 0:
+            return []
+
+        # 하모닉/퍼커시브 분리 → 리듬 경계는 퍼커시브가 민감
+        harm, perc = librosa.effects.hpss(y)
+        # 온셋 탐지 파라미터 튜닝:
+        # - backtrack=True: 에너지 피크 이전 트랜지언트로 이동해 경계가 자연스러움
+        # - pre/post_max/avg, delta: 트랙별 거짓 양성 줄이는 안정 세팅
+        on_times = librosa.onset.onset_detect(
+            y=perc,
+            sr=sr,
+            units="time",
+            backtrack=True,
+            pre_max=20,
+            post_max=20,
+            pre_avg=100,
+            post_avg=100,
+            delta=0.2,
+            wait=0,
+        )
+
+        # 10ms 중복 제거 + 반올림
+        out: list[float] = []
+        last = -1.0
+        for t in on_times:
+            t = float(t)
+            if last < 0.0 or (t - last) >= 0.010:
+                out.append(round(t, 3))
+                last = t
+        return out
+    except (ValueError, RuntimeError):
+        return []
+def sync_lyrics_with_whisper_pro(
+    audio_path: str,
+    lyrics_text: str,
+    *,
+    model_size: str = "medium",
+    min_len: float = 0.5,
+    end_bias_sec: float = 2.5,
+    avg_min_sec_per_unit: float = 2.0,
+    start_preroll: float = 0.30,
+    enable_preprocess: bool = True,
+    enable_demucs: bool = True,
+    enable_calibration: bool = True,
+    # 더 이상 하드코딩 앵커를 쓰지 않는다. None 그대로 유지.
+    anchor_first_line_sec: float | None = None,
+) -> dict:
+    """
+    PRO 파이프(안전한 자동 보정):
+      1) (옵션) 전처리
+      2) (옵션) Demucs 보컬/드럼 분리
+      3) 기존 sync_lyrics_with_whisper 호출
+      4) 퍼커시브 온셋 보강(드럼 없으면 align_path에서 HPSS)
+      5) (옵션) 전역 시프트/선형 드리프트 보정
+      6) (자동) 앵커 보정: '적합도'가 명확히 좋아지는 경우에만 적용
+      7) 겹침/역전 방지(enforce_monotonic_segments)
+      8) 리포트
+    """
+    from pathlib import Path
+
+    src = Path(audio_path)
+    use_path = str(src)
+
+    # 1) 전처리
+    if enable_preprocess and callable(globals().get("preprocess_for_analysis")):
+        try:
+            pre = preprocess_for_analysis(str(src))
+            if pre and Path(pre).exists():
+                use_path = pre
+        except (ValueError, OSError, RuntimeError):
+            use_path = str(src)
+
+    # 2) Demucs
+    vocals_path = None
+    drums_path = None
+    if enable_demucs and callable(globals().get("demucs_vocals_drums")):
+        try:
+            stems = demucs_vocals_drums(use_path)
+            vp = stems.get("vocals")
+            dp = stems.get("drums")
+            if vp and Path(vp).exists():
+                vocals_path = vp
+            if dp and Path(dp).exists():
+                drums_path = dp
+        except (ValueError, OSError, RuntimeError):
+            vocals_path = None
+            drums_path = None
+
+    align_path = vocals_path or use_path
+
+    # 3) 기본 정렬
+    base_res = sync_lyrics_with_whisper(
+        align_path,
+        lyrics_text,
+        model_size=model_size,
+        use_vocal_separation=False,
+        min_len=min_len,
+        end_bias_sec=end_bias_sec,
+        avg_min_sec_per_unit=avg_min_sec_per_unit,
+        start_preroll=start_preroll,
+    )
+
+    # 4) 온셋 보강
+    merged_onsets = []
+    try:
+        merged_onsets = [float(x) for x in (base_res.get("onsets") or [])]
+    except Exception:
+        merged_onsets = []
+
+    onsets_hp = []
+    src_for_onset = drums_path or align_path
+    if callable(globals().get("detect_onsets_percussive_librosa")) and src_for_onset:
+        try:
+            onsets_hp = detect_onsets_percussive_librosa(src_for_onset)
+        except (ValueError, OSError, RuntimeError):
+            onsets_hp = []
+    if onsets_hp:
+        pool = merged_onsets + [t for t in onsets_hp if t not in merged_onsets]
+        pool = sorted(set(round(float(t), 3) for t in pool))
+        merged_onsets = pool
+
+    final_res = dict(base_res or {})
+    final_res["onsets_hp"] = onsets_hp
+    final_res["onsets"] = merged_onsets
+
+    # 5) 전역/드리프트 보정(보수적으로)
+    shift_a = 0.0
+    shift_b = 0.0
+    a_lin = 1.0
+    b_lin = 0.0
+    shift_applied = 0.0
+    if enable_calibration:
+        try:
+            shift_a = estimate_global_shift(final_res.get("segments") or [], merged_onsets, max_abs_sec=8.0)
+        except Exception:
+            shift_a = 0.0
+        try:
+            shift_b = estimate_global_shift_signal(align_path, final_res.get("segments") or [], max_abs_sec=8.0)
+        except Exception:
+            shift_b = 0.0
+
+        # 두 추정치가 같은 방향이며 차이가 너무 크지 않을 때만 적용
+        same_sign = (shift_a == 0.0 and shift_b == 0.0) or (shift_a * shift_b > 0.0)
+        mean_shift = float(round((shift_a + shift_b) * 0.5, 3))
+        if same_sign and abs(mean_shift) >= 0.12 and abs(shift_a - shift_b) <= 1.0:
+            final_res = apply_global_shift(final_res, mean_shift)
+            shift_applied = mean_shift
+
+        # 선형 드리프트(과한 보정 방지: 임계↑)
+        try:
+            a_lin, b_lin = estimate_affine_drift(final_res.get("segments") or [], merged_onsets)
+        except Exception:
+            a_lin, b_lin = (1.0, 0.0)
+        if abs(a_lin - 1.0) >= 0.03 or abs(b_lin) >= 0.15:
+            final_res = apply_affine_time_map(final_res, a_lin, b_lin)
+
+    # 6) 자동 앵커(안전 조건 하에서만)
+    # 적합도 스코어: 첫 3개 세그먼트 start와 최근접 온셋과의 평균 절댓값
+    def _score(segs, ons):
+        import math
+        if not segs or not ons:
+            return 1e9
+        starts = []
+        j = 0
+        n = len(ons)
+        for s in segs[:3]:
+            try:
+                st = float(s.get("start", 0.0))
+            except (TypeError, ValueError):
+                continue
+            while j + 1 < n and abs(ons[j + 1] - st) <= abs(ons[j] - st):
+                j += 1
+            starts.append(abs(ons[j] - st))
+        if not starts:
+            return 1e9
+        return float(sum(starts) / len(starts))
+
+    if anchor_first_line_sec is None:
+        try:
+            auto_t = _auto_anchor_from_energy(align_path)
+        except Exception:
+            auto_t = 0.0
+
+        segs_now = list(final_res.get("segments") or [])
+        if segs_now and auto_t > 0.0:
+            before = _score(segs_now, merged_onsets)
+            # 첫 줄만 auto_t로 바꿔본 테스트 사본
+            import copy
+            test_res = copy.deepcopy(final_res)
+            s0 = test_res.get("segments")[0]
+            # 길이 유지
+            try:
+                old_et = float(segs_now[0].get("end", 0.0))
+                old_st = float(segs_now[0].get("start", 0.0))
+                dur = max(0.0, old_et - old_st)
+            except (TypeError, ValueError):
+                dur = 0.0
+            if isinstance(segs_now[0].get("start", 0.0), str):
+                s0["start"] = f"{auto_t:.3f}"
+            else:
+                s0["start"] = round(auto_t, 3)
+            new_et = auto_t + dur
+            if isinstance(segs_now[0].get("end", 0.0), str):
+                s0["end"] = f"{new_et:.3f}"
+            else:
+                s0["end"] = round(new_et, 3)
+
+            after = _score(test_res.get("segments") or [], merged_onsets)
+            # 스코어가 충분히 좋아질 때만 진짜 적용(0.35s 이상 개선)
+            if after + 0.35 <= before:
+                final_res = test_res
+
+    # 7) 겹침/역전 방지(항상)
+    final_res = enforce_monotonic_segments(final_res, min_gap_sec=0.05)
+
+    # 8) 리포트
+    segs = final_res.get("segments") or []
+    total = len(segs)
+    ok = 0
+    for s in segs:
+        try:
+            if s.get("ok"):
+                ok += 1
+        except Exception:
+            continue
+    ok_ratio = float(ok) / float(total) if total > 0 else 0.0
+
+    final_res["__pro_info__"] = {
+        "preprocessed": (use_path != str(src)),
+        "demucs_vocals_used": bool(vocals_path),
+        "demucs_drums_used": bool(drums_path),
+        "align_input": align_path,
+        "onsets_hp_count": len(onsets_hp),
+        "onsets_total": len(merged_onsets),
+        "global_shift_a_sec": float(shift_a),
+        "global_shift_b_sec": float(shift_b),
+        "global_shift_applied_sec": float(shift_applied),
+        "affine_a": float(a_lin),
+        "affine_b": float(b_lin),
+        "ok_ratio": float(round(ok_ratio, 3)),
+    }
+    return final_res
+
+
+
+
+
+
+def estimate_global_shift(segments: list, onsets: list[float], *, max_abs_sec: float = 12.0) -> float:
+    """
+    세그먼트 start 시각과 가까운 퍼커시브 온셋을 매칭해 '전역 시프트(지연/앞당김)'를 추정.
+    - shift = median( nearest_onset - seg.start )
+    - 너무 큰 값은 max_abs_sec로 제한.
+    - onsets/segments가 비어있으면 0.0
+    """
+    import math
+    if not segments or not onsets:
+        return 0.0
+    starts = []
+    for seg in segments:
+        try:
+            st = float(seg.get("start", 0.0))
+            if math.isfinite(st):
+                starts.append(st)
+        except (TypeError, ValueError):
+            continue
+    if not starts:
+        return 0.0
+    on = sorted(float(t) for t in onsets if isinstance(t, (int, float)))
+    if not on:
+        return 0.0
+
+    diffs = []
+    j = 0
+    n = len(on)
+    for st in starts:
+        while j + 1 < n and abs(on[j + 1] - st) <= abs(on[j] - st):
+            j += 1
+        diffs.append(on[j] - st)
+    diffs.sort()
+    mid = len(diffs) // 2
+    if len(diffs) % 2 == 1:
+        shift = diffs[mid]
+    else:
+        shift = 0.5 * (diffs[mid - 1] + diffs[mid])
+    if abs(shift) > max_abs_sec:
+        if shift > 0:
+            shift = max_abs_sec
+        else:
+            shift = -max_abs_sec
+    return float(round(shift, 3))
+
+def apply_global_shift(res: dict, shift_sec: float) -> dict:
+    """
+    res(dict)에 포함된 segments/start_at을 shift_sec만큼 이동해 새로운 dict 반환.
+    - shift_sec > 0: 지연(뒤로), shift_sec < 0: 당김(앞으로)
+    - duration_sec은 변경하지 않음.
+    - start/end/start_at은 '원래 타입'을 유지해 기록(문자열이면 문자열로).
+    """
+    import copy
+
+    out = copy.deepcopy(res or {})
+    if not isinstance(out, dict):
+        return res
+
+    # segments: 각 항목의 start/end 타입을 보존해 기록
+    segs = out.get("segments") or []
+    new_segs = []
+    for seg in segs:
+        if not isinstance(seg, dict):
+            new_segs.append(seg)
+            continue
+
+        s2 = dict(seg)
+
+        # start
+        orig_start = seg.get("start", 0.0)
+        try:
+            start_num = float(orig_start) + float(shift_sec)
+            start_num = max(0.0, start_num)
+            if isinstance(orig_start, str):
+                s2["start"] = f"{start_num:.3f}"
+            else:
+                s2["start"] = round(start_num, 3)
+        except (TypeError, ValueError):
+            # 원본이 비정상이라면 그대로 둠
+            pass
+
+        # end
+        orig_end = seg.get("end", 0.0)
+        try:
+            end_num = float(orig_end) + float(shift_sec)
+            end_num = max(0.0, end_num)
+            if isinstance(orig_end, str):
+                s2["end"] = f"{end_num:.3f}"
+            else:
+                s2["end"] = round(end_num, 3)
+        except (TypeError, ValueError):
+            pass
+
+        new_segs.append(s2)
+
+    out["segments"] = new_segs
+
+    # start_at: 타입 보존
+    orig_sa = out.get("start_at", 0.0)
+    try:
+        sa_num = float(orig_sa) + float(shift_sec)
+        sa_num = max(0.0, sa_num)
+        if isinstance(orig_sa, str):
+            out["start_at"] = f"{sa_num:.3f}"
+        else:
+            out["start_at"] = round(sa_num, 3)
+    except (TypeError, ValueError):
+        # 원본 유지
+        pass
+
+    return out
+
+def _rms_envelope(audio_path: str, *, sr_out: int = 16000, hop_length: int = 512) -> tuple[list[float], list[float]]:
+    """
+    오디오에서 RMS 엔벨로프 추출 → (times_sec, rms_list) 반환.
+    - librosa.feature.rms 를 직접 임포트하여 타입 스텁 경고 회피
+    - 실패 시 빈 리스트 반환
+    """
+    try:
+        import numpy as np
+        import librosa
+        # 여기서 'librosa.feature.rms'를 모듈 속성으로 접근하지 않고 직접 임포트
+        from librosa.feature import rms as librosa_rms
+    except ImportError:
+        return ([], [])
+
+    try:
+        y, sr = librosa.load(audio_path, sr=sr_out, mono=True)
+        if y is None or y.size == 0:
+            return ([], [])
+
+        # 프레임 RMS (직접 임포트한 함수 사용)
+        rms_vals = librosa_rms(
+            y=y,
+            frame_length=2048,
+            hop_length=hop_length,
+            center=True,
+            pad_mode="reflect",
+        )[0]
+
+        # 프레임 인덱스 → 시간축
+        n_frames = int(rms_vals.shape[0])
+        t = librosa.frames_to_time(np.arange(n_frames), sr=sr, hop_length=hop_length)
+
+        # 정규화
+        peak = float(np.max(rms_vals)) if n_frames > 0 else 0.0
+        if peak > 0.0:
+            rms_vals = (rms_vals / peak).astype(float)
+
+        return ([float(x) for x in t], [float(x) for x in rms_vals])
+    except (ValueError, RuntimeError, OSError):
+        return ([], [])
+
+
+
+def estimate_global_shift_signal(audio_path: str, segments: list, *, max_abs_sec: float = 12.0) -> float:
+    """
+    엔벨로프와 '줄 시작 시각'의 임펄스 열을 교차상관으로 정렬 → 전역 시프트 추정.
+    +면 뒤로(지연), -면 앞으로(당김). 실패 시 0.0
+    """
+    times, env = _rms_envelope(audio_path)
+    if not times or not env or not segments:
+        return 0.0
+
+    import numpy as np
+
+    # 줄 시작 시각 벡터(임펄스)
+    starts = []
+    for s in segments:
+        try:
+            st = float(s.get("start", 0.0))
+            if np.isfinite(st):
+                starts.append(st)
+        except (TypeError, ValueError):
+            continue
+    if not starts:
+        return 0.0
+
+    # env에 맞춰 임펄스 시퀀스 생성
+    dt = float(times[1] - times[0]) if len(times) > 1 else 0.01
+    n = len(times)
+    imp = np.zeros(n, dtype=float)
+    for st in starts:
+        idx = int(round(st / dt))
+        if 0 <= idx < n:
+            imp[idx] = 1.0
+
+    # 교차상관 (valid 범위 내에서 argmax)
+    c = np.correlate(env, imp, mode="full")  # env를 기준
+    lag = int(np.argmax(c)) - (n - 1)
+    shift = -lag * dt  # env(t) ≈ imp(t+shift) → 시프트 부호 보정
+
+    if abs(shift) > max_abs_sec:
+        shift = max_abs_sec if shift > 0 else -max_abs_sec
+    return float(round(shift, 3))
+
+def estimate_affine_drift(segments: list, onsets: list[float]) -> tuple[float, float]:
+    """
+    seg.start 와 가까운 onsets를 짝지어 최소제곱으로 t' = a*t + b 추정.
+    반환: (a, b). 실패/자료 부족 시 (1.0, 0.0)
+    """
+    import numpy as np
+    xs = []
+    ys = []
+    on = sorted(float(t) for t in onsets if isinstance(t, (int, float)))
+    if not segments or not on:
+        return (1.0, 0.0)
+    j = 0
+    n = len(on)
+    for seg in segments:
+        try:
+            st = float(seg.get("start", 0.0))
+        except (TypeError, ValueError):
+            continue
+        while j + 1 < n and abs(on[j + 1] - st) <= abs(on[j] - st):
+            j += 1
+        xs.append(st)
+        ys.append(on[j])
+    if len(xs) < 5:
+        return (1.0, 0.0)
+    X = np.vstack([np.array(xs), np.ones(len(xs))]).T
+    y = np.array(ys)
+    try:
+        a, b = np.linalg.lstsq(X, y, rcond=None)[0]
+    except Exception:
+        return (1.0, 0.0)
+    # 너무 극단적인 값 방지
+    if not np.isfinite(a) or not np.isfinite(b) or a <= 0.5 or a >= 1.5 or abs(b) > 15.0:
+        return (1.0, 0.0)
+    return (float(a), float(b))
+
+
+def apply_affine_time_map(res: dict, a: float, b: float) -> dict:
+    """
+    segments/start_at에 t' = a*t + b 선형 맵 적용. 타입 보존.
+    """
+    import copy
+    out = copy.deepcopy(res or {})
+    if not isinstance(out, dict):
+        return res
+
+    segs = out.get("segments") or []
+    new_segs = []
+    for seg in segs:
+        if not isinstance(seg, dict):
+            new_segs.append(seg)
+            continue
+        s2 = dict(seg)
+
+        # start
+        orig_start = seg.get("start", 0.0)
+        try:
+            start_num = (a * float(orig_start)) + b
+            start_num = max(0.0, start_num)
+            s2["start"] = f"{start_num:.3f}" if isinstance(orig_start, str) else round(start_num, 3)
+        except (TypeError, ValueError):
+            pass
+
+        # end
+        orig_end = seg.get("end", 0.0)
+        try:
+            end_num = (a * float(orig_end)) + b
+            end_num = max(0.0, end_num)
+            s2["end"] = f"{end_num:.3f}" if isinstance(orig_end, str) else round(end_num, 3)
+        except (TypeError, ValueError):
+            pass
+
+        new_segs.append(s2)
+    out["segments"] = new_segs
+
+    orig_sa = out.get("start_at", 0.0)
+    try:
+        sa_num = (a * float(orig_sa)) + b
+        sa_num = max(0.0, sa_num)
+        out["start_at"] = f"{sa_num:.3f}" if isinstance(orig_sa, str) else round(sa_num, 3)
+    except (TypeError, ValueError):
+        pass
+
+    return out
+
+def _auto_anchor_from_energy(audio_path: str, *, sr_out: int = 16000, hop_length: int = 512,
+                             floor_db: float = 35.0, min_run_sec: float = 0.35) -> float:
+    """
+    오디오의 RMS/무음구간을 이용해 '최초로 충분히 큰 에너지'가 등장하는 시각을 추출.
+    - 반환: anchor_sec (없으면 0.0)
+    """
+    try:
+        import numpy as np
+        import librosa
+    except ImportError:
+        return 0.0
+
+    try:
+        y, sr = librosa.load(audio_path, sr=sr_out, mono=True)
+        if y is None or y.size == 0:
+            return 0.0
+
+        # 무음 구간 split (top_db 낮을수록 민감)
+        intervals = librosa.effects.split(y, top_db=floor_db, frame_length=2048, hop_length=hop_length)
+        if intervals is None or len(intervals) == 0:
+            return 0.0
+
+        # 첫 유효 구간(길이가 충분한) 시작 시각
+        min_run = int(round(min_run_sec * sr))
+        for beg, end in intervals:
+            if end - beg >= min_run:
+                t = float(beg) / float(sr)
+                return round(max(0.0, t), 3)
+        # 짧은 구간만 있다면 첫 구간 시작
+        t = float(intervals[0][0]) / float(sr)
+        return round(max(0.0, t), 3)
+    except (ValueError, RuntimeError, OSError):
+        return 0.0
+
+def enforce_monotonic_segments(res: dict, *, min_gap_sec: float = 0.05) -> dict:
+    """
+    segments의 start/end가 서로 겹치지 않도록 단조 증가로 정렬/보정한다.
+    - 인접 세그먼트간 최소 간격(min_gap_sec) 보장
+    - 각 세그먼트의 '길이'는 가능한 한 유지(앞 세그먼트 end를 기준으로 다음 start를 밀어냄)
+    - duration_sec은 변경하지 않음
+    - start/end/start_at의 '기존 타입(str/float)'을 보존
+    """
+    import copy
+
+    out = copy.deepcopy(res or {})
+    if not isinstance(out, dict):
+        return res
+
+    segs = out.get("segments") or []
+    if not isinstance(segs, list) or not segs:
+        return out
+
+    # 헬퍼: 타입 보존하여 수치 쓰기
+    def _write(v_old, v_num):
+        v_num = max(0.0, float(v_num))
+        return f"{v_num:.3f}" if isinstance(v_old, str) else round(v_num, 3)
+
+    # 전체 정렬(있다면) → 순서가 이상할 때를 방지
+    try:
+        segs_sorted = sorted(
+            [s for s in segs if isinstance(s, dict)],
+            key=lambda d: float(d.get("start", 0.0))
+        )
+    except Exception:
+        segs_sorted = [s for s in segs if isinstance(s, dict)]
+
+    prev_end = None
+    new_segs = []
+    for i, seg in enumerate(segs_sorted):
+        s2 = dict(seg)
+
+        # 원래 값
+        st_old = seg.get("start", 0.0)
+        et_old = seg.get("end", 0.0)
+
+        try:
+            st = float(st_old)
+        except (TypeError, ValueError):
+            st = 0.0
+        try:
+            et = float(et_old)
+        except (TypeError, ValueError):
+            et = st
+
+        # 역전 방지
+        if et < st:
+            et = st
+
+        # 이전 끝 이후로 최소 간격 보장
+        if prev_end is not None:
+            min_start = float(prev_end) + float(min_gap_sec)
+            if st < min_start:
+                # 길이는 유지하려 노력: start 밀면 end도 같이 민다
+                dur = max(0.0, et - st)
+                st = min_start
+                et = st + dur
+
+        # 기록(타입 보존)
+        s2["start"] = _write(st_old, st)
+        s2["end"] = _write(et_old, et)
+
+        new_segs.append(s2)
+        prev_end = et
+
+    out["segments"] = new_segs
+    return out
+
+
+
+
+
+
+
 
 
 

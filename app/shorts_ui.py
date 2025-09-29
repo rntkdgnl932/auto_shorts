@@ -840,17 +840,15 @@ class MainWindow(QtWidgets.QMainWindow):
 
     def on_convert_toggle(self, checked: bool) -> None:
         """
-        변환(LLS) 토글 - '창 숨김 없음' 정책:
-        - 항상 보이기 유지(setVisible(True))
-        - ON/OFF는 활성/비활성(setEnabled)만 전환
-        - meta['lls_enabled']만 기록, lyrics_lls는 보존
-        - kroman이 있으면 변환, 없으면 원문 유지
+        변환(LLS) 토글:
+        - ON  : meta['lls_enabled']=True, 필요 시 lyrics_lls 생성. 오른쪽 패널/에디터 '표시+활성화'.
+        - OFF : meta['lls_enabled']=False, lyrics_lls 제거. 오른쪽 패널/에디터 '표시+비활성화(내용은 빈칸)'.
         """
         from pathlib import Path
         import json
         from json import JSONDecodeError
 
-        # 유틸 선호, 없으면 간단 폴백
+        # 파일 IO 유틸
         try:
             from app.utils import load_json as _lj, save_json as _sj  # type: ignore
             load_json_fn, save_json_fn = _lj, _sj
@@ -867,18 +865,17 @@ class MainWindow(QtWidgets.QMainWindow):
                 except Exception:
                     pass
 
-        # 프로젝트 경로
         proj_dir = getattr(self, "_active_project_dir", None) or getattr(self, "project_dir", None)
         if not proj_dir:
             return
+
         pj = Path(proj_dir) / "project.json"
         meta = load_json_fn(pj, {}) or {}
+        if not isinstance(meta, dict):
+            meta = {}
 
-        # 위젯
-        te_l = getattr(self, "te_lyrics", None)
+        # 우측 변환 UI 핸들(이름이 다를 수 있어 안전하게 탐색)
         te_c = getattr(self, "te_lyrics_converted", None)
-
-        # 컨테이너(있으면 같이 enable/visible)
         panel = None
         for name in ("grp_convert", "box_convert", "frame_convert", "gb_convert", "w_convert"):
             w = getattr(self, name, None)
@@ -886,62 +883,62 @@ class MainWindow(QtWidgets.QMainWindow):
                 panel = w
                 break
 
-        # 변환기(kroman이 있으면 사용)
+        # 좌측 원문 에디터(최초 ON 시 변환할 때만 사용)
+        te_l = getattr(self, "te_lyrics", None)
+
         def _convert(txt: str) -> str:
             try:
                 import kroman  # type: ignore
-                out = []
+                out_lines = []
                 for line in (txt or "").splitlines():
                     s = line.strip()
                     if not s or (s.startswith("[") and s.endswith("]")):
-                        out.append(line)
+                        out_lines.append(line)
                     else:
                         rom = kroman.parse(line).strip().replace("-", "")
-                        out.append("[ko]" + rom)
-                return "\n".join(out)
+                        out_lines.append("[ko]" + rom)
+                return "\n".join(out_lines)
             except Exception:
                 return txt or ""
 
-        # 상태 기록
-        meta["lls_enabled"] = bool(checked)
-
         if checked:
-            # 기존 lyrics_lls 우선, 없으면 즉시 변환
-            text_to_show = (meta.get("lyrics_lls") or "").strip()
-            if not text_to_show:
-                src = ""
-                if te_l is not None and hasattr(te_l, "toPlainText"):
-                    try:
-                        src = te_l.toPlainText() or ""
-                    except Exception:
-                        src = ""
-                text_to_show = _convert(src)
-                meta["lyrics_lls"] = text_to_show
-                save_json_fn(pj, meta)
+            # ON: 정책 유지(필요 시 1회 생성), UI는 '표시+활성화'
+            meta["lls_enabled"] = True
+            lls_now = (meta.get("lyrics_lls") or "").strip()
+            if not lls_now and hasattr(te_l, "toPlainText"):
+                raw_txt = te_l.toPlainText()
+                conv_txt = _convert(raw_txt)
+                meta["lyrics_lls"] = conv_txt
+                if hasattr(te_c, "setPlainText"):
+                    te_c.setPlainText(conv_txt)
 
-            # 우측 텍스트 갱신
-            if te_c is not None and hasattr(te_c, "setPlainText"):
-                try:
-                    te_c.setPlainText(text_to_show)
-                except Exception:
-                    pass
-
-        else:
-            # OFF라도 텍스트/패널은 그대로 보존(정책: 숨기지 않음, 내용 유지)
             save_json_fn(pj, meta)
 
-        # 항상 보이기 + 활성/비활성만 전환
-        try:
+            # 표시 + 활성화
             if panel is not None and hasattr(panel, "setVisible"):
                 panel.setVisible(True)
-            if te_c is not None and hasattr(te_c, "setVisible"):
-                te_c.setVisible(True)
-            if panel is not None and hasattr(panel, "setEnabled"):
-                panel.setEnabled(bool(checked))
-            if te_c is not None and hasattr(te_c, "setEnabled"):
-                te_c.setEnabled(bool(checked))
-        except Exception:
-            pass
+            if te_c is not None:
+                if hasattr(te_c, "setVisible"):
+                    te_c.setVisible(True)
+                if hasattr(te_c, "setEnabled"):
+                    te_c.setEnabled(True)
+
+        else:
+            # OFF: 파일에서는 lyrics_lls 제거. UI는 '표시+비활성화', 내용은 빈칸.
+            meta["lls_enabled"] = False
+            if "lyrics_lls" in meta:
+                meta.pop("lyrics_lls", None)
+            save_json_fn(pj, meta)
+
+            if panel is not None and hasattr(panel, "setVisible"):
+                panel.setVisible(True)  # 숨기지 않음
+            if te_c is not None:
+                if hasattr(te_c, "clear"):
+                    te_c.clear()
+                if hasattr(te_c, "setVisible"):
+                    te_c.setVisible(True)  # 항상 보임
+                if hasattr(te_c, "setEnabled"):
+                    te_c.setEnabled(False)  # 비활성화
 
     # ==== PATCH: shorts_ui.py :: on_generate_lyrics_with_log ====
     def on_generate_lyrics_with_log(self) -> None:
@@ -1315,34 +1312,21 @@ class MainWindow(QtWidgets.QMainWindow):
 
     def on_click_analyze_music(self) -> None:
         """
-        '음악분석' 버튼(Whisper 우선 싱크 + 폴백 배분):
-        - project.json → story.json에서 가사 로드
-        - (선택) 보컬 분리 후 Whisper 단어 단위 전사
-        - 공식 가사 라인과 정렬 → 성공 라인은 Whisper 시간 사용
-        - 실패 라인은 온셋-가중치 배분 폴백
-        - 콘솔/다이얼로그 출력 + preview JSON 저장 (story.json 미수정)
-        - ★ 추가: 줄별 정합 기반 '마지막 줄 end + outro_sec'로 컷 & 페이드아웃 수행 → vocal_cut.wav, lyrics_aligned.json 저장
+        음악분석:
+          - project/story에서 가사 확보
+          - '가사 변환 여부'를 정규화 비교로 정확히 판단해 표시
+          - project.json의 auto_tags 실제 값을 리포트에 표시
+          - PRO 파이프 호출(강제 앵커 사용 안 함)
         """
         from pathlib import Path
-        from typing import Optional, List
+        from typing import List
         from PyQt5 import QtWidgets
-        import json
 
-        # 설정값(기존 유지) — 함수 내 변수는 소문자
-        use_vocal_separation = False
-        model_size = "medium"
-        min_len = 0.5
-        end_bias = 2.5
-        avg_min_sec_per_unit = 2.0
-        start_preroll = 0.30
-
-        # utils
         try:
             from app.utils import load_json  # type: ignore
         except Exception:
             from utils import load_json  # type: ignore
 
-        # audio_sync 통합 모듈(대문자 별칭 사용 금지)
         audio_sync_mod = None
         try:
             import app.audio_sync as audio_sync_mod  # type: ignore
@@ -1351,151 +1335,154 @@ class MainWindow(QtWidgets.QMainWindow):
                 import audio_sync as audio_sync_mod  # type: ignore
             except Exception:
                 audio_sync_mod = None
-
         if audio_sync_mod is None:
-            raise RuntimeError("audio_sync 모듈을 불러오지 못했습니다.")
+            raise RuntimeError("audio_sync 모듈 로드 실패")
 
-        # 필수 함수 확인(기존 체크 유지)
-        reqs = [
-            "get_audio_duration",
-            "detect_onsets_seconds",
-            "layout_time_by_weights",
-            "prepare_pure_lyrics_lines",
-            "sync_lyrics_with_whisper",
-        ]
-        for r in reqs:
-            if not callable(getattr(audio_sync_mod, r, None)):
-                raise RuntimeError(f"audio_sync.{r} 가 없습니다. audio_sync.py에 함수를 추가하세요.")
+        has_pro = callable(getattr(audio_sync_mod, "sync_lyrics_with_whisper_pro", None))
+        has_base = callable(getattr(audio_sync_mod, "sync_lyrics_with_whisper", None))
+        if not (has_pro or has_base):
+            raise RuntimeError("audio_sync에 sync 함수가 없습니다.")
+        prepare_lines = getattr(audio_sync_mod, "prepare_pure_lyrics_lines", None)
+        if not callable(prepare_lines):
+            raise RuntimeError("audio_sync.prepare_pure_lyrics_lines 가 없습니다.")
+
+        btn = getattr(self, "btn_analyze_music", None) or getattr(getattr(self, "ui", None), "btn_analyze_music", None)
+
+        # 문자열 정규화(공백/개행/유니코드 넓은 공백 차이 제거)
+        def _norm_text(s: str) -> str:
+            if not isinstance(s, str):
+                return ""
+            s2 = s.replace("\r\n", "\n").replace("\r", "\n")
+            lines = [ln.strip() for ln in s2.split("\n")]
+            # 완전 빈 줄은 제거
+            lines = [ln for ln in lines if ln != ""]
+            return "\n".join(lines)
 
         def job(log):
-            def log_line(tag_or_msg: str, msg: Optional[str] = None) -> None:
-                log(tag_or_msg if msg is None else f"[{tag_or_msg}] {msg}")
+            def slog(tag: str, msg: str) -> None:
+                log(f"[{tag}] {msg}")
 
-            btn = getattr(self, "btn_analyze_music", None) or getattr(getattr(self, "ui", None), "btn_analyze_music",
-                                                                      None)
             if isinstance(btn, QtWidgets.QAbstractButton):
                 btn.setEnabled(False)
-
             try:
-                log_line("ui", "프로젝트/보컬 탐색")
                 proj_dir = self._current_project_dir()
                 if not proj_dir:
-                    raise RuntimeError("프로젝트 폴더가 없습니다. 먼저 프로젝트를 생성/불러오세요.")
+                    raise RuntimeError("프로젝트 폴더가 없습니다.")
 
-                vocal_path = self._find_latest_vocal()
-                if not (vocal_path and Path(vocal_path).exists()):
-                    raise RuntimeError("보컬 오디오(vocal.*)를 찾지 못했습니다.")
-                log_line("음악분석", f"보컬 파일: {Path(vocal_path).name}")
+                # 보컬 경로(str)
+                vocal_path_raw = self._find_latest_vocal()
+                if isinstance(vocal_path_raw, Path):
+                    vocal_path_str = str(vocal_path_raw)
+                elif isinstance(vocal_path_raw, str):
+                    vocal_path_str = vocal_path_raw
+                else:
+                    vocal_path_str = ""
+                if not vocal_path_str or not Path(vocal_path_str).exists():
+                    raise RuntimeError("보컬 오디오 파일을 찾을 수 없습니다.")
+                slog("음악분석", f"오디오: {Path(vocal_path_str).name}")
 
-                # 가사 로드(project → story)
-                lyrics_text = ""
+                # project.json 상태(lyrics, auto_tags)
                 pj = Path(proj_dir) / "project.json"
+                auto_tags_flag = None
+                lyrics_raw = ""
                 if pj.exists():
-                    any_proj = load_json(pj, {}) or {}
-                    if isinstance(any_proj, dict):
-                        lyrics_text = str(any_proj.get("lyrics") or "").strip()
-                if not lyrics_text:
+                    pj_data = load_json(pj, {}) or {}
+                    if isinstance(pj_data, dict):
+                        lyrics_raw = str(pj_data.get("lyrics") or "").strip()
+                        if "auto_tags" in pj_data:
+                            auto_tags_flag = bool(pj_data.get("auto_tags"))
+                if not lyrics_raw:
                     sj = Path(proj_dir) / "story.json"
                     if sj.exists():
-                        any_story = load_json(sj, {}) or {}
-                        if isinstance(any_story, dict):
-                            lyrics_text = str(any_story.get("lyrics") or "").strip()
-                if not lyrics_text:
-                    raise RuntimeError("가사를 찾을 수 없습니다. project.json/story.json에 lyrics가 없습니다.")
-                # 변환 ON이면 변환본으로 교체(OFF면 원본 유지)
-                lyrics_text = self._maybe_convert_lyrics_for_api(lyrics_text)
+                        sj_data = load_json(sj, {}) or {}
+                        if isinstance(sj_data, dict):
+                            lyrics_raw = str(sj_data.get("lyrics") or "").strip()
+                if not lyrics_raw:
+                    raise RuntimeError("가사를 찾지 못했습니다.")
 
-                # Whisper 우선 싱크 (기존 동작)
-                res = audio_sync_mod.sync_lyrics_with_whisper(
-                    str(vocal_path),
-                    lyrics_text,
-                    model_size=model_size,
-                    use_vocal_separation=use_vocal_separation,
-                    min_len=min_len,
-                    end_bias_sec=end_bias,
-                    avg_min_sec_per_unit=avg_min_sec_per_unit,
-                    start_preroll=start_preroll,
-                )
+                # 실제 변환 여부: 정규화해서 비교(개행/공백 차이로 인한 오탐 방지)
+                lyrics_before = _norm_text(lyrics_raw)
+                lyrics_after = _norm_text(self._maybe_convert_lyrics_for_api(lyrics_raw))
+                lyrics_converted = (lyrics_after != lyrics_before)
+                lyrics_text = lyrics_after
 
-                segments = res.get("segments", [])
-                _onsets = res.get("onsets", [])  # 사용 안 함 → 경고 방지용 접두 _
-                _duration = float(res.get("duration_sec", 0.0))
-                _start_at = float(res.get("start_at", 0.0))
+                # 파라미터(기본값 유지)
+                model_size = "medium"
+                min_len = 0.5
+                end_bias = 2.5
+                avg_min_sec_per_unit = 2.0
+                start_preroll = 0.30
 
-                # 라인 표시용(줄바꿈 기준)
-                lines = audio_sync_mod.prepare_pure_lyrics_lines(lyrics_text, drop_section_tags=True)
-
-                # JSON 미리보기 저장 (기존)
-                preview_path = Path(proj_dir) / "music_analysis_preview.json"
-                with open(preview_path, "w", encoding="utf-8") as f:
-                    json.dump(res, f, ensure_ascii=False, indent=2)
-
-                # 출력 조립
-                out: List[str] = ["===== [가사 원문] (줄바꿈 기준 라인) ====="]
-                for i, u in enumerate(lines):
-                    out.append(f"  #{i:02d}: {u}")
-
-                out.append("\n===== [시간 매핑 결과] =====")
-                for seg in segments:
-                    a = float(seg["start"])
-                    b = float(seg["end"])
-                    t = str(seg["text"])
-                    out.append(f"{a:6.2f} ~ {b:6.2f}  {t}")
-
-                out.append(f"\n(저장) {preview_path}")
-
-                # ★ 추가: 줄별 정합 + 컷 & 페이드아웃(자동)
-                import pathlib  # 소문자 별칭으로 경고 회피
-                from audio_sync import analyze_and_cut_project  # 안전하게 지역 import
-
-                cut_res = analyze_and_cut_project(
-                    project_dir=str(pathlib.Path(proj_dir)),
-                    model_size="medium",
-                    snap_window_sec=0.15,
-                )
-
-                cut = cut_res.get("cut") or {}
-                out.append("\n===== [컷 & 페이드아웃 요약] =====")
-                out.append(f"last_end: {float(cut_res.get('last_end') or 0.0):.2f}s")
-                out.append(f"outro_sec: {int(cut.get('outro_sec') or 0)}s")
-                out.append(f"output: {str(cut.get('out') or '')}")
-                out.append(f"duration_out: {float(cut.get('duration_out') or 0.0):.2f}s")
-                out.append(f"aligned(json): {str(cut_res.get('aligned_path') or '')}")
-
-                # 줄별 정합 결과 표시
-                aligned_rows = []
-                aligned_path_s = str(cut_res.get("aligned_path") or "")
-                try:
-                    if aligned_path_s:
-                        ap = pathlib.Path(aligned_path_s)
-                        if ap.exists():
-                            import json as _json
-                            aligned_rows = _json.loads(ap.read_text(encoding="utf-8"))
-                except Exception:
-                    aligned_rows = []
-
-                out.append("\n===== [줄별 정합 결과] =====")
-                if aligned_rows:
-                    for i_row, row in enumerate(aligned_rows):
-                        line = str(row.get("line") or "")
-                        s_val = row.get("start")
-                        e_val = row.get("end")
-                        sc_val = row.get("score")
-                        if isinstance(s_val, (int, float)) and isinstance(e_val, (int, float)):
-                            out.append(
-                                f"#{i_row:02d}: {float(s_val):6.2f} ~ {float(e_val):6.2f}  (score={float(sc_val or 0.0):.2f})  {line}"
-                            )
-                        else:
-                            out.append(f"#{i_row:02d}: (미매칭)  (score={float(sc_val or 0.0):.2f})  {line}")
+                # PRO 호출(강제 앵커 전달 안 함)
+                if has_pro:
+                    res = audio_sync_mod.sync_lyrics_with_whisper_pro(
+                        vocal_path_str,
+                        lyrics_text,
+                        model_size=model_size,
+                        min_len=min_len,
+                        end_bias_sec=end_bias,
+                        avg_min_sec_per_unit=avg_min_sec_per_unit,
+                        start_preroll=start_preroll,
+                        enable_preprocess=True,
+                        enable_demucs=True,
+                        enable_calibration=True,
+                        anchor_first_line_sec=None,
+                    )
                 else:
-                    out.append("(줄별 정합 결과 없음)")
+                    res = audio_sync_mod.sync_lyrics_with_whisper(
+                        vocal_path_str,
+                        lyrics_text,
+                        model_size=model_size,
+                        use_vocal_separation=False,
+                        min_len=min_len,
+                        end_bias_sec=end_bias,
+                        avg_min_sec_per_unit=avg_min_sec_per_unit,
+                        start_preroll=start_preroll,
+                    )
 
-                log_line("분석", "완료")
-                return {"text": "\n".join(out)}
+                # 요약 출력
+                segments = res.get("segments") or []
+                onsets = res.get("onsets") or []
+                onsets_hp = res.get("onsets_hp") or []
+                duration_sec = float(res.get("duration_sec", 0.0))
+                start_at = float(res.get("start_at", 0.0))
+                pro_info = res.get("__pro_info__") or {}
 
-            except Exception as e:
-                log_line("error", f"{type(e).__name__}: {e}")
-                raise
+                lines = prepare_lines(lyrics_text)
+                summary: List[str] = []
+                summary.append(f"파일: {Path(vocal_path_str).name}")
+                if duration_sec > 0:
+                    summary.append(f"오디오 길이: {duration_sec:.2f}s (start_at={start_at:.2f}s)")
+                summary.append(
+                    f"preprocess: {bool(pro_info.get('preprocessed'))}, demucs(vocals/drums): {bool(pro_info.get('demucs_vocals_used'))}/{bool(pro_info.get('demucs_drums_used'))}")
+                summary.append(f"onsets: {len(onsets)}개 (hp={len(onsets_hp)})")
+                if auto_tags_flag is not None:
+                    summary.append(f"project.auto_tags = {auto_tags_flag}")
+                summary.append(f"lyrics_converted = {lyrics_converted}")
+                if "global_shift_applied_sec" in pro_info:
+                    summary.append(
+                        f"global_shift_applied = {pro_info.get('global_shift_applied_sec', 0.0):.3f}s, "
+                        f"affine(a={pro_info.get('affine_a', 1.0):.3f}, b={pro_info.get('affine_b', 0.0):.3f})"
+                    )
+                summary.append("")
+
+                summary.append("=== 줄별 정합 ===")
+                if segments:
+                    for i, seg in enumerate(segments, 1):
+                        try:
+                            st = float(seg.get("start", 0.0))
+                            et = float(seg.get("end", 0.0))
+                            tx = str(seg.get("text") or "")
+                            ok = "OK" if seg.get("ok") else "--"
+                            line = lines[i - 1] if i - 1 < len(lines) else tx
+                            summary.append(f"[{i:02d}] {ok} {st:6.2f}~{et:6.2f}  {line}")
+                        except (TypeError, ValueError):
+                            continue
+                else:
+                    summary.append("(줄별 정합 결과 없음)")
+
+                return {"text": "\n".join(summary)}
+
             finally:
                 if isinstance(btn, QtWidgets.QAbstractButton):
                     btn.setEnabled(True)
@@ -1509,8 +1496,8 @@ class MainWindow(QtWidgets.QMainWindow):
             print("\n[음악분석 결과]\n" + text, flush=True)
 
             dlg = QtWidgets.QDialog(self)
-            dlg.setWindowTitle("음악분석 결과 — Whisper 정렬 + 폴백 배분 + 컷/페이드아웃")
-            dlg.resize(900, 720)
+            dlg.setWindowTitle("음악분석 결과 — 자동보정(앵커 하드코딩 없음)")
+            dlg.resize(1000, 760)
             vbox = QtWidgets.QVBoxLayout(dlg)
             ed = QtWidgets.QPlainTextEdit()
             ed.setReadOnly(True)
@@ -1528,9 +1515,7 @@ class MainWindow(QtWidgets.QMainWindow):
             from app.progress import run_job_with_progress_async  # type: ignore
         except Exception:
             from utils import run_job_with_progress_async  # type: ignore
-
         run_job_with_progress_async(self, "음악분석", job, tail_file=None, on_done=done)
-
 
     @staticmethod
     def _persist_lyric_sections(*, proj_dir: str, sections: list, last_end: float) -> None:
@@ -3714,126 +3699,170 @@ class MainWindow(QtWidgets.QMainWindow):
 
             le.textChanged.connect(_on_le_changed)
 
-    def _save_project_snapshot(self) -> str:
+    def _save_project_snapshot(self) -> None:
         """
-        project.json 하나로 통일 저장.
-        - lyrics : 왼쪽 가사 원문
-        - lyrics_lls : 변환 토글 OFF → "", ON → 변환칸(비면 즉석 변환)
-        - time/target_seconds : 초 단위 그대로 저장
+        현재 UI 상태를 project.json에 저장.
+        - 제목/가사/길이
+        - 변환(LLS) 상태
+        - 자동/수동 태그
+        - 긍정 프롬프트: prompt_user(=UI 값), prompt(호환 필드)도 함께 기록
         """
-        import time as _time
         from pathlib import Path
-        from json import loads, dumps, JSONDecodeError
-        from PyQt5 import QtWidgets
+        import json
+        from json import JSONDecodeError
+        from collections.abc import Iterable
 
-        # 필수 위젯
-        le_title = getattr(self, "le_title", None)
-        te_lyrics = getattr(self, "te_lyrics", None)
-        te_conv = getattr(self, "te_lyrics_converted", None)
-        btn_toggle = getattr(self, "btn_convert_toggle", None)
-
-        title = le_title.text().strip() if isinstance(le_title, QtWidgets.QLineEdit) else "untitled"
-        lyrics = te_lyrics.toPlainText().strip() if hasattr(te_lyrics, "toPlainText") else ""
-
-        # 길이(초): 기존 라디오/입력 값을 가져오는 기존 헬퍼가 있으면 사용
-        secs = 60
         try:
-            if hasattr(self, "_current_seconds"):
-                secs = int(max(1, int(self._current_seconds())))
+            from app.utils import load_json as _lj, save_json as _sj  # type: ignore
+            load_json_fn, save_json_fn = _lj, _sj
         except Exception:
-            pass
-
-        # 활성 프로젝트 폴더
-        base_dir = getattr(self, "_active_project_dir", None) or getattr(self, "last_project_dir", None)
-        if not base_dir:
-            # 최초 생성 경로 규칙 유지: BASE_DIR/shorts_make/<제목>
-            from os import makedirs
-            proj_dir = Path(getattr(__import__('settings'), 'BASE_DIR', '.')) / "shorts_make" / title
-            try:
-                makedirs(proj_dir, exist_ok=True)
-            except Exception:
-                proj_dir.mkdir(parents=True, exist_ok=True)
-        else:
-            proj_dir = Path(base_dir)
-
-        pj = proj_dir / "project.json"
-
-        # 로드/세이브 로컬 헬퍼
-        def _load_json(path: Path) -> dict:
-            try:
-                return loads(path.read_text(encoding="utf-8"))
-            except (FileNotFoundError, JSONDecodeError, UnicodeDecodeError):
-                return {}
-            except OSError:
-                return {}
-
-        def _save_json(path: Path, data: dict) -> None:
-            try:
-                path.write_text(dumps(data, ensure_ascii=False, indent=2), encoding="utf-8")
-            except OSError:
-                pass
-
-        # meta 갱신
-        meta = _load_json(pj) or {}
-        meta["title"] = title
-        meta["lyrics"] = lyrics
-        meta["prompt"] = meta.get("prompt", "")
-        meta.setdefault("created_at", _time.strftime("%Y-%m-%d %H:%M:%S"))
-        meta["time"] = secs
-        meta["target_seconds"] = secs
-
-        # 변환 토글 규칙
-        is_on = False
-        try:
-            is_on = bool(btn_toggle.isChecked()) if isinstance(btn_toggle, (QtWidgets.QPushButton,
-                                                                            QtWidgets.QToolButton)) else False
-        except Exception:
-            is_on = False
-
-        def _convert_if_needed(text: str) -> str:
-            try:
-                import kroman  # type: ignore
-            except ImportError:
-                return text
-            out = []
-            for raw in (text or "").splitlines():
-                s = raw
-                st = s.strip()
-                if (st.startswith("[") and st.endswith("]")) or not st:
-                    out.append(s)
-                else:
-                    rom = kroman.parse(s).strip().replace("-", "")
-                    out.append("[ko]" + rom)
-            return "\n".join(out)
-
-        if is_on:
-            conv_text = ""
-            if hasattr(te_conv, "toPlainText"):
-                conv_text = te_conv.toPlainText().strip()
-            if not conv_text:
-                conv_text = _convert_if_needed(lyrics)
+            def load_json_fn(p: Path, default=None):
                 try:
-                    te_conv.setPlainText(conv_text)
+                    return json.loads(p.read_text(encoding="utf-8"))
+                except (FileNotFoundError, JSONDecodeError, UnicodeDecodeError, OSError):
+                    return default
+
+            def save_json_fn(p: Path, data: dict) -> None:
+                try:
+                    p.write_text(json.dumps(data, ensure_ascii=False, indent=2), encoding="utf-8")
                 except Exception:
                     pass
-            meta["lyrics_lls"] = conv_text
-        else:
-            meta["lyrics_lls"] = ""
 
-        # 저장
-        _save_json(pj, meta)
+        proj_dir = getattr(self, "_active_project_dir", None) or getattr(self, "project_dir", None)
+        if not proj_dir:
+            return
+        pj = Path(proj_dir) / "project.json"
+        meta = load_json_fn(pj, {}) or {}
+        if not isinstance(meta, dict):
+            meta = {}
 
-        # 활성 프로젝트 유지 + UI 재적용(기존 로직 보존)
-        if hasattr(self, "_set_active_project_dir"):
-            self._set_active_project_dir(str(proj_dir))
+        # 제목
+        title = ""
+        if hasattr(self, "le_title"):
+            try:
+                title = self.le_title.text().strip()
+            except Exception:
+                title = (meta.get("title") or "").strip()
+        meta["title"] = title
+
+        # 가사
+        lyrics_left = ""
+        if hasattr(self, "te_lyrics"):
+            try:
+                lyrics_left = self.te_lyrics.toPlainText().strip()
+            except Exception:
+                lyrics_left = (meta.get("lyrics") or "").strip()
+        meta["lyrics"] = lyrics_left
+
+        # 프롬프트(긍정)
+        prompt_widget = (
+                getattr(self, "le_prompt", None)
+                or getattr(self, "te_prompt", None)
+                or getattr(self, "te_prompt_pos", None)
+        )
+        prompt_text = ""
         try:
-            if hasattr(self, "_apply_project_meta"):
-                self._apply_project_meta(str(proj_dir))
+            if prompt_widget is not None:
+                if hasattr(prompt_widget, "text"):
+                    prompt_text = prompt_widget.text().strip()
+                elif hasattr(prompt_widget, "toPlainText"):
+                    prompt_text = prompt_widget.toPlainText().strip()
+        except Exception:
+            prompt_text = (meta.get("prompt_user") or meta.get("prompt") or "").strip()
+        meta["prompt_user"] = prompt_text
+        meta["prompt"] = prompt_text  # 레거시 호환
+
+        # 길이
+        try:
+            seconds = self._read_seconds_from_ui()
+        except Exception:
+            seconds = meta.get("time") or meta.get("target_seconds") or 0
+        try:
+            seconds = int(seconds)
+        except Exception:
+            seconds = 0
+        if seconds > 0:
+            meta["time"] = seconds
+            meta["target_seconds"] = seconds
+
+        # 변환(LLS)
+        cb_convert = (
+                getattr(self, "btn_convert_toggle", None)
+                or getattr(self, "cb_convert", None)
+                or getattr(self, "toggle_convert", None)
+        )
+        lls_on = False
+        if cb_convert is not None and hasattr(cb_convert, "isChecked"):
+            try:
+                lls_on = bool(cb_convert.isChecked())
+            except Exception:
+                lls_on = False
+        te_conv = getattr(self, "te_lyrics_converted", None)
+        if lls_on:
+            lls_text = ""
+            if te_conv is not None and hasattr(te_conv, "toPlainText"):
+                try:
+                    lls_text = te_conv.toPlainText().strip()
+                except Exception:
+                    lls_text = (meta.get("lyrics_lls") or "").strip()
+            else:
+                lls_text = (meta.get("lyrics_lls") or "").strip()
+            meta["lyrics_lls"] = lls_text
+            meta["lyrics_lls_backup"] = lls_text
+        else:
+            lls_now = (meta.get("lyrics_lls") or "").strip()
+            if lls_now:
+                meta["lyrics_lls_backup"] = lls_now
+            if "lyrics_lls" in meta:
+                try:
+                    del meta["lyrics_lls"]
+                except KeyError:
+                    meta["lyrics_lls"] = ""
+
+        # 자동/수동 태그
+        cb_auto = getattr(self, "cb_auto_tags", None)
+        auto_on = None
+        if cb_auto is not None and hasattr(cb_auto, "isChecked"):
+            try:
+                auto_on = bool(cb_auto.isChecked())
+            except Exception:
+                auto_on = None
+        if auto_on is None:
+            auto_on = bool(meta.get("auto_tags", True))
+        meta["auto_tags"] = bool(auto_on)
+
+        # 현재 체크된 태그 수집 (Iterable 검증으로 타입 경고 제거)
+        checked = []
+        try:
+            gather = getattr(self, "_gather_checked_tags", None) or getattr(self, "_collect_checked_tags", None)
+            if callable(gather):
+                gathered = gather()
+                if isinstance(gathered, Iterable) and not isinstance(gathered, (str, bytes)):
+                    checked = [str(x) for x in gathered if str(x).strip()]
+                else:
+                    checked = []
+            else:
+                prev = meta.get("checked_tags") or []
+                checked = [str(x) for x in prev] if isinstance(prev, list) else []
+        except (AttributeError, TypeError, ValueError):
+            prev = meta.get("checked_tags") or []
+            checked = [str(x) for x in prev] if isinstance(prev, list) else []
+
+        if not bool(auto_on):
+            meta["manual_tags"] = list(checked)
+            meta["checked_tags"] = list(checked)
+            meta["tags_effective"] = list(checked)
+            meta.pop("tags_in_use", None)
+            meta.pop("ace_tags", None)
+        else:
+            meta["checked_tags"] = list(checked)
+
+        save_json_fn(pj, meta)
+
+        try:
+            self._set_active_project_dir(str(Path(proj_dir)))
         except Exception:
             pass
-
-        print("[SNAPSHOT] saved(project.json only)", str(pj), flush=True)
-        return str(proj_dir)
 
     # ────────────── 가사 생성 ──────────────
     # app/shorts_ui.py
@@ -4080,7 +4109,7 @@ class MainWindow(QtWidgets.QMainWindow):
         - 제목/가사 UI 채움
         - 자동/수동 태그 반영(OR 체크)
         - 현재 선택된 길이(초)를 project.json 에 저장: time, target_seconds 모두 '초'로 통일
-        - 생성 폴더를 활성 프로젝트로 설정(시그니처 차이를 안전 호출)
+        - 생성 폴더를 활성 프로젝트로 설정(시그니처 차이에 안전 호출)
         """
         from pathlib import Path
 
@@ -4116,7 +4145,6 @@ class MainWindow(QtWidgets.QMainWindow):
         except Exception:
             pass
         try:
-            # 왼쪽: 원 가사
             te_l = getattr(self, "te_lyrics", None) or getattr(getattr(self, "ui", None), "txt_lyrics", None)
             if te_l is not None and hasattr(te_l, "setPlainText"):
                 te_l.setPlainText(lyrics)
@@ -4131,7 +4159,7 @@ class MainWindow(QtWidgets.QMainWindow):
 
         picks_from_ai = data.get("tags_pick") or []
 
-        # _manual_option_set 이 함수이거나, 이미 Iterable일 수도 있으므로 모두 지원
+        # _manual_option_set 이 함수이거나, Iterable일 수도 있으므로 모두 지원
         allowed = []
         getter = getattr(self, "_manual_option_set", None)
         if getter is not None:
@@ -4192,11 +4220,15 @@ class MainWindow(QtWidgets.QMainWindow):
         meta["prompt_user"] = str(prompt or "")
 
         if hasattr(self, "cb_auto_tags") and self.cb_auto_tags.isChecked():
+            # 자동 태그 ON: ace_tags/tags_in_use/checked_tags/tags_effective 모두 채움
             meta["auto_tags"] = True
             meta["ace_tags"] = list(auto_en)
             meta["tags_in_use"] = list(picks)
+            meta["checked_tags"] = list(picks)  # UI 반영/동기화를 위해
+            meta["tags_effective"] = list(picks)  # 후속 파이프라인에서 바로 사용
             meta.pop("manual_tags", None)
         else:
+            # 자동 태그 OFF: 현재 수동 체크들을 '단일 진실원천'으로 저장
             meta["auto_tags"] = False
             manual_checked = []
             try:
@@ -4205,6 +4237,10 @@ class MainWindow(QtWidgets.QMainWindow):
             except Exception:
                 manual_checked = []
             meta["manual_tags"] = manual_checked
+            # ✅ 핵심: 수동 선택을 효과 태그/체크 태그로도 동일 저장
+            meta["checked_tags"] = list(manual_checked)
+            meta["tags_effective"] = list(manual_checked)
+            # 자동 관련 키는 제거
             meta.pop("tags_in_use", None)
             meta.pop("ace_tags", None)
 
@@ -4214,6 +4250,8 @@ class MainWindow(QtWidgets.QMainWindow):
         print("[TAGDBG] saved ace_tags len:", len(meta.get("ace_tags", [])), flush=True)
         print("[TAGDBG] saved tags_in_use len:", len(meta.get("tags_in_use", [])), flush=True)
         print("[TAGDBG] saved manual_tags len:", len(meta.get("manual_tags", [])), flush=True)
+        print("[TAGDBG] saved checked_tags len:", len(meta.get("checked_tags", [])), flush=True)
+        print("[TAGDBG] saved tags_effective len:", len(meta.get("tags_effective", [])), flush=True)
         print(
             "[TAGDBG] saved seconds:", meta.get("time"),
             "(target_seconds:", meta.get("target_seconds"), ")",
@@ -4226,7 +4264,6 @@ class MainWindow(QtWidgets.QMainWindow):
             fn = self._set_active_project_dir
             try:
                 sig = inspect.signature(fn)
-                # bound method이면 self는 이미 바인딩됨 → '필수 인자' 개수로 판단
                 required = [
                     p for p in sig.parameters.values()
                     if p.default is inspect._empty
@@ -4240,10 +4277,8 @@ class MainWindow(QtWidgets.QMainWindow):
                     try:
                         fn(str(pdir))
                     except TypeError:
-                        # 어떤 형태든 실패하면 최후 보루
                         self.project_dir = str(pdir)
             except Exception:
-                # 어떤 형태든 실패하면 최후 보루
                 self.project_dir = str(pdir)
         else:
             self.project_dir = str(pdir)
@@ -4261,17 +4296,16 @@ class MainWindow(QtWidgets.QMainWindow):
             except Exception:
                 pass
 
-
     from pathlib import Path
 
     def _apply_project_meta(self, proj_dir: str) -> None:
         """
-        project.json을 읽어서 제목/가사/길이/태그 및 '변환 토글 + 오른쪽 편집창'을 UI에 반영.
-        (lyrics는 왼쪽, lyrics_lls는 오른쪽)
+        project.json을 읽어 제목/가사/길이/변환/자동태그/프롬프트 UI에 반영.
+        - 프롬프트: prompt_user(우선), 없으면 prompt 사용
         """
         from pathlib import Path
         try:
-            from app.utils import load_json
+            from app.utils import load_json  # type: ignore
         except Exception:
             from utils import load_json  # type: ignore
 
@@ -4287,46 +4321,119 @@ class MainWindow(QtWidgets.QMainWindow):
         if hasattr(self, "te_lyrics"):
             self.te_lyrics.setPlainText(lyrics)
 
-        # 길이(초) 라디오 반영(기존 로직 사용)
+        # 길이
         try:
             self._apply_time_from_project_json()
         except Exception:
             pass
 
-        # ⬇️ 변환(LLS) UI 동기화
+        # 변환(LLS) UI 동기화
         self._sync_convert_ui_from_meta(meta)
+
+        # 자동태그 체크박스 동기화
+        try:
+            self._sync_auto_tags_checkbox_from_meta(meta)
+        except Exception:
+            pass
+
+        # ✅ 프롬프트(긍정) UI 반영: prompt_user 우선, 없으면 prompt
+        prompt_val = (meta.get("prompt_user") or meta.get("prompt") or "").strip()
+        # 다양한 위젯 이름에 방어적으로 대응
+        prompt_widget = (
+                getattr(self, "le_prompt", None)
+                or getattr(self, "te_prompt", None)
+                or getattr(self, "te_prompt_pos", None)
+        )
+        try:
+            if prompt_widget is not None:
+                if hasattr(prompt_widget, "setText"):
+                    prompt_widget.setText(prompt_val)
+                elif hasattr(prompt_widget, "setPlainText"):
+                    prompt_widget.setPlainText(prompt_val)
+        except Exception:
+            pass
 
     def _sync_convert_ui_from_meta(self, meta: dict) -> None:
         """
-        meta(=project.json 내용)에서 lyrics_lls를 읽어
+        meta(=project.json 내용)에서 lyrics_lls/lls_enabled를 읽어
         - 토글 버튼 체크 상태
-        - 오른쪽 변환 에디터 표시/텍스트
+        - 오른쪽 변환 에디터 표시/활성 상태
+        - 에디터 텍스트
         를 동기화한다.
+
+        정책: 패널은 항상 보이기(빈칸이라도), OFF일 땐 비활성화만.
         """
         btn = getattr(self, "btn_convert_toggle", None)
         te_conv = getattr(self, "te_lyrics_converted", None)
 
-        has_lls = bool((meta.get("lyrics_lls") or "").strip())
+        # 상태 값
+        lls_text = (meta.get("lyrics_lls") or "").strip()
+        enabled = bool(meta.get("lls_enabled"))  # 사용자가 토글로 켠 상태
+        on = enabled or bool(lls_text)  # 텍스트가 있으면 자연스럽게 ON으로 간주
 
-        # 토글 상태
+        # 토글 버튼 체크만 반영
         try:
             if btn and hasattr(btn, "setChecked"):
-                btn.setChecked(has_lls)
+                if hasattr(btn, "blockSignals"):
+                    btn.blockSignals(True)
+                btn.setChecked(on)
+                if hasattr(btn, "blockSignals"):
+                    btn.blockSignals(False)
         except Exception:
             pass
 
-        # 오른쪽 에디터 표시/텍스트
+        # 에디터 표시/텍스트/활성 상태
         if te_conv:
             try:
-                if hasattr(te_conv, "setPlainText"):
-                    te_conv.setPlainText((meta.get("lyrics_lls") or "").strip())
+                if hasattr(te_conv, "setVisible"):
+                    te_conv.setVisible(True)  # 항상 보이기
             except Exception:
                 pass
             try:
-                if hasattr(te_conv, "setVisible"):
-                    te_conv.setVisible(has_lls)  # ✅ 토글 ON일 때만 오른쪽 보이기
+                if hasattr(te_conv, "setPlainText"):
+                    te_conv.setPlainText(lls_text)
             except Exception:
                 pass
+            try:
+                if hasattr(te_conv, "setEnabled"):
+                    te_conv.setEnabled(on)  # OFF면 비활성화만
+            except Exception:
+                pass
+
+        # 컨테이너(그룹박스/프레임)가 있으면 동일 정책 적용
+        panel = None
+        for name in ("grp_convert", "box_convert", "frame_convert", "gb_convert", "w_convert"):
+            w = getattr(self, name, None)
+            if w is not None:
+                panel = w
+                break
+        if panel is not None:
+            try:
+                if hasattr(panel, "setVisible"):
+                    panel.setVisible(True)  # 항상 보이기
+            except Exception:
+                pass
+            try:
+                if hasattr(panel, "setEnabled"):
+                    panel.setEnabled(on)  # OFF면 비활성화
+            except Exception:
+                pass
+
+    def _sync_auto_tags_checkbox_from_meta(self, meta: dict) -> None:
+        """
+        project.json의 auto_tags 값을 자동태그 체크박스(cb_auto_tags)에 반영한다.
+        - auto_tags가 명시되어 있지 않으면 기존 UI 상태를 유지(불필요한 덮어쓰기 방지).
+        - 값이 있다면 True/False 그대로 setChecked.
+        """
+        try:
+            cb = getattr(self, "cb_auto_tags", None)
+            if cb is None or not hasattr(cb, "setChecked"):
+                return
+            if "auto_tags" in meta:
+                cb.setChecked(bool(meta.get("auto_tags")))
+        except Exception:
+            # UI 요소가 없거나 일시적 오류가 있어도 앱이 죽지 않도록 방어
+            pass
 
     # ────────────── 저장/불러오기 ──────────────
     def on_save_project(self):
