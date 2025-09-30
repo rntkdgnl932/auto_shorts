@@ -544,16 +544,50 @@ class MainWindow(QtWidgets.QMainWindow):
         # 저장 디바운스 타이머
         self._tag_save_timer = QtCore.QTimer(self)
         self._tag_save_timer.setSingleShot(True)
-        # self._tag_save_timer.timeout.connect(self._persist_checked_tags_now)  # ← 정적 경고 회피
         self._safe_connect(self._tag_save_timer.timeout, self._persist_checked_tags_now)
 
         # 체크 이벤트 연결(정적 경고 없이 안전 연결)
         for label, cb in self._tag_boxes.items():
-            # lambda 캡처: lab=label로 고정
             self._safe_connect(getattr(cb, "stateChanged", None),
                                lambda _s, lab=label: self._on_tag_state_changed(lab))
 
+        # ★ 자동태그 체크박스 통일(alias): 둘 중 있는 위젯을 찾아 둘 다 같은 객체로 맞춤
+        auto_any = (
+                getattr(self, "chk_auto_tags", None)
+                or getattr(self, "cb_auto_tags", None)
+                or getattr(getattr(self, "ui", None), "chk_auto_tags", None)
+                or getattr(getattr(self, "ui", None), "cb_auto_tags", None)
+        )
+        if auto_any is not None:
+            # 둘 다 같은 객체를 가리키게 통일
+            setattr(self, "chk_auto_tags", auto_any)
+            setattr(self, "cb_auto_tags", auto_any)
+            # 토글 → 수동 태그 활성/비활성 즉시 반영
+            self._safe_connect(getattr(auto_any, "stateChanged", None), self._on_auto_tags_toggled)
+
         self._tag_sync_inited = True
+
+    def _on_auto_tags_toggled(self, _state: int) -> None:
+        """
+        자동태그 체크박스 토글 시, 수동 태그 체크박스의 활성/비활성만 즉시 반영한다.
+        - 체크 상태나 저장 로직은 변경하지 않는다.
+        - _init_tag_sync에서 chk_auto_tags/cb_auto_tags를 동일 객체로 통일함.
+        """
+        auto_on = False
+        auto_chk = getattr(self, "chk_auto_tags", None)  # ← 통일된 핸들 사용
+        if auto_chk is not None and hasattr(auto_chk, "isChecked"):
+            try:
+                auto_on = bool(auto_chk.isChecked())
+            except Exception:
+                auto_on = False
+
+        tag_boxes = getattr(self, "_tag_boxes", None)
+        if isinstance(tag_boxes, dict):
+            for _label, tag_box in tag_boxes.items():
+                try:
+                    tag_box.setEnabled(not auto_on)
+                except Exception:
+                    pass
 
     def _collect_tag_checkboxes(self) -> Dict[str, QtWidgets.QCheckBox]:
         """
@@ -597,37 +631,134 @@ class MainWindow(QtWidgets.QMainWindow):
         self._persist_checked_tags_debounced()
 
     def _sync_tags_from_project_json(self) -> None:
-        """project.json -> UI 체크 상태 동기화. 우선순위: checked_tags > tags_effective > []."""
-        try:
-            from app.utils import load_json
-        except Exception:
+        """
+        태그 UI 동기화.
+
+        [원칙]
+        1) 콜드 스타트(앱 첫 실행, 이 함수의 첫 호출):
+           - project.json을 절대 읽지 않는다.
+           - 자동태그를 켠 상태로 만들고(체크박스 체크),
+           - Basic Vocal 7개를 모두 체크하며, UI는 비활성화로 보이도록 설정한다.
+           - 저장하지 않는다.
+        2) 그 이후(프로젝트 열기/가사생성/음악생성 등으로 project.json이 준비된 뒤):
+           - project.json 의 checked_tags > tags_effective 순으로 반영.
+           - 저장값이 없으면 Basic Vocal 7개를 체크하고 저장.
+        """
+        from pathlib import Path
+        from PyQt5 import QtCore
+
+        tag_boxes = getattr(self, "_tag_boxes", None)
+        if not isinstance(tag_boxes, dict) or not tag_boxes:
             return
+
+        basic_defaults_all = {
+            "clean vocals",
+            "clear diction",
+            "natural articulation",
+            "breath control",
+            "warm emotional tone",
+            "balanced mixing",
+            "studio reverb light",
+        }
+        basic_defaults = [label for label in tag_boxes.keys() if label in basic_defaults_all]
+
+        def _apply_defaults(auto_enabled: bool = True) -> None:
+            auto_checkbox_local = getattr(self, "chk_auto_tags", None)
+            if auto_checkbox_local is not None:
+                try:
+                    auto_checkbox_local.blockSignals(True)
+                    auto_checkbox_local.setChecked(bool(auto_enabled))
+                    auto_checkbox_local.blockSignals(False)
+                except Exception:
+                    pass
+
+            self._checked_tags = set()
+            for tag_label_local, tag_box_local in tag_boxes.items():
+                should_mark_local = (tag_label_local in basic_defaults)
+                try:
+                    tag_box_local.blockSignals(True)
+                    tag_box_local.setChecked(should_mark_local)
+                    tag_box_local.setEnabled(False if auto_enabled else True)
+                    tag_box_local.blockSignals(False)
+                except Exception:
+                    pass
+                if should_mark_local:
+                    self._checked_tags.add(tag_label_local)
+
+        # 1) 콜드 스타트: 세션 내 첫 호출이면 무조건 기본값을 적용하고 종료
+        if not getattr(self, "_tags_synced_once", False):
+            _apply_defaults(auto_enabled=True)
+            # 같은 틱에서 다른 코드가 건드릴 가능성 방지: 다음 틱에 한 번 더 적용
+            try:
+                QtCore.QTimer.singleShot(0, lambda: _apply_defaults(auto_enabled=True))
+            except Exception:
+                pass
+            setattr(self, "_tags_synced_once", True)
+            return
+
+        # 2) 이후 호출: project.json 이 준비된 상태에서만 디스크 값 반영
+        project_ready = bool(getattr(self, "_project_context_ready", False))
+        if not project_ready:
+            return
+
+        # project.json을 읽어 반영
+        try:
+            from app.utils import load_json  # type: ignore
+        except Exception:
+            try:
+                from utils import load_json  # type: ignore
+            except Exception:
+                return
 
         proj_dir = self._current_project_dir() if hasattr(self, "_current_project_dir") else None
         if not proj_dir:
             return
 
         meta_path = Path(proj_dir) / "project.json"
+        if not meta_path.exists():
+            _apply_defaults(auto_enabled=True)
+            return
+
         meta = load_json(meta_path, {}) or {}
 
-        selected: List[str] = []
         if isinstance(meta.get("checked_tags"), list):
             selected = [str(x) for x in meta["checked_tags"]]
+            should_persist = False
         elif isinstance(meta.get("tags_effective"), list):
             selected = [str(x) for x in meta["tags_effective"]]
+            should_persist = True
+        else:
+            selected = list(basic_defaults)
+            should_persist = True
+
+        auto_on_state = False
+        auto_checkbox = getattr(self, "chk_auto_tags", None)
+        if auto_checkbox is not None:
+            try:
+                auto_on_state = bool(auto_checkbox.isChecked())
+            except Exception:
+                auto_on_state = False
 
         self._checked_tags = set()
-        for label, cb in self._tag_boxes.items():
-            want = label in selected
-            cb.blockSignals(True)
-            cb.setChecked(want)
-            cb.blockSignals(False)
-            if want:
-                self._checked_tags.add(label)
+        for tag_label, tag_box in tag_boxes.items():
+            should_mark = (tag_label in selected)
+            try:
+                tag_box.blockSignals(True)
+                tag_box.setChecked(should_mark)
+                tag_box.setEnabled(False if auto_on_state else True)
+                tag_box.blockSignals(False)
+            except Exception:
+                pass
+            if should_mark:
+                self._checked_tags.add(tag_label)
 
-        if "checked_tags" not in meta:
-            meta["checked_tags"] = sorted(self._checked_tags)
-            self._persist_checked_tags_now(meta_override=meta)
+        if should_persist and "checked_tags" not in meta:
+            try:
+                meta["checked_tags"] = sorted(self._checked_tags)
+                if hasattr(self, "_persist_checked_tags_now") and callable(self._persist_checked_tags_now):
+                    self._persist_checked_tags_now(meta_override=meta)
+            except Exception:
+                pass
 
     def _persist_checked_tags_debounced(self, msec: int = 250) -> None:
         if hasattr(self, "_tag_save_timer"):
@@ -659,32 +790,70 @@ class MainWindow(QtWidgets.QMainWindow):
         return sorted(self._checked_tags)
 
     def _start_tag_watch(self) -> None:
-        self._tag_watch_last_path: Optional[str] = None
-        self._tag_watch_last_mtime: Optional[float] = None
+        """
+        태그 파일(project.json) 변경 감시 시작.
+        - 콜드 스타트에서는 사용자 액션(프로젝트 열기/가사생성/음악생성) 전까지 감시를 '대기' 상태로 둔다.
+        """
+        from PyQt5 import QtCore
 
-        self._tag_watch_timer = QtCore.QTimer(self)
-        self._tag_watch_timer.setInterval(1500)  # 1.5s
-        # self._tag_watch_timer.timeout.connect(self._tick_tag_watch)  # ← 정적 경고 회피
-        self._safe_connect(self._tag_watch_timer.timeout, self._tick_tag_watch)
-        self._tag_watch_timer.start()
+        # 기존 타이머 가져오거나 새로 생성
+        timer = getattr(self, "_tag_watch_timer", None)
+        if not isinstance(timer, QtCore.QTimer):
+            timer = QtCore.QTimer(self)
+            timer.setInterval(800)  # 0.8s 주기
+
+            # 정적 분석 경고 방지: 시그널 객체 존재와 connect 가용성 점검 후 연결
+            timeout_sig = getattr(timer, "timeout", None)
+            if hasattr(timeout_sig, "connect"):
+                timeout_sig.connect(self._tick_tag_watch)
+
+        # 인스턴스에 보관
+        self._tag_watch_timer = timer
+
+        # 프로젝트 준비 플래그: 반드시 False로 시작(콜드 스타트 차단)
+        setattr(self, "_project_context_ready", False)
+        setattr(self, "_tag_watch_last_mtime", None)
+
+        # 타이머 시작 (중복 시작 방지)
+        if not timer.isActive():
+            timer.start()
 
     def _tick_tag_watch(self) -> None:
+        """
+        태그 파일 감시 틱.
+        - 프로젝트 컨텍스트가 준비된 이후(사용자 액션 발생) 에만 디스크(project.json)를 읽어 UI에 반영한다.
+        - mtime 변화가 있을 때만 반영한다.
+        """
+        import os
+        from pathlib import Path
+
+        # 준비되지 않았다면 아무 것도 하지 않음(콜드 스타트 보호)
+        if not bool(getattr(self, "_project_context_ready", False)):
+            return
+
         proj_dir = self._current_project_dir() if hasattr(self, "_current_project_dir") else None
         if not proj_dir:
             return
-        meta_path = Path(proj_dir) / "project.json"
-        path_str = str(meta_path)
-        try:
-            mtime = meta_path.stat().st_mtime if meta_path.exists() else None
-        except OSError:
-            mtime = None
 
-        changed_path = (self._tag_watch_last_path != path_str)
-        changed_time = (mtime is not None and self._tag_watch_last_mtime != mtime)
-        if changed_path or changed_time:
+        meta_path = Path(proj_dir) / "project.json"
+        if not meta_path.exists():
+            return
+
+        try:
+            mtime = os.path.getmtime(str(meta_path))
+        except Exception:
+            return
+
+        last_mtime = getattr(self, "_tag_watch_last_mtime", None)
+        if last_mtime is not None and last_mtime == mtime:
+            return  # 변화 없음
+
+        # 변화 감지 → 동기화
+        setattr(self, "_tag_watch_last_mtime", mtime)
+        try:
             self._sync_tags_from_project_json()
-        self._tag_watch_last_path = path_str
-        self._tag_watch_last_mtime = mtime
+        except Exception:
+            pass
 
     ######### ######### ######### #########
     ######### ######### ######### #########
@@ -940,56 +1109,78 @@ class MainWindow(QtWidgets.QMainWindow):
                 if hasattr(te_c, "setEnabled"):
                     te_c.setEnabled(False)  # 비활성화
 
-    # ==== PATCH: shorts_ui.py :: on_generate_lyrics_with_log ====
     def on_generate_lyrics_with_log(self) -> None:
-        from app.utils import run_job_with_progress_async
+        from PyQt5 import QtWidgets
+        try:
+            from app.utils import run_job_with_progress_async
+        except Exception:
+            from utils import run_job_with_progress_async  # type: ignore
         try:
             from app.lyrics_gen import generate_title_lyrics_tags
         except Exception:
-            from lyrics_gen import generate_title_lyrics_tags
+            from lyrics_gen import generate_title_lyrics_tags  # type: ignore
 
-        # 버튼 잠금(있을 때만)
         btn = getattr(self, "btn_gen", None) or getattr(getattr(self, "ui", None), "btn_generate_lyrics", None)
         if btn:
-            btn.setEnabled(False)
+            try:
+                btn.setEnabled(False)
+            except Exception:
+                pass
 
         def job(progress):
-            # ★ 최초 진입 로그(항상 한 줄 보장)
-            progress({"msg": "[ui] 가사생성 작업 시작"})
+            try:
+                progress({"msg": "[ui] 가사생성 작업 시작"})
+            except Exception:
+                pass
 
-            # 입력값 수집
-            title_in = getattr(self, "le_title", None).text().strip() if getattr(self, "le_title", None) else ""
-            kw = ""
+            title_in = ""
+            le = getattr(self, "le_title", None)
+            if le and hasattr(le, "text"):
+                try:
+                    title_in = le.text().strip()
+                except Exception:
+                    title_in = ""
+
+            prompt_text = ""
             for nm in ("te_prompt", "txt_prompt", "prompt_edit"):
                 w = getattr(self, nm, None) or getattr(getattr(self, "ui", None), nm, None)
                 if w and hasattr(w, "toPlainText"):
-                    kw = w.toPlainText().strip()
+                    try:
+                        prompt_text = w.toPlainText().strip()
+                    except Exception:
+                        prompt_text = ""
                     break
-            secs = self._current_seconds() if hasattr(self, "_current_seconds") else 60
 
-            # 수동 태그 후보(있으면)
+            secs = 60
+            if hasattr(self, "_current_seconds"):
+                try:
+                    secs = int(self._current_seconds())
+                except Exception:
+                    secs = 60
+
             allowed = []
             getter = getattr(self, "_manual_option_set", None)
             if callable(getter):
                 try:
-                    vals = getter() if callable(getter) else getter
-                    allowed = sorted(vals)
+                    vals = getter()
+                    if isinstance(vals, (list, set, tuple)):
+                        allowed = sorted([str(x) for x in vals])
+                except Exception:
+                    pass
 
-                except Exception as e:
-                    progress({"msg": f"[ui] manual tags 불러오기 실패: {e!r}"})
-
-            # AI 선택
             prefer = "gemini" if (getattr(self, "btn_ai_toggle", None) and self.btn_ai_toggle.isChecked()) else "openai"
             allow_fb = False if prefer == "gemini" else True
 
             def trace(ev: str, msg: str):
-                # 모델/파이프 단계 실시간 노출
                 head = ev.split(":", 1)[0]
-                progress({"msg": f"[{head}] {ev} | {msg}"})
+                try:
+                    progress({"stage": head, "msg": msg})
+                except Exception:
+                    pass
 
             progress({"msg": f"[ai] prefer={prefer}, secs={secs}"})
             data = generate_title_lyrics_tags(
-                prompt=kw,
+                prompt=prompt_text,
                 duration_min=max(1, min(3, int(round(secs / 60)) or 1)),
                 duration_sec=secs,
                 title_in=title_in,
@@ -998,20 +1189,48 @@ class MainWindow(QtWidgets.QMainWindow):
                 prefer=prefer,
                 allow_fallback=allow_fb,
             )
-            return {"data": data, "title": title_in, "prompt": kw}
+            return {"data": data, "title": title_in, "prompt": prompt_text}
 
         def done(ok: bool, payload, err):
             if btn:
-                btn.setEnabled(True)
+                try:
+                    btn.setEnabled(True)
+                except Exception:
+                    pass
+
             if not ok:
-                from PyQt5 import QtWidgets
                 QtWidgets.QMessageBox.critical(self, "가사 생성 실패", str(err))
                 return
+
             pack = payload or {}
             data = pack.get("data", {})
-            # 결과 반영 (기존 함수 사용)
             if hasattr(self, "_apply_lyrics_result"):
-                self._apply_lyrics_result(data, pack.get("title", ""), pack.get("prompt", ""))
+                try:
+                    self._apply_lyrics_result(data, pack.get("title", ""), pack.get("prompt", ""))
+                except Exception:
+                    pass
+
+            # project.json 연동 허용
+            try:
+                setattr(self, "_project_context_ready", True)
+            except Exception:
+                pass
+
+            # ★ 자동태그가 켜져 있으면 수동 태그 체크박스를 즉시 비활성화(이름 통일 이후 단일 참조)
+            auto_on = False
+            auto_chk = getattr(self, "chk_auto_tags", None)
+            if auto_chk is not None and hasattr(auto_chk, "isChecked"):
+                try:
+                    auto_on = bool(auto_chk.isChecked())
+                except Exception:
+                    auto_on = False
+            tag_boxes = getattr(self, "_tag_boxes", None)
+            if isinstance(tag_boxes, dict):
+                for _label, box in tag_boxes.items():
+                    try:
+                        box.setEnabled(not auto_on)
+                    except Exception:
+                        pass
 
         run_job_with_progress_async(self, "가사 생성", job, tail_file=None, on_done=done)
 
@@ -1176,7 +1395,6 @@ class MainWindow(QtWidgets.QMainWindow):
         except Exception:
             from utils import run_job_with_progress_async  # type: ignore
 
-        # ===== 인플라이트 가드(추가) =====
         if getattr(self, "_music_inflight", False):
             print("[UI] music already running -> ignore", flush=True)
             return
@@ -1192,27 +1410,30 @@ class MainWindow(QtWidgets.QMainWindow):
         def job(progress):
             from pathlib import Path
             try:
-                from app.utils import load_json, save_json
+                from app.utils import load_json, save_json  # type: ignore
             except Exception:
                 from utils import load_json, save_json  # type: ignore
+
             try:
-                from app.audio_sync import generate_music_with_acestep
+                progress({"msg": "[ui] 음악 생성 시작"})
             except Exception:
-                from audio_sync import generate_music_with_acestep  # type: ignore
+                pass
 
-            # ▶▶ 활성 프로젝트만 사용
-            project_dir = self._get_active_project_dir() if hasattr(self, "_get_active_project_dir") else None
+            project_dir = None
+            if hasattr(self, "_current_project_dir"):
+                try:
+                    project_dir = self._current_project_dir()
+                except Exception:
+                    project_dir = None
             if not project_dir:
-                raise RuntimeError("프로젝트 폴더가 없습니다. 먼저 가사를 생성하거나 프로젝트를 불러오세요.")
+                raise RuntimeError("프로젝트 폴더를 찾을 수 없습니다.")
 
-            # 길이(초) 즉시 반영
             secs = int(self._current_seconds()) if hasattr(self, "_current_seconds") else 60
             pj = Path(project_dir) / "project.json"
             meta = load_json(pj, {}) or {}
 
-            # === TAG SYNC START === (기존 규칙 유지)
             auto_on = False
-            cb_auto = getattr(self, "cb_auto_tags", None)
+            cb_auto = getattr(self, "cb_auto_tags", None) or getattr(self, "chk_auto_tags", None)
             if cb_auto is not None and hasattr(cb_auto, "isChecked"):
                 try:
                     auto_on = bool(cb_auto.isChecked())
@@ -1236,8 +1457,8 @@ class MainWindow(QtWidgets.QMainWindow):
                                     label = getattr(cb, "text", lambda: "")()
                                     if label:
                                         picked_manual.append(label)
-                        except (AttributeError, TypeError, ValueError):
-                            continue
+                        except Exception:
+                            pass
                 try:
                     if getattr(self, "rb_vocal_female", None) and self.rb_vocal_female.isChecked():
                         picked_manual.append("soft female voice")
@@ -1260,26 +1481,31 @@ class MainWindow(QtWidgets.QMainWindow):
             else:
                 meta["auto_tags"] = False
                 meta["manual_tags"] = list(dict.fromkeys(picked_manual))
-            # === TAG SYNC END ===
 
             meta["time"] = secs
             meta["target_seconds"] = secs
             save_json(pj, meta)
 
-            # 진행 콜백 안전 래핑(기존 유지)
             def forward(info) -> None:
                 try:
                     if isinstance(info, dict):
                         st = str(info.get("stage", "")).upper()
                         extra = {k: v for k, v in info.items() if k != "stage"}
-                        progress({"msg": f"[{st}] {extra}"})
+                        msg = f"[{st}] {extra}" if extra else f"[{st}]"
+                        progress({"msg": msg})
                     else:
-                        progress({"msg": f"[LOG] {str(info)}"})
+                        progress({"msg": str(info)})
                 except Exception:
                     pass
 
+            try:
+                from app.audio_sync import generate_music_with_acestep
+            except Exception:
+                from audio_sync import generate_music_with_acestep  # type: ignore
+
+            import os as _os
             out = generate_music_with_acestep(
-                project_dir,
+                _os.fspath(project_dir),
                 on_progress=forward,
                 target_seconds=secs,
             )
@@ -1287,7 +1513,6 @@ class MainWindow(QtWidgets.QMainWindow):
             return out
 
         def on_done(ok: bool, _payload, err):
-            # 버튼 복원 + 인플라이트 해제는 finally 에서도 보장
             if btn:
                 try:
                     btn.setEnabled(True)
@@ -1295,13 +1520,33 @@ class MainWindow(QtWidgets.QMainWindow):
                     pass
             if not ok and err is not None:
                 QtWidgets.QMessageBox.warning(self, "음악 생성 오류", str(err))
-            # 인플라이트 해제
+            else:
+                try:
+                    setattr(self, "_project_context_ready", True)
+                except Exception:
+                    pass
+
+                # ★ 자동태그 잠금 재적용 — 통일된 chk_auto_tags 사용
+                auto_on = False
+                auto_chk = getattr(self, "chk_auto_tags", None)
+                if auto_chk is not None and hasattr(auto_chk, "isChecked"):
+                    try:
+                        auto_on = bool(auto_chk.isChecked())
+                    except Exception:
+                        auto_on = False
+                tag_boxes = getattr(self, "_tag_boxes", None)
+                if isinstance(tag_boxes, dict):
+                    for _label, box in tag_boxes.items():
+                        try:
+                            box.setEnabled(not auto_on)
+                        except Exception:
+                            pass
+
             self._music_inflight = False
 
         try:
             run_job_with_progress_async(self, "음악 생성 (ACE-Step)", job, on_done=on_done)
         except Exception as e:
-            # 예외 시에도 상태 복원
             if btn:
                 try:
                     btn.setEnabled(True)
@@ -1317,16 +1562,24 @@ class MainWindow(QtWidgets.QMainWindow):
           - '가사 변환 여부'를 정규화 비교로 정확히 판단해 표시
           - project.json의 auto_tags 실제 값을 리포트에 표시
           - PRO 파이프 호출(강제 앵커 사용 안 함)
+          - 진행창 비동기 + (옵션) tail_file 실시간 테일링
         """
         from pathlib import Path
         from typing import List
         from PyQt5 import QtWidgets
 
+        # --- 버튼: 오직 btn_analyze_music만 제어(레거시 제거) ---
+        btn = getattr(self, "btn_analyze_music", None) or getattr(getattr(self, "ui", None), "btn_analyze_music", None)
+        if isinstance(btn, QtWidgets.QAbstractButton):
+            btn.setEnabled(False)
+
+        # --- 유틸 로드 ---
         try:
             from app.utils import load_json  # type: ignore
         except Exception:
             from utils import load_json  # type: ignore
 
+        # --- audio_sync 모듈 로드 ---
         audio_sync_mod = None
         try:
             import app.audio_sync as audio_sync_mod  # type: ignore
@@ -1335,89 +1588,138 @@ class MainWindow(QtWidgets.QMainWindow):
                 import audio_sync as audio_sync_mod  # type: ignore
             except Exception:
                 audio_sync_mod = None
+
         if audio_sync_mod is None:
-            raise RuntimeError("audio_sync 모듈 로드 실패")
+            if isinstance(btn, QtWidgets.QAbstractButton):
+                btn.setEnabled(True)
+            QtWidgets.QMessageBox.critical(self, "음악분석 실패", "audio_sync 모듈 로드 실패")
+            return
 
         has_pro = callable(getattr(audio_sync_mod, "sync_lyrics_with_whisper_pro", None))
         has_base = callable(getattr(audio_sync_mod, "sync_lyrics_with_whisper", None))
-        if not (has_pro or has_base):
-            raise RuntimeError("audio_sync에 sync 함수가 없습니다.")
         prepare_lines = getattr(audio_sync_mod, "prepare_pure_lyrics_lines", None)
-        if not callable(prepare_lines):
-            raise RuntimeError("audio_sync.prepare_pure_lyrics_lines 가 없습니다.")
+        if not (has_pro or has_base) or not callable(prepare_lines):
+            if isinstance(btn, QtWidgets.QAbstractButton):
+                btn.setEnabled(True)
+            QtWidgets.QMessageBox.critical(self, "음악분석 실패", "audio_sync에 필요한 함수가 없습니다.")
+            return
 
-        btn = getattr(self, "btn_analyze_music", None) or getattr(getattr(self, "ui", None), "btn_analyze_music", None)
+        # --- 프로젝트/오디오/가사 수집 ---
+        try:
+            proj_dir = self._current_project_dir()
+        except Exception:
+            proj_dir = None
 
-        # 문자열 정규화(공백/개행/유니코드 넓은 공백 차이 제거)
+        if not proj_dir:
+            if isinstance(btn, QtWidgets.QAbstractButton):
+                btn.setEnabled(True)
+            QtWidgets.QMessageBox.critical(self, "음악분석 실패", "프로젝트 폴더가 없습니다.")
+            return
+
+        # 보컬 파일(최근 것)
+        vocal_path_raw = None
+        try:
+            vocal_path_raw = self._find_latest_vocal()
+        except Exception:
+            vocal_path_raw = None
+
+        if isinstance(vocal_path_raw, Path):
+            vocal_path_str = str(vocal_path_raw)
+        elif isinstance(vocal_path_raw, str):
+            vocal_path_str = vocal_path_raw
+        else:
+            vocal_path_str = ""
+
+        if not vocal_path_str or not Path(vocal_path_str).exists():
+            if isinstance(btn, QtWidgets.QAbstractButton):
+                btn.setEnabled(True)
+            QtWidgets.QMessageBox.critical(self, "음악분석 실패", "보컬 오디오 파일을 찾을 수 없습니다.")
+            return
+
+        # project.json / story.json
+        pj = Path(proj_dir) / "project.json"
+        auto_tags_flag = None
+        lyrics_raw = ""
+
+        if pj.exists():
+            pj_data = load_json(pj, {}) or {}
+            if isinstance(pj_data, dict):
+                lyrics_raw = str(pj_data.get("lyrics") or "").strip()
+                if "auto_tags" in pj_data:
+                    auto_tags_flag = bool(pj_data.get("auto_tags"))
+
+        if not lyrics_raw:
+            sj = Path(proj_dir) / "story.json"
+            if sj.exists():
+                sj_data = load_json(sj, {}) or {}
+                if isinstance(sj_data, dict):
+                    lyrics_raw = str(sj_data.get("lyrics") or "").strip()
+
+        if not lyrics_raw:
+            if isinstance(btn, QtWidgets.QAbstractButton):
+                btn.setEnabled(True)
+            QtWidgets.QMessageBox.critical(self, "음악분석 실패", "가사를 찾지 못했습니다.")
+            return
+
+        # --- 가사 정규화 / 변환 여부 판정 ---
         def _norm_text(s: str) -> str:
             if not isinstance(s, str):
                 return ""
             s2 = s.replace("\r\n", "\n").replace("\r", "\n")
-            lines = [ln.strip() for ln in s2.split("\n")]
-            # 완전 빈 줄은 제거
-            lines = [ln for ln in lines if ln != ""]
-            return "\n".join(lines)
+            lines_ = [ln.strip() for ln in s2.split("\n")]
+            lines_ = [ln for ln in lines_ if ln != ""]
+            return "\n".join(lines_)
 
+        try:
+            lyrics_before = _norm_text(lyrics_raw)
+            lyrics_after = _norm_text(self._maybe_convert_lyrics_for_api(lyrics_raw))
+            lyrics_converted = (lyrics_after != lyrics_before)
+            lyrics_text = lyrics_after
+        except Exception:
+            lyrics_converted = False
+            lyrics_text = _norm_text(lyrics_raw)
+
+        # --- tail_file 경로(있으면 테일링) ---
+        tail_path = None
+        try:
+            candidate = getattr(self, "comfy_log_file", None) or getattr(self, "comfy_log_path", None)
+            if isinstance(candidate, str) and candidate:
+                p = Path(candidate)
+                if p.exists() and p.is_file():
+                    tail_path = str(p)
+        except Exception:
+            tail_path = None
+
+        # --- 분석 잡 정의 ---
         def job(log):
             def slog(tag: str, msg: str) -> None:
-                log(f"[{tag}] {msg}")
+                try:
+                    log({"msg": f"[{tag}] {msg}"})
+                except Exception:
+                    pass
 
-            if isinstance(btn, QtWidgets.QAbstractButton):
-                btn.setEnabled(False)
+            slog("음악분석", f"오디오: {Path(vocal_path_str).name}")
+
+            # 라인 전처리
             try:
-                proj_dir = self._current_project_dir()
-                if not proj_dir:
-                    raise RuntimeError("프로젝트 폴더가 없습니다.")
+                lines = prepare_lines(lyrics_text, drop_section_tags=True)  # type: ignore
+            except Exception:
+                lines = [s for s in lyrics_text.splitlines() if s.strip()]
 
-                # 보컬 경로(str)
-                vocal_path_raw = self._find_latest_vocal()
-                if isinstance(vocal_path_raw, Path):
-                    vocal_path_str = str(vocal_path_raw)
-                elif isinstance(vocal_path_raw, str):
-                    vocal_path_str = vocal_path_raw
-                else:
-                    vocal_path_str = ""
-                if not vocal_path_str or not Path(vocal_path_str).exists():
-                    raise RuntimeError("보컬 오디오 파일을 찾을 수 없습니다.")
-                slog("음악분석", f"오디오: {Path(vocal_path_str).name}")
+            # Whisper 정렬(프로 우선, 상세 옵션 유지)
+            model_size = "medium"
+            min_len = 0.5
+            end_bias = 2.5
+            avg_min_sec_per_unit = 2.0
+            start_preroll = 0.30
 
-                # project.json 상태(lyrics, auto_tags)
-                pj = Path(proj_dir) / "project.json"
-                auto_tags_flag = None
-                lyrics_raw = ""
-                if pj.exists():
-                    pj_data = load_json(pj, {}) or {}
-                    if isinstance(pj_data, dict):
-                        lyrics_raw = str(pj_data.get("lyrics") or "").strip()
-                        if "auto_tags" in pj_data:
-                            auto_tags_flag = bool(pj_data.get("auto_tags"))
-                if not lyrics_raw:
-                    sj = Path(proj_dir) / "story.json"
-                    if sj.exists():
-                        sj_data = load_json(sj, {}) or {}
-                        if isinstance(sj_data, dict):
-                            lyrics_raw = str(sj_data.get("lyrics") or "").strip()
-                if not lyrics_raw:
-                    raise RuntimeError("가사를 찾지 못했습니다.")
-
-                # 실제 변환 여부: 정규화해서 비교(개행/공백 차이로 인한 오탐 방지)
-                lyrics_before = _norm_text(lyrics_raw)
-                lyrics_after = _norm_text(self._maybe_convert_lyrics_for_api(lyrics_raw))
-                lyrics_converted = (lyrics_after != lyrics_before)
-                lyrics_text = lyrics_after
-
-                # 파라미터(기본값 유지)
-                model_size = "medium"
-                min_len = 0.5
-                end_bias = 2.5
-                avg_min_sec_per_unit = 2.0
-                start_preroll = 0.30
-
-                # PRO 호출(강제 앵커 전달 안 함)
+            res = None
+            err = None
+            try:
                 if has_pro:
                     res = audio_sync_mod.sync_lyrics_with_whisper_pro(
-                        vocal_path_str,
-                        lyrics_text,
+                        str(vocal_path_str),
+                        "\n".join(lines),
                         model_size=model_size,
                         min_len=min_len,
                         end_bias_sec=end_bias,
@@ -1430,8 +1732,8 @@ class MainWindow(QtWidgets.QMainWindow):
                     )
                 else:
                     res = audio_sync_mod.sync_lyrics_with_whisper(
-                        vocal_path_str,
-                        lyrics_text,
+                        str(vocal_path_str),
+                        "\n".join(lines),
                         model_size=model_size,
                         use_vocal_separation=False,
                         min_len=min_len,
@@ -1439,83 +1741,97 @@ class MainWindow(QtWidgets.QMainWindow):
                         avg_min_sec_per_unit=avg_min_sec_per_unit,
                         start_preroll=start_preroll,
                     )
+            except Exception as e:
+                err = e
 
-                # 요약 출력
-                segments = res.get("segments") or []
-                onsets = res.get("onsets") or []
-                onsets_hp = res.get("onsets_hp") or []
-                duration_sec = float(res.get("duration_sec", 0.0))
-                start_at = float(res.get("start_at", 0.0))
-                pro_info = res.get("__pro_info__") or {}
+            # 안전한 기본값(경고 제거용) — 기능 변화 없음
+            sections = (res or {}).get("sections") or []
+            last_end = float((res or {}).get("last_end", 0.0))
 
-                lines = prepare_lines(lyrics_text)
-                summary: List[str] = []
-                summary.append(f"파일: {Path(vocal_path_str).name}")
-                if duration_sec > 0:
-                    summary.append(f"오디오 길이: {duration_sec:.2f}s (start_at={start_at:.2f}s)")
+            # 요약 출력(상세 진단 유지)
+            segments = (res or {}).get("segments") or []
+            onsets = (res or {}).get("onsets") or []
+            onsets_hp = (res or {}).get("onsets_hp") or []
+            duration_sec = float((res or {}).get("duration_sec", 0.0))
+            start_at = float((res or {}).get("start_at", 0.0))
+            pro_info = (res or {}).get("__pro_info__") or {}
+
+            summary: List[str] = []
+            summary.append(f"파일: {Path(vocal_path_str).name}")
+            if duration_sec > 0:
+                summary.append(f"오디오 길이: {duration_sec:.2f}s (start_at={start_at:.2f}s)")
+            summary.append(
+                f"preprocess: {bool(pro_info.get('preprocessed'))}, "
+                f"demucs(vocals/drums): {bool(pro_info.get('demucs_vocals_used'))}/{bool(pro_info.get('demucs_drums_used'))}"
+            )
+            summary.append(f"onsets: {len(onsets)}개 (hp={len(onsets_hp)})")
+            if auto_tags_flag is not None:
+                summary.append(f"project.auto_tags = {auto_tags_flag}")
+            summary.append(f"lyrics_converted = {lyrics_converted}")
+            if "global_shift_applied_sec" in pro_info:
                 summary.append(
-                    f"preprocess: {bool(pro_info.get('preprocessed'))}, demucs(vocals/drums): {bool(pro_info.get('demucs_vocals_used'))}/{bool(pro_info.get('demucs_drums_used'))}")
-                summary.append(f"onsets: {len(onsets)}개 (hp={len(onsets_hp)})")
-                if auto_tags_flag is not None:
-                    summary.append(f"project.auto_tags = {auto_tags_flag}")
-                summary.append(f"lyrics_converted = {lyrics_converted}")
-                if "global_shift_applied_sec" in pro_info:
-                    summary.append(
-                        f"global_shift_applied = {pro_info.get('global_shift_applied_sec', 0.0):.3f}s, "
-                        f"affine(a={pro_info.get('affine_a', 1.0):.3f}, b={pro_info.get('affine_b', 0.0):.3f})"
-                    )
-                summary.append("")
+                    f"global_shift_applied = {pro_info.get('global_shift_applied_sec', 0.0):.3f}s, "
+                    f"affine(a={pro_info.get('affine_a', 1.0):.3f}, b={pro_info.get('affine_b', 0.0):.3f})"
+                )
+            summary.append("")
 
-                summary.append("=== 줄별 정합 ===")
-                if segments:
-                    for i, seg in enumerate(segments, 1):
-                        try:
-                            st = float(seg.get("start", 0.0))
-                            et = float(seg.get("end", 0.0))
-                            tx = str(seg.get("text") or "")
-                            ok = "OK" if seg.get("ok") else "--"
-                            line = lines[i - 1] if i - 1 < len(lines) else tx
-                            summary.append(f"[{i:02d}] {ok} {st:6.2f}~{et:6.2f}  {line}")
-                        except (TypeError, ValueError):
-                            continue
-                else:
-                    summary.append("(줄별 정합 결과 없음)")
+            summary.append("=== 줄별 정합 ===")
+            if segments:
+                for i, seg in enumerate(segments, 1):
+                    try:
+                        st = float(seg.get("start", 0.0))
+                        et = float(seg.get("end", 0.0))
+                        tx = str(seg.get("text") or "")
+                        ok = "OK" if seg.get("ok") else "--"
+                        line = lines[i - 1] if i - 1 < len(lines) else tx
+                        summary.append(f"[{i:02d}] {ok} {st:6.2f}~{et:6.2f}  {line}")
+                    except Exception:
+                        summary.append(f"[{i:02d}] {str(seg)}")
+            else:
+                summary.append("(줄별 정합 결과 없음)")
 
-                return {"text": "\n".join(summary)}
+            return {"text": "\n".join(summary)}
 
+        def done(ok: bool, payload, err):
+            try:
+                if not ok:
+                    QtWidgets.QMessageBox.critical(self, "음악분석 실패", str(err))
+                    return
+
+                text = (payload or {}).get("text", "")
+                print("\n[음악분석 결과]\n" + text, flush=True)
+
+                dlg = QtWidgets.QDialog(self)
+                dlg.setWindowTitle("음악분석 결과 — 자동보정(앵커 하드코딩 없음)")
+                dlg.resize(1000, 760)
+                vbox = QtWidgets.QVBoxLayout(dlg)
+                ed = QtWidgets.QPlainTextEdit()
+                ed.setReadOnly(True)
+                ed.setPlainText(text)
+                vbox.addWidget(ed)
+                row = QtWidgets.QHBoxLayout()
+                vbox.addLayout(row)
+                row.addStretch(1)
+                btn_close = QtWidgets.QPushButton("닫기")
+                row.addWidget(btn_close)
+                btn_close.clicked.connect(dlg.accept)
+                dlg.exec_()
             finally:
                 if isinstance(btn, QtWidgets.QAbstractButton):
                     btn.setEnabled(True)
 
-        def done(ok: bool, payload, err):
-            from PyQt5 import QtWidgets
-            if not ok:
-                QtWidgets.QMessageBox.critical(self, "음악분석 실패", str(err))
-                return
-            text = (payload or {}).get("text", "")
-            print("\n[음악분석 결과]\n" + text, flush=True)
-
-            dlg = QtWidgets.QDialog(self)
-            dlg.setWindowTitle("음악분석 결과 — 자동보정(앵커 하드코딩 없음)")
-            dlg.resize(1000, 760)
-            vbox = QtWidgets.QVBoxLayout(dlg)
-            ed = QtWidgets.QPlainTextEdit()
-            ed.setReadOnly(True)
-            ed.setPlainText(text)
-            vbox.addWidget(ed)
-            row = QtWidgets.QHBoxLayout()
-            vbox.addLayout(row)
-            row.addStretch(1)
-            btn_close = QtWidgets.QPushButton("닫기")
-            row.addWidget(btn_close)
-            btn_close.clicked.connect(dlg.accept)
-            dlg.exec_()
-
+        # --- 비동기 실행(+테일링) ---
         try:
-            from app.progress import run_job_with_progress_async  # type: ignore
-        except Exception:
-            from utils import run_job_with_progress_async  # type: ignore
-        run_job_with_progress_async(self, "음악분석", job, tail_file=None, on_done=done)
+            try:
+                from app.progress import run_job_with_progress_async as run_async  # type: ignore
+            except Exception:
+                from utils import run_job_with_progress_async as run_async  # type: ignore
+
+            run_async(self, "음악분석", job, tail_file=tail_path, on_done=done)
+        except Exception as e:
+            if isinstance(btn, QtWidgets.QAbstractButton):
+                btn.setEnabled(True)
+            QtWidgets.QMessageBox.critical(self, "음악분석 실패", str(e))
 
     @staticmethod
     def _persist_lyric_sections(*, proj_dir: str, sections: list, last_end: float) -> None:
@@ -4562,6 +4878,13 @@ class MainWindow(QtWidgets.QMainWindow):
         print("[LOAD-PROJ] activated:", str(pdir), flush=True)
         if hasattr(self, "statusbar"):
             self.statusbar.showMessage(f"불러옴: {pj}")
+
+        # ✅ 프로젝트 컨텍스트 준비 완료 플래그 (이후부터 태그 워치가 project.json과 동기화)
+        try:
+            setattr(self, "_project_context_ready", True)
+        except Exception:
+            pass
+
 
     # ────────────── 진행창/로그 ──────────────
 

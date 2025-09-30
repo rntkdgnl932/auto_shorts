@@ -1910,25 +1910,39 @@ def run_job_with_progress_async(
     tail_file=None,
     on_done=None,  # Callable[[bool, Any, Optional[BaseException]], None]
 ) -> None:
-    # 매개변수 사용 표시(경고 제거; 동작 영향 없음)
-    _ = tail_file
+    """
+    비동기 작업 실행 + 진행창 + (옵션) 로그 테일링(tail_file).
+    - owner: 부모 위젯
+    - title: 진행창 제목
+    - job(on_progress: Callable[[dict], None]) -> Any: 백그라운드에서 실행할 함수
+    - tail_file: 실시간 테일링할 로그 파일 경로(선택)  → _mk_progress 내부에서 처리
+    - on_done(ok: bool, payload: Any, err: Optional[Exception]): 완료 콜백
+    """
+    from PyQt5 import QtCore
 
-    # 진행창
-    dlg = ProgressLogDialog(parent=owner)
+    # --- 네가 제공한 _mk_progress는 (on_progress, finalize, dlg) 순서로 3개 반환 ---
     try:
-        dlg.set_title(title)
-    except Exception:
-        dlg.setWindowTitle(title)
-    dlg.show()
-    QtWidgets.QApplication.processEvents()
+        on_progress_ui, finalize_ui, dlg = _mk_progress(owner, title, tail_file=tail_file)  # type: ignore
+    except Exception as e:
+        # _mk_progress가 없거나 실패하면 바로 알리고 종료(불필요한 대체 구현 없이 명확히 처리)
+        try:
+            QtWidgets.QMessageBox.critical(owner, "진행창 초기화 실패", str(e))  # type: ignore
+        except Exception:
+            pass
+        if callable(on_done):
+            try:
+                on_done(False, None, e)
+            except Exception:
+                pass
+        return
 
-    # 항상 한 줄은 보장
+    # 초기 로그 한 줄(네 _mk_progress.on_progress가 QTimer로 UI 스레드에 안전하게 반영)
     try:
-        dlg.append_log("[ui] 작업 시작 준비")
+        on_progress_ui({"stage": "ui", "msg": "[ui] 작업 시작 준비"})
     except Exception:
         pass
 
-    class _JobObj(QtCore.QObject):
+    class _Worker(QtCore.QObject):
         progress = QtCore.pyqtSignal(dict)
         finished = QtCore.pyqtSignal(object, object)  # (payload, err)
 
@@ -1938,55 +1952,56 @@ def run_job_with_progress_async(
             err = None
             try:
                 def on_progress(info: dict):
+                    # 워커 스레드 → 메인 스레드로 신호만 보냄(실제 UI 반영은 슬롯에서)
                     if not isinstance(info, dict):
                         info = {"msg": str(info)}
                     self.progress.emit(info)
                 payload = job(on_progress)
-            except BaseException as job_exc:
-                err = job_exc
+            except Exception as ex:
+                err = ex
             finally:
                 self.finished.emit(payload, err)
 
-    obj = _JobObj()
-    th = QtCore.QThread(owner)
+    obj = _Worker()
+    th = QtCore.QThread(dlg)
     obj.moveToThread(th)
 
     def _on_progress(info: dict):
-        msg = str(info.get("msg") or "")
-        step = info.get("step")
-        if msg:
-            try:
-                dlg.append_log(msg)
-            except Exception:
-                pass
-        if isinstance(step, int) and step > 0:
-            try:
-                if dlg.bar.maximum() == 0:
-                    dlg.enter_determinate(step)
-                dlg.step(msg or "")
-            except Exception:
-                pass
+        # 메인 스레드: 네 _mk_progress가 넘긴 on_progress_ui 호출(내부가 QTimer로 UI 반영)
+        try:
+            on_progress_ui(info)
+        except Exception:
+            pass
 
     def _on_finished(payload, err):
         ok = (err is None)
+
+        # finalize 호출로 진행창 마무리
         try:
-            dlg.finish(ok, str(err) if err else None)
+            finalize_ui(ok, payload, err)
         except Exception:
             pass
+
+        # 완료 콜백
         if callable(on_done):
             try:
                 on_done(ok, payload, err)
             except Exception:
                 pass
+
         # 스레드 정리
-        th.quit()
-        th.wait(100)
-        # owner 보관 목록에서 제거
         try:
-            job_threads = getattr(owner, "_progress_jobs", [])
-            if th in job_threads:
-                job_threads.remove(th)
-            setattr(owner, "_progress_jobs", job_threads)
+            th.quit()
+            th.wait(100)
+        except Exception:
+            pass
+
+        # 소유자에 보관했던 스레드 참조 제거
+        try:
+            jobs = getattr(owner, "_progress_jobs", [])
+            if th in jobs:
+                jobs.remove(th)
+            setattr(owner, "_progress_jobs", jobs)
         except Exception:
             pass
 
@@ -1994,28 +2009,42 @@ def run_job_with_progress_async(
     obj.finished.connect(_on_finished)
     th.started.connect(obj.run)
 
-    # ★★★ 핵심: 스레드/워커를 owner에 붙여서 GC 방지
-    owner_job_threads = getattr(owner, "_progress_jobs", None)
-    if not isinstance(owner_job_threads, list):
-        owner_job_threads = []
-    owner_job_threads.append(th)
-    setattr(owner, "_progress_jobs", owner_job_threads)
-    setattr(th, "_worker_ref", obj)  # 스레드 객체에도 워커 참조를 잡아둠
+    # GC 방지: 소유자에 스레드 참조를 보관
+    try:
+        jobs = getattr(owner, "_progress_jobs", None)
+        if not isinstance(jobs, list):
+            jobs = []
+        jobs.append(th)
+        setattr(owner, "_progress_jobs", jobs)
+        setattr(th, "_worker_ref", obj)
+    except Exception:
+        pass
 
+    # 시작 로그
+    try:
+        on_progress_ui({"stage": "ui", "msg": "[ui] 백그라운드 스레드 시작"})
+    except Exception:
+        pass
+
+    # 스레드 시작(실패 시 finalize + on_done(False, ...))
     try:
         th.start()
+    except Exception as start_exc:
         try:
-            dlg.append_log("[ui] 백그라운드 스레드 시작")
+            on_progress_ui({"stage": "error", "msg": f"[error] thread start failed: {start_exc}"})
         except Exception:
             pass
-    except BaseException as start_exc:
         try:
-            dlg.append_log(f"[error] thread start failed: {start_exc}")
-            dlg.finish(False, str(start_exc))
+            finalize_ui(False, None, start_exc)
         except Exception:
             pass
         if callable(on_done):
-            on_done(False, None, start_exc)
+            try:
+                on_done(False, None, start_exc)
+            except Exception:
+                pass
+        return
+
 
 
 
