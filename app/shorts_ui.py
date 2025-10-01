@@ -1555,9 +1555,14 @@ class MainWindow(QtWidgets.QMainWindow):
             self._music_inflight = False
             QtWidgets.QMessageBox.warning(self, "음악 생성 오류", str(e))
 
+    print("여기")
+
+    # shorts_ui.py 파일에서 아래 함수를 찾아 전체를 교체해 주세요.
+
     def on_click_analyze_music(self) -> None:
         """
         음악분석:
+          - 종료 시간 추정 로직의 우선순위를 수정하여 정확도 향상.
           - project/story에서 가사 확보
           - '가사 변환 여부'를 정규화 비교로 정확히 판단해 표시
           - project.json의 auto_tags 실제 값을 리포트에 표시
@@ -1670,14 +1675,9 @@ class MainWindow(QtWidgets.QMainWindow):
             lines_ = [ln for ln in lines_ if ln != ""]
             return "\n".join(lines_)
 
-        try:
-            lyrics_before = _norm_text(lyrics_raw)
-            lyrics_after = _norm_text(self._maybe_convert_lyrics_for_api(lyrics_raw))
-            lyrics_converted = (lyrics_after != lyrics_before)
-            lyrics_text = lyrics_after
-        except Exception:
-            lyrics_converted = False
-            lyrics_text = _norm_text(lyrics_raw)
+        lyrics_before = _norm_text(lyrics_raw)
+        lyrics_for_api = _norm_text(self._maybe_convert_lyrics_for_api(lyrics_raw))
+        lyrics_converted = (lyrics_for_api != lyrics_before)
 
         # --- tail_file 경로(있으면 테일링) ---
         tail_path = None
@@ -1695,18 +1695,25 @@ class MainWindow(QtWidgets.QMainWindow):
             def slog(tag: str, msg: str) -> None:
                 try:
                     log({"msg": f"[{tag}] {msg}"})
-                except Exception:
-                    pass
+                except (RuntimeError, ValueError, TypeError):
+                    return
 
+            print("[FLOW] STEP 1) job() 진입")
+            slog("FLOW", "STEP 1) 시작: job() 진입")
+
+            from pathlib import Path
             slog("음악분석", f"오디오: {Path(vocal_path_str).name}")
+            print(f"[FLOW] 오디오 파일 = {Path(vocal_path_str).name}")
 
-            # 라인 전처리
             try:
-                lines = prepare_lines(lyrics_text, drop_section_tags=True)  # type: ignore
-            except Exception:
-                lines = [s for s in lyrics_text.splitlines() if s.strip()]
+                lines_for_api = prepare_lines(lyrics_for_api, drop_section_tags=True)
+                print(f"[FLOW] STEP 2) 가사 전처리 완료: lines={len(lines_for_api)}")
+                slog("FLOW", f"STEP 2) 가사 전처리 완료: lines={len(lines_for_api)}")
+            except (RuntimeError, ValueError, TypeError):
+                lines_for_api = [s for s in lyrics_for_api.splitlines() if s.strip()]
+                print(f"[FLOW] STEP 2) 가사 전처리 폴백: lines={len(lines_for_api)}")
+                slog("FLOW", f"STEP 2) 가사 전처리 폴백: lines={len(lines_for_api)}")
 
-            # Whisper 정렬(프로 우선, 상세 옵션 유지)
             model_size = "medium"
             min_len = 0.5
             end_bias = 2.5
@@ -1714,12 +1721,15 @@ class MainWindow(QtWidgets.QMainWindow):
             start_preroll = 0.30
 
             res = None
-            err = None
             try:
+                print("[FLOW] STEP 3) 싱크 시작")
+                slog("FLOW", "STEP 3) 싱크 시작")
                 if has_pro:
+                    print("  - sync_lyrics_with_whisper_pro 호출")
+                    slog("FLOW", "  - sync_lyrics_with_whisper_pro 호출")
                     res = audio_sync_mod.sync_lyrics_with_whisper_pro(
                         str(vocal_path_str),
-                        "\n".join(lines),
+                        "\n".join(lines_for_api),
                         model_size=model_size,
                         min_len=min_len,
                         end_bias_sec=end_bias,
@@ -1731,30 +1741,137 @@ class MainWindow(QtWidgets.QMainWindow):
                         anchor_first_line_sec=None,
                     )
                 else:
+                    print("  - sync_lyrics_with_whisper 호출")
+                    slog("FLOW", "  - sync_lyrics_with_whisper 호출")
                     res = audio_sync_mod.sync_lyrics_with_whisper(
                         str(vocal_path_str),
-                        "\n".join(lines),
+                        "\n".join(lines_for_api),
                         model_size=model_size,
-                        use_vocal_separation=False,
                         min_len=min_len,
                         end_bias_sec=end_bias,
                         avg_min_sec_per_unit=avg_min_sec_per_unit,
                         start_preroll=start_preroll,
                     )
-            except Exception as e:
-                err = e
+                print("[FLOW] STEP 3) 싱크 종료")
+                slog("FLOW", "STEP 3) 싱크 종료")
+            except (RuntimeError, ValueError, OSError) as e:
+                print(f"[ERROR] whisper 정렬 실패: {e}")
+                slog("ERROR", f"whisper 정렬 실패: {e}")
 
-            # 안전한 기본값(경고 제거용) — 기능 변화 없음
-            sections = (res or {}).get("sections") or []
-            last_end = float((res or {}).get("last_end", 0.0))
+            segments0 = (res or {}).get("segments") or []
+            print(f"[FLOW] STEP 4) 싱크 결과 수집: segments0={len(segments0)}")
+            slog("FLOW", f"STEP 4) 싱크 결과 수집: segments0={len(segments0)}")
 
-            # 요약 출력(상세 진단 유지)
+            try:
+                from app.audio_sync import (
+                    add_korean_lines_to_items,
+                    merge_last_end_with_external,
+                    estimate_vocal_end_from_vocal_stem,
+                    estimate_last_lyric_end_with_mfa,
+                    estimate_vocal_end_sec,
+                )
+                print("[FLOW] STEP 5) 헬퍼 import: app.audio_sync 사용")
+                slog("FLOW", "STEP 5) 헬퍼 import: app.audio_sync 사용")
+
+                seg_src = (res or {}).get("segments") or []
+                print(f"[FLOW] STEP 6) 후처리 입력: seg_src={len(seg_src)}")
+                slog("FLOW", f"STEP 6) 후처리 입력: seg_src={len(seg_src)}")
+
+                try:
+                    if seg_src:
+                        cur_st = float(seg_src[-1].get("start", 0.0))
+                        cur_ed = float(seg_src[-1].get("end", 0.0))
+                        print(f"[DEBUG] 현재 마지막 줄: start={cur_st:.3f}s, end={cur_ed:.3f}s")
+                        slog("DEBUG", f"현재 마지막 줄: start={cur_st:.3f}s, end={cur_ed:.3f}s")
+                except (RuntimeError, ValueError, TypeError):
+                    pass
+
+                if seg_src and callable(add_korean_lines_to_items):
+                    seg_src = add_korean_lines_to_items(seg_src, lyrics_raw)
+                    try:
+                        cnt_ko = sum(1 for it in seg_src if str(it.get("line_ko") or "").strip())
+                    except (RuntimeError, ValueError, TypeError):
+                        cnt_ko = 0
+                    print(f"[DEBUG] line_ko 주입: non_empty={cnt_ko}/{len(seg_src)}")
+                    slog("DEBUG", f"line_ko 주입: non_empty={cnt_ko}/{len(seg_src)}")
+
+                ext_end = 0.0
+                v_stem = v_mfa = v_basic = 0.0
+
+                try:
+                    if callable(estimate_vocal_end_from_vocal_stem):
+                        v_stem = float(estimate_vocal_end_from_vocal_stem(str(vocal_path_str)) or 0.0)
+                    print(f"[DEBUG] ext 후보 stem_end={v_stem:.3f}s")
+                    slog("DEBUG", f"ext 후보 stem_end={v_stem:.3f}s")
+                except (RuntimeError, ValueError, TypeError):
+                    print("[DEBUG] ext 후보 stem_end 계산 실패")
+                    slog("DEBUG", "ext 후보 stem_end 계산 실패")
+
+                try:
+                    if callable(estimate_last_lyric_end_with_mfa):
+                        v_mfa = float(estimate_last_lyric_end_with_mfa(str(vocal_path_str), lyrics_raw) or 0.0)
+                    print(f"[DEBUG] ext 후보 mfa_end={v_mfa:.3f}s")
+                    slog("DEBUG", f"ext 후보 mfa_end={v_mfa:.3f}s")
+                except (RuntimeError, ValueError, TypeError):
+                    print("[DEBUG] ext 후보 mfa_end 계산 실패")
+                    slog("DEBUG", "ext 후보 mfa_end 계산 실패")
+
+                try:
+                    if callable(estimate_vocal_end_sec):
+                        v_basic = float(estimate_vocal_end_sec(str(vocal_path_str)) or 0.0)
+                    print(f"[DEBUG] ext 후보 basic_end={v_basic:.3f}s")
+                    slog("DEBUG", f"ext 후보 basic_end={v_basic:.3f}s")
+                except (RuntimeError, ValueError, TypeError):
+                    print("[DEBUG] ext 후보 basic_end 계산 실패")
+                    slog("DEBUG", "ext 후보 basic_end 계산 실패")
+
+                # FIX: 최종 종료 시간 선택 우선순위를 (1)MFA -> (2)보컬 스템 -> (3)기본 순으로 변경합니다.
+                if v_mfa > 0.0:
+                    ext_end = v_mfa
+                    print(f"[FLOW] STEP 7) ext 선택: mfa_end={ext_end:.3f}s")
+                    slog("FLOW", f"STEP 7) ext 선택: mfa_end={ext_end:.3f}s")
+                elif v_stem > 0.0:
+                    ext_end = v_stem
+                    print(f"[FLOW] STEP 7) ext 선택: stem_end={ext_end:.3f}s")
+                    slog("FLOW", f"STEP 7) ext 선택: stem_end={ext_end:.3f}s")
+                elif v_basic > 0.0:
+                    ext_end = v_basic
+                    print(f"[FLOW] STEP 7) ext 선택: basic_end={ext_end:.3f}s")
+                    slog("FLOW", f"STEP 7) ext 선택: basic_end={ext_end:.3f}s")
+
+                print(f"[FLOW] STEP 7) ext 최종 ext_end={ext_end:.3f}s")
+                slog("FLOW", f"STEP 7) ext 최종 ext_end={ext_end:.3f}s")
+
+                if seg_src and ext_end > 0.0:
+                    if callable(merge_last_end_with_external):
+                        prev_end = float(seg_src[-1].get("end", 0.0))
+                        seg_src = merge_last_end_with_external(seg_src, ext_end, minimum_delta=0.10, round_ndigits=3)
+                        new_end = float(seg_src[-1].get("end", prev_end))
+                        print(f"[FLOW] STEP 8) merge 확장 적용: prev_end={prev_end:.3f}s -> new_end={new_end:.3f}s")
+                        slog("FLOW", f"STEP 8) merge 확장 적용: prev_end={prev_end:.3f}s -> new_end={new_end:.3f}s")
+
+                if isinstance(res, dict):
+                    res["segments"] = seg_src
+
+            except (ImportError, RuntimeError, ValueError, TypeError) as e:
+                print(f"[WARN] 후처리 일부 미적용: {e}")
+                slog("WARN", f"후처리 일부 미적용: {e}")
+
             segments = (res or {}).get("segments") or []
             onsets = (res or {}).get("onsets") or []
             onsets_hp = (res or {}).get("onsets_hp") or []
             duration_sec = float((res or {}).get("duration_sec", 0.0))
             start_at = float((res or {}).get("start_at", 0.0))
             pro_info = (res or {}).get("__pro_info__") or {}
+
+            try:
+                if segments:
+                    fin_st = float(segments[-1].get("start", 0.0))
+                    fin_ed = float(segments[-1].get("end", 0.0))
+                    print(f"[FLOW] STEP 10) 최종 마지막 줄: start={fin_st:.3f}s, end={fin_ed:.3f}s")
+                    slog("FLOW", f"STEP 10) 최종 마지막 줄: start={fin_st:.3f}s, end={fin_ed:.3f}s")
+            except (RuntimeError, ValueError, TypeError):
+                pass
 
             summary: List[str] = []
             summary.append(f"파일: {Path(vocal_path_str).name}")
@@ -1774,21 +1891,35 @@ class MainWindow(QtWidgets.QMainWindow):
                     f"affine(a={pro_info.get('affine_a', 1.0):.3f}, b={pro_info.get('affine_b', 0.0):.3f})"
                 )
             summary.append("")
-
             summary.append("=== 줄별 정합 ===")
+
+            korean_lines = [ln for ln in lyrics_raw.splitlines() if
+                            ln.strip() and not (ln.strip().startswith("[") and ln.strip().endswith("]"))]
+
             if segments:
                 for i, seg in enumerate(segments, 1):
                     try:
                         st = float(seg.get("start", 0.0))
                         et = float(seg.get("end", 0.0))
+                        line_ko = str(seg.get("line_ko") or "")
                         tx = str(seg.get("text") or "")
+
+                        if line_ko:
+                            view_line = line_ko
+                        elif 0 <= (i - 1) < len(korean_lines):
+                            view_line = korean_lines[i - 1]
+                        else:
+                            view_line = tx
+
                         ok = "OK" if seg.get("ok") else "--"
-                        line = lines[i - 1] if i - 1 < len(lines) else tx
-                        summary.append(f"[{i:02d}] {ok} {st:6.2f}~{et:6.2f}  {line}")
-                    except Exception:
+                        summary.append(f"[{i:02d}] {ok} {st:6.2f}~{et:6.2f}  {view_line}")
+                    except (RuntimeError, ValueError, TypeError):
                         summary.append(f"[{i:02d}] {str(seg)}")
             else:
                 summary.append("(줄별 정합 결과 없음)")
+
+            print("[FLOW] STEP 11) 요약 출력 완료")
+            slog("FLOW", "STEP 11) 요약 출력 완료")
 
             return {"text": "\n".join(summary)}
 
@@ -1809,29 +1940,23 @@ class MainWindow(QtWidgets.QMainWindow):
                 ed.setReadOnly(True)
                 ed.setPlainText(text)
                 vbox.addWidget(ed)
-                row = QtWidgets.QHBoxLayout()
-                vbox.addLayout(row)
-                row.addStretch(1)
                 btn_close = QtWidgets.QPushButton("닫기")
-                row.addWidget(btn_close)
                 btn_close.clicked.connect(dlg.accept)
+                row = QtWidgets.QHBoxLayout()
+                row.addStretch(1)
+                row.addWidget(btn_close)
+                vbox.addLayout(row)
                 dlg.exec_()
             finally:
                 if isinstance(btn, QtWidgets.QAbstractButton):
                     btn.setEnabled(True)
 
-        # --- 비동기 실행(+테일링) ---
         try:
-            try:
-                from app.progress import run_job_with_progress_async as run_async  # type: ignore
-            except Exception:
-                from utils import run_job_with_progress_async as run_async  # type: ignore
+            from app.progress import run_job_with_progress_async as run_async
+        except Exception:
+            from utils import run_job_with_progress_async as run_async
 
-            run_async(self, "음악분석", job, tail_file=tail_path, on_done=done)
-        except Exception as e:
-            if isinstance(btn, QtWidgets.QAbstractButton):
-                btn.setEnabled(True)
-            QtWidgets.QMessageBox.critical(self, "음악분석 실패", str(e))
+        run_async(self, "음악분석", job, tail_file=tail_path, on_done=done)
 
     @staticmethod
     def _persist_lyric_sections(*, proj_dir: str, sections: list, last_end: float) -> None:

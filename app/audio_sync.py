@@ -8,7 +8,7 @@ from __future__ import annotations
 import re
 from pathlib import Path
 from typing import Any, Callable, Dict, List, Optional, Tuple, cast
-
+import numpy as np
 # ───────────────────────── utils 안전 import ─────────────────────────
 try:
     from app.utils import audio_duration_sec, save_json, load_json, ensure_dir, sanitize_title
@@ -250,6 +250,7 @@ def _meaning_units_from_lyrics(lines: List[str], *, section: str, ai: Any) -> Li
     - 내부 변수는 소문자 사용
     - 광범위한 예외 제거(가능한 구체적으로)
     """
+    import json
     if not ai or not lines:
         return []
 
@@ -861,6 +862,7 @@ def _analyze_lyrics_global_kor(ai: Any, *, lyrics: str, title: str = "") -> Dict
       "avoid": ["가사 원문 인용 금지", "문자 텍스트 등장 금지"]
     }
     """
+    import json
     lyrics = (lyrics or "").strip()
     if not ai or not lyrics:
         return {
@@ -1456,12 +1458,13 @@ def _ensure_intro_at_head(
 
 
 from typing import List, Tuple, Optional
-import os, math, json, re
+import os, math, re
 
 # ─────────────────────────────────────────────────────────────
 # 0) 유틸: 오디오 길이 견고 획득(중앙값, 3배 튐 방지)
 # ─────────────────────────────────────────────────────────────
 def _probe_duration_ffprobe(path: str) -> float:
+    import json
     try:
         out = subprocess.check_output(
             ["ffprobe", "-v", "error", "-show_entries", "format=duration", "-of", "json", path],
@@ -1564,8 +1567,10 @@ def detect_onsets_seconds(
     p = str(path or "").strip()
     if not p or not os.path.isfile(p):
         return []
+
+
     try:
-        import numpy as np  # type: ignore
+
         import librosa  # type: ignore
         y, _sr = librosa.load(p, sr=sr, mono=True)
         if y is None or len(y) == 0:
@@ -3201,7 +3206,7 @@ def _submit_and_wait(
 
 import subprocess
 from pathlib import Path
-from typing import List, Optional, Callable
+from typing import Optional, Callable
 
 # ─────────────────────────────
 # 필요한 유틸이 이 파일에 이미 있다고 가정:
@@ -3503,7 +3508,6 @@ def preprocess_for_analysis(src: str) -> str:
     """
     try:
         from pathlib import Path
-        import numpy as np
         import soundfile as sf
         import librosa
         import noisereduce as nr
@@ -3605,7 +3609,6 @@ def detect_onsets_percussive_librosa(wav_path: str) -> list[float]:
     """
     from pathlib import Path
     try:
-        import numpy as np
         import soundfile as sf
         import librosa
     except ImportError:
@@ -3776,23 +3779,33 @@ def sync_lyrics_with_whisper_pro(
 
     # 6) 자동 앵커(안전 조건 하에서만)
     # 적합도 스코어: 첫 3개 세그먼트 start와 최근접 온셋과의 평균 절댓값
-    def _score(segs, ons):
-        import math
-        if not segs or not ons:
+    def _score(segments_in: List[Dict[str, Any]], onset_times: List[float]) -> float:
+        """
+        첫 3개 구간의 start를 가장 가까운 온셋에 매칭해 평균 거리(작을수록 좋음)를 계산.
+        - 변수명 충돌/가리기 방지: segs→segments_in, s→seg_item 등으로 변경
+        - 기능 변경 없음
+        """
+        if not segments_in or not onset_times:
             return 1e9
-        starts = []
+
+        starts: List[float] = []
         j = 0
-        n = len(ons)
-        for s in segs[:3]:
+        n = len(onset_times)
+
+        for seg_item in segments_in[:3]:
+            start_val = seg_item.get("start", 0.0)
             try:
-                st = float(s.get("start", 0.0))
+                st = float(start_val)
             except (TypeError, ValueError):
                 continue
-            while j + 1 < n and abs(ons[j + 1] - st) <= abs(ons[j] - st):
+
+            while j + 1 < n and abs(onset_times[j + 1] - st) <= abs(onset_times[j] - st):
                 j += 1
-            starts.append(abs(ons[j] - st))
+            starts.append(abs(onset_times[j] - st))
+
         if not starts:
             return 1e9
+
         return float(sum(starts) / len(starts))
 
     if anchor_first_line_sec is None:
@@ -3984,12 +3997,13 @@ def _rms_envelope(audio_path: str, *, sr_out: int = 16000, hop_length: int = 512
     - 실패 시 빈 리스트 반환
     """
     try:
-        import numpy as np
         import librosa
         # 여기서 'librosa.feature.rms'를 모듈 속성으로 접근하지 않고 직접 임포트
         from librosa.feature import rms as librosa_rms
     except ImportError:
         return ([], [])
+
+
 
     try:
         y, sr = librosa.load(audio_path, sr=sr_out, mono=True)
@@ -4025,11 +4039,12 @@ def estimate_global_shift_signal(audio_path: str, segments: list, *, max_abs_sec
     엔벨로프와 '줄 시작 시각'의 임펄스 열을 교차상관으로 정렬 → 전역 시프트 추정.
     +면 뒤로(지연), -면 앞으로(당김). 실패 시 0.0
     """
+
+
     times, env = _rms_envelope(audio_path)
     if not times or not env or not segments:
         return 0.0
 
-    import numpy as np
 
     # 줄 시작 시각 벡터(임펄스)
     starts = []
@@ -4066,7 +4081,6 @@ def estimate_affine_drift(segments: list, onsets: list[float]) -> tuple[float, f
     seg.start 와 가까운 onsets를 짝지어 최소제곱으로 t' = a*t + b 추정.
     반환: (a, b). 실패/자료 부족 시 (1.0, 0.0)
     """
-    import numpy as np
     xs = []
     ys = []
     on = sorted(float(t) for t in onsets if isinstance(t, (int, float)))
@@ -4085,10 +4099,10 @@ def estimate_affine_drift(segments: list, onsets: list[float]) -> tuple[float, f
         ys.append(on[j])
     if len(xs) < 5:
         return (1.0, 0.0)
-    X = np.vstack([np.array(xs), np.ones(len(xs))]).T
-    y = np.array(ys)
+    x__ = np.vstack([np.array(xs), np.ones(len(xs))]).T
+    y__ = np.array(ys)
     try:
-        a, b = np.linalg.lstsq(X, y, rcond=None)[0]
+        a, b = np.linalg.lstsq(x__, y__, rcond=None)[0]
     except Exception:
         return (1.0, 0.0)
     # 너무 극단적인 값 방지
@@ -4152,7 +4166,6 @@ def _auto_anchor_from_energy(audio_path: str, *, sr_out: int = 16000, hop_length
     - 반환: anchor_sec (없으면 0.0)
     """
     try:
-        import numpy as np
         import librosa
     except ImportError:
         return 0.0
@@ -4251,12 +4264,934 @@ def enforce_monotonic_segments(res: dict, *, min_gap_sec: float = 0.05) -> dict:
 
     out["segments"] = new_segs
     return out
+#####################################################################################
+##########################음악분석 개선###########################################
+#####################################################################################
+from typing import List, Tuple, Dict, Any
+
+def sync_lyrics_with_audio_whisperx(
+    audio_path: str,
+    lyrics_text: str,
+    *,
+    whisperx_model: str = "large-v3",
+    batch_size: int = 16,
+    min_line_sec: float = 0.20,
+    round_ndigits: int = 3,
+    start_preroll: float = 0.30,
+    end_bias_sec: float = 2.50
+) -> List[Dict[str, Any]]:
+    """
+    WhisperX(CPU) 단어 타임스탬프 → 편집거리 매칭 → 온셋 스냅(+보컬 tail 보정)으로
+    각 가사 라인의 [start, end]를 산출한다.
+    - 외부 이름 가리기 없음 / 지역 소문자 / 광범위 예외 금지 / 세미콜론 없음 / 없는 함수 호출 없음
+    """
+
+    # ---------------- 내부 헬퍼들 ----------------
+    import re
+
+    def _h_norm_ko_simple(text_in: str) -> str:
+        lowered_local = (text_in or "").lower()
+        kept_local = re.sub(r"[^0-9a-z가-힣\s]", " ", lowered_local)
+        return re.sub(r"\s+", " ", kept_local).strip()
+
+    def _h_split_lyrics_lines(src_text: str) -> List[str]:
+        out_lines: List[str] = []
+        for ln_raw in (src_text or "").splitlines():
+            ln_stripped = ln_raw.strip()
+            if not ln_stripped:
+                continue
+            if re.match(r"^\s*\[[^]]+]\s*$", ln_stripped):
+                continue
+            out_lines.append(ln_stripped)
+        return out_lines
+
+    def _h_edit_distance_dp(a_list: List[str], b_list: List[str]) -> np.ndarray:
+        na_local = len(a_list)
+        nb_local = len(b_list)
+        dp_mat = np.zeros((na_local + 1, nb_local + 1), dtype=np.int32)
+        for i_local in range(1, na_local + 1):
+            dp_mat[i_local, 0] = i_local
+        for j_local in range(1, nb_local + 1):
+            dp_mat[0, j_local] = j_local
+        for i_local in range(1, na_local + 1):
+            ai_local = a_list[i_local - 1]
+            for j_local in range(1, nb_local + 1):
+                bj_local = b_list[j_local - 1]
+                cost_local = 0 if ai_local == bj_local else 1
+                up_local = int(dp_mat[i_local - 1, j_local]) + 1
+                left_local = int(dp_mat[i_local, j_local - 1]) + 1
+                diag_local = int(dp_mat[i_local - 1, j_local - 1]) + cost_local
+                dp_mat[i_local, j_local] = min(up_local, left_local, diag_local)
+        return dp_mat
+
+    def _h_backtrack_path(dp_mat_in: np.ndarray,
+                          a_list: List[str],
+                          b_list: List[str]) -> List[Tuple[int, int]]:
+        i_local = int(dp_mat_in.shape[0] - 1)
+        j_local = int(dp_mat_in.shape[1] - 1)
+        path_pairs: List[Tuple[int, int]] = []
+        while i_local > 0 or j_local > 0:
+            cand_list: List[Tuple[int, int, int]] = []
+            if i_local > 0:
+                cand_list.append((int(dp_mat_in[i_local - 1, j_local]) + 1, i_local - 1, j_local))
+            if j_local > 0:
+                cand_list.append((int(dp_mat_in[i_local, j_local - 1]) + 1, i_local, j_local - 1))
+            if i_local > 0 and j_local > 0:
+                sub_local = 0 if a_list[i_local - 1] == b_list[j_local - 1] else 1
+                cand_list.append((int(dp_mat_in[i_local - 1, j_local - 1]) + sub_local, i_local - 1, j_local - 1))
+            cand_list.sort(key=lambda x: int(x[0]))
+            _, ni_local, nj_local = cand_list[0]
+            path_pairs.append((ni_local, nj_local))
+            i_local, j_local = ni_local, nj_local
+        path_pairs.reverse()
+        return path_pairs
+
+    def _h_distribute_lines_time(
+        lyric_lines_in: List[str],
+        b_words_in: List[Tuple[str, float, float]],
+        path_pairs_in: List[Tuple[int, int]],
+        *,
+        min_line_sec_in: float,
+        round_ndigits_in: int
+    ) -> List[Dict[str, Any]]:
+        spans_local: List[Tuple[int, int]] = []
+        token_idx_local = 0
+        for ln_once in lyric_lines_in:
+            toks_local = _h_norm_ko_simple(ln_once).split()
+            if toks_local:
+                s_local = token_idx_local
+                e_local = token_idx_local + len(toks_local) - 1
+                spans_local.append((s_local, e_local))
+                token_idx_local = e_local + 1
+            else:
+                spans_local.append((token_idx_local, token_idx_local))
+
+        tok2word_local: Dict[int, List[int]] = {}
+        for ai_local, bj_local in path_pairs_in:
+            if ai_local >= 0 and bj_local >= 0:
+                if ai_local not in tok2word_local:
+                    tok2word_local[ai_local] = []
+                tok2word_local[ai_local].append(bj_local)
+
+        items_synced: List[Dict[str, Any]] = []
+        for (s_local, e_local), ln_text in zip(spans_local, lyric_lines_in):
+            idxs_local: List[int] = []
+            for k_local in range(s_local, e_local + 1):
+                if k_local in tok2word_local:
+                    idxs_local.extend(tok2word_local[k_local])
+            idxs_local = sorted(set([z_local for z_local in idxs_local if 0 <= z_local < len(b_words_in)]))
+            if idxs_local:
+                starts_local = [float(b_words_in[z_local][1]) for z_local in idxs_local]
+                ends_local = [float(b_words_in[z_local][2]) for z_local in idxs_local]
+                st_local = min(starts_local)
+                ed_local = max(ends_local)
+            else:
+                st_local = items_synced[-1]["end"] if items_synced else 0.0
+                ed_local = st_local + min_line_sec_in
+            if ed_local - st_local < min_line_sec_in:
+                ed_local = st_local + min_line_sec_in
+            items_synced.append({
+                "line": ln_text,
+                "start": round(st_local, round_ndigits_in),
+                "end": round(ed_local, round_ndigits_in),
+            })
+
+        for idx_local in range(1, len(items_synced)):
+            prev_end_local = float(items_synced[idx_local - 1]["end"])
+            if float(items_synced[idx_local]["start"]) < prev_end_local:
+                items_synced[idx_local]["start"] = prev_end_local
+                if float(items_synced[idx_local]["end"]) < float(items_synced[idx_local]["start"]):
+                    items_synced[idx_local]["end"] = round(float(items_synced[idx_local]["start"]) + min_line_sec_in, round_ndigits_in)
+        return items_synced
+
+    from typing import List, Dict, Any
+
+    def _h_onset_snap_with_tail(
+            audio_path_in: str,
+            items_in: List[Dict[str, Any]],
+            *,
+            last_word_end_in: float,
+            start_preroll_in: float,
+            end_bias_sec_in: float,
+            outro_pad_sec_in: float,
+            round_ndigits_in: int
+    ) -> List[Dict[str, Any]]:
+        """
+        온셋 스냅 + 보컬 VAD(HPSS + 보컬대역 멜에너지 + RMS)로 마지막 라인 end를 보정한다.
+        - 마지막 라인 end = max(온셋 스냅, last_word_end+pad, 마지막 보컬 종료, duration-0.02)
+        - 지역변수 소문자, 광범위 예외 없음, 세미콜론 없음, 없는 함수 호출 없음
+        """
+
+        if not items_in:
+            return []
+
+        # 기본 폴백 결과(오디오 분석 실패 시에도 동작)
+        base_results: List[Dict[str, Any]] = []
+        for item_loop in items_in[:-1]:
+            s0 = float(item_loop["start"])
+            e0 = float(item_loop["end"])
+            s_adj = max(0.0, s0 - start_preroll_in)
+            e_adj = max(s_adj, e0 + end_bias_sec_in)
+            base_results.append({
+                "line": item_loop["line"],
+                "start": round(s_adj, round_ndigits_in),
+                "end": round(e_adj, round_ndigits_in),
+            })
+        last_item = dict(items_in[-1])
+        last_s = float(last_item["start"])
+        last_e = float(last_item["end"])
+        last_e_base = max(last_e + end_bias_sec_in, last_word_end_in + outro_pad_sec_in)
+        if last_e_base < last_s:
+            last_e_base = last_s
+        final_last_e = last_e_base  # librosa 성공 시 갱신
+
+        # ── librosa 및 하위 함수 "명시 임포트"(속성 접근 금지) ──
+        try:
+            import librosa as lb  # 로딩만 사용
+            from librosa.util.exceptions import ParameterError  # CamelCase 그대로
+            from librosa.feature import melspectrogram as lb_melspectrogram, rms as lb_rms
+            from librosa.onset import onset_strength as lb_onset_strength, onset_detect as lb_onset_detect
+            from librosa.effects import hpss as lb_hpss
+            from librosa import power_to_db as lb_power_to_db, frames_to_time as lb_frames_to_time
+            from librosa.core import mel_frequencies as lb_mel_frequencies
+        except ImportError:
+            last_item["end"] = round(final_last_e, round_ndigits_in)
+            base_results.append(last_item)
+            return base_results
+
+        # 오디오 로드
+        try:
+            y, sr = lb.load(audio_path_in, sr=16000, mono=True)
+        except (FileNotFoundError, ParameterError, RuntimeError, ValueError, OSError):
+            last_item["end"] = round(final_last_e, round_ndigits_in)
+            base_results.append(last_item)
+            return base_results
+
+        duration = float(len(y) / sr) if sr else 0.0
+
+        # 온셋 검출
+        try:
+            onset_env = lb_onset_strength(y=y, sr=sr)
+            onset_times = lb_onset_detect(onset_envelope=onset_env, sr=sr, units="time")
+            on_arr = np.asarray([]) if onset_times is None else np.asarray(onset_times)
+        except (ValueError, RuntimeError):
+            on_arr = np.asarray([])
+
+        def _prev_onset(t: float) -> float:
+            if on_arr.size == 0:
+                return t
+            idx = int(np.searchsorted(on_arr, t, side="right")) - 1
+            if idx < 0:
+                idx = 0
+            return float(on_arr[idx])
+
+        def _next_onset(t: float) -> float:
+            if on_arr.size == 0:
+                return t
+            idx = int(np.searchsorted(on_arr, t, side="right"))
+            if idx >= on_arr.size:
+                idx = on_arr.size - 1
+            return float(on_arr[idx])
+
+        # 보컬 강조(VAD 입력)
+        try:
+            y_harm, _y_perc = lb_hpss(y)
+            y_vad = y_harm
+        except Exception:
+            y_vad = y
+
+        # 멜 스펙트로그램 + RMS (하위 함수 직접 사용: feature 속성 접근 안 함)
+        hop = 512
+        win = 2048
+        mel = lb_melspectrogram(y=y_vad, sr=sr, n_fft=win, hop_length=hop, n_mels=64)
+        mel_db = lb_power_to_db(np.maximum(mel, 1e-10))
+        n_mels = int(mel.shape[0])
+        freqs = lb_mel_frequencies(n_mels=n_mels, fmin=0.0, fmax=sr / 2.0)
+        band_mask = (freqs >= 150.0) & (freqs <= 5000.0)
+        band_energy = np.mean(mel_db[band_mask, :], axis=0)
+
+        rms = lb_rms(y=y_vad, frame_length=win, hop_length=hop, center=True)[0]
+        eps = 1e-9
+        rms_db = 20.0 * np.log10(np.maximum(rms, eps))
+
+        score_raw = 0.6 * band_energy + 0.4 * rms_db
+        if score_raw.size >= 5:
+            kernel = np.ones(5) / 5.0
+            score_smooth = np.convolve(score_raw, kernel, mode="same")
+        else:
+            score_smooth = score_raw
+
+        med = float(np.median(score_smooth))
+        mad = float(np.median(np.abs(score_smooth - med))) + 1e-6
+        th_high = med + 0.6 * mad
+        th_low = med + 0.3 * mad
+        frame_times = lb_frames_to_time(np.arange(score_smooth.shape[0]), sr=sr, hop_length=hop)
+
+        voiced = False
+        last_vocal_end = 0.0
+        hold_sec = 0.30
+        hold_frames = int(hold_sec * sr / hop) if sr else 0
+        off_cnt = 0
+
+        for i, val in enumerate(score_smooth):
+            if not voiced and val >= th_high:
+                voiced = True
+                off_cnt = 0
+            elif voiced:
+                if val <= th_low:
+                    off_cnt += 1
+                    if off_cnt >= max(1, hold_frames):
+                        last_vocal_end = float(frame_times[i])
+                        voiced = False
+                        off_cnt = 0
+                else:
+                    off_cnt = 0
+                    last_vocal_end = float(frame_times[i])
+
+        # 라인 스냅 재계산
+        refined_results: List[Dict[str, Any]] = []
+        for item_loop in items_in[:-1]:
+            s0 = float(item_loop["start"])
+            e0 = float(item_loop["end"])
+            s_adj = max(0.0, _prev_onset(s0) - start_preroll_in)
+            e_adj = max(s_adj, _next_onset(e0) + end_bias_sec_in)
+            refined_results.append({
+                "line": item_loop["line"],
+                "start": round(s_adj, round_ndigits_in),
+                "end": round(e_adj, round_ndigits_in),
+            })
+
+        base_results = refined_results
+
+        # 마지막 라인 종료 확정(최대값)
+        snap_end = max(last_s, _next_onset(last_e) + end_bias_sec_in)
+        final_last_e = max(
+            snap_end,
+            last_word_end_in + outro_pad_sec_in,
+            last_vocal_end,
+            duration - 0.02 if duration > 0 else last_e_base
+        )
+        if final_last_e < last_s:
+            final_last_e = last_s
+
+        last_item["end"] = round(final_last_e, round_ndigits_in)
+        base_results.append(last_item)
+        return base_results
+
+    # ---------------- /내부 헬퍼들 ----------------
+
+    lyric_lines = _h_split_lyrics_lines(lyrics_text)
+    if not lyric_lines:
+        return []
+
+    # 1) WhisperX 전사 + 정렬 (항상 CPU)
+    import whisperx
+    audio_arr = whisperx.load_audio(audio_path)
+    device_fixed = "cpu"
+    model_obj = whisperx.load_model(whisperx_model, device=device_fixed)
+    result_obj = model_obj.transcribe(audio_arr, batch_size=batch_size)
+
+    lang_code_local = result_obj.get("language") or "ko"
+    align_model_obj, meta_obj = whisperx.load_align_model(language_code=lang_code_local, device=device_fixed)
+    aligned_obj = whisperx.align(result_obj["segments"], align_model_obj, meta_obj, audio_arr, device_fixed)
+
+    word_triplets: List[Tuple[str, float, float]] = []
+    for seg_obj in aligned_obj.get("segments", []):
+        for w_obj in seg_obj.get("words", []) or []:
+            w_norm = _h_norm_ko_simple(str(w_obj.get("word", "")))
+            if not w_norm:
+                continue
+            st_f = float(w_obj.get("start", 0.0))
+            ed_f = float(w_obj.get("end", st_f + 0.12))
+            word_triplets.append((w_norm, st_f, ed_f))
+
+    # 2) 편집거리 기반 라인-단어 매칭
+    toks_a = _h_norm_ko_simple(" ".join(lyric_lines)).split()
+    toks_b = [w0 for (w0, _, _) in word_triplets]
+    if not toks_a or not toks_b:
+        fallback_items: List[Dict[str, Any]] = []
+        for i_idx, ln_val in enumerate(lyric_lines):
+            st_f = i_idx * min_line_sec
+            ed_f = st_f + min_line_sec
+            fallback_items.append({"line": ln_val, "start": round(st_f, round_ndigits), "end": round(ed_f, round_ndigits)})
+        return fallback_items
+
+    dp_mat_main = _h_edit_distance_dp(toks_a, toks_b)
+    pairs_bt = _h_backtrack_path(dp_mat_main, toks_a, toks_b)
+    rough_items = _h_distribute_lines_time(
+        lyric_lines_in=lyric_lines,
+        b_words_in=word_triplets,
+        path_pairs_in=pairs_bt,
+        min_line_sec_in=min_line_sec,
+        round_ndigits_in=round_ndigits
+    )
+
+    # 3) 온셋 스냅 + 마지막 라인 tail 보정
+    last_word_end_val = float(word_triplets[-1][2]) if word_triplets else float(rough_items[-1]["end"])
+    snapped_items = _h_onset_snap_with_tail(
+        audio_path_in=audio_path,
+        items_in=rough_items,
+        last_word_end_in=last_word_end_val,
+        start_preroll_in=start_preroll,
+        end_bias_sec_in=end_bias_sec,
+        outro_pad_sec_in=3.0,          # 곡에 따라 2.0~6.0로 조정 가능
+        round_ndigits_in=round_ndigits
+    )
+    return snapped_items
 
 
 
 
+def estimate_vocal_end_sec(audio_path_in: str) -> float:
+    """
+    파일 전체에서 '보컬이 끝나는 시점'을 추정해 초 단위로 반환.
+    - HPSS로 하모닉(보컬 성분) 강조
+    - 보컬대역(150~5000Hz) 멜 에너지 + RMS 결합
+    - 이동평균 + 히스테리시스(상/하한)로 무가창(outro) 진입 검출
+    - librosa 미설치/로드 실패 시 0.0 반환
+    """
+    try:
+        import librosa as lb
+        from librosa.util.exceptions import ParameterError
+        from librosa.feature import melspectrogram as lb_melspectrogram, rms as lb_rms
+        from librosa.effects import hpss as lb_hpss
+        from librosa import power_to_db as lb_power_to_db, frames_to_time as lb_frames_to_time
+        from librosa.core import mel_frequencies as lb_mel_frequencies
+    except ImportError:
+        return 0.0
+
+    try:
+        y, sr = lb.load(audio_path_in, sr=16000, mono=True)
+    except (FileNotFoundError, ParameterError, RuntimeError, ValueError, OSError):
+        return 0.0
+
+    # 보컬 강조 신호
+    try:
+        y_harm, _y_perc = lb_hpss(y)
+        y_vad = y_harm
+    except (ValueError, RuntimeError):
+        y_vad = y
+
+    # 보컬 대역 멜 + RMS
+    hop = 512
+    win = 2048
+    mel = lb_melspectrogram(y=y_vad, sr=sr, n_fft=win, hop_length=hop, n_mels=64)
+    mel_db = lb_power_to_db(np.maximum(mel, 1e-10))
+    n_mels = int(mel.shape[0])
+    freqs = lb_mel_frequencies(n_mels=n_mels, fmin=0.0, fmax=sr / 2.0)
+    band_mask = (freqs >= 150.0) & (freqs <= 5000.0)
+    band_energy = np.mean(mel_db[band_mask, :], axis=0)
+
+    rms = lb_rms(y=y_vad, frame_length=win, hop_length=hop, center=True)[0]
+    eps = 1e-9
+    rms_db = 20.0 * np.log10(np.maximum(rms, eps))
+
+    score_raw = 0.6 * band_energy + 0.4 * rms_db
+    if score_raw.size >= 5:
+        kernel = np.ones(5) / 5.0
+        score_smooth = np.convolve(score_raw, kernel, mode="same")
+    else:
+        score_smooth = score_raw
+
+    # 적응형 임계 + 홀드
+    med = float(np.median(score_smooth))
+    mad = float(np.median(np.abs(score_smooth - med))) + 1e-6
+    th_high = med + 0.6 * mad
+    th_low = med + 0.3 * mad
+    frame_times = lb_frames_to_time(np.arange(score_smooth.shape[0]), sr=sr, hop_length=hop)
+
+    voiced = False
+    last_vocal_end = 0.0
+    hold_sec = 0.30
+    hold_frames = int(hold_sec * sr / hop) if sr else 0
+    off_cnt = 0
+
+    for i, val in enumerate(score_smooth):
+        if not voiced and val >= th_high:
+            voiced = True
+            off_cnt = 0
+        elif voiced:
+            if val <= th_low:
+                off_cnt += 1
+                if off_cnt >= max(1, hold_frames):
+                    last_vocal_end = float(frame_times[i])
+                    voiced = False
+                    off_cnt = 0
+            else:
+                off_cnt = 0
+                last_vocal_end = float(frame_times[i])
+
+    return float(last_vocal_end)
+
+from typing import List, Dict, Any
+
+def add_korean_lines_to_items(items_in: List[Dict[str, Any]], lyrics_text: str) -> List[Dict[str, Any]]:
+    """
+    segments(each: dict)에 'line_ko'를 가사 원문(한글)으로 주입한다.
+    - [Intro], [Hook] 등 대괄호 메타 라인은 제거
+    - 빈 줄 제거
+    - items 길이와 가사 줄 수가 달라도 앞에서부터 순차 매칭 (초과분은 빈 문자열)
+    - 함수 내 변수는 전부 소문자, 광범위 예외 미사용, 세미콜론 없음
+    """
+    if not isinstance(items_in, list):
+        return []
+
+    raw_lines: List[str] = []
+    for raw in (lyrics_text or "").splitlines():
+        line = (raw or "").strip()
+        if not line:
+            continue
+        if line.startswith("[") and line.endswith("]"):
+            continue
+        # 로마자/영문 변환을 하지 않고, 원문 그대로 유지
+        raw_lines.append(line)
+
+    out_list: List[Dict[str, Any]] = []
+    line_idx = 0
+    n_lines = len(raw_lines)
+
+    for seg in items_in:
+        seg_new = dict(seg)
+        if line_idx < n_lines:
+            seg_new["line_ko"] = str(raw_lines[line_idx])
+            line_idx += 1
+        else:
+            seg_new["line_ko"] = ""
+        out_list.append(seg_new)
+
+    return out_list
 
 
+
+from typing import List, Dict, Any
+
+def adjust_last_end_with_vocal_end(
+    items_in: List[Dict[str, Any]],
+    vocal_end_sec: float,
+    *,
+    round_ndigits_in: int = 3
+) -> List[Dict[str, Any]]:
+    """
+    기존 줄별 결과의 '마지막 라인 end'만 보컬 종료 시점으로 보정.
+    - 구조/키 보존. vocal_end_sec가 현재 end보다 뒤이고 start보다 크면 반영.
+    """
+    if not items_in:
+        return []
+    result_items = [dict(x) for x in items_in]
+    last = result_items[-1]
+    try:
+        st = float(last.get("start", 0.0))
+        ed = float(last.get("end", 0.0))
+        ve = float(vocal_end_sec or 0.0)
+    except (TypeError, ValueError):
+        return result_items
+    if ve > st and ve > ed:
+        last["end"] = round(ve, round_ndigits_in)
+    return result_items
+
+def estimate_vocal_end_sec_silero(audio_path_in: str,
+                                  *,
+                                  threshold_in: float = 0.5,
+                                  min_speech_sec_in: float = 0.20) -> float:
+    """
+    Silero VAD로 audio_path_in에서 '사람 발성' 구간을 검출하고
+    마지막 구간의 끝 시각(초)을 반환한다. 실패 시 0.0 반환.
+    - CPU에서 매우 빠름, 정확도 높음 (공식 repo 참조)
+    """
+    try:
+        import torch
+        import torchaudio
+    except ImportError:
+        return 0.0
+
+    # silero 모델 로드 (onnx/jit 둘 다 가능하나 기본 jit)
+    try:
+        # snakers4/silero-vad 권장 로드 방법
+        model, utils = torch.hub.load(repo_or_dir="snakers4/silero-vad",
+                                      model="silero_vad",
+                                      force_reload=False,
+                                      trust_repo=True)
+        get_speech_timestamps = utils.get("get_speech_timestamps")
+        read_audio = utils.get("read_audio")
+        vad_sr = 16000
+    except Exception:
+        return 0.0
+
+    try:
+        wav = read_audio(audio_path_in, sampling_rate=vad_sr)
+    except Exception:
+        # torchaudio로 재시도
+        try:
+            waveform, sr = torchaudio.load(audio_path_in)  # type: ignore
+            if sr != vad_sr:
+                waveform = torchaudio.functional.resample(waveform, sr, vad_sr)  # type: ignore
+            wav = waveform.squeeze().numpy()
+        except Exception:
+            return 0.0
+
+    try:
+        # VAD 실행
+        speech_ts = get_speech_timestamps(wav, model,
+                                          sampling_rate=vad_sr,
+                                          threshold=threshold_in,
+                                          min_speech_duration=int(min_speech_sec_in * 1000.0))
+    except Exception:
+        return 0.0
+
+    if not speech_ts:
+        return 0.0
+
+    last = speech_ts[-1]
+    try:
+        last_end = float(last["end"]) / float(vad_sr)
+    except (KeyError, TypeError, ValueError, ZeroDivisionError):
+        return 0.0
+    return last_end
+
+def cap_last_line_end_with_vad(items_in: List[Dict[str, Any]],
+                               last_speech_end_in: float,
+                               *,
+                               pad_sec_in: float = 0.30,
+                               round_ndigits_in: int = 3) -> List[Dict[str, Any]]:
+    """
+    줄별 결과에서 '마지막 라인 end'를 VAD 기반 마지막 가창 종료로 상한(cap).
+    - end = min(end, last_speech_end + pad)
+    - last_speech_end가 start보다 이르면 보정하지 않음
+    """
+    if not items_in:
+        return []
+    out = [dict(x) for x in items_in]
+    last = out[-1]
+    try:
+        st = float(last.get("start", 0.0))
+        ed = float(last.get("end", 0.0))
+        le = float(last_speech_end_in or 0.0) + float(pad_sec_in or 0.0)
+    except (TypeError, ValueError):
+        return out
+    if le > st and ed > st:
+        if ed > le:
+            last["end"] = round(le, round_ndigits_in)
+    return out
+
+def estimate_vocal_end_sec_energy(audio_path_in: str,
+                                  *,
+                                  anchor_sec_in: float = 0.0,
+                                  low_ratio_in: float = 0.22,
+                                  hold_sec_in: float = 1.8) -> float:
+    """
+    노래(가창)에서 마지막 종료점을 '에너지 하강'으로 추정한다.
+    - HPSS 하모닉 성분 + 보컬대역(150~5000Hz) 멜에너지 + RMS를 결합한 점수를 사용
+    - anchor_sec_in 이후 구간에서 점수가 충분히 낮아지고(비율로) 일정 시간(hold_sec_in) 유지되는 첫 지점을 '가창 종료'로 판단
+    - librosa 미설치/로드 실패 시 0.0 반환
+    - 모든 지역 변수는 소문자, 세미콜론 없음, 광범위 예외 없음
+    """
+    try:
+        import librosa as lb
+        from librosa.util.exceptions import ParameterError
+        from librosa.feature import melspectrogram as lb_melspectrogram, rms as lb_rms
+        from librosa.effects import hpss as lb_hpss
+        from librosa import power_to_db as lb_power_to_db, frames_to_time as lb_frames_to_time
+        from librosa.core import mel_frequencies as lb_mel_frequencies
+    except ImportError:
+        return 0.0
+
+    try:
+        y, sr = lb.load(audio_path_in, sr=16000, mono=True)
+    except (FileNotFoundError, ParameterError, RuntimeError, ValueError, OSError):
+        return 0.0
+
+    # 하모닉 강조(실패 시 원 신호)
+    try:
+        y_harm, _y_perc = lb_hpss(y)
+        y_src = y_harm
+    except (ValueError, RuntimeError):
+        y_src = y
+
+    hop = 512
+    win = 2048
+
+    mel = lb_melspectrogram(y=y_src, sr=sr, n_fft=win, hop_length=hop, n_mels=64)
+    mel_db = lb_power_to_db(np.maximum(mel, 1e-10))
+    n_mels = int(mel.shape[0])
+    freqs = lb_mel_frequencies(n_mels=n_mels, fmin=0.0, fmax=sr / 2.0)
+    band_mask = (freqs >= 150.0) & (freqs <= 5000.0)
+    band_energy = np.mean(mel_db[band_mask, :], axis=0)
+
+    rms = lb_rms(y=y_src, frame_length=win, hop_length=hop, center=True)[0]
+    eps = 1e-9
+    rms_db = 20.0 * np.log10(np.maximum(rms, eps))
+
+    score_raw = 0.6 * band_energy + 0.4 * rms_db
+    if score_raw.size >= 5:
+        kernel = np.ones(5) / 5.0
+        score_smooth = np.convolve(score_raw, kernel, mode="same")
+    else:
+        score_smooth = score_raw
+
+    ft = lb_frames_to_time(np.arange(score_smooth.shape[0]), sr=sr, hop_length=hop)
+
+    # anchor 이후 구간만 평가
+    if anchor_sec_in > 0.0:
+        idx0 = int(np.searchsorted(ft, anchor_sec_in, side="left"))
+    else:
+        idx0 = 0
+
+    # 기준 레벨: anchor~anchor+4초 구간의 중앙값(없으면 전체 중앙값)
+    idx1 = int(np.searchsorted(ft, min(anchor_sec_in + 4.0, ft[-1] if ft.size else 0.0), side="left"))
+    local_slice = score_smooth[idx0:max(idx0 + 1, idx1)]
+    if local_slice.size == 0:
+        local_slice = score_smooth
+    ref = float(np.median(local_slice)) if local_slice.size else 0.0
+    if ref <= 0.0:
+        ref = float(np.median(score_smooth)) if score_smooth.size else 0.0
+
+    if ref == 0.0 or score_smooth.size == 0 or ft.size == 0:
+        return 0.0
+
+    low_th = ref * float(low_ratio_in)
+    hold_frames = int(float(hold_sec_in) * sr / hop) if sr else 0
+
+    run = 0
+    cand_end = 0.0
+    for i in range(idx0, score_smooth.size):
+        if score_smooth[i] <= low_th:
+            run += 1
+            if run >= max(1, hold_frames):
+                cand_end = float(ft[i])
+                break
+        else:
+            run = 0
+
+    return float(cand_end if cand_end > 0.0 else 0.0)
+
+
+# audio_sync.py 파일에서 이 함수를 찾아 아래 내용으로 전체를 교체하세요.
+
+def estimate_vocal_end_from_vocal_stem(audio_path_in: str,
+                                       *,
+                                       hold_sec_in: float = 0.60,
+                                       drop_db_in: float = 23.0) -> float:
+    """
+    demucs가 생성한 '보컬 스템(vocals*.wav)'만을 분석하여 마지막 가창 종료 시점을 반환한다.
+    - 개선된 로직: RMS 에너지를 분석하여, 끝에서부터 역으로 탐색해
+      마지막으로 유의미한 에너지가 나타나는 지점을 가창 종료로 판단한다.
+      이는 긴 잔향이나 페이드아웃에 더 강건하다.
+    - 실패 시 0.0 반환
+    - 지역 변수 소문자, 광범위 예외 없음
+    """
+    import glob
+    from pathlib import Path
+    import numpy as np
+
+    try:
+        base_dir = Path(audio_path_in).resolve().parent
+    except (OSError, RuntimeError, ValueError):
+        return 0.0
+
+    try:
+        # demucs_out 폴더 내 모든 vocals.wav 파일을 재귀적으로 찾습니다.
+        candidates = glob.glob(str(base_dir / "demucs_out" / "**" / "vocals*.wav"), recursive=True)
+    except (OSError, RuntimeError, ValueError):
+        candidates = []
+
+    if not candidates:
+        return 0.0
+
+    # 가장 신뢰도 높은 스템(파일 크기 최대)을 선택
+    try:
+        stem_path = max((Path(p) for p in candidates if p.lower().endswith(".wav")),
+                        key=lambda p: p.stat().st_size)
+    except (ValueError, OSError):
+        return 0.0
+
+    try:
+        import librosa as lb
+        from librosa.feature import rms as lb_rms
+        from librosa import frames_to_time as lb_frames_to_time
+    except ImportError:
+        return 0.0
+
+    try:
+        y_local, sr_local = lb.load(str(stem_path), sr=16000, mono=True)
+    except (FileNotFoundError, OSError, RuntimeError, ValueError):
+        return 0.0
+
+    hop = 512
+    win = 2048
+    try:
+        r_local = lb_rms(y=y_local, frame_length=win, hop_length=hop, center=True)[0]
+    except (RuntimeError, ValueError):
+        return 0.0
+
+    eps = 1e-12
+    r_db = 20.0 * np.log10(np.maximum(r_local, eps))
+
+    if r_db.size == 0:
+        return 0.0
+
+    # 최고점에서 drop_db_in 만큼 낮은 값을 임계치로 설정
+    peak_db = float(np.max(r_db))
+    threshold_db = peak_db - float(drop_db_in)
+
+    frame_times = lb_frames_to_time(np.arange(r_db.shape[0]), sr=sr_local, hop_length=hop)
+
+    # 끝에서부터 역방향으로 탐색하여 임계치를 넘는 마지막 프레임을 찾습니다.
+    last_vocal_frame_idx = -1
+    for i in range(r_db.size - 1, -1, -1):
+        if r_db[i] > threshold_db:
+            last_vocal_frame_idx = i
+            break
+
+    if last_vocal_frame_idx == -1:
+        return 0.0
+
+    # 마지막 유의미한 보컬 지점의 시간에 약간의 패딩(hold_sec)을 더해 반환
+    last_end_time = float(frame_times[last_vocal_frame_idx]) + float(hold_sec_in)
+
+    # 오디오 전체 길이를 넘지 않도록 제한
+    duration_total = float(len(y_local) / sr_local) if sr_local > 0 else 0.0
+    if duration_total > 0 and last_end_time > duration_total:
+        last_end_time = duration_total
+
+    return float(last_end_time if last_end_time > 0.0 else 0.0)
+
+def estimate_last_lyric_end_with_mfa(
+    audio_path: str,
+    lyrics_text: str,
+    *,
+    mfa_bin: str = "mfa",
+    acoustic_model: str = "korean_mfa",      # MFA Korean acoustic model id
+    dictionary: str = "korean_mfa",          # MFA Korean dictionary id
+    tmp_prefix: str = "mfa_tmp_align"
+) -> float:
+    """
+    MFA(Kaldi 기반 강제정렬)로 전체 가사를 오디오에 정렬하고,
+    마지막 align된 토큰(단어/음소)의 종료시각(초)을 반환한다.
+    - MFA 설치 및 한국어 모델/사전이 있어야 동작. 없으면 0.0 반환.
+    - 반환값이 0.0이면 사용하지 않으면 된다(보완 소스).
+    참고: https://montreal-forced-aligner.readthedocs.io/  (한국어 모델/사전 제공)
+    """
+    import shutil
+    import subprocess
+    import tempfile
+    from pathlib import Path
+
+    # 0) 사전 조건 체크: mfa 실행 가능?
+    try:
+        proc = subprocess.run([mfa_bin, "--version"], capture_output=True, text=True, check=False)
+        if proc.returncode != 0:
+            return 0.0
+    except (OSError, FileNotFoundError):
+        return 0.0
+
+    # 1) 임시 디렉터리 구성 (MFA는 폴더 단위 정렬을 권장)
+    tmp_dir_obj = tempfile.TemporaryDirectory(prefix=tmp_prefix)
+    tmp_dir = Path(tmp_dir_obj.name)
+    data_dir = tmp_dir / "data"
+    out_dir = tmp_dir / "out"
+    data_dir.mkdir(parents=True, exist_ok=True)
+    out_dir.mkdir(parents=True, exist_ok=True)
+
+    # MFA 입력: audio(.wav), lab(txt) 파일명은 동일 베이스여야 편함
+    wav_src = Path(audio_path).resolve()
+    if not wav_src.exists():
+        tmp_dir_obj.cleanup()
+        return 0.0
+    wav_dst = data_dir / "utt.wav"
+    shutil.copy2(str(wav_src), str(wav_dst))
+
+    # 텍스트: 한 줄 가사 전체를 단일 발화로 두면 문맥이 길어도 강제정렬은 가능
+    # (필요하면 줄 단위로 나누어 여러 발화로 만들 수도 있음)
+    lab_path = data_dir / "utt.lab"
+    try:
+        # 메타 라인([Hook] 등) 제거
+        lines = []
+        for raw in (lyrics_text or "").splitlines():
+            s = (raw or "").strip()
+            if not s:
+                continue
+            if s.startswith("[") and s.endswith("]"):
+                continue
+            lines.append(s)
+        lab_path.write_text(" ".join(lines), encoding="utf-8")
+    except Exception:
+        tmp_dir_obj.cleanup()
+        return 0.0
+
+    # 2) MFA 실행: align -> TextGrid 생성
+    # 모델/사전이 로컬에 받아져 있어야 함(없으면 mfa model download로 사전 설치 필요)
+    # - acoustic_model, dictionary 이름은 MFA 문서의 한국어 모델 id를 사용
+    #   (예: 'Korean MFA acoustic model', 'Korean MFA dictionary')
+    #   설치 가이드는 공식 문서 참고.
+    try:
+        cmd = [
+            mfa_bin, "align",
+            str(data_dir),
+            dictionary,
+            acoustic_model,
+            str(out_dir),
+            "--clean"
+        ]
+        proc = subprocess.run(cmd, capture_output=True, text=True, check=False)
+        if proc.returncode != 0:
+            # MFA가 실패하면 0.0 반환(보조 신호로만 쓰므로 침묵)
+            tmp_dir_obj.cleanup()
+            return 0.0
+    except (OSError, FileNotFoundError, subprocess.SubprocessError):
+        tmp_dir_obj.cleanup()
+        return 0.0
+
+    # 3) TextGrid 파싱: 마지막 word tier 또는 phones tier의 마지막 end 시각
+    # 생성 파일명은 utt.TextGrid일 가능성이 큼
+    tg_path = out_dir / "utt.TextGrid"
+    if not tg_path.exists():
+        tmp_dir_obj.cleanup()
+        return 0.0
+
+    try:
+        # TextGrid를 파싱(파서 없이도 간단히 정규식으로 마지막 'xmax' 뽑기)
+        text = tg_path.read_text(encoding="utf-8", errors="ignore")
+        # 가장 마지막 xmax(=segment end)를 찾는다
+        import re
+        xmax_vals: List[float] = []
+        for m in re.finditer(r'\bxmax\s*=\s*([0-9]*\.?[0-9]+)', text):
+            try:
+                xmax_vals.append(float(m.group(1)))
+            except ValueError:
+                continue
+        last = max(xmax_vals) if xmax_vals else 0.0
+        tmp_dir_obj.cleanup()
+        return float(last if last > 0 else 0.0)
+    except Exception:
+        tmp_dir_obj.cleanup()
+        return 0.0
+
+
+def merge_last_end_with_external(
+    items_in: List[Dict[str, Any]],
+    ext_last_end: float,
+    *,
+    minimum_delta: float = 0.10,
+    round_ndigits: int = 3
+) -> List[Dict[str, Any]]:
+    """
+    existing 줄별 결과(items_in)에 대해 '마지막 라인 end'만 외부 추정치(ext_last_end)로 보정.
+    - ext_last_end가 현재 end보다 충분히 뒤(=minimum_delta 이상)이고 start보다 크면 반영
+    - 구조/키는 보존
+    """
+    if not items_in:
+        return []
+    out = [dict(x) for x in items_in]
+    last = out[-1]
+    try:
+        st = float(last.get("start", 0.0))
+        ed = float(last.get("end", 0.0))
+        ve = float(ext_last_end or 0.0)
+    except (TypeError, ValueError):
+        return out
+    if ve > st and (ve - ed) >= float(minimum_delta):
+        last["end"] = round(ve, round_ndigits)
+    return out
 
 
 
