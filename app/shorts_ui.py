@@ -41,10 +41,6 @@ except Exception:
         def normalize_to_v11(story: dict) -> dict:  # type: ignore
             return story
 # shorts_ui.py (상단 import 구역 추가)
-try:
-    from app.audio_sync import analyze_and_cut_project
-except ImportError:
-    from audio_sync import analyze_and_cut_project
 
 # (이미 있다면 중복 추가 금지)
 from app.audio_sync import build_story_json  # ← story/analyze 사용
@@ -105,7 +101,7 @@ except ImportError:
 
 try:
     from app import settings
-    from app.progress import run_job_with_progress_async
+    from app.utils import run_job_with_progress_async
 except ImportError:
     import settings  # type: ignore
     from utils import run_job_with_progress_async  # type: ignore
@@ -439,6 +435,7 @@ class MainWindow(QtWidgets.QMainWindow):
         self._ai = AI()
 
         # 중복 방지
+        self._music_inflight = False  # <-- 이 줄을 추가하여 경고를 해결합니다.
         # --- reentry guard flags (추가) ---
         self._analysis_running = False  # 음악 분석 중복 방지
         self._story_build_running = False  # story.json 빌드 중복 방지
@@ -1562,18 +1559,20 @@ class MainWindow(QtWidgets.QMainWindow):
     def on_click_analyze_music(self) -> None:
         """
         음악분석:
-          - 종료 시간 추정 로직의 우선순위를 수정하여 정확도 향상.
-          - project/story에서 가사 확보
-          - '가사 변환 여부'를 정규화 비교로 정확히 판단해 표시
-          - project.json의 auto_tags 실제 값을 리포트에 표시
-          - PRO 파이프 호출(강제 앵커 사용 안 함)
-          - 진행창 비동기 + (옵션) tail_file 실시간 테일링
+          - 상세 흐름 추적을 위한 CHECKPOINT 로그 유지.
+          - Whisper 원본 인식(단어) 로그 출력 유지.
+          - project.json::lyrics_lls([ko])가 있으면, WORD 타임스탬프를 이용해
+            '라인별 타임 매핑'을 표시 전용으로 계산/출력(기존 세그먼트/반환 불변).
+          - 영어(translate) 프린트는 제거.
+          - pro 파이프라인에서 whisper_words가 없을 때, audio_sync.transcribe_words 폴백으로 WORD 타임라인 확보.
         """
         from pathlib import Path
-        from typing import List
+        from typing import List, Tuple, Dict, Any
         from PyQt5 import QtWidgets
 
-        # --- 버튼: 오직 btn_analyze_music만 제어(레거시 제거) ---
+        print("\n--- CHECKPOINT 1: on_click_analyze_music 함수 시작 ---")
+
+        # --- 버튼: 오직 btn_analyze_music만 제어 ---
         btn = getattr(self, "btn_analyze_music", None) or getattr(getattr(self, "ui", None), "btn_analyze_music", None)
         if isinstance(btn, QtWidgets.QAbstractButton):
             btn.setEnabled(False)
@@ -1601,13 +1600,15 @@ class MainWindow(QtWidgets.QMainWindow):
             return
 
         has_pro = callable(getattr(audio_sync_mod, "sync_lyrics_with_whisper_pro", None))
-        has_base = callable(getattr(audio_sync_mod, "sync_lyrics_with_whisper", None))
         prepare_lines = getattr(audio_sync_mod, "prepare_pure_lyrics_lines", None)
-        if not (has_pro or has_base) or not callable(prepare_lines):
+        transcribe_words_fn = getattr(audio_sync_mod, "transcribe_words", None)
+        if not has_pro or not callable(prepare_lines):
             if isinstance(btn, QtWidgets.QAbstractButton):
                 btn.setEnabled(True)
             QtWidgets.QMessageBox.critical(self, "음악분석 실패", "audio_sync에 필요한 함수가 없습니다.")
             return
+
+        print("--- CHECKPOINT 2: 모듈 로드 완료 ---")
 
         # --- 프로젝트/오디오/가사 수집 ---
         try:
@@ -1620,6 +1621,8 @@ class MainWindow(QtWidgets.QMainWindow):
                 btn.setEnabled(True)
             QtWidgets.QMessageBox.critical(self, "음악분석 실패", "프로젝트 폴더가 없습니다.")
             return
+
+        print(f"--- CHECKPOINT 3: 프로젝트 폴더 확인 ({proj_dir}) ---")
 
         # 보컬 파일(최근 것)
         vocal_path_raw = None
@@ -1641,15 +1644,18 @@ class MainWindow(QtWidgets.QMainWindow):
             QtWidgets.QMessageBox.critical(self, "음악분석 실패", "보컬 오디오 파일을 찾을 수 없습니다.")
             return
 
+        print(f"--- CHECKPOINT 4: 보컬 파일 확인 ({vocal_path_str}) ---")
+
         # project.json / story.json
         pj = Path(proj_dir) / "project.json"
         auto_tags_flag = None
         lyrics_raw = ""
-
+        lyrics_lls_raw = ""
         if pj.exists():
             pj_data = load_json(pj, {}) or {}
             if isinstance(pj_data, dict):
                 lyrics_raw = str(pj_data.get("lyrics") or "").strip()
+                lyrics_lls_raw = str(pj_data.get("lyrics_lls") or "").strip()
                 if "auto_tags" in pj_data:
                     auto_tags_flag = bool(pj_data.get("auto_tags"))
 
@@ -1666,13 +1672,16 @@ class MainWindow(QtWidgets.QMainWindow):
             QtWidgets.QMessageBox.critical(self, "음악분석 실패", "가사를 찾지 못했습니다.")
             return
 
+        print(f"--- CHECKPOINT 5: 가사 확인 (길이: {len(lyrics_raw)}) ---")
+        if lyrics_lls_raw:
+            print("[INFO] Using project.json::lyrics_lls (EN/[ko]) for alignment/printout")
+
         # --- 가사 정규화 / 변환 여부 판정 ---
         def _norm_text(s: str) -> str:
             if not isinstance(s, str):
                 return ""
             s2 = s.replace("\r\n", "\n").replace("\r", "\n")
-            lines_ = [ln.strip() for ln in s2.split("\n")]
-            lines_ = [ln for ln in lines_ if ln != ""]
+            lines_ = [ln.strip() for ln in s2.split("\n") if ln.strip()]
             return "\n".join(lines_)
 
         lyrics_before = _norm_text(lyrics_raw)
@@ -1690,8 +1699,93 @@ class MainWindow(QtWidgets.QMainWindow):
         except Exception:
             tail_path = None
 
+        # ===== 라인-타임 매핑 보조 유틸(표시 전용) =====
+        def _is_hangul_syllable(ch: str) -> bool:
+            code = ord(ch)
+            return 0xAC00 <= code <= 0xD7A3
+
+        l_map = [
+            "g", "kk", "n", "d", "tt", "r", "m", "b", "pp", "s",
+            "ss", "", "j", "jj", "ch", "k", "t", "p", "h",
+        ]
+        v_map = [
+            "a", "ae", "ya", "yae", "eo", "e", "yeo", "ye", "o",
+            "wa", "wae", "oe", "yo", "u", "wo", "we", "wi", "yu",
+            "eu", "ui", "i",
+        ]
+        t_map = [
+            "", "k", "k", "k", "n", "n", "n", "t", "l", "lk", "lm", "lp",
+            "ls", "lt", "lp", "lh", "m", "p", "p", "t", "t", "ng",
+            "t", "t", "k", "t", "p", "t",
+        ]
+
+        def _romanize_token(token: str) -> str:
+            out_parts: List[str] = []
+            buf: List[str] = []
+            sbase = 0xAC00
+            vcount = 21
+            tcount = 28
+            ncount = vcount * tcount
+            roman_syllables: List[str] = []
+            only_hangul = True
+            for ch in token:
+                if _is_hangul_syllable(ch):
+                    s_index = ord(ch) - sbase
+                    l_index = s_index // ncount
+                    v_index = (s_index % ncount) // tcount
+                    t_index = s_index % tcount
+                    l = l_map[l_index]
+                    v = v_map[v_index]
+                    t = t_map[t_index]
+                    roman_syllables.append(l + v + t)
+                else:
+                    only_hangul = False
+                    if roman_syllables:
+                        out_parts.append("-".join(roman_syllables))
+                        roman_syllables = []
+                    buf.append(ch)
+            if roman_syllables:
+                out_parts.append("-".join(roman_syllables))
+            if buf:
+                out_parts.append("".join(buf))
+            s = "".join(out_parts).strip()
+            if only_hangul:
+                s = s.lower()
+            return s
+
+        def _roma_norm_token(tok: str) -> str:
+            t = (tok or "").lower()
+            kept = []
+            for ch in t:
+                if ("a" <= ch <= "z") or ("0" <= ch <= "9") or ch == "-" or ch == " ":
+                    kept.append(ch)
+            return "".join(kept).strip()
+
+        def _split_ko_lines_from_lyrics_lls(s: str) -> List[str]:
+            if not s:
+                return []
+            raw = s.replace("\r\n", "\n").replace("\r", "\n").split("\n")
+            out_lines: List[str] = []
+            for ln in raw:
+                t = ln.strip()
+                if not t:
+                    continue
+                if t.startswith("[") and t.endswith("]"):
+                    continue
+                if t.startswith("[ko]"):
+                    out_lines.append(t[4:].strip())
+            return out_lines
+
+        def _fmt_time(t: float) -> str:
+            t = float(t or 0.0)
+            m = int(t // 60)
+            s = t - (m * 60)
+            return f"{m:02d}:{s:06.3f}"
+
         # --- 분석 잡 정의 ---
         def job(log):
+            print("--- CHECKPOINT 7: 'job' 함수 내부 진입 ---")
+
             def slog(tag: str, msg: str) -> None:
                 try:
                     log({"msg": f"[{tag}] {msg}"})
@@ -1701,14 +1795,14 @@ class MainWindow(QtWidgets.QMainWindow):
             print("[FLOW] STEP 1) job() 진입")
             slog("FLOW", "STEP 1) 시작: job() 진입")
 
-            from pathlib import Path
+            from pathlib import Path as _P
             slog("음악분석", f"오디오: {Path(vocal_path_str).name}")
             print(f"[FLOW] 오디오 파일 = {Path(vocal_path_str).name}")
 
             try:
                 lines_for_api = prepare_lines(lyrics_for_api, drop_section_tags=True)
-                print(f"[FLOW] STEP 2) 가사 전처리 완료: lines={len(lines_for_api)}")
-                slog("FLOW", f"STEP 2) 가사 전처리 완료: lines={len(lines_for_api)}")
+                print(f"[FLOW] STEP 2) 가사 전처리 완료(EN): lines={len(lines_for_api)}")
+                slog("FLOW", f"STEP 2) 가사 전처리 완료(EN): lines={len(lines_for_api)}")
             except (RuntimeError, ValueError, TypeError):
                 lines_for_api = [s for s in lyrics_for_api.splitlines() if s.strip()]
                 print(f"[FLOW] STEP 2) 가사 전처리 폴백: lines={len(lines_for_api)}")
@@ -1754,108 +1848,10 @@ class MainWindow(QtWidgets.QMainWindow):
                     )
                 print("[FLOW] STEP 3) 싱크 종료")
                 slog("FLOW", "STEP 3) 싱크 종료")
+
             except (RuntimeError, ValueError, OSError) as e:
                 print(f"[ERROR] whisper 정렬 실패: {e}")
                 slog("ERROR", f"whisper 정렬 실패: {e}")
-
-            segments0 = (res or {}).get("segments") or []
-            print(f"[FLOW] STEP 4) 싱크 결과 수집: segments0={len(segments0)}")
-            slog("FLOW", f"STEP 4) 싱크 결과 수집: segments0={len(segments0)}")
-
-            try:
-                from app.audio_sync import (
-                    add_korean_lines_to_items,
-                    merge_last_end_with_external,
-                    estimate_vocal_end_from_vocal_stem,
-                    estimate_last_lyric_end_with_mfa,
-                    estimate_vocal_end_sec,
-                )
-                print("[FLOW] STEP 5) 헬퍼 import: app.audio_sync 사용")
-                slog("FLOW", "STEP 5) 헬퍼 import: app.audio_sync 사용")
-
-                seg_src = (res or {}).get("segments") or []
-                print(f"[FLOW] STEP 6) 후처리 입력: seg_src={len(seg_src)}")
-                slog("FLOW", f"STEP 6) 후처리 입력: seg_src={len(seg_src)}")
-
-                try:
-                    if seg_src:
-                        cur_st = float(seg_src[-1].get("start", 0.0))
-                        cur_ed = float(seg_src[-1].get("end", 0.0))
-                        print(f"[DEBUG] 현재 마지막 줄: start={cur_st:.3f}s, end={cur_ed:.3f}s")
-                        slog("DEBUG", f"현재 마지막 줄: start={cur_st:.3f}s, end={cur_ed:.3f}s")
-                except (RuntimeError, ValueError, TypeError):
-                    pass
-
-                if seg_src and callable(add_korean_lines_to_items):
-                    seg_src = add_korean_lines_to_items(seg_src, lyrics_raw)
-                    try:
-                        cnt_ko = sum(1 for it in seg_src if str(it.get("line_ko") or "").strip())
-                    except (RuntimeError, ValueError, TypeError):
-                        cnt_ko = 0
-                    print(f"[DEBUG] line_ko 주입: non_empty={cnt_ko}/{len(seg_src)}")
-                    slog("DEBUG", f"line_ko 주입: non_empty={cnt_ko}/{len(seg_src)}")
-
-                ext_end = 0.0
-                v_stem = v_mfa = v_basic = 0.0
-
-                try:
-                    if callable(estimate_vocal_end_from_vocal_stem):
-                        v_stem = float(estimate_vocal_end_from_vocal_stem(str(vocal_path_str)) or 0.0)
-                    print(f"[DEBUG] ext 후보 stem_end={v_stem:.3f}s")
-                    slog("DEBUG", f"ext 후보 stem_end={v_stem:.3f}s")
-                except (RuntimeError, ValueError, TypeError):
-                    print("[DEBUG] ext 후보 stem_end 계산 실패")
-                    slog("DEBUG", "ext 후보 stem_end 계산 실패")
-
-                try:
-                    if callable(estimate_last_lyric_end_with_mfa):
-                        v_mfa = float(estimate_last_lyric_end_with_mfa(str(vocal_path_str), lyrics_raw) or 0.0)
-                    print(f"[DEBUG] ext 후보 mfa_end={v_mfa:.3f}s")
-                    slog("DEBUG", f"ext 후보 mfa_end={v_mfa:.3f}s")
-                except (RuntimeError, ValueError, TypeError):
-                    print("[DEBUG] ext 후보 mfa_end 계산 실패")
-                    slog("DEBUG", "ext 후보 mfa_end 계산 실패")
-
-                try:
-                    if callable(estimate_vocal_end_sec):
-                        v_basic = float(estimate_vocal_end_sec(str(vocal_path_str)) or 0.0)
-                    print(f"[DEBUG] ext 후보 basic_end={v_basic:.3f}s")
-                    slog("DEBUG", f"ext 후보 basic_end={v_basic:.3f}s")
-                except (RuntimeError, ValueError, TypeError):
-                    print("[DEBUG] ext 후보 basic_end 계산 실패")
-                    slog("DEBUG", "ext 후보 basic_end 계산 실패")
-
-                # FIX: 최종 종료 시간 선택 우선순위를 (1)MFA -> (2)보컬 스템 -> (3)기본 순으로 변경합니다.
-                if v_mfa > 0.0:
-                    ext_end = v_mfa
-                    print(f"[FLOW] STEP 7) ext 선택: mfa_end={ext_end:.3f}s")
-                    slog("FLOW", f"STEP 7) ext 선택: mfa_end={ext_end:.3f}s")
-                elif v_stem > 0.0:
-                    ext_end = v_stem
-                    print(f"[FLOW] STEP 7) ext 선택: stem_end={ext_end:.3f}s")
-                    slog("FLOW", f"STEP 7) ext 선택: stem_end={ext_end:.3f}s")
-                elif v_basic > 0.0:
-                    ext_end = v_basic
-                    print(f"[FLOW] STEP 7) ext 선택: basic_end={ext_end:.3f}s")
-                    slog("FLOW", f"STEP 7) ext 선택: basic_end={ext_end:.3f}s")
-
-                print(f"[FLOW] STEP 7) ext 최종 ext_end={ext_end:.3f}s")
-                slog("FLOW", f"STEP 7) ext 최종 ext_end={ext_end:.3f}s")
-
-                if seg_src and ext_end > 0.0:
-                    if callable(merge_last_end_with_external):
-                        prev_end = float(seg_src[-1].get("end", 0.0))
-                        seg_src = merge_last_end_with_external(seg_src, ext_end, minimum_delta=0.10, round_ndigits=3)
-                        new_end = float(seg_src[-1].get("end", prev_end))
-                        print(f"[FLOW] STEP 8) merge 확장 적용: prev_end={prev_end:.3f}s -> new_end={new_end:.3f}s")
-                        slog("FLOW", f"STEP 8) merge 확장 적용: prev_end={prev_end:.3f}s -> new_end={new_end:.3f}s")
-
-                if isinstance(res, dict):
-                    res["segments"] = seg_src
-
-            except (ImportError, RuntimeError, ValueError, TypeError) as e:
-                print(f"[WARN] 후처리 일부 미적용: {e}")
-                slog("WARN", f"후처리 일부 미적용: {e}")
 
             segments = (res or {}).get("segments") or []
             onsets = (res or {}).get("onsets") or []
@@ -1863,6 +1859,33 @@ class MainWindow(QtWidgets.QMainWindow):
             duration_sec = float((res or {}).get("duration_sec", 0.0))
             start_at = float((res or {}).get("start_at", 0.0))
             pro_info = (res or {}).get("__pro_info__") or {}
+
+            # --- 디버그 whisper_words 우선 사용 ---
+            ww = []
+            try:
+                debug_info = (pro_info.get("debug") or {})
+                ww = debug_info.get("whisper_words") or []
+            except Exception:
+                ww = []
+
+            # --- 폴백: whisper_words가 없으면 로컬 한국어 ASR 한 번 더 돌려 WORD 타임라인 확보 ---
+            # 반환/정렬 결과에는 영향 주지 않고, 표시 전용으로만 사용
+            if not ww and callable(transcribe_words_fn):
+                try:
+                    print("[INFO] whisper_words empty → fallback to local transcribe_words for WORD timeline",
+                          flush=True)
+                    tw_res = transcribe_words_fn(
+                        path=str(vocal_path_str),
+                        model_size="medium",
+                        initial_prompt="",
+                        beam_size=5,
+                        vad_filter=False,
+                    )
+                    tw_words = (tw_res or {}).get("words") or []
+                    # tw_words: List[Tuple[float, float, str]]
+                    ww = tw_words
+                except (RuntimeError, ValueError, OSError, TypeError) as e:
+                    print(f"[WARN] local transcribe_words fallback failed: {e}", flush=True)
 
             try:
                 if segments:
@@ -1890,12 +1913,12 @@ class MainWindow(QtWidgets.QMainWindow):
                     f"global_shift_applied = {pro_info.get('global_shift_applied_sec', 0.0):.3f}s, "
                     f"affine(a={pro_info.get('affine_a', 1.0):.3f}, b={pro_info.get('affine_b', 0.0):.3f})"
                 )
+
+            # === 기존 줄별 정합 표시(유지) ===
             summary.append("")
             summary.append("=== 줄별 정합 ===")
-
             korean_lines = [ln for ln in lyrics_raw.splitlines() if
                             ln.strip() and not (ln.strip().startswith("[") and ln.strip().endswith("]"))]
-
             if segments:
                 for i, seg in enumerate(segments, 1):
                     try:
@@ -1903,20 +1926,98 @@ class MainWindow(QtWidgets.QMainWindow):
                         et = float(seg.get("end", 0.0))
                         line_ko = str(seg.get("line_ko") or "")
                         tx = str(seg.get("text") or "")
-
                         if line_ko:
                             view_line = line_ko
                         elif 0 <= (i - 1) < len(korean_lines):
                             view_line = korean_lines[i - 1]
                         else:
                             view_line = tx
-
-                        ok = "OK" if seg.get("ok") else "--"
+                        ok = "--"
                         summary.append(f"[{i:02d}] {ok} {st:6.2f}~{et:6.2f}  {view_line}")
                     except (RuntimeError, ValueError, TypeError):
                         summary.append(f"[{i:02d}] {str(seg)}")
             else:
                 summary.append("(줄별 정합 결과 없음)")
+
+            # ===== 신규: lyrics_lls([ko]) 기반 라인-타임 매핑 (표시 전용) =====
+            def _build_line_time_mapping(ww_seq: List[Tuple[float, float, str]]) -> List[str]:
+                lines_out: List[str] = []
+                if not lyrics_lls_raw or not ww_seq:
+                    return lines_out
+
+                # 1) WORD 타임라인 → 로마자/정규화 토큰으로 변환
+                wlist: List[Tuple[float, float, str, str]] = []
+                for item in ww_seq:
+                    try:
+                        ws, we, tok = item
+                        tok_str = str(tok or "").strip()
+                        if not tok_str:
+                            continue
+                        tok_roma = _romanize_token(tok_str)
+                        tok_norm = _roma_norm_token(tok_roma).replace(" ", "")
+                        if not tok_norm:
+                            continue
+                        wlist.append((float(ws), float(we), tok_roma, tok_norm))
+                    except (ValueError, TypeError):
+                        continue
+
+                # 2) lyrics_lls의 [ko] 라인
+                ko_lines = _split_ko_lines_from_lyrics_lls(lyrics_lls_raw)
+                cursor = 0
+                for idx, ko_line in enumerate(ko_lines, 1):
+                    line_disp = ko_line
+                    raw_tokens = [t for t in ko_line.split() if t.strip()]
+                    sub_tokens: List[str] = []
+                    for t in raw_tokens:
+                        t_norm = _roma_norm_token(t)
+                        parts = [p for p in t_norm.split("-") if p]
+                        if parts:
+                            sub_tokens.extend(parts)
+                    if not sub_tokens:
+                        lines_out.append(f"[{idx:02d}] (no segment)  {line_disp}")
+                        continue
+
+                    start_tok = sub_tokens[0]
+                    end_tok = sub_tokens[-1]
+
+                    start_idx = -1
+                    for j in range(cursor, len(wlist)):
+                        if wlist[j][3] == start_tok:
+                            start_idx = j
+                            break
+                    if start_idx == -1:
+                        lines_out.append(f"[{idx:02d}] (no segment)  {line_disp}")
+                        continue
+
+                    end_idx = start_idx
+                    for j in range(start_idx, len(wlist)):
+                        if wlist[j][3] == end_tok:
+                            end_idx = j
+
+                    st_time = wlist[start_idx][0]
+                    ed_time = wlist[end_idx][1]
+                    if ed_time < st_time:
+                        ed_time = st_time
+
+                    lines_out.append(f"[{idx:02d}] {_fmt_time(st_time)} ~ {_fmt_time(ed_time)}  {line_disp}")
+                    cursor = max(cursor, end_idx + 1)
+
+                return lines_out
+
+            # 디버그 or 폴백에서 얻은 ww로 매핑 생성
+            line_map_rows: List[str] = []
+            try:
+                if ww:
+                    line_map_rows = _build_line_time_mapping(ww)
+            except (RuntimeError, ValueError, TypeError) as e:
+                line_map_rows = [f"(mapping failed: {e})"]
+
+            summary.append("")
+            summary.append("=== 라인-타임 매핑 ([ko] from lyrics_lls) ===")
+            if line_map_rows:
+                summary.extend(line_map_rows)
+            else:
+                summary.append("(no WORD timeline; whisper_words unavailable)")
 
             print("[FLOW] STEP 11) 요약 출력 완료")
             slog("FLOW", "STEP 11) 요약 출력 완료")
@@ -1933,7 +2034,7 @@ class MainWindow(QtWidgets.QMainWindow):
                 print("\n[음악분석 결과]\n" + text, flush=True)
 
                 dlg = QtWidgets.QDialog(self)
-                dlg.setWindowTitle("음악분석 결과 — 자동보정(앵커 하드코딩 없음)")
+                dlg.setWindowTitle("음악분석 결과 — 자동보정")
                 dlg.resize(1000, 760)
                 vbox = QtWidgets.QVBoxLayout(dlg)
                 ed = QtWidgets.QPlainTextEdit()
@@ -1951,12 +2052,13 @@ class MainWindow(QtWidgets.QMainWindow):
                 if isinstance(btn, QtWidgets.QAbstractButton):
                     btn.setEnabled(True)
 
+        print("--- CHECKPOINT 6: 비동기 작업(run_job_with_progress_async) 호출 직전 ---")
         try:
-            from app.progress import run_job_with_progress_async as run_async
+            from app.utils import run_job_with_progress_async
         except Exception:
-            from utils import run_job_with_progress_async as run_async
+            from utils import run_job_with_progress_async  # type: ignore
 
-        run_async(self, "음악분석", job, tail_file=tail_path, on_done=done)
+        run_job_with_progress_async(self, "음악분석", job, tail_file=tail_path, on_done=done)
 
     @staticmethod
     def _persist_lyric_sections(*, proj_dir: str, sections: list, last_end: float) -> None:
@@ -3855,16 +3957,16 @@ class MainWindow(QtWidgets.QMainWindow):
         #    - 이미 연결되었는지 플래그로 확인
         if not getattr(self, "_tags_signal_bound", False):
             def _bind_cb_list(cbs):
-                for cb in cbs:
+                for cbb in cbs:
                     # QCheckBox / QRadioButton 호환: stateChanged 또는 toggled 사용 가능
-                    if hasattr(cb, "stateChanged"):
+                    if hasattr(cbb, "stateChanged"):
                         try:
-                            cb.stateChanged.connect(self._on_tags_changed)  # type: ignore[attr-defined]
+                            cbb.stateChanged.connect(self._on_tags_changed)  # type: ignore[attr-defined]
                         except Exception:
                             pass
-                    if hasattr(cb, "toggled"):
+                    if hasattr(cbb, "toggled"):
                         try:
-                            cb.toggled.connect(self._on_tags_changed)  # type: ignore[attr-defined]
+                            cbb.toggled.connect(self._on_tags_changed)  # type: ignore[attr-defined]
                         except Exception:
                             pass
 

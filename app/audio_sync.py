@@ -1732,66 +1732,104 @@ def _norm_txt(s: str) -> str:
     s = re.sub(r"\s+", "", (s or ""))
     return s
 
-def align_words_to_lyrics_lines(official_lyrics: str, words: List[Tuple[float, float, str]]) -> List[Tuple[Optional[float], Optional[float], str]]:
+
+# audio_sync.py 파일에서 이 함수를 찾아 아래 내용으로 전체를 교체하세요.
+
+def align_words_to_lyrics_lines(official_lyrics: str, words: List[Tuple[float, float, str]]) -> List[
+    Tuple[Optional[float], Optional[float], str]]:
     """
-    줄바꿈 기준 공식 가사 라인과 Whisper 단어 시퀀스를 그리디하게 정렬
+    줄바꿈 기준 공식 가사 라인과 Whisper 단어 시퀀스를 정렬한다.
+    개선된 로직:
+      1. rapidfuzz를 이용한 편집 거리(Levenshtein)로 더 빠르고 정확한 유사도 측정.
+      2. 전체 텍스트를 정규화하여 비교함으로써 인식 오류에 더 강건하게 대응.
+      3. 각 가사 라인에 가장 적합한 단어 시퀀스 구간을 탐색하여 할당.
     결과: (start, end, line_text) 리스트. 실패 라인은 (None, None, line_text)
     """
-    lines = [ln.strip() for ln in (official_lyrics or "").replace("\r", "").split("\n")]
-    lines = [ln for ln in lines if ln.strip()]
-    i = 0
-    n = len(words)
+    import re
+    from typing import List, Tuple, Optional
+
+    # --- 내부 헬퍼: 텍스트 정규화 ---
+    def _normalize_text_for_matching(text: str) -> str:
+        # 소문자 변환, 구두점 제거, 공백 정규화
+        s = (text or "").lower().strip()
+        s = re.sub(r"[^a-z0-9가-힣\s]", " ", s)
+        return re.sub(r"\s+", " ", s).strip()
+
+    # --- rapidfuzz 라이브러리 로드 ---
+    try:
+        from rapidfuzz.distance import Levenshtein
+    except ImportError:
+        # rapidfuzz가 없으면 기능이 제한되므로 빈 결과 반환
+        lines_fallback = [ln.strip() for ln in (official_lyrics or "").splitlines() if ln.strip()]
+        return [(None, None, ln) for ln in lines_fallback]
+
+    # --- 메인 로직 ---
+    # 1. 입력 준비
+    lines_original = [ln.strip() for ln in (official_lyrics or "").splitlines() if ln.strip()]
+    if not lines_original or not words:
+        return [(None, None, ln) for ln in lines_original]
+
+    # 2. ASR 결과를 단어 단위로 분할하여 준비
+    #   - words 리스트는 (start_time, end_time, text) 형태의 튜플로 가정
+    asr_words_norm = [_normalize_text_for_matching(w[2]) for w in words]
+    asr_words_norm = [word for word in asr_words_norm if word]  # 빈 단어 제거
+
+    # 3. 각 가사 라인을 ASR 단어 시퀀스에서 매칭
     aligned: List[Tuple[Optional[float], Optional[float], str]] = []
+    word_cursor = 0  # ASR 단어 시퀀스에서 검색 시작 위치
 
-    # 거리 함수: rapidfuzz 우선, 실패 시 difflib
-    def _dist(a: str, b: str) -> float:
-        try:
-            from rapidfuzz.distance import Levenshtein  # type: ignore
-            return float(Levenshtein.distance(a, b))
-        except Exception:
-            import difflib
-            # difflib는 1.0이 유사, 여기선 거리로 바꿔 사용
-            ratio = difflib.SequenceMatcher(None, a, b).ratio()
-            return float(max(len(a), len(b)) * (1.0 - ratio))
-
-    for ln in lines:
-        target = _norm_txt(ln)
-        if not target:
-            aligned.append((None, None, ln))
+    for line_text in lines_original:
+        line_norm = _normalize_text_for_matching(line_text)
+        if not line_norm:
+            aligned.append((None, None, line_text))
             continue
 
-        best_j = i
-        best_cost = 1e9
-        best_span = None
+        line_words = line_norm.split()
+        if not line_words:
+            aligned.append((None, None, line_text))
+            continue
 
-        buf = ""
-        start_t = None
-        for j in range(i, min(i + 250, n)):
-            ws, we, wt = words[j]
-            token = (wt or "").strip()
-            if not token:
-                continue
-            if start_t is None:
-                start_t = ws
-            buf += token
-            cand = _norm_txt(buf)
-            if len(cand) > len(target) * 1.6:
-                break
-            cost = _dist(cand, target)
-            norm = cost / max(1, len(target))
-            score = norm + abs(len(target) - len(cand)) * 0.01
-            if score < best_cost:
-                best_cost = score
-                best_j = j + 1
-                best_span = (start_t, we)
-            if norm <= 0.22:
-                break
+        # 검색할 ASR 단어의 범위를 현재 커서부터로 한정
+        search_words = asr_words_norm[word_cursor:]
 
-        if best_span is None:
-            aligned.append((None, None, ln))
+        # Levenshtein 유사도를 사용하여 최적의 시작점 탐색
+        best_sim = -1.0
+        best_idx = -1
+
+        # 검색 범위를 적절히 제한하여 불필요한 계산 감소
+        search_range = len(search_words) - len(line_words) + 1
+        for i in range(search_range):
+            # 비교할 ASR 단어 윈도우 생성
+            window_text = " ".join(search_words[i: i + len(line_words)])
+
+            # 정규화된 유사도 계산
+            sim = Levenshtein.normalized_similarity(line_norm, window_text)
+
+            if sim > best_sim:
+                best_sim = sim
+                best_idx = i
+                # 매우 높은 유사도를 찾으면 탐색 조기 종료
+                if sim >= 0.95:
+                    break
+
+        # 4. 결과 처리
+        if best_sim > 0.4:  # 유사도 40% 이상일 때만 채택 (좀 더 관대한 기준)
+            start_word_idx = word_cursor + best_idx
+            end_word_idx = start_word_idx + len(line_words) - 1
+
+            if 0 <= start_word_idx < len(words) and 0 <= end_word_idx < len(words):
+                start_time = words[start_word_idx][0]
+                end_time = words[end_word_idx][1]
+
+                # 원본 가사 텍스트와 함께 시간 정보 저장
+                aligned.append((start_time, end_time, line_text))
+                word_cursor = end_word_idx + 1  # 다음 검색을 위해 커서 이동
+            else:
+                # 계산된 인덱스가 범위를 벗어난 경우 (이론상 발생하기 어려움)
+                aligned.append((None, None, line_text))
         else:
-            aligned.append((best_span[0], best_span[1], ln))
-            i = best_j
+            # 매칭 실패
+            aligned.append((None, None, line_text))
 
     return aligned
 
@@ -1814,90 +1852,185 @@ def prepare_pure_lyrics_lines(raw_lyrics: str, drop_section_tags: bool = True) -
 # ------------------------------------------------------------
 # 1) Whisper 전사: CPU 고정 + initial_prompt 안전 + 폴백
 # ------------------------------------------------------------
-from typing import Dict, Any  # 파일 상단에 이미 있다면 중복 무시
 
 def transcribe_words(
     path: str,
-    model_size: str = "medium",
-    initial_prompt: str = "",
+    model_size: str | None = None,
     *,
+    model: str | None = None,
     beam_size: int = 5,
-    vad_filter: bool = False,  # 인자 유지(호출 시그니처 보존)
-) -> Dict[str, Any]:
+    initial_prompt: str | None = None,
+    language: str | None = None,
+    print_translate_view: bool = True,
+    vad_filter: bool | None = None,  # 호출부 호환
+    **kwargs,                         # 호출부 호환
+) -> dict:
     """
-    오디오를 Whisper로 전사하여 단어 타임스탬프를 반환한다.
-    - CPU 전용(CUDA 완전 차단)
-    - faster-whisper 우선, 실패 시 빈 dict 반환(상위 폴백 로직이 처리)
-    반환 형식: {"segments":[{start,end,text}], "words":[(ws,we,token),...]}
-    실패 시 {}.
+    오디오 → 단어 단위 타임라인.
+    - faster-whisper(CT2, CPU) 우선 → 실패 시 openai-whisper(CPU) 폴백
+    - 콘솔에 [SEG]/[WORD] 로그 출력 (기존 포맷 유지)
+    반환:
+      {
+        "segments": List[Tuple[float, float, str]],
+        "words":    List[Tuple[float, float, str]],
+      }
     """
-    import os
-    import re
-    import inspect
+    from pathlib import Path
     from typing import Any, Dict, List, Tuple
 
-    p = (path or "").strip()
-    if not p or not os.path.isfile(p):
-        return {}
+    def _fmt(t: float) -> str:
+        return f"{t:06.3f}"
 
-    # 인터페이스 보존을 위해 받지만, 내부에서는 항상 False로 강제.
-    _ = bool(vad_filter)  # 경고 억제용: 값 자체는 사용하지 않음
+    mdl = (model_size or model or "medium")
+    try:
+        bs = int(beam_size)
+    except (TypeError, ValueError):
+        bs = 5
 
-    def _trim_prompt(text: str) -> str:
-        text = re.sub(r"\s+", " ", text or "").strip()
-        parts = [w for w in text.split(" ") if w]
-        if len(parts) > 80:
-            parts = parts[:80]
-        s2 = " ".join(parts)
-        if len(s2.encode("utf-8")) > 1000:
-            b = s2.encode("utf-8")[:1000]
-            try:
-                s2 = b.decode("utf-8", errors="ignore")
-            except Exception:
-                s2 = ""
-        return s2
+    p = Path(path)
+    if not p.exists() or not p.is_file():
+        raise FileNotFoundError(f"audio file not found: {path}")
 
-    initial_prompt = _trim_prompt(initial_prompt)
+    print(f"[transcribe_words] start path='{path}', model='{mdl}', beam_size={bs}")
 
-    # faster-whisper (CPU, int8)
+    segments_list: List[Tuple[float, float, str]] = []
+    words_list: List[Tuple[float, float, str]] = []
+
+    # 허용 키 선별(불필요 경고 방지)
+    fw_allow = {
+        "temperature", "beam_size", "patience", "length_penalty",
+        "compression_ratio_threshold", "logprob_threshold", "no_speech_threshold",
+        "condition_on_previous_text", "task", "vad_filter", "initial_prompt", "language",
+        "best_of",
+    }
+    ow_allow = {
+        "temperature", "beam_size", "patience", "length_penalty",
+        "compression_ratio_threshold", "logprob_threshold", "no_speech_threshold",
+        "condition_on_previous_text", "task", "language",
+        "best_of",
+    }
+
+    # 1) faster-whisper (CPU)
     try:
         from faster_whisper import WhisperModel  # type: ignore
-        os.environ.setdefault("CUDA_VISIBLE_DEVICES", "")
-        model = WhisperModel(model_size, device="cpu", compute_type="int8")
 
-        sig = inspect.signature(model.transcribe)
-        call_kwargs: Dict[str, Any] = {
-            "word_timestamps": True,
-            "vad_filter": False,                 # 항상 False로 강제
-            "beam_size": int(max(1, beam_size)),
-        }
-        if "initial_prompt" in sig.parameters and initial_prompt:
-            call_kwargs["initial_prompt"] = initial_prompt
+        fw_opts: Dict[str, Any] = {"beam_size": bs, "word_timestamps": True}
+        if isinstance(language, str) and language.strip():
+            fw_opts["language"] = language.strip()
+        if isinstance(initial_prompt, str) and initial_prompt.strip():
+            fw_opts["initial_prompt"] = initial_prompt.strip()
+        if vad_filter is not None:
+            fw_opts["vad_filter"] = bool(vad_filter)
+        for k, v in kwargs.items():
+            if k in fw_allow:
+                fw_opts[k] = v
 
-        segments, _ = model.transcribe(p, **call_kwargs)
+        wmodel = WhisperModel(mdl, device="cpu", compute_type="int8")
+        seg_iter, _info = wmodel.transcribe(str(p), **fw_opts)
 
-        out_segs: List[Dict[str, Any]] = []
-        out_words: List[Tuple[float, float, str]] = []
-        for seg_item in (segments or []):
-            start_f = float(seg_item.get("start", 0.0) or 0.0)
-            end_f = float(seg_item.get("end", start_f + 0.01) or (start_f + 0.01))
-            out_segs.append({
-                "start": start_f,
-                "end": end_f,
-                "text": (seg_item.get("text") or "").strip()
-            })
-            for word_item in (seg_item.get("words") or []):
-                ws = word_item.get("start"); we = word_item.get("end")
-                if ws is None or we is None:
+        seg_idx = 0
+        for seg in seg_iter:
+            seg_idx += 1
+            a = float(getattr(seg, "start", 0.0) or 0.0)
+            b = float(getattr(seg, "end", a) or a)
+            txt = str(getattr(seg, "text", "") or "").strip()
+            segments_list.append((a, b, txt))
+            print(f"[SEG {seg_idx:04d}] {_fmt(a)} ~ {_fmt(b)} | {txt}")
+
+            ws = getattr(seg, "words", None) or []
+            for w in ws:
+                try:
+                    wa = float(getattr(w, "start", a) or a)
+                    wb = float(getattr(w, "end", wa) or wa)
+                    wt = str(getattr(w, "word", "") or "").strip()
+                    if wt:
+                        words_list.append((wa, wb, wt))
+                        print(f"  [WORD {len(words_list):05d}] {_fmt(wa)} ~ {_fmt(wb)} | {wt}")
+                except (TypeError, ValueError):
                     continue
-                out_words.append((
-                    float(ws),
-                    float(we),
-                    (word_item.get("word") or "").strip()
-                ))
-        return {"segments": out_segs, "words": out_words}
-    except Exception:
-        return {}
+
+        print(f"[transcribe_words] ko-pass done: segments={len(segments_list)}, words={len(words_list)}")
+
+    except ImportError:
+        # 미설치 시 폴백으로 진행
+        pass
+    except (RuntimeError, ValueError, OSError) as e:
+        print(f"[WARN] faster-whisper failed: {e}")
+
+    # 2) openai-whisper (CPU) 폴백
+    if not segments_list:
+        try:
+            import whisper  # type: ignore
+            wmodel2 = whisper.load_model(mdl)
+
+            ow_opts: Dict[str, Any] = {
+                "beam_size": bs,
+                "word_timestamps": True,
+                "fp16": False,
+            }
+            if isinstance(initial_prompt, str) and initial_prompt.strip():
+                ow_opts["prompt"] = initial_prompt.strip()
+            if isinstance(language, str) and language.strip():
+                ow_opts["language"] = language.strip()
+            for k, v in kwargs.items():
+                if k in ow_allow and k != "initial_prompt":
+                    ow_opts[k] = v
+
+            res = wmodel2.transcribe(str(p), **ow_opts)
+            segs = res.get("segments") or []
+            seg_idx = 0
+            for seg in segs:
+                seg_idx += 1
+                a = float(seg.get("start", 0.0))
+                b = float(seg.get("end", a))
+                txt = str(seg.get("text", "")).strip()
+                segments_list.append((a, b, txt))
+                print(f"[SEG {seg_idx:04d}] {_fmt(a)} ~ {_fmt(b)} | {txt}")
+
+                ws = seg.get("words") or []
+                for w in ws:
+                    try:
+                        wa = float(w.get("start", a))
+                        wb = float(w.get("end", wa))
+                        wt = str(w.get("word", "")).strip()
+                        if wt:
+                            words_list.append((wa, wb, wt))
+                            print(f"  [WORD {len(words_list):05d}] {_fmt(wa)} ~ {_fmt(wb)} | {wt}")
+                    except (TypeError, ValueError):
+                        continue
+
+            print(f"[transcribe_words] ko-pass done: segments={len(segments_list)}, words={len(words_list)}")
+
+        except ImportError as e:
+            raise RuntimeError("whisper import failed: No module named 'whisper'") from e
+        except (RuntimeError, ValueError, OSError) as e:
+            raise RuntimeError(f"whisper.transcribe failed: {e}") from e
+
+    if print_translate_view and segments_list:
+        try:
+            print("[transcribe_words] translate-pass (en view) start")
+            en_idx = 0
+            for a, b, txt in segments_list:
+                en_idx += 1
+                print(f"[EN-SEG {en_idx:04d}] {_fmt(a)} ~ {_fmt(b)} | {txt}")
+            print(f"[transcribe_words] translate-pass done: segments={len(segments_list)}")
+        except (ValueError, RuntimeError, TypeError):
+            pass
+
+    return {"segments": segments_list, "words": words_list}
+
+
+
+
+
+
+
+
+
+
+
+
+
 
 
 
@@ -1906,267 +2039,16 @@ def transcribe_words(
 # ------------------------------------------------------------
 # 2) 가사 싱크: 보컬분리(옵션) → 전사 → 정렬 → 폴백 배분
 # ------------------------------------------------------------
-def sync_lyrics_with_whisper(
-    audio_path: str,
-    lyrics_text: str,
-    *,
-    model_size: str = "medium",
-    use_vocal_separation: bool = False,
-    min_len: float = 0.5,
-    end_bias_sec: float = 2.5,
-    avg_min_sec_per_unit: float = 2.0,
-    start_preroll: float = 0.30,
-    beam_size: int = 5,
-    vad_filter: bool = False,
-) -> Dict[str, Any]:
-    """
-    1) (옵션) 보컬 분리
-    2) Whisper 단어 전사(가사 기반 initial_prompt)
-    3) 단어→가사 라인 정렬
-    4) 실패 라인만 온셋-가중치 배분(폴백)
-    반환:
-      {
-        "duration_sec": float,
-        "start_at": float,
-        "onsets": [float, ...],
-        "segments": [{"start": a, "end": b, "text": line}, ...],
-        "unused_lines": [...],
-        "debug": {...}
-      }
-    """
-    p = (audio_path or "").strip()
-    if not p or not os.path.isfile(p):
-        raise RuntimeError("오디오 파일이 없습니다.")
+# audio_sync.py 파일에서 이 함수를 찾아 아래 내용으로 전체를 교체하세요.
 
-    total_dur = float(get_audio_duration(p))
-    if not math.isfinite(total_dur) or total_dur <= 0:
-        raise RuntimeError("오디오 길이를 읽지 못했습니다.")
-
-    # 1) (옵션) 보컬 분리
-    use_path = p
-    if use_vocal_separation:
-        vp = separate_vocals_demucs(p)
-        if vp and os.path.isfile(vp):
-            use_path = vp
-
-    # 2) 가사 라인 정리 & initial_prompt 생성
-    lines = prepare_pure_lyrics_lines(lyrics_text, drop_section_tags=True)
-    if not lines:
-        raise RuntimeError("분할할 가사 라인이 없습니다.")
-
-    tokens: List[str] = []
-    for ln in lines:
-        t = re.sub(r"[^0-9A-Za-z가-힣\s]", " ", ln)
-        for w in t.split():
-            if len(w) >= 2:
-                tokens.append(w)
-    uniq: List[str] = []
-    seen = set()
-    for w in tokens:
-        if w not in seen:
-            uniq.append(w); seen.add(w)
-    initial_prompt = " ".join(uniq[:80])  # 실제 길이/바이트 절삭은 transcribe_words에서 재확인
-
-    # 3) Whisper 전사 (단어 타임스탬프 포함)
-    tr = transcribe_words(
-        use_path,
-        model_size=model_size,
-        initial_prompt=initial_prompt,
-        beam_size=beam_size,
-        vad_filter=vad_filter,
-    )
-
-    # 온셋 검출
-    onsets = detect_onsets_seconds(p) or []
-    onsets = [float(t) for t in onsets if math.isfinite(float(t)) and t >= 0.0]
-    onsets.sort()
-
-    # 시작점: 첫 온셋 - preroll
-    start_at = max(0.0, (onsets[0] - start_preroll) if onsets else 0.0)
-
-    final_segments: List[Tuple[float, float, str]] = []
-    unused: List[str] = []
-
-    if tr and tr.get("words"):
-        # 단어 → 라인 정렬
-        aligned = align_words_to_lyrics_lines("\n".join(lines), tr["words"])
-
-        # 성공 라인 수집
-        for st, et, txt in aligned:
-            if st is not None and et is not None and st < et:
-                final_segments.append((float(st), float(et), txt))
-
-        # 실패 라인 폴백 배분
-        missing_lines = [txt for st, et, txt in aligned if st is None or et is None]
-        if missing_lines:
-            spans = layout_time_by_weights(
-                missing_lines,
-                start_at,
-                total_dur,
-                onsets=onsets,
-                min_len=min_len,
-                end_bias_sec=end_bias_sec,
-                avg_min_sec_per_unit=avg_min_sec_per_unit,
-            )
-            for i, (a, b) in enumerate(spans):
-                final_segments.append((a, b, missing_lines[i]))
-
-        # 시간순 정렬 + 겹침 최소화
-        final_segments.sort(key=lambda x: x[0])
-        merged: List[Tuple[float, float, str]] = []
-        for a, b, t in final_segments:
-            if not merged:
-                merged.append((a, b, t))
-            else:
-                pa, pb, pt = merged[-1]
-                if a <= pb:
-                    merged[-1] = (pa, max(pb, b), pt)
-                else:
-                    merged.append((a, b, t))
-        final_segments = merged
-    else:
-        # 전사 실패 → 전체 라인 일괄 배분
-        spans = layout_time_by_weights(
-            lines,
-            start_at,
-            total_dur,
-            onsets=onsets,
-            min_len=min_len,
-            end_bias_sec=end_bias_sec,
-            avg_min_sec_per_unit=avg_min_sec_per_unit,
-        )
-        for i, (a, b) in enumerate(spans):
-            final_segments.append((a, b, lines[i]))
-
-    return {
-        "duration_sec": float(total_dur),
-        "start_at": float(start_at),
-        "onsets": onsets,
-        "segments": [{"start": float(a), "end": float(b), "text": t} for a, b, t in final_segments],
-        "unused_lines": unused,
-        "debug": {
-            "used_audio_path": use_path,
-            "lines_count": len(lines),
-            "whisper_used": bool(tr and tr.get("words")),
-            "beam_size": int(max(1, beam_size)),
-            "vad_filter": bool(vad_filter),
-        },
-    }
+# audio_sync.py
 
 
 
 
-def cut_audio_to_last_lyric_with_outro(
-    audio_path: str,
-    lyrics_text: str,
-    *,
-    project_dir: str | None = None,
-    outro_sec: int | None = None,
-    model_size: str = "medium",
-    fade_out: bool = True,
-    export_path: str | None = None,
-) -> dict:
-    """
-    Whisper로 마지막 가사 종료 시각을 찾고,
-    그 시점 + outro_sec까지만 오디오를 잘라 새 파일로 저장한다. 마지막 구간은 페이드아웃(선택) 적용.
-    반환 예:
-      {"in":..., "out":..., "t_end":..., "outro_sec":..., "duration_in":..., "duration_out":..., "whisper_used": ...}
-    """
-    from pathlib import Path
-    import math
-    import random as _random
 
-    src = Path(audio_path).resolve()
-    if not src.exists():
-        raise FileNotFoundError(f"audio not found: {src}")
 
-    # project.json의 outro_sec 우선 사용
-    if outro_sec is None and project_dir:
-        pj = Path(project_dir).resolve() / "project.json"
-        try:
-            meta = load_json(str(pj), default={}) or {}
-            music_meta = meta.get("music_meta") or {}
-            v = music_meta.get("outro_sec")
-            if isinstance(v, (int, float)) and v > 0:
-                outro_sec = int(v)
-        except Exception:
-            pass
-    if outro_sec is None or not isinstance(outro_sec, int) or outro_sec <= 0:
-        outro_sec = int(_random.randint(5, 15))
 
-    # Whisper 동기화
-    sync = sync_lyrics_with_whisper(
-        audio_path=str(src),
-        lyrics_text=str(lyrics_text or ""),
-        model_size=model_size,
-        use_vocal_separation=False,
-    )
-    segments = sync.get("segments") or []
-    duration_in = float(sync.get("duration_sec") or 0.0)
-
-    # 마지막 가사 종료 시각
-    t_end = 0.0
-    for seg in segments:
-        try:
-            endv = float(seg.get("end") or 0.0)
-        except (TypeError, ValueError):
-            endv = 0.0
-        if math.isfinite(endv) and endv > t_end:
-            t_end = endv
-
-    if duration_in <= 0.0:
-        duration_in = float(get_audio_duration(str(src)) or 0.0)
-    if duration_in <= 0.0:
-        raise RuntimeError("오디오 길이를 파악할 수 없습니다.")
-
-    # 컷 지점: 마지막 가사 + outro_sec (원본 길이 이내)
-    t_cut = t_end + float(outro_sec)
-    if t_cut > duration_in:
-        t_cut = duration_in
-
-    # Pydub 컷 + 페이드아웃
-    try:
-        from pydub import AudioSegment  # type: ignore
-    except Exception as e:
-        raise RuntimeError(f"pydub import failed: {type(e).__name__}: {e}")
-
-    seg_a = AudioSegment.from_file(str(src))
-    cut_ms = int(max(1, round(t_cut * 1000)))
-    seg_a = seg_a[:cut_ms]
-
-    if fade_out:
-        fade_ms = int(max(500, outro_sec * 1000))
-        if fade_ms > len(seg_a):
-            fade_ms = int(len(seg_a) * 0.5)
-        seg_a = seg_a.fade_out(fade_ms)
-
-    # 저장 경로
-    if export_path:
-        out_path = Path(export_path)
-    else:
-        out_path = src.with_name("vocal_cut.wav")
-
-    fmt = out_path.suffix.lower().lstrip(".") or "wav"
-    if fmt not in ("wav", "mp3", "flac", "ogg"):
-        fmt = "wav"
-        out_path = out_path.with_suffix(".wav")
-
-    # ★ format은 한 번만 전달한다
-    if fmt == "wav":
-        # 16-bit PCM
-        seg_a.export(str(out_path), format="wav", parameters=["-acodec", "pcm_s16le"])
-    else:
-        seg_a.export(str(out_path), format=fmt)
-
-    return {
-        "in": str(src),
-        "out": str(out_path),
-        "t_end": float(t_end),
-        "outro_sec": int(outro_sec),
-        "duration_in": float(duration_in),
-        "duration_out": float(cut_ms / 1000.0),
-        "whisper_used": bool(segments),
-    }
 
 
 from typing import List, Optional, Tuple
@@ -2333,260 +2215,6 @@ def _interpolate_missing_lines(
 
 
 
-def align_lyrics_per_line(
-    audio_path: str,
-    lyrics_text: str,
-    *,
-    model_size: str = "medium",
-    snap_onsets: Optional[List[float]] = None,
-    snap_window_sec: float = 0.15,
-) -> List[Dict[str, object]]:
-    """
-    Whisper(가능하면 word timestamps)로 ASR → 가사 '한 줄'마다 [start, end] 추정.
-    개선점:
-      - project.json의 music_meta.intro_sec 만큼 '최소 시작 시각'으로 사용하여 인트로를 후보에서 제외
-      - 라인 순서 단조 증가(앞 라인 end 이후에서만 다음 라인 탐색)
-    반환: [{'line': '...', 'start': 12.34, 'end': 15.67, 'score': 0.83, 'word_level': True/False}, ...]
-    """
-    from pathlib import Path
-    import os, json
-    src = Path(audio_path).resolve()
-    if not src.exists():
-        raise FileNotFoundError(f"audio not found: {src}")
-
-    # 0) project.json에서 intro_sec 가져와 '최소 시작 시각'으로 사용
-    proj_dir = src.parent
-    min_start_sec = 0.0
-    pj = proj_dir / "project.json"
-    if pj.exists():
-        try:
-            meta = json.loads(pj.read_text(encoding="utf-8"))
-            mm = meta.get("music_meta") or {}
-            v = mm.get("intro_sec")
-            if isinstance(v, (int, float)) and v > 0:
-                # 인트로는 무가사로 가정 → 그 이전은 매칭 금지
-                min_start_sec = float(v)
-        except Exception:
-            pass
-
-    body_lines = _split_lyrics_body_lines(lyrics_text)
-    if not body_lines:
-        return []
-
-    # ==== ASR 실행 (word-level 우선; CPU 강제) ====
-    words: List[Tuple[str, float, float]] = []
-
-    try:
-        os.environ.setdefault("CUDA_VISIBLE_DEVICES", "")
-        from faster_whisper import WhisperModel  # type: ignore
-        model = WhisperModel(model_size, device="cpu", compute_type="int8")
-        segments, _info = model.transcribe(str(src), vad_filter=False, word_timestamps=True)
-        for seg in segments:
-            for w in (seg.words or []):
-                if w.word and (w.start is not None) and (w.end is not None):
-                    words.append((w.word, float(w.start), float(w.end)))
-        word_level_flag = True  # ← 여기서만 설정
-    except Exception:
-        # fallback: 기존 sync 결과 세그먼트를 거대 단어로 취급
-        sync = sync_lyrics_with_whisper(
-            audio_path=str(src),
-            lyrics_text=str(lyrics_text or ""),
-            model_size=model_size,
-            use_vocal_separation=False,
-        )
-        segs = sync.get("segments") or []
-        for s in segs:
-            txt = _normalize_korean_text(str(s.get("text") or ""))
-            t0 = float(s.get("start") or 0.0)
-            t1 = float(s.get("end") or 0.0)
-            if txt:
-                words.append((txt, t0, t1))
-        word_level_flag = False  # ← 여기서만 설정
-
-    # 후보 단어에서 인트로 이전 구간 제거
-    if min_start_sec > 0.0 and words:
-        words = [(t, a, b) for (t, a, b) in words if b >= min_start_sec]
-
-    aligned: List[Dict[str, object]] = []
-    tokens_norm = [(_normalize_korean_text(w[0]), w[1], w[2]) for w in words]
-
-    # 단조 증가(순서 고정) 매칭: 앞 라인의 종료시각 이후에서만 탐색
-    cursor_time = float(min_start_sec)
-    guard = 0.15  # 앞 라인 end 직후 보호구간
-
-    def _find_start_index_from_time(ts: List[Tuple[str, float, float]], tmin: float) -> int:
-        # 단어 시작시각이 tmin 이상인 첫 인덱스
-        for i, (_t, a, _b) in enumerate(ts):
-            if a >= tmin:
-                return i
-        return len(ts)
-
-    si_hint = _find_start_index_from_time(tokens_norm, cursor_time)
-
-    for raw in body_lines:
-        line_norm = _normalize_korean_text(raw)
-        # 윈도우를 '현재 커서 이후'로 제한
-        slice_tokens = tokens_norm[si_hint:] if si_hint < len(tokens_norm) else []
-        if slice_tokens:
-            matched = _soft_match_line_in_words(line_norm, [(t, a, b) for t, a, b in slice_tokens], win=22)
-        else:
-            matched = None
-
-        if matched is None:
-            aligned.append({"line": raw, "start": None, "end": None, "score": 0.0, "word_level": word_level_flag})
-            # 다음 줄도 같은 힌트에서 다시 시도
-            continue
-
-        # slice 기준 인덱스를 전체 기준으로 변환
-        si_local, ei_local, score = matched
-        si = si_hint + si_local
-        ei = si_hint + ei_local
-        si = max(0, min(si, len(tokens_norm) - 1))
-        ei = max(si + 1, min(ei, len(tokens_norm)))
-        t0 = float(tokens_norm[si][1]); t1 = float(tokens_norm[ei - 1][2])
-
-        # onsets 스냅(선택)
-        if snap_onsets:
-            def _snap(t: float) -> float:
-                best = None
-                for x in snap_onsets:
-                    if abs(x - t) <= snap_window_sec:
-                        if (best is None) or (abs(x - t) < abs(best - t)):
-                            best = x
-                return best if best is not None else t
-            t0 = _snap(t0); t1 = _snap(t1)
-
-        if t1 < t0:
-            t1 = t0
-
-        aligned.append({"line": raw, "start": t0, "end": t1, "score": float(score), "word_level": word_level_flag})
-
-        # 다음 라인은 이번 라인 종료 이후에서만 탐색
-        cursor_time = t1 + guard
-        si_hint = _find_start_index_from_time(tokens_norm, cursor_time)
-
-    # 마지막 안전 보정(겹침 제거)
-    last_end = float(min_start_sec)
-    for it in aligned:
-        s = it.get("start")
-        e = it.get("end")
-        if isinstance(s, (int, float)) and isinstance(e, (int, float)):
-            if s < last_end:
-                s = last_end
-            if e < s:
-                e = s
-            it["start"], it["end"] = float(s), float(e)
-            last_end = float(e)
-
-    # ★ 빈 줄 보간으로 누락된 라인 채우기
-    aligned = _interpolate_missing_lines(aligned, min_start_sec=float(min_start_sec))
-
-    return aligned
-
-
-
-
-
-def analyze_and_cut_project(
-    project_dir: str,
-    *,
-    model_size: str = "medium",
-    snap_window_sec: float = 0.15,
-) -> dict:
-    """
-    1) project_dir 안의 vocal.wav, lyrics.txt(or project.json의 lyrics), music_analysis_preview.json(onsets)
-    2) 줄별 정합(align_lyrics_per_line) → 마지막 줄 end 추출
-    3) project.json의 music_meta.outro_sec (없으면 5~15 랜덤)로 컷 지점 = last_end + outro_sec
-    4) Pydub 페이드아웃 적용하여 vocal_cut.wav 저장
-    반환: 요약 딕셔너리
-    """
-    from pathlib import Path
-    import json
-
-    proj = Path(project_dir).resolve()
-    audio_in = proj / "vocal.wav"
-    if not audio_in.exists():
-        raise FileNotFoundError(f"audio not found: {audio_in}")
-
-    # 가사 가져오기: lyrics.txt > project.json
-    lyrics_text = ""
-    lyrics_txt = proj / "lyrics.txt"
-    if lyrics_txt.exists():
-        lyrics_text = lyrics_txt.read_text(encoding="utf-8", errors="ignore")
-    else:
-        pj = proj / "project.json"
-        if pj.exists():
-            try:
-                meta = json.loads(pj.read_text(encoding="utf-8"))
-                lyrics_text = str(meta.get("lyrics") or "")
-            except Exception:
-                lyrics_text = ""
-    if not lyrics_text.strip():
-        raise RuntimeError("lyrics not found in project")
-
-    # onsets(선택)
-    onsets = []
-    preview_json = proj / "music_analysis_preview.json"
-    if preview_json.exists():
-        try:
-            preview = json.loads(preview_json.read_text(encoding="utf-8"))
-            onsets = preview.get("onsets") or []
-        except Exception:
-            onsets = []
-
-    # 줄별 정합
-    aligned = align_lyrics_per_line(
-        audio_path=str(audio_in),
-        lyrics_text=lyrics_text,
-        model_size=model_size,
-        snap_onsets=onsets,
-        snap_window_sec=snap_window_sec,
-    )
-
-    # 마지막 줄 end
-    last_end = 0.0
-    for row in aligned:
-        e = row.get("end")
-        if isinstance(e, (int, float)) and e > last_end:
-            last_end = float(e)
-
-    # outro_sec 결정: project.json의 music_meta.outro_sec 우선
-    outro_sec = None
-    pj = proj / "project.json"
-    if pj.exists():
-        try:
-            meta = json.loads(pj.read_text(encoding="utf-8"))
-            mm = meta.get("music_meta") or {}
-            v = mm.get("outro_sec")
-            if isinstance(v, (int, float)) and v > 0:
-                outro_sec = int(v)
-        except Exception:
-            pass
-
-    # 컷 + 페이드아웃 실행 (내부에서 outro_sec 없으면 5~15 랜덤)
-    cut_info = cut_audio_to_last_lyric_with_outro(
-        audio_path=str(audio_in),
-        lyrics_text=lyrics_text,
-        project_dir=str(proj),
-        outro_sec=outro_sec,
-        model_size=model_size,
-        fade_out=True,
-        export_path=None,  # proj/vocal_cut.wav
-    )
-
-    # 정합 결과 저장(검증용)
-    aligned_path = proj / "lyrics_aligned.json"
-    try:
-        aligned_path.write_text(json.dumps(aligned, ensure_ascii=False, indent=2), encoding="utf-8")
-    except Exception:
-        pass
-
-    return {
-        "aligned_path": str(aligned_path),
-        "aligned_count": len(aligned),
-        "last_end": last_end,
-        "cut": cut_info,
-    }
 
 
 
@@ -3653,11 +3281,18 @@ def detect_onsets_percussive_librosa(wav_path: str) -> list[float]:
         return out
     except (ValueError, RuntimeError):
         return []
+
+
+
+
+# file: audio_sync.py
+
 def sync_lyrics_with_whisper_pro(
     audio_path: str,
     lyrics_text: str,
     *,
     model_size: str = "medium",
+    # 호출부 호환 파라미터(동작에는 사용하지 않지만 반환에 보존)
     min_len: float = 0.5,
     end_bias_sec: float = 2.5,
     avg_min_sec_per_unit: float = 2.0,
@@ -3665,214 +3300,228 @@ def sync_lyrics_with_whisper_pro(
     enable_preprocess: bool = True,
     enable_demucs: bool = True,
     enable_calibration: bool = True,
-    # 더 이상 하드코딩 앵커를 쓰지 않는다. None 그대로 유지.
     anchor_first_line_sec: float | None = None,
+    **extra_kwargs,
 ) -> dict:
     """
-    PRO 파이프(안전한 자동 보정):
-      1) (옵션) 전처리
-      2) (옵션) Demucs 보컬/드럼 분리
-      3) 기존 sync_lyrics_with_whisper 호출
-      4) 퍼커시브 온셋 보강(드럼 없으면 align_path에서 HPSS)
-      5) (옵션) 전역 시프트/선형 드리프트 보정
-      6) (자동) 앵커 보정: '적합도'가 명확히 좋아지는 경우에만 적용
-      7) 겹침/역전 방지(enforce_monotonic_segments)
-      8) 리포트
+    - 원시 세그먼트 시간(start/end)을 그대로 사용
+    - 텍스트는 '원문 가사' 사용(프로젝트 한글 가사 우선, 없으면 인자 가사)
+    - [verse]/[bridge]/[chorus] 등 섹션 태그는 저장/표시에서 제외
+    - 줄 수(N) < 세그먼트 수면 앞 N개만 매핑(초과는 드롭 로그)
+    - seg.json: [{start, end, text}] 저장
+    - 호환 인자는 result['compat']에 보존
     """
     from pathlib import Path
+    from typing import Any, Dict, List, Tuple, Optional
+    import json
+    import re
 
+    def has_hangul(s: str) -> bool:
+        return bool(re.search(r"[가-힣]", s))
+
+    section_re = re.compile(
+        r"^\[\s*(verse|bridge|chorus|intro|outro|hook|refrain|interlude|instrumental|break|coda|pre[\s-]?chorus|post[\s-]?chorus)\s*\]$",
+        re.IGNORECASE,
+    )
+    leading_tag_re = re.compile(r"^\s*\[[^\]]+\]\s*")
+
+    def normalize_lines_keep_lyrics(raw: Any) -> List[str]:
+        lines: List[str] = []
+        if isinstance(raw, str):
+            candidates = [ln.strip() for ln in raw.splitlines()]
+        elif isinstance(raw, list):
+            candidates = [str(x).strip() for x in raw]
+        else:
+            candidates = []
+        for ln in candidates:
+            if not ln:
+                continue
+            if section_re.match(ln):
+                continue
+            ln_clean = leading_tag_re.sub("", ln).strip()
+            if ln_clean:
+                lines.append(ln_clean)
+        return lines
+
+    # ---------- 전처리 ----------
     src = Path(audio_path)
     use_path = str(src)
 
-    # 1) 전처리
     if enable_preprocess and callable(globals().get("preprocess_for_analysis")):
         try:
-            pre = preprocess_for_analysis(str(src))
+            pre = preprocess_for_analysis(str(src))  # type: ignore[name-defined]
             if pre and Path(pre).exists():
                 use_path = pre
         except (ValueError, OSError, RuntimeError):
             use_path = str(src)
 
-    # 2) Demucs
-    vocals_path = None
-    drums_path = None
+    vocals_path: Optional[str] = None
     if enable_demucs and callable(globals().get("demucs_vocals_drums")):
         try:
-            stems = demucs_vocals_drums(use_path)
-            vp = stems.get("vocals")
-            dp = stems.get("drums")
-            if vp and Path(vp).exists():
-                vocals_path = vp
-            if dp and Path(dp).exists():
-                drums_path = dp
-        except (ValueError, OSError, RuntimeError):
+            stems = demucs_vocals_drums(use_path)  # type: ignore[name-defined]
+            candidate: Optional[str] = None
+            if isinstance(stems, dict) and hasattr(stems, "get"):
+                v = stems.get("vocals")
+                candidate = v if isinstance(v, str) else None
+            elif isinstance(stems, (list, tuple)) and stems and isinstance(stems[0], str):
+                candidate = stems[0]
+            elif isinstance(stems, str):
+                candidate = stems
+            if candidate and Path(candidate).exists():
+                vocals_path = candidate
+        except (ValueError, OSError, RuntimeError, TypeError):
             vocals_path = None
-            drums_path = None
 
     align_path = vocals_path or use_path
 
-    # 3) 기본 정렬
-    base_res = sync_lyrics_with_whisper(
-        align_path,
-        lyrics_text,
+    # ---------- 단어/세그먼트(원시 시간) ----------
+    tr = transcribe_words(
+        path=align_path,
         model_size=model_size,
-        use_vocal_separation=False,
-        min_len=min_len,
-        end_bias_sec=end_bias_sec,
-        avg_min_sec_per_unit=avg_min_sec_per_unit,
-        start_preroll=start_preroll,
+        beam_size=5,
+        language="ko",
+        print_translate_view=False,
     )
+    raw_segments: List[Tuple[float, float, str]] = list(tr.get("segments") or [])
+    raw_words: List[Tuple[float, float, str]] = list(tr.get("words") or [])
 
-    # 4) 온셋 보강
-    merged_onsets = []
+    # ---------- project.json에서 '한글' 원문 가사 우선 ----------
+    def load_project_lines(proj_dir: Path) -> List[str]:
+        pj = proj_dir / "project.json"
+        if not pj.exists():
+            return []
+        try:
+            with open(pj, "r", encoding="utf-8") as fh:
+                data = json.load(fh)
+        except (OSError, json.JSONDecodeError, UnicodeDecodeError):
+            return []
+        keys_prefer = [
+            "lyrics_ko", "lyrics_kr", "lyrics_kor", "lyrics_original",
+            "lyrics_text", "lyrics_lines", "lyrics",
+        ]
+        buckets: List[List[str]] = []
+        for k in keys_prefer:
+            if k in data:
+                lines = normalize_lines_keep_lyrics(data[k])
+                if lines:
+                    buckets.append(lines)
+        for cand in buckets:
+            if any(has_hangul(s) for s in cand):
+                return cand
+        return buckets[0] if buckets else []
+
+    project_lines = load_project_lines(src.parent)
+    arg_lines = normalize_lines_keep_lyrics(lyrics_text)
+    final_lines = project_lines if project_lines else arg_lines
+
+    # ---------- 1:1 매핑(원시 종료 시각 유지) ----------
+    segs: List[Dict[str, Any]] = []
+    num_lines = len(final_lines)
+    seg_count = len(raw_segments)
+    if raw_segments:
+        take = min(num_lines, seg_count) if num_lines > 0 else seg_count
+        picked = raw_segments[:take]
+        for i, (a, b, _raw_txt) in enumerate(picked):
+            text_line = final_lines[i] if num_lines > 0 else str(_raw_txt)
+            segs.append({"start": round(float(a), 3), "end": round(float(b), 3), "text": text_line})
+        if 0 < num_lines < seg_count:
+            print(f"(dropped: SEG {num_lines+1:04d}~{seg_count:04d} - excess segments)")
+
+    # ---------- 출력 로그 ----------
+    def fmt_time(t: float) -> str:
+        m = int(t // 60)
+        s = t % 60.0
+        return f"{m:02d}.{s:06.3f}"
+
+    if segs:
+        print("=== 라인-타임 매핑 ([ko] from project.json) ===")
+        for i, it in enumerate(segs, start=1):
+            a = float(it["start"])
+            b = float(it["end"])
+            print(f"[{i:02d}] {fmt_time(a)} ~ {fmt_time(b)}  <project[{i:02d}] 공식 가사>")
+    else:
+        print("=== 라인-타임 매핑 === (no segments)")
+
+    # ---------- seg.json 저장 (파일 핸들 이름 충돌 방지) ----------
     try:
-        merged_onsets = [float(x) for x in (base_res.get("onsets") or [])]
-    except Exception:
-        merged_onsets = []
+        seg_path = src.parent / "seg.json"
+        with open(seg_path, "w", encoding="utf-8") as fp:
+            json.dump(segs, fp, ensure_ascii=False, indent=2)
+        print(f"[INFO] seg.json saved: {seg_path}")
+    except (OSError, ValueError, TypeError):
+        pass
 
-    onsets_hp = []
-    src_for_onset = drums_path or align_path
-    if callable(globals().get("detect_onsets_percussive_librosa")) and src_for_onset:
+    # ---------- 부가 정보 (이름 충돌 방지용 로컬 헬퍼명) ----------
+    def _dur_sec_local(pth: str) -> float:
         try:
-            onsets_hp = detect_onsets_percussive_librosa(src_for_onset)
+            from mutagen import File as MutagenFile  # type: ignore
+            mf = MutagenFile(pth)
+            if mf and getattr(mf, "info", None) and getattr(mf.info, "length", None):
+                return float(mf.info.length)
+        except (OSError, ValueError, RuntimeError, TypeError):
+            pass
+        try:
+            import soundfile as sf  # type: ignore
+            data, sr = sf.read(pth, dtype="float32")
+            n = getattr(data, "shape", [len(data)])[0]
+            if sr:
+                return float(n / sr)
+        except (OSError, ValueError, RuntimeError, TypeError):
+            pass
+        return 0.0
+
+    def _onsets_local(pth: str) -> tuple[list[float], list[float]]:
+        try:
+            import librosa  # type: ignore
+            y, sr = librosa.load(pth, sr=None, mono=True)
+            on = librosa.onset.onset_detect(y=y, sr=sr, units="time", backtrack=False)
+            y_h, y_p = librosa.effects.hpss(y)
+            on_hp = librosa.onset.onset_detect(y=y_p, sr=sr, units="time", backtrack=False)
+            return list(map(float, on)), list(map(float, on_hp))
         except (ValueError, OSError, RuntimeError):
-            onsets_hp = []
-    if onsets_hp:
-        pool = merged_onsets + [t for t in onsets_hp if t not in merged_onsets]
-        pool = sorted(set(round(float(t), 3) for t in pool))
-        merged_onsets = pool
+            return [], []
 
-    final_res = dict(base_res or {})
-    final_res["onsets_hp"] = onsets_hp
-    final_res["onsets"] = merged_onsets
+    duration_sec = _dur_sec_local(align_path) or _dur_sec_local(use_path)
+    onsets, onsets_hp = _onsets_local(align_path)
 
-    # 5) 전역/드리프트 보정(보수적으로)
-    shift_a = 0.0
-    shift_b = 0.0
-    a_lin = 1.0
-    b_lin = 0.0
-    shift_applied = 0.0
-    if enable_calibration:
-        try:
-            shift_a = estimate_global_shift(final_res.get("segments") or [], merged_onsets, max_abs_sec=8.0)
-        except Exception:
-            shift_a = 0.0
-        try:
-            shift_b = estimate_global_shift_signal(align_path, final_res.get("segments") or [], max_abs_sec=8.0)
-        except Exception:
-            shift_b = 0.0
+    start_at = 0.0
+    for it in segs:
+        st = it.get("start")
+        if isinstance(st, (int, float)):
+            start_at = float(st)
+            break
 
-        # 두 추정치가 같은 방향이며 차이가 너무 크지 않을 때만 적용
-        same_sign = (shift_a == 0.0 and shift_b == 0.0) or (shift_a * shift_b > 0.0)
-        mean_shift = float(round((shift_a + shift_b) * 0.5, 3))
-        if same_sign and abs(mean_shift) >= 0.12 and abs(shift_a - shift_b) <= 1.0:
-            final_res = apply_global_shift(final_res, mean_shift)
-            shift_applied = mean_shift
+    words_payload = [{"text": t, "start": float(a), "end": float(b)} for (a, b, t) in raw_words]
 
-        # 선형 드리프트(과한 보정 방지: 임계↑)
-        try:
-            a_lin, b_lin = estimate_affine_drift(final_res.get("segments") or [], merged_onsets)
-        except Exception:
-            a_lin, b_lin = (1.0, 0.0)
-        if abs(a_lin - 1.0) >= 0.03 or abs(b_lin) >= 0.15:
-            final_res = apply_affine_time_map(final_res, a_lin, b_lin)
-
-    # 6) 자동 앵커(안전 조건 하에서만)
-    # 적합도 스코어: 첫 3개 세그먼트 start와 최근접 온셋과의 평균 절댓값
-    def _score(segments_in: List[Dict[str, Any]], onset_times: List[float]) -> float:
-        """
-        첫 3개 구간의 start를 가장 가까운 온셋에 매칭해 평균 거리(작을수록 좋음)를 계산.
-        - 변수명 충돌/가리기 방지: segs→segments_in, s→seg_item 등으로 변경
-        - 기능 변경 없음
-        """
-        if not segments_in or not onset_times:
-            return 1e9
-
-        starts: List[float] = []
-        j = 0
-        n = len(onset_times)
-
-        for seg_item in segments_in[:3]:
-            start_val = seg_item.get("start", 0.0)
-            try:
-                st = float(start_val)
-            except (TypeError, ValueError):
-                continue
-
-            while j + 1 < n and abs(onset_times[j + 1] - st) <= abs(onset_times[j] - st):
-                j += 1
-            starts.append(abs(onset_times[j] - st))
-
-        if not starts:
-            return 1e9
-
-        return float(sum(starts) / len(starts))
-
-    if anchor_first_line_sec is None:
-        try:
-            auto_t = _auto_anchor_from_energy(align_path)
-        except Exception:
-            auto_t = 0.0
-
-        segs_now = list(final_res.get("segments") or [])
-        if segs_now and auto_t > 0.0:
-            before = _score(segs_now, merged_onsets)
-            # 첫 줄만 auto_t로 바꿔본 테스트 사본
-            import copy
-            test_res = copy.deepcopy(final_res)
-            s0 = test_res.get("segments")[0]
-            # 길이 유지
-            try:
-                old_et = float(segs_now[0].get("end", 0.0))
-                old_st = float(segs_now[0].get("start", 0.0))
-                dur = max(0.0, old_et - old_st)
-            except (TypeError, ValueError):
-                dur = 0.0
-            if isinstance(segs_now[0].get("start", 0.0), str):
-                s0["start"] = f"{auto_t:.3f}"
-            else:
-                s0["start"] = round(auto_t, 3)
-            new_et = auto_t + dur
-            if isinstance(segs_now[0].get("end", 0.0), str):
-                s0["end"] = f"{new_et:.3f}"
-            else:
-                s0["end"] = round(new_et, 3)
-
-            after = _score(test_res.get("segments") or [], merged_onsets)
-            # 스코어가 충분히 좋아질 때만 진짜 적용(0.35s 이상 개선)
-            if after + 0.35 <= before:
-                final_res = test_res
-
-    # 7) 겹침/역전 방지(항상)
-    final_res = enforce_monotonic_segments(final_res, min_gap_sec=0.05)
-
-    # 8) 리포트
-    segs = final_res.get("segments") or []
-    total = len(segs)
-    ok = 0
-    for s in segs:
-        try:
-            if s.get("ok"):
-                ok += 1
-        except Exception:
-            continue
-    ok_ratio = float(ok) / float(total) if total > 0 else 0.0
-
-    final_res["__pro_info__"] = {
-        "preprocessed": (use_path != str(src)),
-        "demucs_vocals_used": bool(vocals_path),
-        "demucs_drums_used": bool(drums_path),
-        "align_input": align_path,
-        "onsets_hp_count": len(onsets_hp),
-        "onsets_total": len(merged_onsets),
-        "global_shift_a_sec": float(shift_a),
-        "global_shift_b_sec": float(shift_b),
-        "global_shift_applied_sec": float(shift_applied),
-        "affine_a": float(a_lin),
-        "affine_b": float(b_lin),
-        "ok_ratio": float(round(ok_ratio, 3)),
+    compat = {
+        "min_len": float(min_len),
+        "end_bias_sec": float(end_bias_sec),
+        "avg_min_sec_per_unit": float(avg_min_sec_per_unit),
+        "start_preroll": float(start_preroll),
+        "enable_calibration": bool(enable_calibration),
+        "anchor_first_line_sec": anchor_first_line_sec
+            if anchor_first_line_sec is None else float(anchor_first_line_sec),
+        "extra_kwargs": dict(extra_kwargs),
     }
-    return final_res
+
+    return {
+        "segments": segs,
+        "words": words_payload,
+        "duration_sec": float(duration_sec),
+        "start_at": float(start_at),
+        "onsets": onsets,
+        "onsets_hp": onsets_hp,
+        "compat": compat,
+    }
+
+
+
+
+
+
+
+
+
 
 
 
@@ -4076,39 +3725,106 @@ def estimate_global_shift_signal(audio_path: str, segments: list, *, max_abs_sec
         shift = max_abs_sec if shift > 0 else -max_abs_sec
     return float(round(shift, 3))
 
+
+# audio_sync.py 파일에서 이 함수를 찾아 아래 내용으로 전체를 교체하세요.
+
 def estimate_affine_drift(segments: list, onsets: list[float]) -> tuple[float, float]:
     """
-    seg.start 와 가까운 onsets를 짝지어 최소제곱으로 t' = a*t + b 추정.
-    반환: (a, b). 실패/자료 부족 시 (1.0, 0.0)
+    RANSAC 알고리즘을 사용하여 이상치(outlier)에 강건한 선형 드리프트를 추정한다.
+    - seg.start와 가장 가까운 onsets를 짝지어 (t, t') 데이터 포인트를 생성.
+    - 무작위 샘플링으로 여러 선형 모델(t' = a*t + b)을 만들고,
+      가장 많은 데이터 포인트를 지지하는 (inliers) 모델을 선택.
+    - 최종적으로 모든 inlier를 사용하여 모델을 다시 피팅하여 정확도 향상.
+    - 실패 또는 데이터 부족 시 (1.0, 0.0) 반환.
     """
-    xs = []
-    ys = []
-    on = sorted(float(t) for t in onsets if isinstance(t, (int, float)))
-    if not segments or not on:
+    import random
+
+    if not segments or not onsets or len(segments) < 5:
         return (1.0, 0.0)
+
+    # 1. 데이터 포인트 생성: (segment_start, nearest_onset)
+    points = []
+    on = sorted([float(o) for o in onsets if isinstance(o, (int, float))])
     j = 0
-    n = len(on)
+    n_onsets = len(on)
     for seg in segments:
         try:
             st = float(seg.get("start", 0.0))
         except (TypeError, ValueError):
             continue
-        while j + 1 < n and abs(on[j + 1] - st) <= abs(on[j] - st):
+
+        # 가장 가까운 온셋 탐색
+        while j + 1 < n_onsets and abs(on[j + 1] - st) <= abs(on[j] - st):
             j += 1
-        xs.append(st)
-        ys.append(on[j])
-    if len(xs) < 5:
+        points.append((st, on[j]))
+
+    if len(points) < 5:
         return (1.0, 0.0)
-    x__ = np.vstack([np.array(xs), np.ones(len(xs))]).T
-    y__ = np.array(ys)
-    try:
-        a, b = np.linalg.lstsq(x__, y__, rcond=None)[0]
-    except Exception:
-        return (1.0, 0.0)
-    # 너무 극단적인 값 방지
-    if not np.isfinite(a) or not np.isfinite(b) or a <= 0.5 or a >= 1.5 or abs(b) > 15.0:
-        return (1.0, 0.0)
-    return (float(a), float(b))
+
+    # 2. RANSAC 파라미터
+    n_points = len(points)
+    iterations = 50
+    sample_size = 2  # 최소 2개의 점으로 직선 정의
+    inlier_threshold = 0.5  # FIX: 허용 오차를 0.25초에서 0.5초로 늘려 더 유연하게 추세 분석
+    min_inliers = max(5, int(n_points * 0.3))  # 최소 30%의 데이터가 모델을 지지해야 함
+
+    best_model = (1.0, 0.0)
+    best_inliers_count = 0
+
+    # numpy 배열로 변환
+    data = np.array(points)
+    x_coords = data[:, 0]
+    y_coords = data[:, 1]
+
+    # 3. RANSAC 반복
+    for _ in range(iterations):
+        # 무작위 샘플 추출
+        sample_indices = random.sample(range(n_points), sample_size)
+        sample = data[sample_indices]
+
+        # 샘플로 모델 피팅 (t' = a*t + b)
+        aaa = np.vstack([sample[:, 0], np.ones(len(sample))]).T
+        try:
+            a, b = np.linalg.lstsq(aaa, sample[:, 1], rcond=None)[0]
+        except np.linalg.LinAlgError:
+            continue
+
+        # 전체 데이터에 대한 오차 계산
+        y_predicted = a * x_coords + b
+        errors = np.abs(y_coords - y_predicted)
+
+        # Inlier 개수 계산
+        inlier_indices = np.where(errors < inlier_threshold)[0]
+        current_inliers_count = len(inlier_indices)
+
+        # 더 나은 모델이면 교체
+        if current_inliers_count > best_inliers_count:
+            best_inliers_count = current_inliers_count
+            best_model = (a, b)
+            # 수렴 조건: 충분한 inlier를 찾으면 조기 종료
+            if best_inliers_count >= n_points * 0.7:
+                break
+
+    # 4. 최종 모델 피팅
+    if best_inliers_count >= min_inliers:
+        y_predicted_best = best_model[0] * x_coords + best_model[1]
+        errors_best = np.abs(y_coords - y_predicted_best)
+        final_inlier_indices = np.where(errors_best < inlier_threshold)[0]
+
+        if len(final_inlier_indices) >= 2:
+            inlier_points = data[final_inlier_indices]
+            A_final = np.vstack([inlier_points[:, 0], np.ones(len(inlier_points))]).T
+            try:
+                a_final, b_final = np.linalg.lstsq(A_final, inlier_points[:, 1], rcond=None)[0]
+
+                # 극단적인 값 방지
+                if 0.85 <= a_final <= 1.15 and abs(b_final) < 15.0:
+                    return (float(a_final), float(b_final))
+            except np.linalg.LinAlgError:
+                pass
+
+    # RANSAC 실패 시 기본값 반환
+    return (1.0, 0.0)
 
 
 def apply_affine_time_map(res: dict, a: float, b: float) -> dict:
@@ -4981,7 +4697,6 @@ def estimate_vocal_end_from_vocal_stem(audio_path_in: str,
     """
     import glob
     from pathlib import Path
-    import numpy as np
 
     try:
         base_dir = Path(audio_path_in).resolve().parent
