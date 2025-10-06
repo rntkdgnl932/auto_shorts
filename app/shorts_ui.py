@@ -1567,7 +1567,7 @@ class MainWindow(QtWidgets.QMainWindow):
           - pro 파이프라인에서 whisper_words가 없을 때, audio_sync.transcribe_words 폴백으로 WORD 타임라인 확보.
         """
         from pathlib import Path
-        from typing import List, Tuple, Dict, Any
+        from typing import List, Tuple
         from PyQt5 import QtWidgets
 
         print("\n--- CHECKPOINT 1: on_click_analyze_music 함수 시작 ---")
@@ -1584,14 +1584,13 @@ class MainWindow(QtWidgets.QMainWindow):
             from utils import load_json  # type: ignore
 
         # --- audio_sync 모듈 로드 ---
-        audio_sync_mod = None
         try:
             import app.audio_sync as audio_sync_mod  # type: ignore
         except Exception:
             try:
                 import audio_sync as audio_sync_mod  # type: ignore
             except Exception:
-                audio_sync_mod = None
+                audio_sync_mod = None  # type: ignore
 
         if audio_sync_mod is None:
             if isinstance(btn, QtWidgets.QAbstractButton):
@@ -1599,10 +1598,13 @@ class MainWindow(QtWidgets.QMainWindow):
             QtWidgets.QMessageBox.critical(self, "음악분석 실패", "audio_sync 모듈 로드 실패")
             return
 
-        has_pro = callable(getattr(audio_sync_mod, "sync_lyrics_with_whisper_pro", None))
+        # 필요한 심볼 존재 여부 안전 확인
         prepare_lines = getattr(audio_sync_mod, "prepare_pure_lyrics_lines", None)
         transcribe_words_fn = getattr(audio_sync_mod, "transcribe_words", None)
-        if not has_pro or not callable(prepare_lines):
+        pro_fn = getattr(audio_sync_mod, "sync_lyrics_with_whisper_pro", None)
+        legacy_fn = getattr(audio_sync_mod, "sync_lyrics_with_whisper", None)
+
+        if not callable(prepare_lines) or (not callable(pro_fn) and not callable(legacy_fn)):
             if isinstance(btn, QtWidgets.QAbstractButton):
                 btn.setEnabled(True)
             QtWidgets.QMessageBox.critical(self, "음악분석 실패", "audio_sync에 필요한 함수가 없습니다.")
@@ -1625,7 +1627,6 @@ class MainWindow(QtWidgets.QMainWindow):
         print(f"--- CHECKPOINT 3: 프로젝트 폴더 확인 ({proj_dir}) ---")
 
         # 보컬 파일(최근 것)
-        vocal_path_raw = None
         try:
             vocal_path_raw = self._find_latest_vocal()
         except Exception:
@@ -1688,14 +1689,14 @@ class MainWindow(QtWidgets.QMainWindow):
         lyrics_for_api = _norm_text(self._maybe_convert_lyrics_for_api(lyrics_raw))
         lyrics_converted = (lyrics_for_api != lyrics_before)
 
-        # --- tail_file 경로(있으면 테일링) ---
+        # tail_file 경로(있으면 테일링)
         tail_path = None
         try:
             candidate = getattr(self, "comfy_log_file", None) or getattr(self, "comfy_log_path", None)
             if isinstance(candidate, str) and candidate:
-                p = Path(candidate)
-                if p.exists() and p.is_file():
-                    tail_path = str(p)
+                pth = Path(candidate)
+                if pth.exists() and pth.is_file():
+                    tail_path = str(pth)
         except Exception:
             tail_path = None
 
@@ -1704,20 +1705,11 @@ class MainWindow(QtWidgets.QMainWindow):
             code = ord(ch)
             return 0xAC00 <= code <= 0xD7A3
 
-        l_map = [
-            "g", "kk", "n", "d", "tt", "r", "m", "b", "pp", "s",
-            "ss", "", "j", "jj", "ch", "k", "t", "p", "h",
-        ]
-        v_map = [
-            "a", "ae", "ya", "yae", "eo", "e", "yeo", "ye", "o",
-            "wa", "wae", "oe", "yo", "u", "wo", "we", "wi", "yu",
-            "eu", "ui", "i",
-        ]
-        t_map = [
-            "", "k", "k", "k", "n", "n", "n", "t", "l", "lk", "lm", "lp",
-            "ls", "lt", "lp", "lh", "m", "p", "p", "t", "t", "ng",
-            "t", "t", "k", "t", "p", "t",
-        ]
+        l_map = ["g", "kk", "n", "d", "tt", "r", "m", "b", "pp", "s", "ss", "", "j", "jj", "ch", "k", "t", "p", "h"]
+        v_map = ["a", "ae", "ya", "yae", "eo", "e", "yeo", "ye", "o", "wa", "wae", "oe", "yo", "u", "wo", "we", "wi",
+                 "yu", "eu", "ui", "i"]
+        t_map = ["", "k", "k", "k", "n", "n", "n", "t", "l", "lk", "lm", "lp", "ls", "lt", "lp", "lh", "m", "p", "p",
+                 "t", "t", "ng", "t", "t", "k", "t", "p", "t"]
 
         def _romanize_token(token: str) -> str:
             out_parts: List[str] = []
@@ -1795,12 +1787,11 @@ class MainWindow(QtWidgets.QMainWindow):
             print("[FLOW] STEP 1) job() 진입")
             slog("FLOW", "STEP 1) 시작: job() 진입")
 
-            from pathlib import Path as _P
             slog("음악분석", f"오디오: {Path(vocal_path_str).name}")
             print(f"[FLOW] 오디오 파일 = {Path(vocal_path_str).name}")
 
             try:
-                lines_for_api = prepare_lines(lyrics_for_api, drop_section_tags=True)
+                lines_for_api = prepare_lines(lyrics_for_api, drop_section_tags=True)  # type: ignore[arg-type]
                 print(f"[FLOW] STEP 2) 가사 전처리 완료(EN): lines={len(lines_for_api)}")
                 slog("FLOW", f"STEP 2) 가사 전처리 완료(EN): lines={len(lines_for_api)}")
             except (RuntimeError, ValueError, TypeError):
@@ -1818,10 +1809,10 @@ class MainWindow(QtWidgets.QMainWindow):
             try:
                 print("[FLOW] STEP 3) 싱크 시작")
                 slog("FLOW", "STEP 3) 싱크 시작")
-                if has_pro:
+                if callable(pro_fn):
                     print("  - sync_lyrics_with_whisper_pro 호출")
                     slog("FLOW", "  - sync_lyrics_with_whisper_pro 호출")
-                    res = audio_sync_mod.sync_lyrics_with_whisper_pro(
+                    res = pro_fn(  # type: ignore[misc]
                         str(vocal_path_str),
                         "\n".join(lines_for_api),
                         model_size=model_size,
@@ -1834,10 +1825,10 @@ class MainWindow(QtWidgets.QMainWindow):
                         enable_calibration=True,
                         anchor_first_line_sec=None,
                     )
-                else:
+                elif callable(legacy_fn):
                     print("  - sync_lyrics_with_whisper 호출")
                     slog("FLOW", "  - sync_lyrics_with_whisper 호출")
-                    res = audio_sync_mod.sync_lyrics_with_whisper(
+                    res = legacy_fn(  # type: ignore[misc]
                         str(vocal_path_str),
                         "\n".join(lines_for_api),
                         model_size=model_size,
@@ -1846,6 +1837,8 @@ class MainWindow(QtWidgets.QMainWindow):
                         avg_min_sec_per_unit=avg_min_sec_per_unit,
                         start_preroll=start_preroll,
                     )
+                else:
+                    raise RuntimeError("필요한 싱크 함수가 audio_sync에 없습니다.")
                 print("[FLOW] STEP 3) 싱크 종료")
                 slog("FLOW", "STEP 3) 싱크 종료")
 
@@ -1868,8 +1861,7 @@ class MainWindow(QtWidgets.QMainWindow):
             except Exception:
                 ww = []
 
-            # --- 폴백: whisper_words가 없으면 로컬 한국어 ASR 한 번 더 돌려 WORD 타임라인 확보 ---
-            # 반환/정렬 결과에는 영향 주지 않고, 표시 전용으로만 사용
+            # --- 폴백: whisper_words가 없으면 로컬 ASR로 WORD 타임라인 확보(표시 전용) ---
             if not ww and callable(transcribe_words_fn):
                 try:
                     print("[INFO] whisper_words empty → fallback to local transcribe_words for WORD timeline",
@@ -1881,9 +1873,7 @@ class MainWindow(QtWidgets.QMainWindow):
                         beam_size=5,
                         vad_filter=False,
                     )
-                    tw_words = (tw_res or {}).get("words") or []
-                    # tw_words: List[Tuple[float, float, str]]
-                    ww = tw_words
+                    ww = (tw_res or {}).get("words") or []
                 except (RuntimeError, ValueError, OSError, TypeError) as e:
                     print(f"[WARN] local transcribe_words fallback failed: {e}", flush=True)
 
@@ -1905,16 +1895,13 @@ class MainWindow(QtWidgets.QMainWindow):
                 f"demucs(vocals/drums): {bool(pro_info.get('demucs_vocals_used'))}/{bool(pro_info.get('demucs_drums_used'))}"
             )
             summary.append(f"onsets: {len(onsets)}개 (hp={len(onsets_hp)})")
-            if auto_tags_flag is not None:
-                summary.append(f"project.auto_tags = {auto_tags_flag}")
-            summary.append(f"lyrics_converted = {lyrics_converted}")
+            summary.append(f"lyrics_converted = {bool(lyrics_converted)}")
             if "global_shift_applied_sec" in pro_info:
                 summary.append(
                     f"global_shift_applied = {pro_info.get('global_shift_applied_sec', 0.0):.3f}s, "
                     f"affine(a={pro_info.get('affine_a', 1.0):.3f}, b={pro_info.get('affine_b', 0.0):.3f})"
                 )
 
-            # === 기존 줄별 정합 표시(유지) ===
             summary.append("")
             summary.append("=== 줄별 정합 ===")
             korean_lines = [ln for ln in lyrics_raw.splitlines() if
@@ -1939,13 +1926,11 @@ class MainWindow(QtWidgets.QMainWindow):
             else:
                 summary.append("(줄별 정합 결과 없음)")
 
-            # ===== 신규: lyrics_lls([ko]) 기반 라인-타임 매핑 (표시 전용) =====
+            # ===== lyrics_lls([ko]) 기반 라인-타임 매핑 (표시 전용) =====
             def _build_line_time_mapping(ww_seq: List[Tuple[float, float, str]]) -> List[str]:
-                lines_out: List[str] = []
+                rows: List[str] = []
                 if not lyrics_lls_raw or not ww_seq:
-                    return lines_out
-
-                # 1) WORD 타임라인 → 로마자/정규화 토큰으로 변환
+                    return rows
                 wlist: List[Tuple[float, float, str, str]] = []
                 for item in ww_seq:
                     try:
@@ -1960,8 +1945,6 @@ class MainWindow(QtWidgets.QMainWindow):
                         wlist.append((float(ws), float(we), tok_roma, tok_norm))
                     except (ValueError, TypeError):
                         continue
-
-                # 2) lyrics_lls의 [ko] 라인
                 ko_lines = _split_ko_lines_from_lyrics_lls(lyrics_lls_raw)
                 cursor = 0
                 for idx, ko_line in enumerate(ko_lines, 1):
@@ -1974,37 +1957,30 @@ class MainWindow(QtWidgets.QMainWindow):
                         if parts:
                             sub_tokens.extend(parts)
                     if not sub_tokens:
-                        lines_out.append(f"[{idx:02d}] (no segment)  {line_disp}")
+                        rows.append(f"[{idx:02d}] (no segment)  {line_disp}")
                         continue
-
                     start_tok = sub_tokens[0]
                     end_tok = sub_tokens[-1]
-
                     start_idx = -1
                     for j in range(cursor, len(wlist)):
                         if wlist[j][3] == start_tok:
                             start_idx = j
                             break
                     if start_idx == -1:
-                        lines_out.append(f"[{idx:02d}] (no segment)  {line_disp}")
+                        rows.append(f"[{idx:02d}] (no segment)  {line_disp}")
                         continue
-
                     end_idx = start_idx
                     for j in range(start_idx, len(wlist)):
                         if wlist[j][3] == end_tok:
                             end_idx = j
-
                     st_time = wlist[start_idx][0]
                     ed_time = wlist[end_idx][1]
                     if ed_time < st_time:
                         ed_time = st_time
-
-                    lines_out.append(f"[{idx:02d}] {_fmt_time(st_time)} ~ {_fmt_time(ed_time)}  {line_disp}")
+                    rows.append(f"[{idx:02d}] {_fmt_time(st_time)} ~ {_fmt_time(ed_time)}  {line_disp}")
                     cursor = max(cursor, end_idx + 1)
+                return rows
 
-                return lines_out
-
-            # 디버그 or 폴백에서 얻은 ww로 매핑 생성
             line_map_rows: List[str] = []
             try:
                 if ww:
@@ -2029,10 +2005,8 @@ class MainWindow(QtWidgets.QMainWindow):
                 if not ok:
                     QtWidgets.QMessageBox.critical(self, "음악분석 실패", str(err))
                     return
-
                 text = (payload or {}).get("text", "")
                 print("\n[음악분석 결과]\n" + text, flush=True)
-
                 dlg = QtWidgets.QDialog(self)
                 dlg.setWindowTitle("음악분석 결과 — 자동보정")
                 dlg.resize(1000, 760)
