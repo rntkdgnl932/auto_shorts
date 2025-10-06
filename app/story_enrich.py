@@ -3,7 +3,6 @@ from __future__ import annotations
 from typing import List, Dict, Callable, Any, Optional, Tuple
 import os
 import re
-import json
 from copy import deepcopy
 
 TraceFn = Callable[[str, str], None]
@@ -1144,108 +1143,7 @@ def _fit_to_target_count(units: List[str], target_min: int, target_max: int) -> 
 # ─────────────────────────────────────────────────────────────
 # 메인: 의미단위 분할
 # ─────────────────────────────────────────────────────────────
-def split_lyrics_into_semantic_units_ai(
-    lyrics: str,
-    *,
-    ai: Any | None = None,
-    lang: str = "ko",
-    trace: Optional[TraceFn] = None,
-    min_units: int = 6,
-    max_units: int = 12,
-    max_chars_per_unit: int = 18,
-    preset: str = "auto",          # auto | breath8 | breath_auto | flow_all
-    duration_sec: float | None = None,
-    sec_per_unit: float | None = None,
-) -> List[str]:
-    """
-    가사를 의미 단위로 분할하는 통합 엔트리.
-    - preset="flow_all": 원문 흐름/반복 보존, 길면 추가 분할만
-    - preset="breath8": 호흡 위주 8~10컷 느낌
-    - preset="breath_auto": 곡 길이에 따라 목표 컷 수 자동
-    - preset="auto": AI→규칙 보정(일반)
-    """
-    text = _normalize_text_ko(lyrics)
-    if not text:
-        return []
 
-    # ── flow_all: 전체 흐름 그대로(반복 포함) ──
-    if preset == "flow_all":
-        seeds = _split_basic_chunks(text)
-        refined: List[str] = []
-        for s in seeds:
-            refined.extend(_split_long_ko(s, max_chars_per_unit=max_chars_per_unit))
-        return _post_refine_flow_all(refined)
-
-    # ── breath8: 짧은 곡 8~10컷 느낌 ──
-    if preset == "breath8":
-        # 1차: 표면 단서로 쪼갬
-        seeds = _split_basic_chunks(text)
-        # 2차: 길이 제한 충족
-        refined: List[str] = []
-        for s in seeds:
-            refined.extend(_split_long_ko(s, max_chars_per_unit=max_chars_per_unit))
-        # 3차: 호흡 감각 보정
-        return _post_refine_breath8(refined)
-
-    # ── breath_auto: 길이에 따라 목표 컷 수 자동 ──
-    if preset == "breath_auto":
-        tmin, tmax = _target_units_from_duration(duration_sec, sec_per_unit=sec_per_unit)
-
-        # 1) 우선 AI 시도
-        units: List[str]
-        used_ai = False
-        if ai is not None:
-            try:
-                system = (
-                    f"한국어 가사를 의미 단위로 분해. 전체 {tmin}~{tmax}개, "
-                    f"각 요소는 짧고 자연스럽게(최대 {max_chars_per_unit}자). "
-                    "접속/보조어미(고/며/면서/도록/싶어 등) 경계 고려. JSON 배열만."
-                )
-                user = "자연스러운 호흡 단위로 분리:\n\n" + text
-                raw = ai.ask_smart(
-                    system, user,
-                    prefer=getattr(ai, "default_prefer", "openai"),
-                    allow_fallback=True,
-                    trace=trace,
-                )
-                arr = json.loads(str(raw).strip())
-                units = [str(x).strip() for x in arr if str(x).strip()]
-                used_ai = True
-            except Exception:
-                units = _split_basic_chunks(text)
-        else:
-            units = _split_basic_chunks(text)
-
-        # 2) 호흡 규칙 보정 + 목표 개수 맞춤
-        units = _post_refine_breath8(units)
-        units = _fit_to_target_count(units, tmin, tmax)
-        return units
-
-    # ── auto: 일반 경로(AI→규칙 보정) ──
-    units: List[str]
-    if ai is not None:
-        try:
-            system = (
-                f"한국어 가사를 의미 단위로 분리. 전체 {min_units}~{max_units}개, "
-                f"각 요소 최대 {max_chars_per_unit}자. 접속/보조어미 경계 고려. JSON 배열만."
-            )
-            user = "가사를 자연스러운 호흡 단위로 분리:\n\n" + text
-            raw = ai.ask_smart(
-                system, user,
-                prefer=getattr(ai, "default_prefer", "openai"),
-                allow_fallback=True,
-                trace=trace,
-            )
-            arr = json.loads(str(raw).strip())
-            units = [str(x).strip() for x in arr if str(x).strip()]
-        except Exception:
-            units = _split_basic_chunks(text)
-    else:
-        units = _split_basic_chunks(text)
-
-    # 규칙 보정으로 호흡감만 정리
-    units = _post_refine_breath8(units)
-    return units
 
 
 
@@ -1261,44 +1159,7 @@ def _korean_weight(s: str) -> int:
     return max(1, len(re.findall(r"[가-힣A-Za-z0-9]", t)))
 
 
-def layout_time_by_weights(
-    units: List[str],
-    *,
-    total_start: float,
-    total_end: float,
-    onsets: Optional[List[float]] = None,
-) -> List[float]:
-    """유닛 가중치 비율로 시간 경계를 배치."""
-    start = float(total_start)
-    end = float(total_end)
-    if end <= start or not units:
-        return [start, end]
 
-    weights = [_korean_weight(u) for u in units]
-    s = sum(weights)
-    ratios = [w / s for w in weights]
-    dur = end - start
-
-    boundaries = [start]
-    acc = start
-    for r in ratios:
-        acc += dur * r
-        boundaries.append(round(acc, 3))
-
-    # onsets가 있으면 경계 스냅(선택적, 간단히 가장 가까운 onset으로 보정)
-    if onsets:
-        snapped = [boundaries[0]]
-        for b in boundaries[1:-1]:
-            near = min(onsets, key=lambda x: abs(x - b))
-            snapped.append(round(near, 3))
-        snapped.append(boundaries[-1])
-        boundaries = snapped
-
-    # 단조 증가 보장
-    for i in range(1, len(boundaries)):
-        if boundaries[i] <= boundaries[i-1]:
-            boundaries[i] = round(boundaries[i-1] + 0.01, 3)
-    return boundaries
 
 
 def build_lyrics_sections(units: List[str], boundaries: List[float]) -> List[Dict[str, Any]]:

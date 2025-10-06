@@ -76,7 +76,6 @@ try:
     from app.video_build import build_shots_with_i2v, xfade_concat, recalc_overlap
     from app.audio_sync import generate_music_with_acestep, rewrite_prompt_audio_format
     from app.tag_norm import normalize_tags_to_english
-    from app.audio_sync import analyze_project
 except ImportError:
     # noinspection PyPep8Naming
     import settings as S  # type: ignore
@@ -89,8 +88,7 @@ except ImportError:
     from lyrics_gen import generate_title_lyrics_tags, create_project_files               # type: ignore
     from video_build import build_shots_with_i2v, xfade_concat, recalc_overlap                             # type: ignore
     from audio_sync import generate_music_with_acestep, rewrite_prompt_audio_format                         # type: ignore
-    from utils import normalize_tags_to_english                                                          # type: ignore
-    from audio_sync import analyze_project                                                                  # type: ignore                                                   # type: ignore
+    from utils import normalize_tags_to_english                                                          # type: ignore                                                       # type: ignore                                                   # type: ignore
 
 # ==== CRASH LOGGER (붙여넣기) ====
 # from pathlib import Path as _Path # Path 중복 import
@@ -196,51 +194,7 @@ def _resolve_audio_dir_from_template(template_path: str, title: str) -> Path:
     return path
 
 # ───────────────────────── 공통 Worker (가사 생성/일반 함수 호출) ────────────────
-def _analyze_project_compat(*, project_dir: str, audio_path: str,
-                            ai=None, on_progress=None):
-    """
-    audio_sync.analyze_project 버전별 파라미터 이름을 자동 매핑해서 호출한다.
-    - audio_path <-> audio_file
-    - on_progress / progress_cb / progress / callback / on_update / cb
-    - ai 파라미터가 없으면 자동으로 생략
-    """
-    import inspect
-    from audio_sync import analyze_project as _analyze_project
 
-    sig = inspect.signature(_analyze_project)
-    params = sig.parameters
-
-    kwargs = {}
-
-    # project_dir
-    if 'project_dir' in params:
-        kwargs['project_dir'] = project_dir
-
-    # 오디오 인자 이름 자동 매핑
-    if 'audio_path' in params:
-        kwargs['audio_path'] = audio_path
-    elif 'audio_file' in params:
-        kwargs['audio_file'] = audio_path
-    else:
-        # 혹시 이름이 다르면 마지막 수단: 그대로 두고(포기),
-        # positional이 필요할 수 있으므로 아래에서 args로 넣을 수도 있음.
-        pass
-
-    # ai 지원 여부
-    if 'ai' in params:
-        kwargs['ai'] = ai
-
-    # 진행 콜백 이름 자동 매핑
-    if on_progress is not None:
-        for name in ('on_progress', 'progress_cb', 'progress',
-                     'callback', 'on_update', 'cb'):
-            if name in params:
-                kwargs[name] = on_progress
-                break
-        # 어느 것도 없으면 조용히 콜백 미전달(해당 버전은 콜백 미지원)
-
-    # 남은 필수 positional-only 파라미터가 있으면 안 건드려도 대개 없음
-    return _analyze_project(**kwargs)
 
 class Worker(QtCore.QObject):
     done = QtCore.pyqtSignal(object, object)
@@ -2174,35 +2128,59 @@ class MainWindow(QtWidgets.QMainWindow):
     # shorts_ui.py (class MainWindow 내부)
     def on_click_test1_analyze(self) -> None:
         """
-        '음악분석' 버튼(Whisper 우선 싱크 + 폴백 배분):
-        - project.json → story.json에서 가사 로드
-        - (선택) 보컬 분리 후 Whisper 단어 단위 전사
-        - 공식 가사 라인과 정렬 → 성공 라인은 Whisper 시간 사용
-        - 실패 라인은 온셋-가중치 배분 폴백
-        - 콘솔/다이얼로그 출력 + preview JSON 저장 (story.json 미수정)
-        - ★ 추가: 줄별 정합 기반 '마지막 줄 end + outro_sec'로 컷 & 페이드아웃 수행 → vocal_cut.wav, lyrics_aligned.json 저장
+        '프로젝트분석' 버튼 로직 (수정된 최종 워크플로우):
+        1. '음악분석'과 동일한 방식으로 가사를 전처리한다.
+        2. 정확한 '음악분석'(`sync_lyrics_with_whisper_pro`)을 먼저 실행하여 `segments`를 얻는다.
+        3. 이 `segments`의 정확한 시간 정보를 기반으로 story.json의 뼈대를 생성한다.
+        4. 생성된 뼈대를 GPT로 상세화하고 최종 저장한다.
         """
         from pathlib import Path
-        from utils import run_job_with_progress_async
-        from utils import load_json, save_json
-
-        test_phase = 0  # 0=전체, 1=가사만, 2=가사+오디오 매칭
+        # 필요한 함수들을 모두 import 합니다.
+        try:
+            from app.utils import run_job_with_progress_async, load_json, save_json
+            from app.audio_sync import sync_lyrics_with_whisper_pro, prepare_pure_lyrics_lines
+            from app.story_enrich import (
+                merge_scenes_preserve_assets_strict,
+                postprocess_story_layout,
+                label_scenes_by_kinds,
+                apply_gpt_to_story_v11,
+                finalize_story_coherence,
+                ensure_global_negative,
+                normalize_prompts,
+            )
+        except ImportError:
+            # 단독 실행 환경을 위한 폴백 import
+            from utils import run_job_with_progress_async, load_json, save_json  # type: ignore
+            from audio_sync import sync_lyrics_with_whisper_pro, prepare_pure_lyrics_lines  # type: ignore
+            from story_enrich import (  # type: ignore
+                merge_scenes_preserve_assets_strict,
+                postprocess_story_layout,
+                label_scenes_by_kinds,
+                apply_gpt_to_story_v11,
+                finalize_story_coherence,
+                ensure_global_negative,
+                normalize_prompts,
+            )
 
         btn = getattr(self, "btn_test1_story", None) or getattr(getattr(self, "ui", None), "btn_test1_story", None)
         if btn:
-            btn.setEnabled(False)
+            try:
+                btn.setEnabled(False)
+            except RuntimeError:  # 이미 삭제된 위젯일 경우를 대비
+                pass
 
         def job(log):
-            # 래퍼: log는 1인자만 받으므로 여기서 문자열로 합칩니다.
+            # 래퍼: log 콜백은 딕셔너리 형태의 인자 하나를 받습니다.
             def p(tag_or_msg: str, msg: str | None = None) -> None:
-                if msg is None:
-                    log(str(tag_or_msg))
-                else:
-                    log(f"[{tag_or_msg}] {msg}")
+                log_msg = str(tag_or_msg) if msg is None else f"[{tag_or_msg}] {msg}"
+                try:
+                    log({"msg": log_msg})
+                except Exception:
+                    pass
 
             try:
-                # 2) 프로젝트/보컬 파악
-                p("ui", "프로젝트/보컬 탐색")
+                # 1) 프로젝트/보컬/가사 파악
+                p("ui", "프로젝트 정보 탐색")
                 proj_dir_str = self._current_project_dir()
                 if not proj_dir_str:
                     raise RuntimeError("프로젝트 폴더를 선택/생성해 주세요.")
@@ -2210,128 +2188,86 @@ class MainWindow(QtWidgets.QMainWindow):
 
                 meta_path = proj_dir / "project.json"
                 if not meta_path.exists():
-                    raise FileNotFoundError(str(meta_path))
+                    raise FileNotFoundError(f"project.json을 찾을 수 없습니다: {meta_path}")
 
                 meta = load_json(str(meta_path), default={}) or {}
-                duration_hint = float(meta.get("duration") or 0.0) or None
+                lyrics_raw = str(meta.get("lyrics") or "").strip()
+                if not lyrics_raw:
+                    raise RuntimeError("project.json 내 lyrics가 비어 있습니다.")
 
-                audio_from_meta = str(meta.get("audio") or "").strip()
-                if audio_from_meta:
-                    audio_file = (proj_dir / audio_from_meta) if not Path(audio_from_meta).is_absolute() else Path(
-                        audio_from_meta)
-                else:
-                    found = self._find_latest_vocal()
-                    if not found:
-                        raise FileNotFoundError("vocal.* 파일을 찾지 못했습니다.")
-                    audio_file = Path(found)
+                audio_file = self._find_latest_vocal()
+                if not audio_file or not audio_file.exists():
+                    raise FileNotFoundError("vocal.* 파일을 찾지 못했습니다.")
 
-                if not audio_file.exists():
-                    raise FileNotFoundError(f"오디오 없음: {audio_file}")
+                # ✨ (변경) '음악분석' 버튼과 동일한 가사 전처리 로직 적용
+                p("lyrics", "API 호출을 위한 가사 정규화")
+                lyrics_for_api = self._maybe_convert_lyrics_for_api(lyrics_raw)
+                final_lyrics_lines = prepare_pure_lyrics_lines(lyrics_for_api, drop_section_tags=True)
+                lyrics_to_pass = "\n".join(final_lyrics_lines)
+
+                # 2) 정확한 '음악분석' 실행하여 세그먼트 확보
+                p("analyze", "정확한 시간 분석(sync_lyrics_with_whisper_pro) 시작")
+                analysis_result = sync_lyrics_with_whisper_pro(
+                    audio_path=str(audio_file),
+                    lyrics_text=lyrics_to_pass,  # ✨ 변경된 가사 전달
+                    enable_preprocess=True,
+                    enable_demucs=True,
+                    enable_calibration=True,
+                )
+                segments = analysis_result.get("segments")
+                if not segments:
+                    raise RuntimeError("음악 분석에서 유효한 세그먼트를 얻지 못했습니다.")
+                p("analyze", f"분석 완료. 세그먼트 {len(segments)}개 확보.")
+
+                # 3) 확보된 세그먼트로 story.json 뼈대 생성
+                p("build", "정확한 시간 기반으로 story.json 뼈대 구성")
+                skeleton_scenes = []
+                for i, seg in enumerate(segments):
+                    start_time = seg.get("start", 0.0)
+                    end_time = seg.get("end", 0.0)
+                    duration = round(max(0.0, end_time - start_time), 3)
+
+                    skeleton_scenes.append({
+                        "id": f"S{i + 1:03d}",
+                        "name": f"scene_{i + 1:02d}",
+                        "start": start_time,
+                        "end": end_time,
+                        "duration": duration,
+                        "lyric": seg.get("text", "") or seg.get("line_ko", ""),
+                        "section": seg.get("section", "verse"),
+                        "kind": seg.get("section", "verse"),
+                    })
 
                 old_story = load_json(str(proj_dir / "story.json"), default={}) or {}
                 old_scenes = list(old_story.get("scenes") or [])
 
-                # 5) 가사 의미단위 (AI만)
-                from story_enrich import split_lyrics_into_semantic_units_ai
-                lyrics = str(meta.get("lyrics") or "").strip()
-                if not lyrics:
-                    raise RuntimeError("project.json 내 lyrics가 비어 있습니다.")
-
-                p("ai", "AI 의미단위 분할 시작")
-
-                def _trace(ev: str, msg: str) -> None:
-                    p(ev, msg)  # trace도 1인자 log 규약 준수
-
-                units = split_lyrics_into_semantic_units_ai(
-                    lyrics,
-                    ai=getattr(self, "_ai", None),
-                    lang="ko",
-                    preset="flow_all",  # ★ 전체 흐름 그대로(반복 포함)
-                    max_chars_per_unit=18  # 필요시 16~22 사이로 미세조정
-                )
-
-                p("ai", f"의미단위 {len(units)}개")
-
-                if test_phase == 1:
-                    save_json(str(proj_dir / "story_ready.json"), {
-                        "title": meta.get("title"),
-                        "lyrics": lyrics,
-                        "units_ai": units
-                    })
-                    p("done", "TEST_PHASE=1 완료 (story_ready.json 저장)")
-                    return
-
-                # 4) 오디오 분석
-                from audio_sync import analyze_project
-                p("audio", "오디오 분석(analyze_project)")
-                analysis = analyze_project(
-                    project_dir=str(proj_dir),
-                    audio_path=str(audio_file),
-                    save=True,
-                    use_audio_segmentation=True,
-                    force_total_sec=duration_hint,
-                    ai=None,
-                )
-                effective_dur = float(analysis.get("effective_duration") or analysis.get("duration") or 0.0)
-                if effective_dur <= 0:
-                    raise RuntimeError("유효 길이를 확인할 수 없습니다.")
-
-                # 6) 시간배치/섹션/스켈레톤/자산머지
-                from story_enrich import (
-                    layout_time_by_weights,
-                    build_lyrics_sections,
-                    build_scene_skeleton_from_units_with_kinds,
-                    merge_scenes_preserve_assets_strict,
-                    postprocess_story_layout,
-                    label_scenes_by_kinds,
-                )
-                p("build", "시간배치/섹션/스켈레톤 구성")
-
-                boundaries = layout_time_by_weights(
-                    units,
-                    total_start=0.0,
-                    total_end=effective_dur,
-                    onsets=None,
-                )
-                sections = build_lyrics_sections(units, boundaries)
-
-                skeleton = build_scene_skeleton_from_units_with_kinds(
-                    units,
-                    boundaries,
-                    kinds=None,
-                    old_scenes=old_scenes if isinstance(old_scenes, list) else [],
-                )
-
                 story_tmp = {
                     "title": meta.get("title"),
-                    "lyrics": lyrics,
-                    "duration": round(effective_dur, 3),
-                    "sections": sections,
-                    "scenes": skeleton,
+                    "lyrics": lyrics_raw,  # 원본 가사는 그대로 유지
+                    "duration": round(analysis_result.get("duration_sec", 0.0), 3),
+                    "scenes": skeleton_scenes,
                 }
+
+                # 4) 뼈대와 기존 씬 병합 및 후처리
+                p("build", "기존 씬 정보와 병합 및 후처리")
                 story_tmp = label_scenes_by_kinds(story_tmp)
                 story_tmp = postprocess_story_layout(story_tmp)
 
                 merged_scenes = merge_scenes_preserve_assets_strict(
-                    old_scenes=list(old_scenes if isinstance(old_scenes, list) else []),
+                    old_scenes=old_scenes,
                     new_skeleton=list(story_tmp.get("scenes") or []),
                 )
                 story_tmp["scenes"] = merged_scenes
 
-                if test_phase == 2:
-                    save_json(str(proj_dir / "story.json"), story_tmp)
-                    p("done", "TEST_PHASE=2 완료 (story.json 부분 저장)")
-                    return
-
-                # 7) GPT v11 강화
-                p("gpt", "apply_gpt_to_story_v11")
-                from story_enrich import apply_gpt_to_story_v11, finalize_story_coherence, ensure_global_negative, \
-                    normalize_prompts
+                # 5) GPT로 프롬프트 상세화
+                p("gpt", "GPT로 씬 상세화 시작 (apply_gpt_to_story_v11)")
 
                 def _ask(system, user, **kw):
                     return self._ai.ask_smart(system, user, **kw)
 
-                # apply_gpt_to_story_v11 trace도 1인자 log 래퍼 사용
+                def _trace(ev: str, msg: str) -> None:
+                    p(ev, msg)
+
                 story_tmp = apply_gpt_to_story_v11(
                     story_tmp,
                     ask=_ask,
@@ -2339,8 +2275,10 @@ class MainWindow(QtWidgets.QMainWindow):
                     allow_fallback=(getattr(self._ai, "default_prefer", "openai") == "openai"),
                     trace=_trace,
                 )
+                p("gpt", "GPT 상세화 완료")
 
-                # 8) 최종 정합/정규화
+                # 6) 최종 정리 및 저장
+                p("finalize", "최종 일관성 정리 및 저장")
                 story_tmp = finalize_story_coherence(story_tmp)
                 story_tmp = ensure_global_negative(story_tmp)
                 story_tmp = normalize_prompts(story_tmp)
@@ -2349,17 +2287,17 @@ class MainWindow(QtWidgets.QMainWindow):
                 p("done", "완료: story.json 저장")
 
             except Exception as e:
-                p("error", f"{type(e).__name__}: {e}")
+                p(f"error:{type(e).__name__}", str(e))
                 raise
 
         try:
-            run_job_with_progress_async(self, "프로젝트분석", job)  # 진행창 문구
+            run_job_with_progress_async(self, "프로젝트 분석 (통합 v2)", job)
         finally:
             if btn:
-                btn.setEnabled(True)
-
-    # ────────────── 공용 UI 헬퍼 ──────────────
-    # Busy guard helpers (MainWindow 메서드로 추가)
+                try:
+                    btn.setEnabled(True)
+                except RuntimeError:
+                    pass
 
 
 
