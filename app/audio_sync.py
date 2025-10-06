@@ -3310,6 +3310,7 @@ def sync_lyrics_with_whisper_pro(
     - 줄 수(N) < 세그먼트 수면 앞 N개만 매핑(초과는 드롭 로그)
     - seg.json: [{start, end, text}] 저장
     - 호환 인자는 result['compat']에 보존
+    - 후반 처리: 마지막 가사 end + 5초 지점까지 **선형 페이드아웃** 후 컷하여 audio_path에 덮어쓰기
     """
     from pathlib import Path
     from typing import Any, Dict, List, Tuple, Optional
@@ -3391,8 +3392,8 @@ def sync_lyrics_with_whisper_pro(
         if not pj.exists():
             return []
         try:
-            with open(pj, "r", encoding="utf-8") as fh:
-                data = json.load(fh)
+            with open(pj, "r", encoding="utf-8") as fpj:
+                data = json.load(fpj)
         except (OSError, json.JSONDecodeError, UnicodeDecodeError):
             return []
         keys_prefer = [
@@ -3442,30 +3443,30 @@ def sync_lyrics_with_whisper_pro(
     else:
         print("=== 라인-타임 매핑 === (no segments)")
 
-    # ---------- seg.json 저장 (파일 핸들 이름 충돌 방지) ----------
+    # ---------- seg.json 저장 ----------
     try:
         seg_path = src.parent / "seg.json"
-        with open(seg_path, "w", encoding="utf-8") as fp:
-            json.dump(segs, fp, ensure_ascii=False, indent=2)
+        with open(seg_path, "w", encoding="utf-8") as fseg:
+            json.dump(segs, fseg, ensure_ascii=False, indent=2)
         print(f"[INFO] seg.json saved: {seg_path}")
     except (OSError, ValueError, TypeError):
         pass
 
-    # ---------- 부가 정보 (이름 충돌 방지용 로컬 헬퍼명) ----------
+    # ---------- 부가 정보 (별칭 가리기 방지) ----------
     def _dur_sec_local(pth: str) -> float:
         try:
             from mutagen import File as MutagenFile  # type: ignore
-            mf = MutagenFile(pth)
-            if mf and getattr(mf, "info", None) and getattr(mf.info, "length", None):
-                return float(mf.info.length)
+            mf_local = MutagenFile(pth)
+            if mf_local and getattr(mf_local, "info", None) and getattr(mf_local.info, "length", None):
+                return float(mf_local.info.length)
         except (OSError, ValueError, RuntimeError, TypeError):
             pass
         try:
-            import soundfile as sf  # type: ignore
-            data, sr = sf.read(pth, dtype="float32")
-            n = getattr(data, "shape", [len(data)])[0]
-            if sr:
-                return float(n / sr)
+            import soundfile as sf_ro  # type: ignore  # <-- 읽기 전용 별칭
+            audio_arr, sr_hz = sf_ro.read(pth, dtype="float32")
+            n_frames = getattr(audio_arr, "shape", [len(audio_arr)])[0]
+            if sr_hz:
+                return float(n_frames / sr_hz)
         except (OSError, ValueError, RuntimeError, TypeError):
             pass
         return 0.0
@@ -3473,10 +3474,10 @@ def sync_lyrics_with_whisper_pro(
     def _onsets_local(pth: str) -> tuple[list[float], list[float]]:
         try:
             import librosa  # type: ignore
-            y, sr = librosa.load(pth, sr=None, mono=True)
-            on = librosa.onset.onset_detect(y=y, sr=sr, units="time", backtrack=False)
-            y_h, y_p = librosa.effects.hpss(y)
-            on_hp = librosa.onset.onset_detect(y=y_p, sr=sr, units="time", backtrack=False)
+            y_mono, sr_lib = librosa.load(pth, sr=None, mono=True)
+            on = librosa.onset.onset_detect(y=y_mono, sr=sr_lib, units="time", backtrack=False)
+            y_h, y_p = librosa.effects.hpss(y_mono)
+            on_hp = librosa.onset.onset_detect(y=y_p, sr=sr_lib, units="time", backtrack=False)
             return list(map(float, on)), list(map(float, on_hp))
         except (ValueError, OSError, RuntimeError):
             return [], []
@@ -3504,6 +3505,44 @@ def sync_lyrics_with_whisper_pro(
         "extra_kwargs": dict(extra_kwargs),
     }
 
+    # ---------- 후반 처리: 마지막 가사 end + 5s 페이드아웃 후 컷 ----------
+    try:
+        last_end_sec = 0.0
+        for it in reversed(segs):
+            ed = it.get("end")
+            if isinstance(ed, (int, float)):
+                last_end_sec = float(ed)
+                break
+
+        if last_end_sec > 0.0:
+            cut_end_sec = last_end_sec + 5.0
+            if duration_sec and duration_sec > 0.0:
+                cut_end_sec = min(cut_end_sec, float(duration_sec))
+
+            import soundfile as sf_io  # type: ignore  # <-- 쓰기용 별칭(가리기 방지)
+            import numpy as np_io      # type: ignore
+
+            audio_arr2, sr_hz2 = sf_io.read(str(src), dtype="float32", always_2d=True)
+            total_len = audio_arr2.shape[0]
+            max_time = total_len / float(sr_hz2) if sr_hz2 else 0.0
+            cut_end_sec = max(0.0, min(cut_end_sec, max_time))
+            to_idx = int(cut_end_sec * sr_hz2) if sr_hz2 else total_len
+            if to_idx <= 0:
+                to_idx = total_len
+
+            trimmed_arr = audio_arr2[:to_idx, :]
+
+            fade_len = int(min(5.0, cut_end_sec) * sr_hz2) if sr_hz2 else 0
+            if fade_len > 0:
+                fade_start = max(0, trimmed_arr.shape[0] - fade_len)
+                ramp = np_io.linspace(1.0, 0.0, trimmed_arr.shape[0] - fade_start, dtype=trimmed_arr.dtype)
+                trimmed_arr[fade_start:, :] *= ramp.reshape(-1, 1)
+
+            sf_io.write(str(src), trimmed_arr, sr_hz2)
+            print(f"[INFO] vocal.wav finalized: cut@{cut_end_sec:.3f}s with 5s fade-out")
+    except (OSError, ValueError, RuntimeError) as e_finalize:
+        print(f"[WARN] finalize audio failed: {e_finalize}")
+
     return {
         "segments": segs,
         "words": words_payload,
@@ -3513,6 +3552,8 @@ def sync_lyrics_with_whisper_pro(
         "onsets_hp": onsets_hp,
         "compat": compat,
     }
+
+
 
 
 
@@ -3813,9 +3854,9 @@ def estimate_affine_drift(segments: list, onsets: list[float]) -> tuple[float, f
 
         if len(final_inlier_indices) >= 2:
             inlier_points = data[final_inlier_indices]
-            A_final = np.vstack([inlier_points[:, 0], np.ones(len(inlier_points))]).T
+            aa_final = np.vstack([inlier_points[:, 0], np.ones(len(inlier_points))]).T
             try:
-                a_final, b_final = np.linalg.lstsq(A_final, inlier_points[:, 1], rcond=None)[0]
+                a_final, b_final = np.linalg.lstsq(aa_final, inlier_points[:, 1], rcond=None)[0]
 
                 # 극단적인 값 방지
                 if 0.85 <= a_final <= 1.15 and abs(b_final) < 15.0:
