@@ -1519,6 +1519,8 @@ class MainWindow(QtWidgets.QMainWindow):
             '라인별 타임 매핑'을 표시 전용으로 계산/출력(기존 세그먼트/반환 불변).
           - 영어(translate) 프린트는 제거.
           - pro 파이프라인에서 whisper_words가 없을 때, audio_sync.transcribe_words 폴백으로 WORD 타임라인 확보.
+          - 2회차(local transcribe_words on vocal.wav)의 EN-SEG 결과를 seg_ready.json으로 저장.
+          - 오디오 길이(초)를 project.json::time에 저장.
         """
         from pathlib import Path
         from typing import List, Tuple
@@ -1526,18 +1528,15 @@ class MainWindow(QtWidgets.QMainWindow):
 
         print("\n--- CHECKPOINT 1: on_click_analyze_music 함수 시작 ---")
 
-        # --- 버튼: 오직 btn_analyze_music만 제어 ---
         btn = getattr(self, "btn_analyze_music", None) or getattr(getattr(self, "ui", None), "btn_analyze_music", None)
         if isinstance(btn, QtWidgets.QAbstractButton):
             btn.setEnabled(False)
 
-        # --- 유틸 로드 ---
         try:
             from app.utils import load_json  # type: ignore
         except Exception:
             from utils import load_json  # type: ignore
 
-        # --- audio_sync 모듈 로드 ---
         try:
             import app.audio_sync as audio_sync_mod  # type: ignore
         except Exception:
@@ -1552,7 +1551,6 @@ class MainWindow(QtWidgets.QMainWindow):
             QtWidgets.QMessageBox.critical(self, "음악분석 실패", "audio_sync 모듈 로드 실패")
             return
 
-        # 필요한 심볼 존재 여부 안전 확인
         prepare_lines = getattr(audio_sync_mod, "prepare_pure_lyrics_lines", None)
         transcribe_words_fn = getattr(audio_sync_mod, "transcribe_words", None)
         pro_fn = getattr(audio_sync_mod, "sync_lyrics_with_whisper_pro", None)
@@ -1566,7 +1564,6 @@ class MainWindow(QtWidgets.QMainWindow):
 
         print("--- CHECKPOINT 2: 모듈 로드 완료 ---")
 
-        # --- 프로젝트/오디오/가사 수집 ---
         try:
             proj_dir = self._current_project_dir()
         except Exception:
@@ -1580,7 +1577,6 @@ class MainWindow(QtWidgets.QMainWindow):
 
         print(f"--- CHECKPOINT 3: 프로젝트 폴더 확인 ({proj_dir}) ---")
 
-        # 보컬 파일(최근 것)
         try:
             vocal_path_raw = self._find_latest_vocal()
         except Exception:
@@ -1601,7 +1597,6 @@ class MainWindow(QtWidgets.QMainWindow):
 
         print(f"--- CHECKPOINT 4: 보컬 파일 확인 ({vocal_path_str}) ---")
 
-        # project.json / story.json
         pj = Path(proj_dir) / "project.json"
         auto_tags_flag = None
         lyrics_raw = ""
@@ -1631,7 +1626,6 @@ class MainWindow(QtWidgets.QMainWindow):
         if lyrics_lls_raw:
             print("[INFO] Using project.json::lyrics_lls (EN/[ko]) for alignment/printout")
 
-        # --- 가사 정규화 / 변환 여부 판정 ---
         def _norm_text(s: str) -> str:
             if not isinstance(s, str):
                 return ""
@@ -1643,7 +1637,6 @@ class MainWindow(QtWidgets.QMainWindow):
         lyrics_for_api = _norm_text(self._maybe_convert_lyrics_for_api(lyrics_raw))
         lyrics_converted = (lyrics_for_api != lyrics_before)
 
-        # tail_file 경로(있으면 테일링)
         tail_path = None
         try:
             candidate = getattr(self, "comfy_log_file", None) or getattr(self, "comfy_log_path", None)
@@ -1654,7 +1647,6 @@ class MainWindow(QtWidgets.QMainWindow):
         except Exception:
             tail_path = None
 
-        # ===== 라인-타임 매핑 보조 유틸(표시 전용) =====
         def _is_hangul_syllable(ch: str) -> bool:
             code = ord(ch)
             return 0xAC00 <= code <= 0xD7A3
@@ -1728,7 +1720,6 @@ class MainWindow(QtWidgets.QMainWindow):
             s = t - (m * 60)
             return f"{m:02d}:{s:06.3f}"
 
-        # --- 분석 잡 정의 ---
         def job(log):
             print("--- CHECKPOINT 7: 'job' 함수 내부 진입 ---")
 
@@ -1801,13 +1792,26 @@ class MainWindow(QtWidgets.QMainWindow):
                 slog("ERROR", f"whisper 정렬 실패: {e}")
 
             segments = (res or {}).get("segments") or []
+            if not isinstance(segments, list):
+                segments = []
+
             onsets = (res or {}).get("onsets") or []
-            onsets_hp = (res or {}).get("onsets_hp") or []
+            if not isinstance(onsets, list):
+                onsets = []
+
+            onsets_hp_raw = (res or {}).get("onsets_hp")
+            if isinstance(onsets_hp_raw, list):
+                onsets_hp_count = len(onsets_hp_raw)
+            else:
+                try:
+                    onsets_hp_count = int(onsets_hp_raw if onsets_hp_raw is not None else 0)
+                except (TypeError, ValueError):
+                    onsets_hp_count = 0
+
             duration_sec = float((res or {}).get("duration_sec", 0.0))
             start_at = float((res or {}).get("start_at", 0.0))
             pro_info = (res or {}).get("__pro_info__") or {}
 
-            # --- 디버그 whisper_words 우선 사용 ---
             ww = []
             try:
                 debug_info = (pro_info.get("debug") or {})
@@ -1815,8 +1819,10 @@ class MainWindow(QtWidgets.QMainWindow):
             except Exception:
                 ww = []
 
-            # --- 폴백: whisper_words가 없으면 로컬 ASR로 WORD 타임라인 확보(표시 전용) ---
-            if not ww and callable(transcribe_words_fn):
+            tw_res = None
+            seg_ready_rows = []
+            seg_ready_items = []
+            if callable(transcribe_words_fn):
                 try:
                     print("[INFO] whisper_words empty → fallback to local transcribe_words for WORD timeline",
                           flush=True)
@@ -1827,7 +1833,25 @@ class MainWindow(QtWidgets.QMainWindow):
                         beam_size=5,
                         vad_filter=False,
                     )
-                    ww = (tw_res or {}).get("words") or []
+                    seg_en = list((tw_res or {}).get("segments_en") or [])
+                    if not seg_en:
+                        seg_en = list((tw_res or {}).get("segments") or [])
+                    try:
+                        import json
+                        seg_ready_path = Path(proj_dir) / "seg_ready.json"
+                        for i, tpl in enumerate(seg_en, 1):
+                            try:
+                                st, et, tx = tpl
+                                item = {"start": float(st), "end": float(et), "text": str(tx)}
+                                seg_ready_items.append(item)
+                                seg_ready_rows.append(f"[{i:02d}] {float(st):.2f} ~ {float(et):.2f}  <matched lyric>")
+                            except (TypeError, ValueError):
+                                continue
+                        with open(seg_ready_path, "w", encoding="utf-8") as f:
+                            json.dump(seg_ready_items, f, ensure_ascii=False, indent=2)
+                        print(f"[INFO] seg_ready.json saved: {seg_ready_path}")
+                    except (OSError, ValueError, TypeError, ImportError) as e:
+                        print(f"[WARN] failed to save seg_ready.json: {e}")
                 except (RuntimeError, ValueError, OSError, TypeError) as e:
                     print(f"[WARN] local transcribe_words fallback failed: {e}", flush=True)
 
@@ -1840,6 +1864,51 @@ class MainWindow(QtWidgets.QMainWindow):
             except (RuntimeError, ValueError, TypeError):
                 pass
 
+            try:
+                import json
+                def _probe_duration_seconds(pth: str) -> float:
+                    try:
+                        import mutagen
+                        mf = mutagen.File(str(pth))
+                        if mf and getattr(mf, "info", None) and getattr(mf.info, "length", None):
+                            return float(mf.info.length)
+                    except (ImportError, ValueError, OSError, TypeError):
+                        return 0.0
+                    return 0.0
+
+                duration_actual = _probe_duration_seconds(vocal_path_str)
+                dur_to_store = 0.0
+                if duration_actual > 0.0:
+                    dur_to_store = duration_actual
+                elif isinstance(duration_sec, float) and duration_sec > 0.0:
+                    dur_to_store = duration_sec
+                elif seg_ready_items:
+                    try:
+                        last_end = max(float(x.get("end", 0.0)) for x in seg_ready_items)
+                        if last_end > 0.0:
+                            dur_to_store = last_end
+                    except (ValueError, TypeError):
+                        dur_to_store = 0.0
+
+                if dur_to_store > 0.0:
+                    pj_data_now = {}
+                    if pj.exists():
+                        try:
+                            with open(pj, "r", encoding="utf-8") as f:
+                                pj_data_now = json.load(f) or {}
+                        except (OSError, ValueError, TypeError):
+                            pj_data_now = {}
+                    if isinstance(pj_data_now, dict):
+                        pj_data_now["time"] = int(round(dur_to_store))
+                        try:
+                            with open(pj, "w", encoding="utf-8") as f:
+                                json.dump(pj_data_now, f, ensure_ascii=False, indent=2)
+                            print(f"[TIME] saved to project.json::time = {pj_data_now['time']}s")
+                        except (OSError, ValueError, TypeError):
+                            print("[WARN] project.json time write failed")
+            except Exception:
+                pass
+
             summary: List[str] = []
             summary.append(f"파일: {Path(vocal_path_str).name}")
             if duration_sec > 0:
@@ -1848,7 +1917,7 @@ class MainWindow(QtWidgets.QMainWindow):
                 f"preprocess: {bool(pro_info.get('preprocessed'))}, "
                 f"demucs(vocals/drums): {bool(pro_info.get('demucs_vocals_used'))}/{bool(pro_info.get('demucs_drums_used'))}"
             )
-            summary.append(f"onsets: {len(onsets)}개 (hp={len(onsets_hp)})")
+            summary.append(f"onsets: {len(onsets)}개 (hp={onsets_hp_count})")
             summary.append(f"lyrics_converted = {bool(lyrics_converted)}")
             if "global_shift_applied_sec" in pro_info:
                 summary.append(
@@ -1880,7 +1949,6 @@ class MainWindow(QtWidgets.QMainWindow):
             else:
                 summary.append("(줄별 정합 결과 없음)")
 
-            # ===== lyrics_lls([ko]) 기반 라인-타임 매핑 (표시 전용) =====
             def _build_line_time_mapping(ww_seq: List[Tuple[float, float, str]]) -> List[str]:
                 rows: List[str] = []
                 if not lyrics_lls_raw or not ww_seq:
@@ -1948,6 +2016,12 @@ class MainWindow(QtWidgets.QMainWindow):
                 summary.extend(line_map_rows)
             else:
                 summary.append("(no WORD timeline; whisper_words unavailable)")
+
+            if seg_ready_rows:
+                summary.append("")
+                summary.append("=== 라인-타임 매핑 (lyrics vs ASR: pass2) ===")
+                for r in seg_ready_rows:
+                    summary.append(r)
 
             print("[FLOW] STEP 11) 요약 출력 완료")
             slog("FLOW", "STEP 11) 요약 출력 완료")
