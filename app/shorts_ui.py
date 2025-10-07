@@ -1720,7 +1720,147 @@ class MainWindow(QtWidgets.QMainWindow):
             s = t - (m * 60)
             return f"{m:02d}:{s:06.3f}"
 
+        def _build_clean_seg_from_ready(proj_dir: str, lyrics_raw: str, lyrics_lls_raw: str) -> None:
+            """
+            seg_ready.json을 읽어서 실제 가사와 유사도 매칭 후
+            정상 항목만 남겨 seg.json으로 저장한다.
+            - 순서 보존(앞에서 매칭된 가사 인덱스 이후 라인에서 검색)
+            - 짧거나 깨진 텍스트(� 포함)는 제외
+            - 매칭 실패 항목은 제외
+            """
+            from pathlib import Path
+            import json
+            from difflib import SequenceMatcher
+
+            def _only_hangul(s: str) -> str:
+                # 한글 음절과 공백만 남기고 나머지 제거
+                return "".join(ch for ch in (s or "") if (0xAC00 <= ord(ch) <= 0xD7A3) or ch == " ")
+
+            def _norm(s: str) -> str:
+                # 소문자화 + 공백/기호 축소 (한글만 보되 공백 제거)
+                s2 = _only_hangul(s).replace(" ", "")
+                return s2
+
+            def _valid_text(s: str) -> bool:
+                if not s:
+                    return False
+                if "�" in s:  # 깨진 문자 포함시 바로 제외
+                    return False
+                # 한글 수가 2자 미만이면 제외
+                han = [ch for ch in s if 0xAC00 <= ord(ch) <= 0xD7A3]
+                return len(han) >= 2
+
+            def _split_ko_lines_from_lls(s: str):
+                if not s:
+                    return []
+                raw = s.replace("\r\n", "\n").replace("\r", "\n").split("\n")
+                out = []
+                for ln in raw:
+                    t = ln.strip()
+                    if not t:
+                        continue
+                    if t.startswith("[") and t.endswith("]"):
+                        continue
+                    if t.startswith("[ko]"):
+                        out.append(t[4:].strip())
+                return out
+
+            # 1) seg_ready.json 로드
+            seg_ready_path = Path(proj_dir) / "seg_ready.json"
+            if not seg_ready_path.exists():
+                return
+            try:
+                seg_ready = json.loads(seg_ready_path.read_text(encoding="utf-8"))
+                if not isinstance(seg_ready, list):
+                    return
+            except (OSError, ValueError, TypeError):
+                return
+
+            # 2) 실제 가사 라인 구성 (lyrics 우선, 보조로 lyrics_lls의 [ko] 병합)
+            def _split_lyrics_lines(s: str):
+                if not s:
+                    return []
+                raw = s.replace("\r\n", "\n").replace("\r", "\n").split("\n")
+                out = []
+                for ln in raw:
+                    t = ln.strip()
+                    if not t:
+                        continue
+                    if t.startswith("[") and t.endswith("]"):
+                        continue
+                    out.append(t)
+                return out
+
+            ko_lines = _split_lyrics_lines(lyrics_raw)
+            ko_lls = _split_ko_lines_from_lls(lyrics_lls_raw)
+            # 병합(중복 제거, 순서 유지)
+            seen = set()
+            merged_lines = []
+            for line in ko_lines + ko_lls:
+                if line not in seen:
+                    seen.add(line)
+                    merged_lines.append(line)
+
+            # 3) 유사도 매칭
+            #    - 앞에서 매칭된 인덱스 이후로만 탐색하여 순서 보존
+            #    - 길이에 따라 임계값 가변
+            out_items = []
+            last_idx = 0  # 가사 라인 진행 커서
+            for it in seg_ready:
+                try:
+                    st = float(it.get("start", 0.0))
+                    et = float(it.get("end", 0.0))
+                    tx = str(it.get("text") or "")
+                except (ValueError, TypeError, AttributeError):
+                    continue
+
+                if not _valid_text(tx):
+                    # 깨진/너무 짧은 텍스트는 제외
+                    continue
+
+                norm_tx = _norm(tx)
+                if not norm_tx:
+                    continue
+
+                # 길이에 따라 임계값 설정
+                #  한글 4자 미만: 0.80, 그 외: 0.60
+                han_len = len([ch for ch in tx if 0xAC00 <= ord(ch) <= 0xD7A3])
+                thr = 0.80 if han_len < 4 else 0.60
+
+                best_score = -1.0
+                best_idx = -1
+                best_line = ""
+
+                for j in range(last_idx, len(merged_lines)):
+                    cand = merged_lines[j]
+                    norm_cand = _norm(cand)
+                    if not norm_cand:
+                        continue
+                    # 유사도 (공백 제거된 한글만 기반)
+                    sc = SequenceMatcher(None, norm_tx, norm_cand).ratio()
+                    if sc > best_score:
+                        best_score = sc
+                        best_idx = j
+                        best_line = cand
+
+                if best_score >= thr and best_idx >= last_idx:
+                    out_items.append({
+                        "start": round(st, 3),
+                        "end": round(et, 3),
+                        "text": best_line
+                    })
+                    last_idx = best_idx + 1
+                # 임계치 미달이면 버림
+
+            # 4) seg.json 저장 (덮어씀)
+            seg_path = Path(proj_dir) / "seg.json"
+            try:
+                seg_path.write_text(json.dumps(out_items, ensure_ascii=False, indent=2), encoding="utf-8")
+                print(f"[INFO] seg.json overwritten with cleaned alignment: {seg_path}")
+            except (OSError, ValueError, TypeError):
+                print("[WARN] failed to write cleaned seg.json")
         def job(log):
+            from pathlib import Path
             print("--- CHECKPOINT 7: 'job' 함수 내부 진입 ---")
 
             def slog(tag: str, msg: str) -> None:
@@ -1811,6 +1951,16 @@ class MainWindow(QtWidgets.QMainWindow):
             duration_sec = float((res or {}).get("duration_sec", 0.0))
             start_at = float((res or {}).get("start_at", 0.0))
             pro_info = (res or {}).get("__pro_info__") or {}
+
+            try:
+                from pathlib import Path
+                seg_ready_path = Path(proj_dir) / "seg_ready.json"
+                if seg_ready_path.exists():
+                    _build_clean_seg_from_ready(str(proj_dir), lyrics_raw, lyrics_lls_raw)
+                else:
+                    print("[INFO] seg_ready.json not found yet; skipping clean seg build")
+            except Exception as e:
+                print(f"[WARN] clean seg build skipped: {e}")
 
             ww = []
             try:
@@ -2061,6 +2211,8 @@ class MainWindow(QtWidgets.QMainWindow):
             from utils import run_job_with_progress_async  # type: ignore
 
         run_job_with_progress_async(self, "음악분석", job, tail_file=tail_path, on_done=done)
+
+
 
     @staticmethod
     def _persist_lyric_sections(*, proj_dir: str, sections: list, last_end: float) -> None:
