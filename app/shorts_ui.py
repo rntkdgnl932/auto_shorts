@@ -1297,184 +1297,263 @@ class MainWindow(QtWidgets.QMainWindow):
                     te_c.setEnabled(False)  # 비활성화
 
     def on_generate_lyrics_with_log(self) -> None:
-        """
-        가사 생성 버튼 핸들러.
-        - 기존 기능(버튼 상태, 진행창, 생성 호출, project.json 저장/경로 세팅)은 그대로 유지
-        - 변경점: 진행 콜백을 표준화해 어떤 서명으로든 생성기에 전달되도록 보강
-                 (on_progress / progress / 단일 콜백 인자 모두 지원)
-        """
         from PyQt5 import QtWidgets
         from pathlib import Path
-
+        import os
         try:
             from app.utils import run_job_with_progress_async  # type: ignore
-        except Exception:
+        except ImportError:
             from utils import run_job_with_progress_async  # type: ignore
+        try:
+            from app.lyrics_gen import generate_title_lyrics_tags  # type: ignore
+        except ImportError:
+            from lyrics_gen import generate_title_lyrics_tags  # type: ignore
 
-        btn = getattr(self, "btn_generate_lyrics", None) or getattr(self, "btn_gen", None)
-        if isinstance(btn, QtWidgets.QAbstractButton):
+        btn = getattr(self, "btn_gen", None) or getattr(getattr(self, "ui", None), "btn_generate_lyrics", None)
+        if btn:
             try:
                 btn.setEnabled(False)
             except Exception:
                 pass
 
-        def job(progress):
-            try:
-                from app.utils import load_json, save_json  # type: ignore
-            except Exception:
-                from utils import load_json, save_json  # type: ignore
-
-            # --- 진행 콜백 표준화: dict/str 모두 처리, 항상 'msg' 키로 보내기 ---
-            def _forward(info) -> None:
+        # 진행창 테일링용 로그 경로 계산
+        def _get_proj_dir_str() -> str:
+            cur = getattr(self, "_current_project_dir", None)
+            if callable(cur):
                 try:
-                    if isinstance(info, dict):
-                        txt = str(info.get("msg") or info.get("text") or info.get("line") or "")
-                        if not txt:
-                            # 흔한 키 조합: stage + detail
-                            stage = str(info.get("stage") or "")
-                            detail = str(info.get("detail") or "")
-                            txt = f"[{stage}] {detail}".strip() if stage or detail else ""
-                        if not txt:
-                            txt = str(info)
-                        progress({"msg": txt})
-                    else:
-                        progress({"msg": str(info)})
-                except Exception:
-                    # 진행창 없을 때도 안전
+                    cur = cur()
+                except (TypeError, ValueError):
+                    cur = None
+            if isinstance(cur, (str, bytes, os.PathLike)):
+                try:
+                    return os.fspath(cur)
+                except TypeError:
+                    return ""
+            alt = getattr(self, "project_dir", None) or getattr(self, "_forced_project_dir", None)
+            if isinstance(alt, (str, bytes, os.PathLike)):
+                try:
+                    return os.fspath(alt)
+                except TypeError:
+                    return ""
+            return ""
+
+        proj_dir = _get_proj_dir_str()
+        if proj_dir:
+            log_path = str(Path(proj_dir) / "lyrics_gen.log")
+        else:
+            try:
+                import tempfile
+                log_path = str(Path(tempfile.gettempdir()) / "lyrics_gen.log")
+            except (ImportError, OSError, ValueError):
+                log_path = "lyrics_gen.log"
+
+        def job(progress):
+            # 파일/진행창 동시 로깅
+            def _emit(line: str) -> None:
+                try:
+                    p = Path(log_path)
+                    p.parent.mkdir(parents=True, exist_ok=True)
+                    with p.open("a", encoding="utf-8") as fp:
+                        fp.write((line or "").rstrip("\r\n") + "\n")
+                except (OSError, ValueError):
                     pass
+                try:
+                    progress({"msg": line})
+                except Exception:
+                    try:
+                        progress(line)
+                    except Exception:
+                        pass
 
-            _forward("[ui] 가사 생성 시작")
+            _emit("[ui] 가사생성 작업 시작")
 
-            # --- 활성 프로젝트 폴더 확보/세팅(기존 동작 유지) ---
-            project_dir = ""
-            getter = getattr(self, "_get_active_project_dir", None)
+            # 입력 수집
+            title_in = ""
+            le = getattr(self, "le_title", None)
+            if le and hasattr(le, "text"):
+                try:
+                    title_in = (le.text() or "").strip()
+                except (AttributeError, TypeError, ValueError):
+                    title_in = ""
+
+            prompt_text = ""
+            for nm in ("te_prompt", "txt_prompt", "prompt_edit"):
+                w = getattr(self, nm, None) or getattr(getattr(self, "ui", None), nm, None)
+                if w and hasattr(w, "toPlainText"):
+                    try:
+                        prompt_text = (w.toPlainText() or "").strip()
+                    except (AttributeError, TypeError, ValueError):
+                        prompt_text = ""
+                    break
+
+            secs = 60
+            if hasattr(self, "_current_seconds") and callable(self._current_seconds):
+                try:
+                    secs = int(self._current_seconds())
+                except (TypeError, ValueError):
+                    secs = 60
+
+            allowed = []
+            getter = getattr(self, "_manual_option_set", None)
             if callable(getter):
                 try:
-                    project_dir = str(getter() or "")
-                except Exception:
-                    project_dir = ""
-            if not project_dir:
-                cur = getattr(self, "_current_project_dir", None)
-                if callable(cur):
-                    try:
-                        project_dir = str(cur() or "")
-                    except Exception:
-                        project_dir = ""
-            if not project_dir:
-                latest = getattr(self, "_latest_project", None)
-                if callable(latest):
-                    try:
-                        lp = latest()
-                        if lp:
-                            project_dir = str(lp)
-                    except Exception:
-                        project_dir = ""
-            setter = getattr(self, "_set_active_project_dir", None)
-            if project_dir and callable(setter):
-                try:
-                    setter(project_dir)
-                    _forward(f"[ui] 활성 프로젝트 설정: {project_dir}")
-                except Exception:
-                    pass
+                    vals = getter()
+                    if isinstance(vals, (list, set, tuple)):
+                        allowed = sorted(str(x) for x in vals)
+                except (TypeError, ValueError):
+                    allowed = []
 
-            # --- 실제 가사 생성 호출: 시그니처 다양성 안전 지원 ---
-            payload = None
-            err_text = ""
+            prefer = "gemini" if (getattr(self, "btn_ai_toggle", None) and getattr(self,
+                                                                                   "btn_ai_toggle").isChecked()) else "openai"
+            allow_fb = False if prefer == "gemini" else True
 
-            # 1) 내부 메서드 우선
-            gen_inner = getattr(self, "_do_generate_lyrics", None)
-            if callable(gen_inner):
-                try:
-                    # 단일 콜백 인자 형태
-                    payload = gen_inner(_forward)
-                except TypeError:
-                    try:
-                        # on_progress= 형태
-                        payload = gen_inner(on_progress=_forward)  # type: ignore
-                    except TypeError:
-                        # progress= 형태
-                        payload = gen_inner(progress=_forward)  # type: ignore
-                except Exception as e:
-                    err_text = str(e)
+            def trace(ev: str, msg: str):
+                head = (ev or "").split(":", 1)[0]
+                _emit(f"[{head}] {msg}")
 
-            # 2) 모듈 함수 폴백
-            if payload is None and not err_text:
-                try:
-                    try:
-                        from app.lyrics_gen import generate_lyrics_with_log  # type: ignore
-                    except Exception:
-                        from lyrics_gen import generate_lyrics_with_log  # type: ignore
-                    try:
-                        payload = generate_lyrics_with_log(_forward)  # 단일 콜백
-                    except TypeError:
-                        try:
-                            payload = generate_lyrics_with_log(on_progress=_forward)  # type: ignore
-                        except TypeError:
-                            payload = generate_lyrics_with_log(progress=_forward)  # type: ignore
-                except Exception as e:
-                    err_text = str(e)
+            _emit(f"[ai] prefer={prefer}, secs={secs}]")
 
-            if payload is None and err_text:
-                raise RuntimeError(err_text or "가사 생성에 실패했습니다.")
+            data = generate_title_lyrics_tags(
+                prompt=prompt_text,
+                duration_min=max(1, min(3, int(round(secs / 60)) or 1)),
+                duration_sec=secs,
+                title_in=title_in,
+                allowed_tags=allowed,
+                trace=trace,
+                prefer=prefer,
+                allow_fallback=allow_fb,
+            )
 
-            _forward("[ui] 가사 생성 완료")
+            # 이후 단계에서 폴더 유실 방지를 위해 proj_dir 후보도 함께 반환
+            return {"data": data, "title": title_in, "prompt": prompt_text, "proj_dir": proj_dir}
 
-            # --- project.json 경로 재확정(기존 로직 유지) ---
-            picked = project_dir
-            if picked:
-                pj = Path(picked) / "project.json"
-                if pj.exists():
-                    meta = load_json(pj, {}) or {}
-                    try:
-                        inner = str(((meta.get("paths") or {}).get("project_dir")) or "")
-                    except Exception:
-                        inner = ""
-                    if inner and Path(inner).exists():
-                        picked = inner
-
-            if picked and callable(setter):
-                try:
-                    setter(picked)
-                    _forward(f"[ui] 활성 프로젝트 재설정: {picked}")
-                except Exception:
-                    pass
-
-            return {"project_dir": picked or project_dir}
-
-        def on_done(ok: bool, _payload, err):
-            if isinstance(btn, QtWidgets.QAbstractButton):
+        def done(ok: bool, payload, err):
+            if btn:
                 try:
                     btn.setEnabled(True)
                 except Exception:
                     pass
 
             if not ok:
-                try:
-                    QtWidgets.QMessageBox.critical(self, "가사 생성 실패", str(err))
-                except Exception:
-                    pass
+                QtWidgets.QMessageBox.critical(self, "가사 생성 실패", str(err))
                 return
 
-            try:
-                QtWidgets.QMessageBox.information(self, "완료", "가사 생성이 완료되었습니다.")
-            except Exception:
-                pass
+            pack = payload or {}
+            data = pack.get("data", {}) or {}
 
-        try:
-            # tail_file은 가사 생성 단계에선 보통 없음(기존 동작 유지)
-            run_job_with_progress_async(self, "가사 생성", job, on_done=on_done)
-        except Exception as e:
-            if isinstance(btn, QtWidgets.QAbstractButton):
+            # ── 프로젝트 폴더 확정: data → 추정 → project.json → 최신 프로젝트
+            final_dir = ""
+
+            def _pick_dir_from_data(obj) -> str:
+                if not isinstance(obj, dict):
+                    return ""
+                # 1) paths.project_dir 최우선
+                paths = obj.get("paths")
+                if isinstance(paths, dict):
+                    v = paths.get("project_dir")
+                    if isinstance(v, (str, bytes, os.PathLike)) and Path(os.fspath(v)).exists():
+                        return os.fspath(v)
+                # 2) title 기반 추정: BASE_DIR/maked_title/<title>
+                title_guess = (obj.get("title") or pack.get("title") or "").strip()
+                if title_guess:
+                    try:
+                        from app.settings import BASE_DIR as _base  # type: ignore
+                    except Exception:
+                        from settings import BASE_DIR as _base  # type: ignore
+                    guess = Path(_base) / "maked_title" / title_guess
+                    if guess.exists():
+                        return str(guess)
+                return ""
+
+            # 1) data에서 직접
+            final_dir = _pick_dir_from_data(data)
+            # 2) 없으면, 방금 job 시작 시점의 proj_dir 후보 사용
+            if not final_dir:
+                pd = pack.get("proj_dir")
+                if isinstance(pd, (str, bytes, os.PathLike)) and Path(os.fspath(pd)).exists():
+                    final_dir = os.fspath(pd)
+            # 3) 그래도 없으면, 현재 UI에 보이는 제목으로 추정
+            if not final_dir:
                 try:
-                    btn.setEnabled(True)
+                    cur_title = ""
+                    le2 = getattr(self, "le_title", None)
+                    if le2 and hasattr(le2, "text"):
+                        cur_title = (le2.text() or "").strip()
+                    if cur_title:
+                        from app.settings import BASE_DIR as _base2  # type: ignore
+                        guess2 = Path(_base2) / "maked_title" / cur_title
+                        if guess2.exists():
+                            final_dir = str(guess2)
                 except Exception:
                     pass
+            # 4) project.json에서 경로 복구
+            if not final_dir:
+                try:
+                    from app.settings import BASE_DIR as _base3  # type: ignore
+                except Exception:
+                    from settings import BASE_DIR as _base3  # type: ignore
+                try:
+                    latest = sorted([p for p in (Path(_base3) / "maked_title").glob("*/project.json")],
+                                    key=lambda p: p.stat().st_mtime, reverse=True)
+                    if latest:
+                        import json
+                        meta = json.loads(latest[0].read_text(encoding="utf-8")) or {}
+                        paths_obj = meta.get("paths") if isinstance(meta, dict) else None
+                        inner = str(paths_obj.get("project_dir") or "") if isinstance(paths_obj, dict) else ""
+                        if inner and Path(inner).exists():
+                            final_dir = inner
+                except Exception:
+                    pass
+            # 5) 최후: 최신 프로젝트 폴더로 폴백
+            if not final_dir:
+                last = getattr(self, "_latest_project", None)
+                if callable(last):
+                    try:
+                        lv = last()
+                        if isinstance(lv, (str, bytes, os.PathLike)) and Path(os.fspath(lv)).exists():
+                            final_dir = os.fspath(lv)
+                    except (TypeError, ValueError):
+                        pass
+
+            # 확정되면 UI 활성 프로젝트로 세팅
+            setter = getattr(self, "_set_active_project_dir", None)
+            if final_dir and callable(setter):
+                try:
+                    setter(final_dir)
+                except Exception:
+                    pass
+
+            # 기존 apply 로직 유지
+            if hasattr(self, "_apply_lyrics_result"):
+                try:
+                    self._apply_lyrics_result(data, pack.get("title", ""), pack.get("prompt", ""))
+                except Exception:
+                    pass
+
+            # project.json 연동 허용
             try:
-                QtWidgets.QMessageBox.warning(self, "가사 생성 오류", str(e))
+                setattr(self, "_project_context_ready", True)
             except Exception:
                 pass
 
-    # ==== PATCH END ====
+            # 자동태그 상태에 맞춰 수동 태그 박스 enable/disable 유지
+            auto_on = False
+            auto_chk = getattr(self, "chk_auto_tags", None)
+            if auto_chk is not None and hasattr(auto_chk, "isChecked"):
+                try:
+                    auto_on = bool(auto_chk.isChecked())
+                except Exception:
+                    auto_on = False
+            tag_boxes = getattr(self, "_tag_boxes", None)
+            if isinstance(tag_boxes, dict):
+                for _label, box in tag_boxes.items():
+                    try:
+                        box.setEnabled(not auto_on)
+                    except Exception:
+                        pass
+
+        # 진행창에 tail_file 연결(실시간 로그 표시)
+        run_job_with_progress_async(self, "가사 생성", job, tail_file=log_path, on_done=done)
 
     # --- 누락 이미지 생성: 비동기 + 진행창 로그 (no _guess_project_dir) ---
     def on_click_test2_1_generate_missing_images_with_log(self) -> None:
@@ -2841,6 +2920,8 @@ class MainWindow(QtWidgets.QMainWindow):
         - 변환 패널(LLS)과 가사 에디터, 태그 UI, 내부 컨텍스트 플래그를 모두 초기화.
         - 디스크의 파일(project.json 등)은 건드리지 않는다(기존 기능 보존).
         """
+        from pathlib import Path
+        from PyQt5 import QtWidgets
 
         # 1) 가사/제목/태그 입력 에디터류 초기화 (가능한 위젯 이름들을 모두 시도)
         text_candidates = [
@@ -2851,11 +2932,26 @@ class MainWindow(QtWidgets.QMainWindow):
         ]
         for name in text_candidates:
             w = getattr(self, name, None) or getattr(getattr(self, "ui", None), name, None)
-            if hasattr(w, "clear") and callable(w.clear):
-                try:
+            if w is None:
+                continue
+            # setText / setPlainText / clear 순서로 방어적 호출
+            try:
+                if hasattr(w, "setText"):
+                    w.setText("")
+                    continue
+            except Exception:
+                pass
+            try:
+                if hasattr(w, "setPlainText"):
+                    w.setPlainText("")
+                    continue
+            except Exception:
+                pass
+            try:
+                if hasattr(w, "clear"):
                     w.clear()
-                except Exception:
-                    pass
+            except Exception:
+                pass
 
         # 2) 변환(LLS) 패널은 '항상 보이기' 유지 + 비활성화(ON/OFF 토글 상태를 초기화 느낌으로 OFF)
         panel = None
@@ -2883,10 +2979,10 @@ class MainWindow(QtWidgets.QMainWindow):
         except Exception:
             pass
 
-        # 체크박스들 모두 수집해서 'Basic Vocal 7개'를 켜고 나머지는 끔(콜드 스타트와 동일)
-        try:
-            tag_boxes = getattr(self, "_tag_boxes", None)
-            if isinstance(tag_boxes, dict):
+        # 태그 체크박스들 초기화
+        tag_boxes = getattr(self, "_tag_boxes", None)
+        if isinstance(tag_boxes, dict) and tag_boxes:
+            try:
                 basic_defaults_all = {
                     "clean vocals", "clear diction", "natural articulation",
                     "breath control", "warm emotional tone", "balanced mixing", "studio reverb light",
@@ -2903,11 +2999,11 @@ class MainWindow(QtWidgets.QMainWindow):
                         pass
                     if on_basic:
                         self._checked_tags.add(label)
-        except Exception:
-            pass
+            except Exception:
+                pass
 
-        # 4) 내부 컨텍스트(프로젝트 관련) 플래그 완전 리셋 → "아무 프로젝트도 열리지 않은 상태"를 보장
-        #    - 감시 타이머/라스트 mtime/프로젝트 준비 플래그/강제 프로젝트 경로/최근 태그 등을 리셋
+        # 4) 내부 컨텍스트(프로젝트 관련) 플래그 리셋
+        #    - ⚠️ 메서드 이름(_current_project_dir)은 절대 건드리지 않는다(섀도잉 방지).
         try:
             if hasattr(self, "_project_context_ready"):
                 setattr(self, "_project_context_ready", False)
@@ -2915,10 +3011,6 @@ class MainWindow(QtWidgets.QMainWindow):
                 setattr(self, "_tag_watch_last_path", None)
             if hasattr(self, "_tag_watch_last_mtime"):
                 setattr(self, "_tag_watch_last_mtime", None)
-            if hasattr(self, "_forced_project_dir"):
-                setattr(self, "_forced_project_dir", None)
-            if hasattr(self, "_last_tags"):
-                setattr(self, "_last_tags", [])
             if hasattr(self, "_music_inflight"):
                 setattr(self, "_music_inflight", False)
             if hasattr(self, "_analysis_running"):
@@ -2927,17 +3019,23 @@ class MainWindow(QtWidgets.QMainWindow):
                 setattr(self, "_story_build_running", False)
             if hasattr(self, "_docs_build_running"):
                 setattr(self, "_docs_build_running", False)
-            # 현재 프로젝트 디렉터리를 보관하는 내부 속성이 있다면 해제
-            for cand in ("_current_project_dir", "_active_project_dir", "project_dir"):
+
+            # 프로젝트 경로 상태만 안전하게 초기화
+            # - project_dir(문자열/PathLike 저장소)만 비우고,
+            # - _active_project_dir, _forced_project_dir도 비운다.
+            for cand in ("project_dir", "_active_project_dir", "_forced_project_dir"):
                 if hasattr(self, cand):
                     try:
-                        delattr(self, cand)
-                    except Exception:
                         setattr(self, cand, None)
+                    except Exception:
+                        pass
+
+            # ⚠️ _current_project_dir 는 "메서드"이므로 절대로 delattr/setattr 하지 않음
+            #    (이전 버전에서 None으로 섀도잉되어 TypeError가 발생했음)
         except Exception:
             pass
 
-        # 5) 상태바/라벨류 안내(있을 때만) — 기능 삭제 없이 안전하게
+        # 5) 상태바/라벨류 안내(있을 때만)
         try:
             sb = getattr(self, "statusBar", None)
             bar = sb() if callable(sb) else None
@@ -3445,16 +3543,98 @@ class MainWindow(QtWidgets.QMainWindow):
 
     # ────────────── 최신 프로젝트/현재 프로젝트 ──────────────
     def _latest_project(self) -> Optional[Path]:
-        if self._forced_project_dir and Path(self._forced_project_dir).exists():
-            return Path(self._forced_project_dir)
-        root = Path(BASE_DIR)
-        if not root.exists():
-            return None
-        subs = [p for p in root.glob("*") if p.is_dir()]
-        return max(subs, key=lambda p: p.stat().st_mtime) if subs else None
+        """
+        최근 프로젝트 폴더 추정.
+        우선순위:
+          1) self._forced_project_dir 이 유효하면 그것
+          2) BASE_DIR/maked_title/* 중 project.json 존재 폴더의 최신 mtime
+          3) BASE_DIR/* (과거 레이아웃 호환) 중 최신 mtime
+        """
+        from pathlib import Path
+
+        # 1) 강제 지정이 있으면 최우선
+        forced = getattr(self, "_forced_project_dir", None)
+        if isinstance(forced, (str, bytes, os.PathLike)):
+            try:
+                forced_p = Path(forced)
+                if forced_p.exists():
+                    return forced_p
+            except Exception:
+                pass
+
+        # BASE_DIR 확보 (app.settings → settings 순서)
+        try:
+            from app.settings import BASE_DIR as _base  # type: ignore
+        except Exception:
+            try:
+                from settings import BASE_DIR as _base  # type: ignore
+            except Exception:
+                _base = "."
+
+        base = Path(_base)
+
+        # 2) 신 레이아웃: BASE_DIR/maked_title/*/project.json 기준으로 최신
+        try:
+            mt = base / "maked_title"
+            if mt.exists():
+                # project.json을 기준으로 최신 정렬
+                cands = []
+                for pj in mt.glob("*/project.json"):
+                    try:
+                        cands.append((pj.stat().st_mtime, pj.parent))
+                    except Exception:
+                        continue
+                if cands:
+                    cands.sort(key=lambda t: t[0], reverse=True)
+                    return cands[0][1]
+        except Exception:
+            pass
+
+        # 3) 구 레이아웃 호환: BASE_DIR/* 디렉토리 중 최신
+        try:
+            if base.exists():
+                subs = [p for p in base.glob("*") if p.is_dir()]
+                if subs:
+                    subs.sort(key=lambda p: p.stat().st_mtime, reverse=True)
+                    return subs[0]
+        except Exception:
+            pass
+
+        return None
 
     def _current_project_dir(self) -> Optional[Path]:
-        return self._forced_project_dir or self._latest_project()
+        """
+        현재 활성 프로젝트 폴더.
+        우선순위:
+          1) self.project_dir (가사 생성 직후 _apply_lyrics_result에서 설정됨)
+          2) self._forced_project_dir
+          3) self._latest_project()
+        """
+        from pathlib import Path
+        import os
+
+        # 1) 명시적으로 잡힌 project_dir 우선
+        p = getattr(self, "project_dir", None)
+        if isinstance(p, (str, bytes, os.PathLike)):
+            try:
+                pp = Path(os.fspath(p))
+                if pp.exists():
+                    return pp
+            except Exception:
+                pass
+
+        # 2) 강제 지정 폴더
+        f = getattr(self, "_forced_project_dir", None)
+        if isinstance(f, (str, bytes, os.PathLike)):
+            try:
+                pf = Path(os.fspath(f))
+                if pf.exists():
+                    return pf
+            except Exception:
+                pass
+
+        # 3) 최근 프로젝트 폴더
+        return self._latest_project()
 
     # ────────────── UI 구축 ──────────────
     def _build_ui(self):
