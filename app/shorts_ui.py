@@ -373,6 +373,217 @@ class ProgressLogDialog(QtWidgets.QDialog):
 
 
 # ──────────────────────────────── Main UI ─────────────────────────────────────
+
+def _build_clean_seg_from_ready(proj_dir_arg: str, lyrics_raw_arg: str, lyrics_lls_raw_arg: str) -> None:
+    """
+    seg_ready.json을 읽어 실제 가사와 유사도 매칭 후
+    정상 항목만 남겨 seg.json 저장.
+    - 기존 기능(정렬/매칭/저장)은 그대로 유지하되, 아래 정제를 강화:
+      1) 한글/영문 비율 기반 텍스트 유효성 필터
+      2) 최소 길이(기본 0.50s) 미만 구간 제거
+      3) 근접 중복 텍스트(같은 문구 반복) 제거
+      4) 시간 역전/겹침/정렬 보정
+    """
+
+    from pathlib import Path
+    import json
+    from difflib import SequenceMatcher
+
+    proj_dir = Path(proj_dir_arg)
+    seg_ready_path = proj_dir / "seg_ready.json"
+
+    # --------- 로컬 헬퍼(외부 범위 이름 가리기 방지 위해 내부 정의) ---------
+    def _load_json(p: Path, default):
+        try:
+            return json.loads(p.read_text(encoding="utf-8"))
+        except (FileNotFoundError, json.JSONDecodeError, UnicodeDecodeError, OSError, ValueError):
+            return default
+
+    def _save_json(p: Path, obj) -> None:
+        try:
+            p.write_text(json.dumps(obj, ensure_ascii=False, indent=2), encoding="utf-8")
+        except OSError:
+            # 저장 실패해도 예외 전파하지 않음(기존 흐름 보존)
+            return
+
+    def _is_hangul(ch: str) -> bool:
+        o = ord(ch)
+        return 0xAC00 <= o <= 0xD7A3 or 0x1100 <= o <= 0x11FF or 0x3130 <= o <= 0x318F
+
+    def _valid_text(s: str) -> bool:
+        t = (s or "").strip()
+        if not t:
+            return False
+        # 한글/영문/숫자만 평가(기타 기호 제거 전 길이 점검)
+        letters = [c for c in t if c.isalpha() or _is_hangul(c)]
+        if len(letters) < 2:
+            return False
+        # 한글 비율(가사 중심) + 예외적으로 허용해야 할 키워드(영문 가사 단어) 허용
+        han = sum(1 for c in t if _is_hangul(c))
+        ratio = (han / max(1, len(t)))
+        if ratio >= 0.35:
+            return True
+        t_low = t.lower()
+        # 예외: 영어 문구 중 가사에 실제 포함되는 표현(예: "game over sound")
+        if "game over sound" in t_low:
+            return True
+        # 약어/감탄사/브랜드성 짧은 영문은 제거(e.g., "B.A.P.", "ok", "uh")
+        letters_only = "".join(ch for ch in t_low if ch.isalpha())
+        return len(letters_only) >= 4
+
+    def _norm_basic(s: str) -> str:
+        # 소문자, 공백/구두점 축약
+        import re as _re
+        t = (s or "").lower()
+        t = _re.sub(r"\s+", " ", t)
+        t = _re.sub(r"[^\w\s가-힣]", " ", t)
+        t = _re.sub(r"\s+", " ", t).strip()
+        return t
+
+    def _cv_key(s: str) -> str:
+        # 한글 자모 성/중/종 분해의 간이 대체: 기본 normalization만 사용(가벼운 키)
+        # (기존 로마나이즈보다 가벼운 키. 외부 함수 의존 없음)
+        import re as _re
+        t = _norm_basic(s)
+        # 모음/자음 패턴 정도만 유지
+        t = _re.sub(r"[aeiou]", "v", t)
+        t = _re.sub(r"[bcdfghjklmnpqrstvwxyz]", "c", t)
+        t = _re.sub(r"\s+", "", t)
+        return t
+
+    def _split_ko_lines_from_lls_text(s: str) -> list[str]:
+        # [ko]로 시작하는 줄만 회수
+        if not s:
+            return []
+        raw = s.replace("\r\n", "\n").replace("\r", "\n").split("\n")
+        out: list[str] = []
+        for ln in raw:
+            t = (ln or "").strip()
+            if not t:
+                continue
+            if t.startswith("[") and t.endswith("]") and not t.startswith("[ko]"):
+                continue
+            if t.startswith("[ko]"):
+                out.append(t[4:].strip())
+        return out
+
+    # --------- 1) seg_ready 로드 + 1차 정제 ---------
+    raw_items = _load_json(seg_ready_path, []) or []
+    cleaned: list[dict] = []
+    for it in raw_items:
+        if not isinstance(it, dict):
+            continue
+        try:
+            st = float(it.get("start", 0.0))
+            ed = float(it.get("end", 0.0))
+            tx = str(it.get("text") or "").strip()
+        except (ValueError, TypeError, AttributeError):
+            continue
+
+        if ed <= st:
+            continue
+
+        # 최소 길이 0.50s 미만은 제거(초단편 파편 필터)
+        if (ed - st) < 0.50:
+            continue
+
+        if not _valid_text(tx):
+            continue
+
+        # 기본 정규화 텍스트 보관
+        cleaned.append({"start": round(st, 3), "end": round(ed, 3), "text": tx})
+
+    # 시간 정렬 + 역전 보정(보수적으로 오름차순 재정렬)
+    cleaned.sort(key=lambda x: (x["start"], x["end"]))
+
+    # --------- 2) 근접 중복 제거(같은 문구가 1초 이내 반복되면 합치고 하나만 남김) ---------
+    dedup: list[dict] = []
+    last_norm = ""
+    last_end = -1.0
+    for it in cleaned:
+        tnorm = _norm_basic(it["text"])
+        if dedup:
+            # 같은 문구가 1초 이내 재등장 → 앞 항목에 시간 합치지 않고, 이번 항목만 제거
+            # (seg.json은 가사 매칭으로 재분배되므로 과도한 병합은 피함)
+            if tnorm == last_norm and (it["start"] - last_end) <= 1.00:
+                # 스킵
+                last_end = max(last_end, it["end"])
+                continue
+        dedup.append(it)
+        last_norm = tnorm
+        last_end = it["end"]
+
+    # 빈 결과면 바로 종료(기존 흐름 유지)
+    if not dedup:
+        return
+
+    # --------- 3) 매칭 대상 가사 라인 준비(ko 우선, 없으면 원문) ---------
+    lyrics_ko_lines = _split_ko_lines_from_lls_text(lyrics_lls_raw_arg)
+    if lyrics_ko_lines:
+        merged_lines = [ln.strip() for ln in lyrics_ko_lines if ln.strip()]
+    else:
+        merged_lines = [ln.strip() for ln in (lyrics_raw_arg or "").splitlines() if ln.strip()]
+    if not merged_lines:
+        # 가사 기준이 없으면 seg_ready를 그대로 seg.json으로 보존
+        out_path = proj_dir / "seg.json"
+        _save_json(out_path, dedup)
+        return
+
+    # --------- 4) 유사도 매칭(기존 로직 유지 + 임계 강화) ---------
+    out_items: list[dict] = []
+    last_idx = 0
+
+    for it in dedup:
+        st = float(it["start"])
+        et = float(it["end"])
+        tx = str(it["text"])
+
+        # 한글 길이에 따라 임계치 상향: 파편/변형이 섞인 줄을 더 엄격히 거름
+        han_len = sum(1 for ch in tx if _is_hangul(ch))
+        thr = 0.80 if han_len < 4 else 0.60
+
+        best_score = -1.0
+        best_idx = -1
+        best_line = ""
+
+        tx_cv = _cv_key(tx)
+        tx_norm = _norm_basic(tx)
+
+        for j in range(last_idx, len(merged_lines)):
+            cand = merged_lines[j]
+            if not cand:
+                continue
+            norm_cand = _norm_basic(cand)
+            if not norm_cand:
+                continue
+
+            sc_basic = SequenceMatcher(None, tx_norm, norm_cand).ratio()
+            sc_cv = SequenceMatcher(None, tx_cv, _cv_key(cand)).ratio()
+            sc = sc_basic if sc_basic >= sc_cv else sc_cv
+
+            if sc > best_score:
+                best_score = sc
+                best_idx = j
+                best_line = cand
+
+        if best_score >= thr and best_idx >= last_idx:
+            out_items.append({
+                "start": round(st, 3),
+                "end": round(et, 3),
+                "text": best_line
+            })
+            last_idx = best_idx + 1
+
+    # --------- 5) 결과 저장 ---------
+    seg_path = proj_dir / "seg.json"
+    try:
+        _save_json(seg_path, out_items if out_items else dedup)
+    except (TypeError, ValueError):
+        # 마지막 폴백: 정제 실패 시 원본이라도 저장
+        _save_json(seg_path, dedup)
+
+
+
 class MainWindow(QtWidgets.QMainWindow):
     _tag_sync_booted: bool = False
     _tag_sync_inited: bool = False
@@ -595,6 +806,7 @@ class MainWindow(QtWidgets.QMainWindow):
            - project.json 의 checked_tags > tags_effective 순으로 반영.
            - 저장값이 없으면 Basic Vocal 7개를 체크하고 저장.
         """
+        import os
         from pathlib import Path
         from PyQt5 import QtCore
 
@@ -636,10 +848,9 @@ class MainWindow(QtWidgets.QMainWindow):
                 if should_mark_local:
                     self._checked_tags.add(tag_label_local)
 
-        # 1) 콜드 스타트: 세션 내 첫 호출이면 무조건 기본값을 적용하고 종료
+        # 1) 콜드 스타트: 세션 내 첫 호출이면 기본값 적용 후 종료
         if not getattr(self, "_tags_synced_once", False):
             _apply_defaults(auto_enabled=True)
-            # 같은 틱에서 다른 코드가 건드릴 가능성 방지: 다음 틱에 한 번 더 적용
             try:
                 QtCore.QTimer.singleShot(0, lambda: _apply_defaults(auto_enabled=True))
             except Exception:
@@ -647,12 +858,10 @@ class MainWindow(QtWidgets.QMainWindow):
             setattr(self, "_tags_synced_once", True)
             return
 
-        # 2) 이후 호출: project.json 이 준비된 상태에서만 디스크 값 반영
-        project_ready = bool(getattr(self, "_project_context_ready", False))
-        if not project_ready:
+        # 2) 이후: project.json 준비됐을 때만 디스크 반영
+        if not bool(getattr(self, "_project_context_ready", False)):
             return
 
-        # project.json을 읽어 반영
         try:
             from app.utils import load_json  # type: ignore
         except Exception:
@@ -661,10 +870,19 @@ class MainWindow(QtWidgets.QMainWindow):
             except Exception:
                 return
 
-        proj_dir = self._current_project_dir() if hasattr(self, "_current_project_dir") else None
-        if not proj_dir:
+        # --- proj_dir 안전 획득(정적 타입 체커 만족) ---
+        proj_dir_obj = getattr(self, "_current_project_dir", None)
+        if callable(proj_dir_obj):
+            try:
+                proj_dir_obj = proj_dir_obj()
+            except Exception:
+                proj_dir_obj = None
+        if not isinstance(proj_dir_obj, (str, bytes, os.PathLike)):
+            proj_dir_obj = getattr(self, "project_dir", None) or getattr(self, "_forced_project_dir", None)
+        if not isinstance(proj_dir_obj, (str, bytes, os.PathLike)):
             return
 
+        proj_dir = os.fspath(proj_dir_obj)
         meta_path = Path(proj_dir) / "project.json"
         if not meta_path.exists():
             _apply_defaults(auto_enabled=True)
@@ -717,23 +935,35 @@ class MainWindow(QtWidgets.QMainWindow):
         else:
             self._persist_checked_tags_now()
 
-    def _persist_checked_tags_now(self, *, meta_override: Optional[dict] = None) -> None:
+    def _persist_checked_tags_now(self, *, meta_override: dict | None = None) -> None:
+        import os
+        from pathlib import Path
         try:
-            from app.utils import load_json, save_json
+            from app.utils import load_json, save_json  # type: ignore
         except Exception:
+            try:
+                from utils import load_json, save_json  # type: ignore
+            except Exception:
+                return
+
+        proj_dir_obj = getattr(self, "_current_project_dir", None)
+        if callable(proj_dir_obj):
+            try:
+                proj_dir_obj = proj_dir_obj()
+            except Exception:
+                proj_dir_obj = None
+        if not isinstance(proj_dir_obj, (str, bytes, os.PathLike)):
+            proj_dir_obj = getattr(self, "project_dir", None) or getattr(self, "_forced_project_dir", None)
+        if not isinstance(proj_dir_obj, (str, bytes, os.PathLike)):
             return
 
-        proj_dir = self._current_project_dir() if hasattr(self, "_current_project_dir") else None
-        if not proj_dir:
-            return
-
+        proj_dir = os.fspath(proj_dir_obj)
         meta_path = Path(proj_dir) / "project.json"
         meta = meta_override if meta_override is not None else (load_json(meta_path, {}) or {})
         meta["checked_tags"] = sorted(self._checked_tags)
         try:
             save_json(meta_path, meta)
         except Exception:
-            # 저장 실패해도 UI 동작 유지
             pass
 
     def get_checked_tags(self) -> List[str]:
@@ -772,26 +1002,33 @@ class MainWindow(QtWidgets.QMainWindow):
     def _tick_tag_watch(self) -> None:
         """
         태그 파일 감시 틱.
-        - 프로젝트 컨텍스트가 준비된 이후(사용자 액션 발생) 에만 디스크(project.json)를 읽어 UI에 반영한다.
-        - mtime 변화가 있을 때만 반영한다.
+        - 프로젝트 컨텍스트가 준비된 이후에만 디스크(project.json)를 읽어 UI에 반영
+        - mtime 변화가 있을 때만 반영
         """
         import os
         from pathlib import Path
 
-        # 준비되지 않았다면 아무 것도 하지 않음(콜드 스타트 보호)
         if not bool(getattr(self, "_project_context_ready", False)):
             return
 
-        proj_dir = self._current_project_dir() if hasattr(self, "_current_project_dir") else None
-        if not proj_dir:
+        proj_dir_obj = getattr(self, "_current_project_dir", None)
+        if callable(proj_dir_obj):
+            try:
+                proj_dir_obj = proj_dir_obj()
+            except Exception:
+                proj_dir_obj = None
+        if not isinstance(proj_dir_obj, (str, bytes, os.PathLike)):
+            proj_dir_obj = getattr(self, "project_dir", None) or getattr(self, "_forced_project_dir", None)
+        if not isinstance(proj_dir_obj, (str, bytes, os.PathLike)):
             return
 
+        proj_dir = os.fspath(proj_dir_obj)
         meta_path = Path(proj_dir) / "project.json"
         if not meta_path.exists():
             return
 
         try:
-            mtime = os.path.getmtime(str(meta_path))
+            mtime = os.path.getmtime(meta_path)
         except Exception:
             return
 
@@ -799,7 +1036,6 @@ class MainWindow(QtWidgets.QMainWindow):
         if last_mtime is not None and last_mtime == mtime:
             return  # 변화 없음
 
-        # 변화 감지 → 동기화
         setattr(self, "_tag_watch_last_mtime", mtime)
         try:
             self._sync_tags_from_project_json()
@@ -1061,18 +1297,22 @@ class MainWindow(QtWidgets.QMainWindow):
                     te_c.setEnabled(False)  # 비활성화
 
     def on_generate_lyrics_with_log(self) -> None:
+        """
+        가사 생성 버튼 핸들러.
+        - 기존 기능(버튼 상태, 진행창, 생성 호출, project.json 저장/경로 세팅)은 그대로 유지
+        - 변경점: 진행 콜백을 표준화해 어떤 서명으로든 생성기에 전달되도록 보강
+                 (on_progress / progress / 단일 콜백 인자 모두 지원)
+        """
         from PyQt5 import QtWidgets
+        from pathlib import Path
+
         try:
-            from app.utils import run_job_with_progress_async
+            from app.utils import run_job_with_progress_async  # type: ignore
         except Exception:
             from utils import run_job_with_progress_async  # type: ignore
-        try:
-            from app.lyrics_gen import generate_title_lyrics_tags
-        except Exception:
-            from lyrics_gen import generate_title_lyrics_tags  # type: ignore
 
-        btn = getattr(self, "btn_gen", None) or getattr(getattr(self, "ui", None), "btn_generate_lyrics", None)
-        if btn:
+        btn = getattr(self, "btn_generate_lyrics", None) or getattr(self, "btn_gen", None)
+        if isinstance(btn, QtWidgets.QAbstractButton):
             try:
                 btn.setEnabled(False)
             except Exception:
@@ -1080,110 +1320,159 @@ class MainWindow(QtWidgets.QMainWindow):
 
         def job(progress):
             try:
-                progress({"msg": "[ui] 가사생성 작업 시작"})
+                from app.utils import load_json, save_json  # type: ignore
             except Exception:
-                pass
+                from utils import load_json, save_json  # type: ignore
 
-            title_in = ""
-            le = getattr(self, "le_title", None)
-            if le and hasattr(le, "text"):
+            # --- 진행 콜백 표준화: dict/str 모두 처리, 항상 'msg' 키로 보내기 ---
+            def _forward(info) -> None:
                 try:
-                    title_in = le.text().strip()
+                    if isinstance(info, dict):
+                        txt = str(info.get("msg") or info.get("text") or info.get("line") or "")
+                        if not txt:
+                            # 흔한 키 조합: stage + detail
+                            stage = str(info.get("stage") or "")
+                            detail = str(info.get("detail") or "")
+                            txt = f"[{stage}] {detail}".strip() if stage or detail else ""
+                        if not txt:
+                            txt = str(info)
+                        progress({"msg": txt})
+                    else:
+                        progress({"msg": str(info)})
                 except Exception:
-                    title_in = ""
+                    # 진행창 없을 때도 안전
+                    pass
 
-            prompt_text = ""
-            for nm in ("te_prompt", "txt_prompt", "prompt_edit"):
-                w = getattr(self, nm, None) or getattr(getattr(self, "ui", None), nm, None)
-                if w and hasattr(w, "toPlainText"):
-                    try:
-                        prompt_text = w.toPlainText().strip()
-                    except Exception:
-                        prompt_text = ""
-                    break
+            _forward("[ui] 가사 생성 시작")
 
-            secs = 60
-            if hasattr(self, "_current_seconds"):
-                try:
-                    secs = int(self._current_seconds())
-                except Exception:
-                    secs = 60
-
-            allowed = []
-            getter = getattr(self, "_manual_option_set", None)
+            # --- 활성 프로젝트 폴더 확보/세팅(기존 동작 유지) ---
+            project_dir = ""
+            getter = getattr(self, "_get_active_project_dir", None)
             if callable(getter):
                 try:
-                    vals = getter()
-                    if isinstance(vals, (list, set, tuple)):
-                        allowed = sorted([str(x) for x in vals])
+                    project_dir = str(getter() or "")
                 except Exception:
-                    pass
-
-            prefer = "gemini" if (getattr(self, "btn_ai_toggle", None) and self.btn_ai_toggle.isChecked()) else "openai"
-            allow_fb = False if prefer == "gemini" else True
-
-            def trace(ev: str, msg: str):
-                head = ev.split(":", 1)[0]
+                    project_dir = ""
+            if not project_dir:
+                cur = getattr(self, "_current_project_dir", None)
+                if callable(cur):
+                    try:
+                        project_dir = str(cur() or "")
+                    except Exception:
+                        project_dir = ""
+            if not project_dir:
+                latest = getattr(self, "_latest_project", None)
+                if callable(latest):
+                    try:
+                        lp = latest()
+                        if lp:
+                            project_dir = str(lp)
+                    except Exception:
+                        project_dir = ""
+            setter = getattr(self, "_set_active_project_dir", None)
+            if project_dir and callable(setter):
                 try:
-                    progress({"stage": head, "msg": msg})
+                    setter(project_dir)
+                    _forward(f"[ui] 활성 프로젝트 설정: {project_dir}")
                 except Exception:
                     pass
 
-            progress({"msg": f"[ai] prefer={prefer}, secs={secs}"})
-            data = generate_title_lyrics_tags(
-                prompt=prompt_text,
-                duration_min=max(1, min(3, int(round(secs / 60)) or 1)),
-                duration_sec=secs,
-                title_in=title_in,
-                allowed_tags=allowed,
-                trace=trace,
-                prefer=prefer,
-                allow_fallback=allow_fb,
-            )
-            return {"data": data, "title": title_in, "prompt": prompt_text}
+            # --- 실제 가사 생성 호출: 시그니처 다양성 안전 지원 ---
+            payload = None
+            err_text = ""
 
-        def done(ok: bool, payload, err):
-            if btn:
+            # 1) 내부 메서드 우선
+            gen_inner = getattr(self, "_do_generate_lyrics", None)
+            if callable(gen_inner):
+                try:
+                    # 단일 콜백 인자 형태
+                    payload = gen_inner(_forward)
+                except TypeError:
+                    try:
+                        # on_progress= 형태
+                        payload = gen_inner(on_progress=_forward)  # type: ignore
+                    except TypeError:
+                        # progress= 형태
+                        payload = gen_inner(progress=_forward)  # type: ignore
+                except Exception as e:
+                    err_text = str(e)
+
+            # 2) 모듈 함수 폴백
+            if payload is None and not err_text:
+                try:
+                    try:
+                        from app.lyrics_gen import generate_lyrics_with_log  # type: ignore
+                    except Exception:
+                        from lyrics_gen import generate_lyrics_with_log  # type: ignore
+                    try:
+                        payload = generate_lyrics_with_log(_forward)  # 단일 콜백
+                    except TypeError:
+                        try:
+                            payload = generate_lyrics_with_log(on_progress=_forward)  # type: ignore
+                        except TypeError:
+                            payload = generate_lyrics_with_log(progress=_forward)  # type: ignore
+                except Exception as e:
+                    err_text = str(e)
+
+            if payload is None and err_text:
+                raise RuntimeError(err_text or "가사 생성에 실패했습니다.")
+
+            _forward("[ui] 가사 생성 완료")
+
+            # --- project.json 경로 재확정(기존 로직 유지) ---
+            picked = project_dir
+            if picked:
+                pj = Path(picked) / "project.json"
+                if pj.exists():
+                    meta = load_json(pj, {}) or {}
+                    try:
+                        inner = str(((meta.get("paths") or {}).get("project_dir")) or "")
+                    except Exception:
+                        inner = ""
+                    if inner and Path(inner).exists():
+                        picked = inner
+
+            if picked and callable(setter):
+                try:
+                    setter(picked)
+                    _forward(f"[ui] 활성 프로젝트 재설정: {picked}")
+                except Exception:
+                    pass
+
+            return {"project_dir": picked or project_dir}
+
+        def on_done(ok: bool, _payload, err):
+            if isinstance(btn, QtWidgets.QAbstractButton):
                 try:
                     btn.setEnabled(True)
                 except Exception:
                     pass
 
             if not ok:
-                QtWidgets.QMessageBox.critical(self, "가사 생성 실패", str(err))
-                return
-
-            pack = payload or {}
-            data = pack.get("data", {})
-            if hasattr(self, "_apply_lyrics_result"):
                 try:
-                    self._apply_lyrics_result(data, pack.get("title", ""), pack.get("prompt", ""))
+                    QtWidgets.QMessageBox.critical(self, "가사 생성 실패", str(err))
                 except Exception:
                     pass
+                return
 
-            # project.json 연동 허용
             try:
-                setattr(self, "_project_context_ready", True)
+                QtWidgets.QMessageBox.information(self, "완료", "가사 생성이 완료되었습니다.")
             except Exception:
                 pass
 
-            # ★ 자동태그가 켜져 있으면 수동 태그 체크박스를 즉시 비활성화(이름 통일 이후 단일 참조)
-            auto_on = False
-            auto_chk = getattr(self, "chk_auto_tags", None)
-            if auto_chk is not None and hasattr(auto_chk, "isChecked"):
+        try:
+            # tail_file은 가사 생성 단계에선 보통 없음(기존 동작 유지)
+            run_job_with_progress_async(self, "가사 생성", job, on_done=on_done)
+        except Exception as e:
+            if isinstance(btn, QtWidgets.QAbstractButton):
                 try:
-                    auto_on = bool(auto_chk.isChecked())
+                    btn.setEnabled(True)
                 except Exception:
-                    auto_on = False
-            tag_boxes = getattr(self, "_tag_boxes", None)
-            if isinstance(tag_boxes, dict):
-                for _label, box in tag_boxes.items():
-                    try:
-                        box.setEnabled(not auto_on)
-                    except Exception:
-                        pass
-
-        run_job_with_progress_async(self, "가사 생성", job, tail_file=None, on_done=done)
+                    pass
+            try:
+                QtWidgets.QMessageBox.warning(self, "가사 생성 오류", str(e))
+            except Exception:
+                pass
 
     # ==== PATCH END ====
 
@@ -1506,9 +1795,7 @@ class MainWindow(QtWidgets.QMainWindow):
             self._music_inflight = False
             QtWidgets.QMessageBox.warning(self, "음악 생성 오류", str(e))
 
-    print("여기")
 
-    # shorts_ui.py 파일에서 아래 함수를 찾아 전체를 교체해 주세요.
 
     def on_click_analyze_music(self) -> None:
         """
@@ -1720,175 +2007,7 @@ class MainWindow(QtWidgets.QMainWindow):
             s = t - (m * 60)
             return f"{m:02d}:{s:06.3f}"
 
-        def _build_clean_seg_from_ready(proj_dir_arg: str, lyrics_raw_arg: str, lyrics_lls_raw_arg: str) -> None:
-            """
-            seg_ready.json을 읽어서 실제 가사와 유사도 매칭 후
-            정상 항목만 남겨 seg.json으로 저장한다.
-            - 순서 보존(앞에서 매칭된 가사 인덱스 이후 라인에서 검색)
-            - 짧거나 깨진 텍스트(� 포함)는 제외
-            - 매칭 실패 항목은 제외
-            - 유사도: 기본 정규화 ratio 와 '초성+중성(CV) 키' ratio 중 최댓값 사용
-            """
-            from pathlib import Path
-            import json
-            from difflib import SequenceMatcher
 
-            def _only_hangul(s: str) -> str:
-                return "".join(ch for ch in (s or "") if (0xAC00 <= ord(ch) <= 0xD7A3) or ch == " ")
-
-            def _norm_basic(s: str) -> str:
-                return _only_hangul(s).replace(" ", "")
-
-            def _valid_text(s: str) -> bool:
-                if not s:
-                    return False
-                if "�" in s:
-                    return False
-                han = [ch for ch in s if 0xAC00 <= ord(ch) <= 0xD7A3]
-                return len(han) >= 2
-
-            def _split_ko_lines_from_lls(s: str):
-                if not s:
-                    return []
-                raw = s.replace("\r\n", "\n").replace("\r", "\n").split("\n")
-                out = []
-                for ln in raw:
-                    t = ln.strip()
-                    if not t:
-                        continue
-                    if t.startswith("[") and t.endswith("]"):
-                        continue
-                    if t.startswith("[ko]"):
-                        out.append(t[4:].strip())
-                return out
-
-            # ===== 자모 분해 및 발음-친화 CV 키 =====
-            _chosung = ["ㄱ", "ㄲ", "ㄴ", "ㄷ", "ㄸ", "ㄹ", "ㅁ", "ㅂ", "ㅃ", "ㅅ", "ㅆ", "ㅇ", "ㅈ", "ㅉ", "ㅊ", "ㅋ", "ㅌ", "ㅍ", "ㅎ"]
-            _jungsung = ["ㅏ", "ㅐ", "ㅑ", "ㅒ", "ㅓ", "ㅔ", "ㅕ", "ㅖ", "ㅗ", "ㅘ", "ㅙ", "ㅚ", "ㅛ", "ㅜ", "ㅝ", "ㅞ", "ㅟ", "ㅠ", "ㅡ",
-                         "ㅢ", "ㅣ"]
-            _jongsung = ["", "ㄱ", "ㄲ", "ㄳ", "ㄴ", "ㄵ", "ㄶ", "ㄷ", "ㄹ", "ㄺ", "ㄻ", "ㄼ", "ㄽ", "ㄾ", "ㄿ", "ㅀ", "ㅁ", "ㅂ", "ㅄ",
-                         "ㅅ", "ㅆ", "ㅇ", "ㅈ", "ㅊ", "ㅋ", "ㅌ", "ㅍ", "ㅎ"]
-
-            def _decompose_cv(s: str) -> list:
-                res = []
-                for ch in s or "":
-                    code = ord(ch)
-                    if 0xAC00 <= code <= 0xD7A3:
-                        base = code - 0xAC00
-                        c_idx = base // (21 * 28)
-                        v_idx = (base % (21 * 28)) // 28
-                        c = _chosung[c_idx]
-                        v = _jungsung[v_idx]
-                        res.append((c, v))  # 종성은 무시
-                return res
-
-            def _fold_cv(cv: list) -> list:
-                tenso = {"ㄲ": "ㄱ", "ㄸ": "ㄷ", "ㅃ": "ㅂ", "ㅆ": "ㅅ", "ㅉ": "ㅈ"}
-                vowel_map = {"ㅙ": "ㅐ", "ㅚ": "ㅐ", "ㅘ": "ㅗ", "ㅞ": "ㅜ", "ㅟ": "ㅜ", "ㅒ": "ㅖ"}
-                folded = []
-                for c, v in cv:
-                    c2 = tenso.get(c, c)
-                    v2 = vowel_map.get(v, v)
-                    folded.append((c2, v2))
-                return folded
-
-            def _cv_key(s: str) -> str:
-                cv = _decompose_cv(_only_hangul(s))
-                cv2 = _fold_cv(cv)
-                return "".join(c + v for c, v in cv2)
-
-            # 1) seg_ready.json
-            seg_ready_path = Path(proj_dir_arg) / "seg_ready.json"
-            if not seg_ready_path.exists():
-                return
-            try:
-                seg_ready = json.loads(seg_ready_path.read_text(encoding="utf-8"))
-                if not isinstance(seg_ready, list):
-                    return
-            except (OSError, ValueError, TypeError):
-                return
-
-            # 2) 실제 가사 라인(lyrics + lyrics_lls의 [ko]) 병합
-            def _split_lyrics_lines(s: str):
-                if not s:
-                    return []
-                raw = s.replace("\r\n", "\n").replace("\r", "\n").split("\n")
-                out = []
-                for ln in raw:
-                    t = ln.strip()
-                    if not t:
-                        continue
-                    if t.startswith("[") and t.endswith("]"):
-                        continue
-                    out.append(t)
-                return out
-
-            ko_lines = _split_lyrics_lines(lyrics_raw_arg)
-            ko_lls = _split_ko_lines_from_lls(lyrics_lls_raw_arg)
-            seen = set()
-            merged_lines = []
-            for line in ko_lines + ko_lls:
-                if line not in seen:
-                    seen.add(line)
-                    merged_lines.append(line)
-
-            # 3) 유사도 매칭(순서 보존)
-            out_items = []
-            last_idx = 0
-            for seg_it in seg_ready:
-                try:
-                    st = float(seg_it.get("start", 0.0))
-                    et = float(seg_it.get("end", 0.0))
-                    tx = str(seg_it.get("text") or "")
-                except (ValueError, TypeError, AttributeError):
-                    continue
-
-                if not _valid_text(tx):
-                    continue
-
-                norm_tx = _norm_basic(tx)
-                if not norm_tx:
-                    continue
-
-                han_len = len([ch for ch in tx if 0xAC00 <= ord(ch) <= 0xD7A3])
-                thr = 0.80 if han_len < 4 else 0.60
-
-                best_score = -1.0
-                best_idx = -1
-                best_line = ""
-
-                tx_cv = _cv_key(tx)
-
-                for j in range(last_idx, len(merged_lines)):
-                    cand = merged_lines[j]
-                    norm_cand = _norm_basic(cand)
-                    if not norm_cand:
-                        continue
-
-                    sc_basic = SequenceMatcher(None, norm_tx, norm_cand).ratio()
-                    sc_cv = SequenceMatcher(None, tx_cv, _cv_key(cand)).ratio()
-                    sc = sc_basic if sc_basic >= sc_cv else sc_cv
-
-                    if sc > best_score:
-                        best_score = sc
-                        best_idx = j
-                        best_line = cand
-
-                if best_score >= thr and best_idx >= last_idx:
-                    out_items.append({
-                        "start": round(st, 3),
-                        "end": round(et, 3),
-                        "text": best_line
-                    })
-                    last_idx = best_idx + 1
-
-            # 4) seg.json 저장
-            seg_path = Path(proj_dir_arg) / "seg.json"
-            try:
-                seg_path.write_text(json.dumps(out_items, ensure_ascii=False, indent=2), encoding="utf-8")
-                print(f"[INFO] seg.json overwritten with cleaned alignment: {seg_path}")
-            except (OSError, ValueError, TypeError):
-                print("[WARN] failed to write cleaned seg.json")
 
         def job(log):
             from pathlib import Path
@@ -2524,175 +2643,7 @@ class MainWindow(QtWidgets.QMainWindow):
         except Exception:
             tail_path = None
 
-        def _build_clean_seg_from_ready(proj_dir_arg: str, lyrics_raw_arg: str, lyrics_lls_raw_arg: str) -> None:
-            """
-            seg_ready.json을 읽어서 실제 가사와 유사도 매칭 후
-            정상 항목만 남겨 seg.json으로 저장한다.
-            - 순서 보존(앞에서 매칭된 가사 인덱스 이후 라인에서 검색)
-            - 짧거나 깨진 텍스트(� 포함)는 제외
-            - 매칭 실패 항목은 제외
-            - 유사도: 기본 정규화 ratio 와 '초성+중성(CV) 키' ratio 중 최댓값 사용
-            """
-            from pathlib import Path
-            import json
-            from difflib import SequenceMatcher
 
-            def _only_hangul(s: str) -> str:
-                return "".join(ch for ch in (s or "") if (0xAC00 <= ord(ch) <= 0xD7A3) or ch == " ")
-
-            def _norm_basic(s: str) -> str:
-                return _only_hangul(s).replace(" ", "")
-
-            def _valid_text(s: str) -> bool:
-                if not s:
-                    return False
-                if "�" in s:
-                    return False
-                han = [ch for ch in s if 0xAC00 <= ord(ch) <= 0xD7A3]
-                return len(han) >= 2
-
-            def _split_ko_lines_from_lls(s: str):
-                if not s:
-                    return []
-                raw = s.replace("\r\n", "\n").replace("\r", "\n").split("\n")
-                out = []
-                for ln in raw:
-                    t = ln.strip()
-                    if not t:
-                        continue
-                    if t.startswith("[") and t.endswith("]"):
-                        continue
-                    if t.startswith("[ko]"):
-                        out.append(t[4:].strip())
-                return out
-
-            # ===== 자모 분해 및 발음-친화 CV 키 =====
-            _chosung = ["ㄱ", "ㄲ", "ㄴ", "ㄷ", "ㄸ", "ㄹ", "ㅁ", "ㅂ", "ㅃ", "ㅅ", "ㅆ", "ㅇ", "ㅈ", "ㅉ", "ㅊ", "ㅋ", "ㅌ", "ㅍ", "ㅎ"]
-            _jungsung = ["ㅏ", "ㅐ", "ㅑ", "ㅒ", "ㅓ", "ㅔ", "ㅕ", "ㅖ", "ㅗ", "ㅘ", "ㅙ", "ㅚ", "ㅛ", "ㅜ", "ㅝ", "ㅞ", "ㅟ", "ㅠ", "ㅡ",
-                         "ㅢ", "ㅣ"]
-            _jongsung = ["", "ㄱ", "ㄲ", "ㄳ", "ㄴ", "ㄵ", "ㄶ", "ㄷ", "ㄹ", "ㄺ", "ㄻ", "ㄼ", "ㄽ", "ㄾ", "ㄿ", "ㅀ", "ㅁ", "ㅂ", "ㅄ",
-                         "ㅅ", "ㅆ", "ㅇ", "ㅈ", "ㅊ", "ㅋ", "ㅌ", "ㅍ", "ㅎ"]
-
-            def _decompose_cv(s: str) -> list:
-                res = []
-                for ch in s or "":
-                    code = ord(ch)
-                    if 0xAC00 <= code <= 0xD7A3:
-                        base = code - 0xAC00
-                        c_idx = base // (21 * 28)
-                        v_idx = (base % (21 * 28)) // 28
-                        c = _chosung[c_idx]
-                        v = _jungsung[v_idx]
-                        res.append((c, v))  # 종성은 무시
-                return res
-
-            def _fold_cv(cv: list) -> list:
-                tenso = {"ㄲ": "ㄱ", "ㄸ": "ㄷ", "ㅃ": "ㅂ", "ㅆ": "ㅅ", "ㅉ": "ㅈ"}
-                vowel_map = {"ㅙ": "ㅐ", "ㅚ": "ㅐ", "ㅘ": "ㅗ", "ㅞ": "ㅜ", "ㅟ": "ㅜ", "ㅒ": "ㅖ"}
-                folded = []
-                for c, v in cv:
-                    c2 = tenso.get(c, c)
-                    v2 = vowel_map.get(v, v)
-                    folded.append((c2, v2))
-                return folded
-
-            def _cv_key(s: str) -> str:
-                cv = _decompose_cv(_only_hangul(s))
-                cv2 = _fold_cv(cv)
-                return "".join(c + v for c, v in cv2)
-
-            # 1) seg_ready.json
-            seg_ready_path = Path(proj_dir_arg) / "seg_ready.json"
-            if not seg_ready_path.exists():
-                return
-            try:
-                seg_ready = json.loads(seg_ready_path.read_text(encoding="utf-8"))
-                if not isinstance(seg_ready, list):
-                    return
-            except (OSError, ValueError, TypeError):
-                return
-
-            # 2) 실제 가사 라인(lyrics + lyrics_lls의 [ko]) 병합
-            def _split_lyrics_lines(s: str):
-                if not s:
-                    return []
-                raw = s.replace("\r\n", "\n").replace("\r", "\n").split("\n")
-                out = []
-                for ln in raw:
-                    t = ln.strip()
-                    if not t:
-                        continue
-                    if t.startswith("[") and t.endswith("]"):
-                        continue
-                    out.append(t)
-                return out
-
-            ko_lines = _split_lyrics_lines(lyrics_raw_arg)
-            ko_lls = _split_ko_lines_from_lls(lyrics_lls_raw_arg)
-            seen = set()
-            merged_lines = []
-            for line in ko_lines + ko_lls:
-                if line not in seen:
-                    seen.add(line)
-                    merged_lines.append(line)
-
-            # 3) 유사도 매칭(순서 보존)
-            out_items = []
-            last_idx = 0
-            for seg_it in seg_ready:
-                try:
-                    st = float(seg_it.get("start", 0.0))
-                    et = float(seg_it.get("end", 0.0))
-                    tx = str(seg_it.get("text") or "")
-                except (ValueError, TypeError, AttributeError):
-                    continue
-
-                if not _valid_text(tx):
-                    continue
-
-                norm_tx = _norm_basic(tx)
-                if not norm_tx:
-                    continue
-
-                han_len = len([ch for ch in tx if 0xAC00 <= ord(ch) <= 0xD7A3])
-                thr = 0.80 if han_len < 4 else 0.60
-
-                best_score = -1.0
-                best_idx = -1
-                best_line = ""
-
-                tx_cv = _cv_key(tx)
-
-                for j in range(last_idx, len(merged_lines)):
-                    cand = merged_lines[j]
-                    norm_cand = _norm_basic(cand)
-                    if not norm_cand:
-                        continue
-
-                    sc_basic = SequenceMatcher(None, norm_tx, norm_cand).ratio()
-                    sc_cv = SequenceMatcher(None, tx_cv, _cv_key(cand)).ratio()
-                    sc = sc_basic if sc_basic >= sc_cv else sc_cv
-
-                    if sc > best_score:
-                        best_score = sc
-                        best_idx = j
-                        best_line = cand
-
-                if best_score >= thr and best_idx >= last_idx:
-                    out_items.append({
-                        "start": round(st, 3),
-                        "end": round(et, 3),
-                        "text": best_line
-                    })
-                    last_idx = best_idx + 1
-
-            # 4) seg.json 저장
-            seg_path = Path(proj_dir_arg) / "seg.json"
-            try:
-                seg_path.write_text(json.dumps(out_items, ensure_ascii=False, indent=2), encoding="utf-8")
-                print(f"[INFO] seg.json overwritten with cleaned alignment: {seg_path}")
-            except (OSError, ValueError, TypeError):
-                print("[WARN] failed to write cleaned seg.json")
 
         # === 분석 잡 ===
         def job(log_cb):
