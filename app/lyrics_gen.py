@@ -141,37 +141,85 @@ def _ensure_intro_in_lyrics(text: str, *, total_seconds: int) -> str:
 
 
 
-def normalize_sections(text: str) -> str:
-    if not text:
-        return text
-    out_lines, has_tag = [], False
-    for ln in text.splitlines():
-        stripped = ln.strip()
-        # 이미 정식 라벨이면 통과
-        if re.match(r"^\[(verse|chorus|bridge|outro)(\s+\d+)?]\s*$", stripped, flags=re.IGNORECASE):
-            out_lines.append(stripped.lower())
-            has_tag = True
+def normalize_sections(lyrics: str) -> str:
+    """
+    섹션/가사 정규화.
+    - 섹션 헤더([verse], [bridge], [chorus] 등)는 그대로 보존
+    - 가사 라인은 언어 태그를 보수적으로 고정:
+        * 한글(가-힣)이 하나라도 있으면 [ko] 강제
+        * 한글이 전혀 없으면 [en] 기본
+      -> [fr], [pl], [de] 등 비의도 언어 태그를 제거하여 LLS/Comfy 파이프라인에서
+         한국어 라인이 무시되는 문제를 방지
+    - 공백/빈 줄은 유지하되 불필요한 트레일링 스페이스는 제거
+    """
+    import re
+
+    if not isinstance(lyrics, str):
+        return ""
+
+    # 허용 섹션 태그(필요 시 확장 가능)
+    section_pat = re.compile(r"^\s*\[(verse|bridge|chorus|hook|intro|outro|pre-chorus|post-chorus)]\s*$",
+                             re.IGNORECASE)
+    # 기존 언어 태그 패턴
+    lang_tag_pat = re.compile(r"^\s*\[([a-z]{2})]\s*", re.IGNORECASE)
+    # 한글 존재 여부
+    has_hangul = re.compile(r"[\uac00-\ud7a3]")
+
+    # ko/en만 허용
+    allowed_langs = {"ko", "en"}
+
+    lines = lyrics.splitlines()
+    out = []
+
+    for raw in lines:
+        line = raw.rstrip("\r\n")
+        if not line.strip():
+            out.append(line)
             continue
-        # 한국어 라벨을 치환
-        converted = None
-        for pat, repl in _SECTION_PATTERNS:
-            m = pat.match(stripped)
-            if m:
-                converted = repl(m)
-                break
-        out_lines.append(converted if converted else ln)
-        has_tag = has_tag or bool(converted)
-    if not has_tag and out_lines:
-        out_lines.insert(0, "[verse]")
-    return "\n".join(out_lines)
+
+        # 섹션 헤더는 그대로
+        if section_pat.match(line):
+            # 섹션명은 소문자로 통일
+            sec = section_pat.match(line).group(1).lower()
+            out.append(f"[{sec}]")
+            continue
+
+        # 선행 언어 태그 제거 후 재적용
+        m = lang_tag_pat.match(line)
+        if m:
+            lang = m.group(1).lower()
+            content = line[m.end():].lstrip()
+        else:
+            lang = ""
+            content = line.lstrip()
+
+        # 한글 포함 여부로 우선 판정
+        if has_hangul.search(content):
+            lang = "ko"
+        else:
+            # 한글이 없으면 기본 en (혼합 토큰으로 인한 오탐 방지)
+            if lang not in allowed_langs:
+                lang = "en"
+
+        # 이미 ko/en 태그라면 유지, 그렇지 않으면 ko/en로 교정
+        if lang not in allowed_langs:
+            lang = "ko" if has_hangul.search(content) else "en"
+
+        # 빈 컨텐츠는 그대로
+        if not content:
+            out.append(content)
+            continue
+
+        out.append(f"[{lang}]{content}")
+
+    return "\n".join(out)
+
 
 
 
 # ───────── 공개 API ─────────
 
 # 맨 위에 이미 import re 되어 있으면 생략
-
-import re
 
 def generate_title_lyrics_tags(
     *,
@@ -186,161 +234,139 @@ def generate_title_lyrics_tags(
 ) -> dict:
     """
     가사 생성:
-      - 1줄≈5초 규칙으로 '본문 줄수(섹션 헤더 제외)' 범위만 제시
-      - 허용 섹션은 [verse], [bridge]만 (intro/outro/chorus/pre-chorus 금지)
-      - 모델이 실수로 금지 섹션을 내보내면 모두 제거하거나 [verse]로 치환
-    출력 JSON: {"title": "...", "lyrics_ko":"...", "tags":["...", "..."], "tags_pick":["...", "..."]}
+      - 1줄≈5초 기준으로 '본문 줄수(헤더 제외)' 가이드를 제시
+      - 허용 섹션: [verse], [bridge] (그 외 헤더는 제거/치환)
+      - 본문 라인 ko/en 언어태그 '강제 교정'
+        * 한글만 -> [ko], 영문만 -> [en]
+        * 혼합(한글+영문) -> [ko]줄과 [en]줄로 분리하여 2줄 생성
+          - ko줄: 라틴 알파벳 제거 후 공백 정리
+          - en줄: 한글 제거 후 공백 정리
+          - 둘 중 하나가 비면 남은 한 줄만 출력
+      - 변환 '최종본'을 BASE_DIR/_debug/lyrics_gen.log 에 기록
+    출력: {"title":".", "lyrics":".", "tags":[...], "tags_pick":[...]}
     """
     import json
+    import re
     from typing import List
     from utils import AI  # 기존 구조 유지
 
-    def t(ev: str, msg: str):
-        try:
-            print(f"[lyrics_gen:{ev}] {msg}")
-        except Exception:
-            pass
+    def emit(ev: str, msg: str) -> None:
+        if callable(trace):
+            try:
+                trace(ev, msg)
+            except (TypeError, ValueError):
+                pass
 
     allowed_tags = allowed_tags or []
 
     # ---- 목표 초 계산(초 우선) ----
-    sec = None
+    sec_val = None
     if duration_sec is not None:
         try:
-            sec = int(duration_sec)
-        except ValueError:
-            sec = None
-    if sec is None and prompt:
-        m = re.search(r"(\d{1,3})\s*(초|s|sec|secs|second|seconds)\b", prompt, flags=re.I)
-        if m:
+            sec_val = int(duration_sec)
+        except (TypeError, ValueError):
+            sec_val = None
+    if sec_val is None and isinstance(prompt, str):
+        match_sec = re.search(r"(\d{1,3})\s*(초|s|sec|secs|second|seconds)\b", prompt, flags=re.I)
+        if match_sec:
             try:
-                sec = int(m.group(1))
-            except ValueError:
-                sec = None
-    if sec is None or sec <= 0:
+                sec_val = int(match_sec.group(1))
+            except (TypeError, ValueError):
+                sec_val = None
+    if sec_val is None or sec_val <= 0:
         try:
             duration_min = int(duration_min)
-        except ValueError:
+        except (TypeError, ValueError):
             duration_min = 2
         duration_min = max(1, min(3, duration_min))
-        sec = duration_min * 60
+        sec_val = duration_min * 60
 
-    # ---- 1줄≈5초: '본문 줄수' 범위 가이드(헤더 제외) ----
-    base_lines = max(1, round(sec / 5))
-    if sec <= 35:
+    # ---- 1줄≈5초: '본문 줄수' 가이드(헤더 제외) ----
+    base_lines = max(1, round(sec_val / 5))
+    if sec_val <= 35:
         min_lines, max_lines = 6, 8
-    elif sec <= 75:
+    elif sec_val <= 75:
         min_lines, max_lines = 10, 12
-    elif sec <= 150:
+    elif sec_val <= 150:
         min_lines, max_lines = max(8, base_lines - 2), base_lines + 2
     else:
-        min_lines, max_lines = max(10, base_lines - 2), base_lines + 2
+        min_lines, max_lines = max(10, base_lines - 2), base_lines + 3
 
-    # ---- 시스템/유저 프롬프트 (intro/outro/chorus 금지) ----
-    system = (
+    sys_msg = (
         "You are a Korean lyricist and music director. Return ONE JSON object only:\n"
-        '{"title":"...", "lyrics_ko":"...", "tags":["...", "..."], "tags_pick":["...", "..."]}\n'
-        "- Allowed headers: [verse], [bridge] (lowercase)\n"
-        f"- Body line budget (EXCLUDING headers): {min_lines}–{max_lines} total lines.\n"
+        '{"title":".", "lyrics_ko":".", "tags":[".", "."], "tags_pick":[".", "."]}\n'
+        "- Allowed headers: [verse], [bridge]\n"
+        f"- Body line budget (EXCLUDING headers): {min_lines}–{max_lines}\n"
         "- IMPORTANT:\n"
-        "  1) Do NOT use [intro], [outro], [chorus], or any pre-chorus sections.\n"
+        "  1) Do NOT use [intro], [outro], [chorus], pre/post-chorus, hook, etc.\n"
         "  2) Keep lyric lines only under [verse]/[bridge].\n"
-        "  3) Do NOT add production notes, camera/stage directions, or metadata.\n"
-        f"- Target duration guide: ~{sec}s; assume ~5s per line.\n"
+        "  3) No production notes or metadata.\n"
+        f"- Target duration: ~{sec_val}s (≈5s per line)\n"
     )
     if allowed_tags:
-        system += "ALLOWED_TAGS: " + ", ".join(sorted(set(allowed_tags))) + "\n"
+        sys_msg += "ALLOWED_TAGS: " + ", ".join(sorted(set(allowed_tags))) + "\n"
 
-    user = (
+    user_msg = (
         "[TASK]\n"
         "- Write natural Korean lyrics with the above constraints.\n"
         "- Title may be short and poetic.\n\n"
         "[PROMPT]\n" + (prompt or "")
     )
 
-    # ---- 모델 호출 (스마트 라우팅) ----
-    prefer0 = "openai" if prefer is None else str(prefer)
-    allow0 = (allow_fallback if allow_fallback is not None else (prefer0 == "openai"))
-    t("ai:prepare", f"prefer={prefer0}, allow_fallback={allow0}, sec={sec}, lines={min_lines}-{max_lines}")
+    # ---- 모델 호출 ----
+    prefer_opt = "openai" if prefer is None else str(prefer)
+    allow_opt = (allow_fallback if allow_fallback is not None else (prefer_opt == "openai"))
+    emit("ai:prepare", f"prefer={prefer_opt}, allow_fallback={allow_opt}, sec={sec_val}, lines={min_lines}-{max_lines}")
 
     ai = AI()
-    raw = ai.ask_smart(system, user, prefer=prefer0, allow_fallback=allow0, trace=trace)
-    text = str(raw or "").strip()
-    if not text:
+    raw_reply = ai.ask_smart(sys_msg, user_msg, prefer=prefer_opt, allow_fallback=allow_opt, trace=trace)
+    reply_text = str(raw_reply or "").strip()
+    if not reply_text:
         raise RuntimeError("빈 응답입니다.")
 
     # ---- JSON 파싱(관대한 추출) ----
-    t("parse:begin", f"text_len={len(text)}")
-    start = text.find("{")
-    end = text.rfind("}")
-    if start == -1 or end == -1 or end <= start:
-        data_obj = json.loads(text)
-    else:
-        data_obj = json.loads(text[start:end + 1])
-    t("parse:end", "ok")
+    emit("parse:begin", f"text_len={len(reply_text)}")
+    try:
+        a = reply_text.find("{")
+        b = reply_text.rfind("}")
+        if a == -1 or b == -1 or b <= a:
+            data_obj = json.loads(reply_text)
+        else:
+            data_obj = json.loads(reply_text[a:b + 1])
+    except json.JSONDecodeError:
+        data_obj = {"title": title_in or "untitled", "lyrics_ko": reply_text}
+    emit("parse:end", "ok")
 
     # ---- 필드 보정 ----
     title = str(data_obj.get("title", "")).strip() or (title_in or "untitled")
-    lyrics = str(data_obj.get("lyrics_ko", "") or data_obj.get("lyrics", "")).strip()
-
-    # (선택) 섹션 라벨 정규화가 파일에 이미 있다면 활용 (없어도 무시)
-    try:
-        from lyrics_gen import normalize_sections as _norm_sections  # type: ignore
-        lyrics = _norm_sections(lyrics)
-    except (ImportError, AttributeError):
-        pass
+    lyrics_src = str(data_obj.get("lyrics_ko", "") or data_obj.get("lyrics", "")).strip()
 
     # ---- 금지 섹션 제거/치환 ----
-    # 1) 헤더만 있는 라인 패턴
-    header_only = re.compile(
-        r"^\s*\[(?:intro|outro|pre[- ]?chorus|chorus|hook|coda|break|tag|interlude|verse|bridge)(?:\s+\d+)?]\s*$",
+    ban_head_pat = re.compile(
+        r"^\s*\[(?:chorus|pre[- ]?chorus|post[- ]?chorus|hook|coda|break|tag|interlude|intro|outro)(?:\s+\d+)?]\s*$",
         re.IGNORECASE,
     )
-    # 2) 금지 헤더(섹션 전체 제거) 블록 추출
-    forbidden_heads = re.compile(r"^\s*\[(?:intro|outro|pre[- ]?chorus|chorus)\b[^]]*]\s*$", re.IGNORECASE)
-
-    lines = lyrics.splitlines()
-    cleaned_lines: list[str] = []
-    skip_mode = False
-    for ln in lines:
+    tmp_lines: List[str] = []
+    for ln in lyrics_src.splitlines():
         s = ln.strip()
-        if forbidden_heads.match(s):
-            skip_mode = True
-            continue
-        if header_only.match(s):
-            # 허용 헤더만 통과(verse/bridge). 금지 헤더는 위에서 잡힘.
-            head = s.lower()
-            if "[verse]" in head or "[bridge]" in head:
-                cleaned_lines.append(s)
-            skip_mode = False
-            continue
-        if skip_mode:
-            # 금지 섹션의 본문은 통째로 제거
-            continue
-        cleaned_lines.append(ln)
-    lyrics = "\n".join(cleaned_lines).strip()
-
-    # 혹시 모델이 헤더 없이 코러스 단어를 본문에 넣는 경우는 그대로 두되,
-    # "[pre-chorus]"나 "[chorus]" 형식의 헤더는 위에서 모두 제거됨.
-    # 일부 모델이 "[Chorus 1]" 등 변형을 쓸 수 있어 추가 방어:
-    chorus_head_pat = re.compile(r"^\s*\[(?:pre[- ]?chorus|chorus)(?:\s+\d+)?]\s*$", re.IGNORECASE)
-    lyrics = "\n".join("[verse]" if chorus_head_pat.match(x.strip()) else x for x in lyrics.splitlines())
+        if ban_head_pat.match(s):
+            tmp_lines.append("[verse]")
+        else:
+            tmp_lines.append(ln)
+    lyrics_mid = "\n".join(tmp_lines)
 
     # ---- 기본 노이즈 정리 ----
-    section_only = re.compile(
-        r"^\s*\[(?:verse|bridge)(?:\s+\d+)?]\s*$",
-        re.IGNORECASE,
-    )
-    paren_only = re.compile(r"^\s*\(.+?\)\s*$")
+    keep_head_pat = re.compile(r"^\s*\[(?:verse|bridge)(?:\s+\d+)?]\s*$", re.IGNORECASE)
+    paren_only_pat = re.compile(r"^\s*\(.+?\)\s*$")
     cleaned: List[str] = []
-    for ln in lyrics.splitlines():
+    for ln in lyrics_mid.splitlines():
         s = ln.strip()
         if not s:
             continue
-        if section_only.match(s):
+        if keep_head_pat.match(s):
             cleaned.append(s)
             continue
-        if paren_only.match(s):
+        if paren_only_pat.match(s):
             continue
         cleaned.append(s)
 
@@ -352,8 +378,8 @@ def generate_title_lyrics_tags(
             uniq.append(s)
             seen.add(s)
 
-    lyrics = "\n".join(uniq).strip()
-    if not lyrics:
+    lyrics_body = "\n".join(uniq).strip()
+    if not lyrics_body:
         raise RuntimeError("가사 내용이 비어 있습니다.")
 
     # ---- 태그 정규화 ----
@@ -380,7 +406,77 @@ def generate_title_lyrics_tags(
     else:
         picks = picks_raw[:10]
 
-    return {"title": title, "lyrics": lyrics, "tags": tags, "tags_pick": picks}
+    # ---- ko/en 강제 교정 + 혼합 분리 ----
+    tag_head_pat = re.compile(r"^\s*\[([a-z]{2})]\s*", re.IGNORECASE)
+
+    def _split_and_tag(line_text: str) -> List[str]:
+        body = (line_text or "").strip()
+        if not body:
+            return []
+        match_lang = tag_head_pat.match(body)
+        tail = body[match_lang.end():].lstrip() if match_lang else body
+
+        # 문자 수 집계
+        n_ko = len(re.findall(r"[가-힣]", tail))
+        n_en = len(re.findall(r"[A-Za-z]", tail))
+
+        # 단일 언어 라인
+        if n_ko > 0 and n_en == 0:
+            return ["[ko]" + tail]
+        if n_en > 0 and n_ko == 0:
+            return ["[en]" + tail]
+
+        # 혼합 라인 -> ko/en 두 줄로 분리
+        if n_ko > 0 and n_en > 0:
+            ko_tail = re.sub(r"[A-Za-z]+", "", tail)
+            en_tail = re.sub(r"[가-힣]+", "", tail)
+            ko_tail = re.sub(r"\s{2,}", " ", ko_tail).strip()
+            en_tail = re.sub(r"\s{2,}", " ", en_tail).strip()
+            outs: List[str] = []
+            if ko_tail:
+                outs.append("[ko]" + ko_tail)
+            if en_tail:
+                outs.append("[en]" + en_tail)
+            # 둘 다 비어버린 엣지 케이스(기호만 등) → 기본 en 한 줄
+            return outs if outs else ["[en]" + tail]
+
+        # 둘 다 0 (숫자/기호만): 보수적으로 en
+        return ["[en]" + tail]
+
+    final_lines: List[str] = []
+    for ln in lyrics_body.splitlines():
+        if keep_head_pat.match(ln.strip()):
+            final_lines.append(ln.strip().lower())
+        else:
+            final_lines.extend(_split_and_tag(ln))
+
+    lyrics_out = "\n".join(final_lines)
+
+    # ---- 디버그 로그(최종본 기록) ----
+    try:
+        try:
+            from app import settings as settings_mod  # type: ignore
+        except ImportError:
+            import settings as settings_mod  # type: ignore
+        from pathlib import Path
+        base_dir = Path(getattr(settings_mod, "BASE_DIR", "."))
+        dbg_dir = base_dir / "_debug"
+        dbg_dir.mkdir(parents=True, exist_ok=True)
+        with (dbg_dir / "lyrics_gen.log").open("a", encoding="utf-8") as fp:
+            fp.write("\n===== LYRICS NORMALIZE (final ko/en with split) =====\n")
+            fp.write(f"title: {title}\n")
+            fp.write(lyrics_out + "\n")
+    except (OSError, ValueError, TypeError, ImportError):
+        pass
+
+    emit("normalize:done", "lyrics ko/en forced; mixed lines split")
+
+    return {"title": title, "lyrics": lyrics_out, "tags": tags, "tags_pick": picks}
+
+
+
+
+
 
 
 

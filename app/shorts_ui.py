@@ -1083,18 +1083,49 @@ class MainWindow(QtWidgets.QMainWindow):
         변환(LLS) 토글.
         - 오른쪽 변환 패널/에디터는 '항상 보이기' 유지
         - ON/OFF에 따라 '활성/비활성'만 전환 (위치 흔들림 없음)
-        - meta['lls_enabled']만 기록하고, 기존 변환 텍스트는 보존
+        - meta['lls_enabled'] 기록
+        - OFF 시 project.json의 lyrics_lls 를 빈 문자열로 비워 이후 파이프라인이 lyrics 를 우선 사용
+          (기존 값은 lyrics_lls_backup 으로 보존)
+        - proj_dir 해석 시 Callable(메서드/함수) 가능성까지 모두 정규화
         """
         from pathlib import Path
+        import os
         import json
         from json import JSONDecodeError
 
-        # 프로젝트 경로
+        # --- proj_dir 정규화(반드시 str/PathLike 로 확정) ---
+        # 후보들을 다양하게 시도하되, callable 이면 호출해서 경로 값을 얻는다.
         proj_dir = None
-        try:
-            proj_dir = getattr(self, "_get_active_project_dir", None)()
-        except Exception:
-            proj_dir = getattr(self, "_active_project_dir", None) or getattr(self, "project_dir", None)
+        candidates = [
+            "_get_active_project_dir", "_current_project_dir", "current_project_dir",
+            "_active_project_dir", "project_dir", "_forced_project_dir",
+        ]
+        for name in candidates:
+            val = getattr(self, name, None)
+            if val is None:
+                continue
+            # 메서드/함수를 먼저 해석
+            if callable(val):
+                try:
+                    val = val()
+                except Exception:
+                    val = None
+            # 여전히 callable 이면 사용 불가
+            if callable(val):
+                continue
+            # 문자열/PathLike 만 허용
+            if isinstance(val, (str, os.PathLike)):
+                proj_dir = val
+                break
+            # Qt 타입 등은 문자열로 캐스팅 시도
+            try:
+                s = str(val)
+                if s:
+                    proj_dir = s
+                    break
+            except Exception:
+                continue
+
         if not proj_dir:
             return
 
@@ -1110,11 +1141,19 @@ class MainWindow(QtWidgets.QMainWindow):
         def _save(p: Path, data: dict) -> None:
             try:
                 p.write_text(json.dumps(data, ensure_ascii=False, indent=2), encoding="utf-8")
-            except Exception:
-                pass
+            except OSError:
+                return
 
         meta = _load(pj, {}) or {}
         meta["lls_enabled"] = bool(checked)
+
+        # OFF이면 lyrics_lls를 비우고 백업
+        if not checked:
+            prev = str(meta.get("lyrics_lls") or "").strip()
+            if prev:
+                meta["lyrics_lls_backup"] = prev
+            meta["lyrics_lls"] = ""
+
         _save(pj, meta)
 
         # 패널/에디터 핸들
@@ -1141,6 +1180,9 @@ class MainWindow(QtWidgets.QMainWindow):
                 panel.setEnabled(bool(checked))
             if te_conv is not None and hasattr(te_conv, "setEnabled"):
                 te_conv.setEnabled(bool(checked))
+            # OFF 직후 에디터 내용도 비워 UI 혼동 방지(파일 저장과 일치)
+            if not checked and te_conv is not None and hasattr(te_conv, "clear"):
+                te_conv.clear()
         except Exception:
             pass
 
@@ -1297,9 +1339,17 @@ class MainWindow(QtWidgets.QMainWindow):
                     te_c.setEnabled(False)  # 비활성화
 
     def on_generate_lyrics_with_log(self) -> None:
+        """
+        가사 생성 버튼 핸들러.
+        - 진행창 로그를 파일과 UI에 동시에 남김
+        - generate_title_lyrics_tags 호출
+        - 생성 직후 프로젝트 폴더 추정/고정(음악생성 이어지도록)
+        - 자동태그 UI enable/disable 동기화
+        """
         from PyQt5 import QtWidgets
         from pathlib import Path
         import os
+
         try:
             from app.utils import run_job_with_progress_async  # type: ignore
         except ImportError:
@@ -1316,13 +1366,25 @@ class MainWindow(QtWidgets.QMainWindow):
             except Exception:
                 pass
 
-        # 진행창 테일링용 로그 경로 계산
+        def _get_base_dir() -> Path:
+            """설정의 BASE_DIR을 안전하게 Path로 반환."""
+            try:
+                from app import settings as settings_mod  # type: ignore
+            except ImportError:
+                import settings as settings_mod  # type: ignore
+            val = getattr(settings_mod, "BASE_DIR", ".")
+            try:
+                return Path(val)
+            except Exception:
+                return Path(".")
+
         def _get_proj_dir_str() -> str:
+            """현재 활성 프로젝트 경로를 문자열로 반환(Callable 처리 포함)."""
             cur = getattr(self, "_current_project_dir", None)
             if callable(cur):
                 try:
                     cur = cur()
-                except (TypeError, ValueError):
+                except Exception:
                     cur = None
             if isinstance(cur, (str, bytes, os.PathLike)):
                 try:
@@ -1341,11 +1403,9 @@ class MainWindow(QtWidgets.QMainWindow):
         if proj_dir:
             log_path = str(Path(proj_dir) / "lyrics_gen.log")
         else:
-            try:
-                import tempfile
-                log_path = str(Path(tempfile.gettempdir()) / "lyrics_gen.log")
-            except (ImportError, OSError, ValueError):
-                log_path = "lyrics_gen.log"
+            # 프로젝트가 아직 없다면 임시 위치에 로그 남김
+            import tempfile
+            log_path = str(Path(tempfile.gettempdir()) / "lyrics_gen.log")
 
         def job(progress):
             # 파일/진행창 동시 로깅
@@ -1355,7 +1415,7 @@ class MainWindow(QtWidgets.QMainWindow):
                     p.parent.mkdir(parents=True, exist_ok=True)
                     with p.open("a", encoding="utf-8") as fp:
                         fp.write((line or "").rstrip("\r\n") + "\n")
-                except (OSError, ValueError):
+                except OSError:
                     pass
                 try:
                     progress({"msg": line})
@@ -1365,7 +1425,7 @@ class MainWindow(QtWidgets.QMainWindow):
                     except Exception:
                         pass
 
-            _emit("[ui] 가사생성 작업 시작")
+            _emit("[ui] 가사 생성 시작")
 
             # 입력 수집
             title_in = ""
@@ -1373,7 +1433,7 @@ class MainWindow(QtWidgets.QMainWindow):
             if le and hasattr(le, "text"):
                 try:
                     title_in = (le.text() or "").strip()
-                except (AttributeError, TypeError, ValueError):
+                except Exception:
                     title_in = ""
 
             prompt_text = ""
@@ -1382,7 +1442,7 @@ class MainWindow(QtWidgets.QMainWindow):
                 if w and hasattr(w, "toPlainText"):
                     try:
                         prompt_text = (w.toPlainText() or "").strip()
-                    except (AttributeError, TypeError, ValueError):
+                    except Exception:
                         prompt_text = ""
                     break
 
@@ -1390,7 +1450,7 @@ class MainWindow(QtWidgets.QMainWindow):
             if hasattr(self, "_current_seconds") and callable(self._current_seconds):
                 try:
                     secs = int(self._current_seconds())
-                except (TypeError, ValueError):
+                except Exception:
                     secs = 60
 
             allowed = []
@@ -1400,18 +1460,18 @@ class MainWindow(QtWidgets.QMainWindow):
                     vals = getter()
                     if isinstance(vals, (list, set, tuple)):
                         allowed = sorted(str(x) for x in vals)
-                except (TypeError, ValueError):
+                except Exception:
                     allowed = []
 
             prefer = "gemini" if (getattr(self, "btn_ai_toggle", None) and getattr(self,
                                                                                    "btn_ai_toggle").isChecked()) else "openai"
-            allow_fb = False if prefer == "gemini" else True
+            allow_fb = prefer != "gemini"
 
             def trace(ev: str, msg: str):
                 head = (ev or "").split(":", 1)[0]
                 _emit(f"[{head}] {msg}")
 
-            _emit(f"[ai] prefer={prefer}, secs={secs}]")
+            _emit(f"[ai] prefer={prefer}, secs={secs}")
 
             data = generate_title_lyrics_tags(
                 prompt=prompt_text,
@@ -1424,7 +1484,7 @@ class MainWindow(QtWidgets.QMainWindow):
                 allow_fallback=allow_fb,
             )
 
-            # 이후 단계에서 폴더 유실 방지를 위해 proj_dir 후보도 함께 반환
+            # 이후 단계에서 폴더 유실 방지용 후보도 함께 반환
             return {"data": data, "title": title_in, "prompt": prompt_text, "proj_dir": proj_dir}
 
         def done(ok: bool, payload, err):
@@ -1441,7 +1501,7 @@ class MainWindow(QtWidgets.QMainWindow):
             pack = payload or {}
             data = pack.get("data", {}) or {}
 
-            # ── 프로젝트 폴더 확정: data → 추정 → project.json → 최신 프로젝트
+            # ── 프로젝트 폴더 확정: data → 추정 → 최근 project.json → 최종 폴백
             final_dir = ""
 
             def _pick_dir_from_data(obj) -> str:
@@ -1451,28 +1511,31 @@ class MainWindow(QtWidgets.QMainWindow):
                 paths = obj.get("paths")
                 if isinstance(paths, dict):
                     v = paths.get("project_dir")
-                    if isinstance(v, (str, bytes, os.PathLike)) and Path(os.fspath(v)).exists():
-                        return os.fspath(v)
+                    if isinstance(v, (str, bytes, os.PathLike)):
+                        v2 = os.fspath(v)
+                        if Path(v2).exists():
+                            return v2
                 # 2) title 기반 추정: BASE_DIR/maked_title/<title>
                 title_guess = (obj.get("title") or pack.get("title") or "").strip()
                 if title_guess:
-                    try:
-                        from app.settings import BASE_DIR as _base  # type: ignore
-                    except Exception:
-                        from settings import BASE_DIR as _base  # type: ignore
-                    guess = Path(_base) / "maked_title" / title_guess
-                    if guess.exists():
-                        return str(guess)
+                    root_path = _get_base_dir()  # ← base_dir 섀도잉 방지(이름 변경)
+                    guess_path = root_path / "maked_title" / title_guess
+                    if guess_path.exists():
+                        return str(guess_path)
                 return ""
 
             # 1) data에서 직접
             final_dir = _pick_dir_from_data(data)
-            # 2) 없으면, 방금 job 시작 시점의 proj_dir 후보 사용
+
+            # 2) 없으면, job 시작 시점의 proj_dir 후보 사용
             if not final_dir:
                 pd = pack.get("proj_dir")
-                if isinstance(pd, (str, bytes, os.PathLike)) and Path(os.fspath(pd)).exists():
-                    final_dir = os.fspath(pd)
-            # 3) 그래도 없으면, 현재 UI에 보이는 제목으로 추정
+                if isinstance(pd, (str, bytes, os.PathLike)):
+                    pd2 = os.fspath(pd)
+                    if Path(pd2).exists():
+                        final_dir = pd2
+
+            # 3) 그래도 없으면, 현재 UI 제목으로 추정
             if not final_dir:
                 try:
                     cur_title = ""
@@ -1480,39 +1543,40 @@ class MainWindow(QtWidgets.QMainWindow):
                     if le2 and hasattr(le2, "text"):
                         cur_title = (le2.text() or "").strip()
                     if cur_title:
-                        from app.settings import BASE_DIR as _base2  # type: ignore
-                        guess2 = Path(_base2) / "maked_title" / cur_title
+                        base_dir = _get_base_dir()
+                        guess2 = base_dir / "maked_title" / cur_title
                         if guess2.exists():
                             final_dir = str(guess2)
                 except Exception:
                     pass
-            # 4) project.json에서 경로 복구
+
+            # 4) 가장 최근 project.json에서 경로 복구
             if not final_dir:
+                base_dir = _get_base_dir()
                 try:
-                    from app.settings import BASE_DIR as _base3  # type: ignore
-                except Exception:
-                    from settings import BASE_DIR as _base3  # type: ignore
-                try:
-                    latest = sorted([p for p in (Path(_base3) / "maked_title").glob("*/project.json")],
-                                    key=lambda p: p.stat().st_mtime, reverse=True)
-                    if latest:
+                    pj_list = list((base_dir / "maked_title").glob("*/project.json"))
+                    pj_list.sort(key=lambda p: p.stat().st_mtime, reverse=True)
+                    if pj_list:
                         import json
-                        meta = json.loads(latest[0].read_text(encoding="utf-8")) or {}
+                        meta = json.loads(pj_list[0].read_text(encoding="utf-8")) or {}
                         paths_obj = meta.get("paths") if isinstance(meta, dict) else None
                         inner = str(paths_obj.get("project_dir") or "") if isinstance(paths_obj, dict) else ""
                         if inner and Path(inner).exists():
                             final_dir = inner
                 except Exception:
                     pass
-            # 5) 최후: 최신 프로젝트 폴더로 폴백
+
+            # 5) 최후 폴백 훅
             if not final_dir:
                 last = getattr(self, "_latest_project", None)
                 if callable(last):
                     try:
                         lv = last()
-                        if isinstance(lv, (str, bytes, os.PathLike)) and Path(os.fspath(lv)).exists():
-                            final_dir = os.fspath(lv)
-                    except (TypeError, ValueError):
+                        if isinstance(lv, (str, bytes, os.PathLike)):
+                            lv2 = os.fspath(lv)
+                            if Path(lv2).exists():
+                                final_dir = lv2
+                    except Exception:
                         pass
 
             # 확정되면 UI 활성 프로젝트로 세팅
@@ -2920,8 +2984,6 @@ class MainWindow(QtWidgets.QMainWindow):
         - 변환 패널(LLS)과 가사 에디터, 태그 UI, 내부 컨텍스트 플래그를 모두 초기화.
         - 디스크의 파일(project.json 등)은 건드리지 않는다(기존 기능 보존).
         """
-        from pathlib import Path
-        from PyQt5 import QtWidgets
 
         # 1) 가사/제목/태그 입력 에디터류 초기화 (가능한 위젯 이름들을 모두 시도)
         text_candidates = [
