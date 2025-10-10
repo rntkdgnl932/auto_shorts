@@ -134,7 +134,7 @@
   },
   "74": {
     "inputs": {
-      "lyrics": "[intro]\n\n[verse]\n노란 깃털 옷을 입고\n아장아장 걸어와\n세상에서 제일 귀여워\n\n[chorus]\n착한 우리 꼬꼬\n오늘도 기분 좋아\n작은 발로 콩콩콩",
+      "lyrics": "",
       "language": "Korean",
       "threshold": 0.85
     },
@@ -145,7 +145,7 @@
   },
   "75": {
     "inputs": {
-      "preview": "[intro]\n\n[verse]\n[ko]nolan gisteol os-eul ibgo\n[ko]ajang-ajang geol-eo-wa\n[ko]sesang-eseo je-il gwi-yeo-wo\n\n[chorus]\n[ko]chaghan uli kko-kko\n[ko]oneuldo gibun joh-a\n[ko]jag-eun ballo kongkongkong\n",
+      "preview": "",
       "source": [
         "74",
         0

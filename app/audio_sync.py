@@ -2688,91 +2688,60 @@ def _ensure_vocal_wav(src_path: Path, proj_dir: Path, ffmpeg_exe: str = "ffmpeg"
     return out_wav
 
 
-
-
-
+# audio_sync.py 파일에서 이 함수를 찾아 아래 내용으로 전체를 교체하세요.
 
 def generate_music_with_acestep(
-    project_dir: str,
-    *,
-    on_progress: Optional[Callable[[dict], None]] = None,
-    target_seconds: int | None = None,
+        project_dir: str,
+        *,
+        on_progress: Optional[Callable[[dict], None]] = None,
+        target_seconds: int | None = None,
 ) -> str:
     """
-    ComfyUI(ACE-Step) 단일 트랙 음악 생성 — 기존 기능 100% 보존.
-
-    전송 규칙(최종 확정):
-      - lls_enabled == False (변환 OFF)
-        → 저장된 lyrics_lls_now는 신뢰하지 않음
-        → 실행 직전에 project.json의 'lyrics'를 즉석 분리/정규화하여 runtime용 가사 생성
-        → 그 runtime 가사를 전송(제로폭 추가로 캐시 무력화)
-        → 실행 후 lyrics_lls_now는 ""로 되돌림
-      - lls_enabled == True  (변환 ON)
-        → lyrics_lls 전송
-
-    저장 규칙:
-      - lyrics_lls_after: '항상' Comfy가 반환한 변환 결과(텍스트)를 저장
-        (히스토리 인라인/파일 → /view 폴백 → 그래도 없으면 빈 문자열)
+    ComfyUI(ACE-Step) 단일 트랙 음악 생성 — project.json 단일 소스 정책.
+    - comfyui 전송 직전 가사를 'lyrics_lls_now'에 저장합니다.
+    - comfyui 작업 후 실제 사용된 가사를 'lyrics_lls_after'에 저장합니다.
+    - 변환 OFF 시, 한/영 혼용 가사를 분석하여 영어 앞에만 [en] 태그를 부착합니다.
     """
     from pathlib import Path
+    import re
     from typing import List, Optional
-    import time
-    import os
-    import random
 
-    # ───────── 로컬 헬퍼 (외부 심볼 가리기 방지 위해 *_local 네이밍) ─────────
-    def _dlog(tag: str, *parts: object) -> None:
-        try:
-            print("[ACE]", tag, *parts)
-        except Exception:
-            pass
+    def notify(stage: str, **kw):
+        if on_progress:
+            try:
+                info = {"stage": stage}
+                info.update(kw)
+                on_progress(info)
+            except Exception:
+                pass
 
-    def _iter_nodes_local(graph_obj: dict):
-        if not isinstance(graph_obj, dict):
+    def _iter_nodes(graph: dict):
+        if not isinstance(graph, dict):
             return
-        nodes_val = graph_obj.get("nodes")
-        if isinstance(nodes_val, list):
-            for node_obj in nodes_val:
-                if isinstance(node_obj, dict):
-                    yield node_obj
-            return
-        for _k_local, node_obj in graph_obj.items():
-            if isinstance(node_obj, dict) and "class_type" in node_obj:
-                yield node_obj
+        if "nodes" in graph and isinstance(graph["nodes"], list):
+            for nobj in graph["nodes"]:
+                if isinstance(nobj, dict):
+                    yield nobj
+        else:
+            for _k, nobj in graph.items():
+                if isinstance(nobj, dict) and "class_type" in nobj:
+                    yield nobj
 
-    def _find_nodes_by_class_names_local(graph_obj: dict, class_names: tuple[str, ...]) -> list[tuple[str, dict]]:
-        out_list_local: list[tuple[str, dict]] = []
-        want_set = {c.lower() for c in class_names}
-        for n_local in _iter_nodes_local(graph_obj):
-            ct_val = str(n_local.get("class_type", "")).lower()
-            if ct_val in want_set and "id" in n_local:
-                out_list_local.append((str(n_local["id"]), n_local))
-        return out_list_local
-
-    def _find_nodes_by_class_contains_local(graph_obj: dict, word: str) -> list[tuple[str, dict]]:
-        out_list_local: list[tuple[str, dict]] = []
-        key = word.lower()
-        for n_local in _iter_nodes_local(graph_obj):
-            ct_val = str(n_local.get("class_type", "")).lower()
-            if key in ct_val and "id" in n_local:
-                out_list_local.append((str(n_local["id"]), n_local))
-        return out_list_local
-
-    def _force_wav_save_for_graph_local(graph_obj: dict, *, proj_dir_in: Path, filename_prefix_in: str) -> str:
-        for node_obj in _iter_nodes_local(graph_obj):
-            ct_val = str(node_obj.get("class_type", "")).lower()
-            if ct_val in ("saveaudio", "saveaudiowav", "saveaudiomp3", "pysssss_saveaudio"):
-                inputs_map = node_obj.setdefault("inputs", {}) or {}
-                inputs_map["filename_prefix"] = filename_prefix_in
+    def _force_wav_save_for_this_graph(graph: dict, *, proj_dir: Path, filename_prefix: str) -> str:
+        for nobj in _iter_nodes(graph):
+            ct = str(nobj.get("class_type", "")).lower()
+            if ct in ("saveaudio", "saveaudiowav", "saveaudiomp3", "pysssss_saveaudio", "saveaudio"):
+                inputs_map = nobj.setdefault("inputs", {}) or {}
+                inputs_map["filename_prefix"] = filename_prefix
                 if "output_path" in inputs_map:
-                    inputs_map["output_path"] = str(proj_dir_in)
+                    inputs_map["output_path"] = str(proj_dir)
                 if "basename" in inputs_map:
                     inputs_map["basename"] = "vocal"
                 if "base_filename" in inputs_map:
                     inputs_map["base_filename"] = "vocal"
-                for k_local, v_local in (("format", "wav"), ("container", "wav"), ("codec", "pcm_s16le")):
-                    if k_local in inputs_map:
-                        inputs_map[k_local] = v_local
+                for k, v in (("format", "wav"), ("container", "wav"), ("codec", "pcm_s16le")):
+                    if k in inputs_map:
+                        inputs_map[k] = v
                 if "sample_rate" in inputs_map:
                     inputs_map.setdefault("sample_rate", 44100)
                 for bd_key in ("bit_depth", "bitdepth", "bits"):
@@ -2780,189 +2749,128 @@ def generate_music_with_acestep(
                         inputs_map[bd_key] = 16
         return ".wav"
 
-    def _notify_local(stage: str, **kw) -> None:
-        if on_progress is None:
-            return
-        info = {"stage": stage}
-        info.update(kw)
-        try:
-            on_progress(info)
-        except (TypeError, ValueError):
-            pass
-
-    # 유틸 함수/상수 로드 (기존 모듈의 함수들 사용)
-    try:
-        from app.utils import load_json, save_json  # type: ignore
-    except Exception:
-        from utils import load_json, save_json  # type: ignore
-
-    # normalize_sections가 외부에 없을 수도 있어 안전 폴백
-    try:
-        from app.lyrics_gen import normalize_sections  # type: ignore
-    except Exception:
-        try:
-            from lyrics_gen import normalize_sections  # type: ignore
-        except Exception:
-            def normalize_sections(text_in: str) -> str:  # type: ignore
-                return text_in
-
-    # 프로젝트 메타 준비
+    # ───────── 기본 준비 ─────────
+    _dlog("ENTER", f"project_dir={project_dir}")
     proj = Path(project_dir)
     proj.mkdir(parents=True, exist_ok=True)
-    meta_path = proj / "project.json"
-    meta = load_json(meta_path, {}) or {}
+    pj = proj / "project.json"
+    meta = load_json(pj, {}) or {}
 
-    title_val = effective_title(meta)
+    title = effective_title(meta)
+
+    # 가사 소스 선정(오직 project.json)
+    lyrics_raw = (meta.get("lyrics") or "").strip()
+    lyrics_lls = (meta.get("lyrics_lls") or "").strip()
+    use_lls = bool(lyrics_lls)
+
+    # ▼▼▼ 요청사항 반영: 변환 OFF일 때의 처리 로직 수정 ▼▼▼
+    if use_lls:
+        # 변환 ON: 기존과 동일하게 lyrics_lls 사용
+        lyrics_eff = lyrics_lls
+    else:
+        # 변환 OFF: lyrics_raw를 분석하여 영어 앞에만 [en] 태그 부착
+        processed_lines: List[str] = []
+        # 한글, 영어/숫자/공백을 포함하는 텍스트 덩어리를 찾습니다.
+        lang_pattern = re.compile(r'([가-힣\s]+|[a-zA-Z0-9\s]+)')
+
+        for line in lyrics_raw.splitlines():
+            stripped_line = line.strip()
+            if not stripped_line:
+                continue
+
+            # 섹션 태그([verse] 등)는 그대로 유지합니다.
+            if stripped_line.startswith('[') and stripped_line.endswith(']'):
+                processed_lines.append(stripped_line)
+                continue
+
+            chunks = lang_pattern.findall(stripped_line)
+            for chunk in chunks:
+                trimmed_chunk = chunk.strip()
+                if not trimmed_chunk:
+                    continue
+
+                # 한글 문자가 포함되지 않은 경우에만 [en] 태그를 붙입니다.
+                if not re.search(r'[가-힣]', trimmed_chunk):
+                    processed_lines.append(f"[en]{trimmed_chunk}")
+                else:
+                    # 한글 덩어리는 접두사 없이 그대로 추가합니다.
+                    processed_lines.append(trimmed_chunk)
+
+        lyrics_eff = "\n".join(processed_lines)
+    # ▲▲▲ 요청사항 반영 완료 ▲▲▲
+
+    if not lyrics_eff:
+        raise RuntimeError("project.json에 가사가 없습니다. 먼저 저장/생성해 주세요.")
+
+    # 길이(초) 그대로 사용
     if target_seconds is not None:
-        seconds_val = int(max(1, target_seconds))
+        seconds = int(max(1, target_seconds))
     else:
-        seconds_val = int(max(1, int(meta.get("target_seconds") or meta.get("time") or 60)))
-    meta["target_seconds"] = int(seconds_val)
-    meta["time"] = int(seconds_val)
-    save_json(meta_path, meta)
+        seconds = int(max(1, int(meta.get("target_seconds") or meta.get("time") or 60)))
+    meta["target_seconds"] = int(seconds)
+    meta["time"] = int(seconds)
 
-    tags_effective = _collect_effective_tags(meta)
+    # 1. comfyui api에 보내기 전, 실제 전송될 가사를 lyrics_lls_now에 저장
+    meta["lyrics_lls_now"] = lyrics_eff
 
-    # 변환 ON/OFF
-    lls_enabled = bool(meta.get("lls_enabled"))
+    save_json(pj, meta)
 
-    # 변환 OFF일 때: 저장된 lyrics_lls_now는 무시하고 'lyrics'에서 즉석 변환
-    def _split_ko_en_runtime_local(text_src: str) -> str:
-        import re as _re_local
-        body = normalize_sections(text_src or "")
-        if not body.strip():
-            return ""
-        tag_head_pat_local = _re_local.compile(r"^\s*\[([a-z]{2})]\s*$", _re_local.IGNORECASE)
-        keep_head_pat_local = _re_local.compile(
-            r"^\s*\[(?:verse|bridge|chorus|intro|outro)(?:\s+\d+)?]\s*$",
-            _re_local.IGNORECASE,
-        )
+    effective_tags = _collect_effective_tags(meta)
 
-        out_lines_local: list[str] = []
-        for raw_line in body.splitlines():
-            line_str = (raw_line or "").strip()
-            if not line_str:
-                continue
-            if keep_head_pat_local.match(line_str):
-                out_lines_local.append(line_str.lower())
-                continue
-            if tag_head_pat_local.match(line_str):
-                continue
+    # ───────── 워크플로 로드/보정 ─────────
+    g = _load_workflow_graph(ACE_STEP_PROMPT_JSON)
+    base = _choose_host()
+    _dlog("HOST", base, "| DESIRED_FMT wav")
 
-            has_ko = bool(_re_local.search(r"[가-힣]", line_str))
-            has_en = bool(_re_local.search(r"[A-Za-z]", line_str))
-            if has_ko and has_en:
-                ko_only = _re_local.sub(r"[^가-힣\s]", "", line_str)
-                ko_only = _re_local.sub(r"\s{2,}", " ", ko_only).strip()
-                en_only = _re_local.sub(r"[가-힣]", "", line_str)
-                en_only = _re_local.sub(r"\s{2,}", " ", en_only).strip()
-                if ko_only:
-                    out_lines_local.append("[ko]" + ko_only)
-                if en_only:
-                    out_lines_local.append("[en]" + en_only)
-                if not ko_only and not en_only:
-                    out_lines_local.append("[en]" + line_str)
-            elif has_ko:
-                out_lines_local.append("[ko]" + line_str)
-            elif has_en:
-                out_lines_local.append("[en]" + line_str)
-            else:
-                out_lines_local.append("[en]" + line_str)
-        return "\n".join(out_lines_local).strip()
+    subfolder = f"shorts_make/{sanitize_title(title)}"
+    save_prefix = f"{subfolder}/vocal_final"
+    ext = _force_wav_save_for_this_graph(g, proj_dir=proj, filename_prefix=save_prefix)
 
-    if lls_enabled:
-        send_text_base = str(meta.get("lyrics_lls") or "")
-        if not send_text_base.strip():
-            raise RuntimeError("변환 ON이지만 project.json의 'lyrics_lls'가 비어 있습니다.")
-    else:
-        raw_lyrics_src = str(meta.get("lyrics") or "")
-        if not raw_lyrics_src.strip():
-            raise RuntimeError("project.json에 'lyrics'가 없습니다. 먼저 저장/생성해 주세요.")
-        send_text_base = _split_ko_en_runtime_local(raw_lyrics_src)
-
-    # 캐시 무력화(ZWSP 1자)
-    send_text_inject = send_text_base.rstrip("\n") + "\u200B"
-
-    # ───────── 워크플로 로드/보정(기존 로직 유지) ─────────
-    graph = _load_workflow_graph(ACE_STEP_PROMPT_JSON)
-    host = _choose_host()
-    _dlog("HOST", host, "| DESIRED_FMT wav")
-
-    subfolder_val = f"shorts_make/{sanitize_title(title_val)}"
-    save_prefix = f"{subfolder_val}/vocal_final"
-    ext = _force_wav_save_for_graph_local(graph, proj_dir_in=proj, filename_prefix_in=save_prefix)
-
-    # LLS/태그/초/threshold 주입(기존 유지, threshold에 미세 지터로 캐시 무력화)
-    now_frac = (time.time() % 1.0)
-    threshold_jitter = (now_frac * 0.0006) - 0.0003  # -0.0003 ~ +0.0003
-
-    for _nid_local, node_item in _find_nodes_by_class_names_local(graph, ("LyricsLangSwitch",)):
+    # LLS/태그/초 주입
+    for _nid, node_item in _find_nodes_by_class_names(g, ("LyricsLangSwitch",)):
         inputs_map2 = node_item.setdefault("inputs", {})
-        inputs_map2["lyrics"] = send_text_inject
-        if "text" in inputs_map2 and not isinstance(inputs_map2.get("text"), dict):
-            inputs_map2["text"] = send_text_inject
-        base_th = 0.85
-        try:
-            base_th = float(inputs_map2.get("threshold", base_th))
-        except (TypeError, ValueError):
-            base_th = 0.85
-        new_th = base_th + threshold_jitter
-        if new_th < 0.0:
-            new_th = 0.0
-        if new_th > 0.999:
-            new_th = 0.999
-        inputs_map2["threshold"] = new_th
-        inputs_map2["language"] = "Korean"
-        inputs_map2["seconds"] = int(seconds_val)
+        inputs_map2["lyrics"] = lyrics_eff
+        inputs_map2["language"] = "Korean"  # 기본 언어는 한국어로 설정
+        inputs_map2.setdefault("threshold", 0.85)
+        inputs_map2["seconds"] = int(seconds)
 
-    for _nid_local, node_item in _find_nodes_by_class_names_local(graph, ("TextEncodeAceStepAudio",)):
+    for _nid, node_item in _find_nodes_by_class_names(g, ("TextEncodeAceStepAudio",)):
         inputs_map3 = node_item.setdefault("inputs", {})
-        inputs_map3["tags"] = ", ".join(tags_effective)
+        inputs_map3["tags"] = ", ".join(effective_tags)
         inputs_map3.setdefault("lyrics_strength", 1.0)
 
     targets = []
-    targets += _find_nodes_by_class_names_local(graph, ("EmptyAceStepLatentAudio", "EmptyLatentAudio", "EmptyAudio", "NoiseLatentAudio"))
+    targets += _find_nodes_by_class_names(g, ("EmptyAceStepLatentAudio", "EmptyLatentAudio", "EmptyAudio",
+                                              "NoiseLatentAudio"))
     if not targets:
-        for nid_try, node_item_try in _find_nodes_by_class_contains_local(graph, "audio"):
-            if "latent" in str(node_item_try.get("class_type", "")).lower():
-                targets.append((nid_try, node_item_try))
-    for _nid_local, node_item in targets:
-        node_item.setdefault("inputs", {})["seconds"] = int(max(1, seconds_val))
+        for nid, node_item in _find_nodes_by_class_contains(g, "audio"):
+            if "latent" in str(node_item.get("class_type", "")).lower():
+                targets.append((nid, node_item))
+    for _nid, node_item in targets:
+        node_item.setdefault("inputs", {})["seconds"] = int(max(1, seconds))
 
+    # 랜덤 시드
     try:
-        for nid_any, node_item_any in list(graph.items()):
-            if str(node_item_any.get("class_type", "")).lower() == "ksampler":
-                node_item_any.setdefault("inputs", {})["seed"] = _rand_seed()
+        for nid, node_item in list(g.items()):
+            if str(node_item.get("class_type", "")).lower() == "ksampler":
+                node_item.setdefault("inputs", {})["seed"] = _rand_seed()
     except Exception:
         pass
 
-    # ───────── 제출 & 대기(기존 함수 사용) ─────────
-    _notify_local("submitting", host=host)
+    # ───────── 제출 & 대기 ─────────
+    notify("submitting", host=base)
     hist = _submit_and_wait(
-        host,
-        graph,
+        base, g,
         timeout=(globals().get("ACE_STEP_WAIT_TIMEOUT_SEC") or globals().get("ACE_WAIT_TIMEOUT_SEC", 1800.0)),
         poll=(globals().get("ACE_STEP_POLL_INTERVAL_SEC") or globals().get("ACE_POLL_INTERVAL_SEC", 2.0)),
         on_progress=(on_progress or (lambda info: _dlog("PROG", info))),
     )
 
-    # ───────── 결과 다운로드(기존 로직) + 텍스트 수집 ─────────
+    # ───────── 결과 다운로드 ─────────
     saved_files: List[Path] = []
-    text_payloads: list[str] = []
     outputs = hist.get("outputs") if isinstance(hist, dict) else {}
     if isinstance(outputs, dict):
-        for _nid_local, node_out in outputs.items():
-            # 인라인 텍스트 키
-            for txt_key in ("text", "txt", "string", "strings"):
-                inline_val = node_out.get(txt_key)
-                if isinstance(inline_val, str):
-                    if inline_val.strip():
-                        text_payloads.append(inline_val.strip())
-                elif isinstance(inline_val, list):
-                    for s in inline_val:
-                        if isinstance(s, str) and s.strip():
-                            text_payloads.append(s.strip())
-            # 파일 리스트(오디오/텍스트)
+        for _nid, node_out in outputs.items():
             for key in ("audio", "audios", "files"):
                 arr = node_out.get(key)
                 if not isinstance(arr, list):
@@ -2975,21 +2883,15 @@ def generate_music_with_acestep(
                     if not sf or fn.startswith("ComfyUI_temp_"):
                         continue
                     sf_norm = sf.replace("\\", "/").lstrip("/")
-                    out_file = _download_output_file(host, fn, sf_norm, out_dir=proj)
+                    out_file = _download_output_file(base, fn, sf_norm, out_dir=proj)
                     if out_file:
                         saved_files.append(out_file)
-                        if out_file.suffix.lower() == ".txt":
-                            try:
-                                txt_body = out_file.read_text(encoding="utf-8").strip()
-                                if txt_body:
-                                    text_payloads.append(txt_body)
-                            except (OSError, UnicodeDecodeError, ValueError):
-                                pass
 
-    # 최신 오디오를 vocal.wav로 정규화 + (옵션)마스터링
+    # 최신 오디오를 vocal.wav로 통일 + (옵션)마스터링
     final_path: Optional[Path] = None
     if saved_files:
-        audio_candidates = [p for p in saved_files if p.suffix.lower() in (".wav", ".mp3", ".flac", ".ogg", ".opus", ".m4a")]
+        audio_candidates = [p for p in saved_files if
+                            p.suffix.lower() in (".wav", ".mp3", ".flac", ".ogg", ".opus", ".m4a")]
         src = max(audio_candidates or saved_files, key=lambda p: p.stat().st_mtime)
         ff = getattr(S, "FFMPEG_EXE", "ffmpeg")
         final_path = _ensure_vocal_wav(src, proj, ffmpeg_exe=ff)
@@ -3016,41 +2918,50 @@ def generate_music_with_acestep(
                     )
                     if isinstance(res2, Path):
                         final_path = res2
-                except Exception as _e2:
-                    _dlog("MASTER-FAIL", type(_e2).__name__, str(_e2))
-            except Exception as _e3:
-                _dlog("MASTER-FAIL", type(_e3).__name__, str(_e3))
+                except Exception as _e:
+                    _dlog("MASTER-FAIL", type(_e).__name__, str(_e))
+            except Exception as _e:
+                _dlog("MASTER-FAIL", type(_e).__name__, str(_e))
 
-    # ───────── Comfy 결과 텍스트 저장 + 변환 OFF면 lyrics_lls_now 비우기 ─────────
-    meta.setdefault("comfy_debug", {})
-    meta["comfy_debug"].update({
-        "host": host,
-        "prompt_json": str(ACE_STEP_PROMPT_JSON),
-        "prompt_seconds": seconds_val,
-        "requested_format": "wav",
-        "requested_ext": ext,
-        "subfolder": f"shorts_make/{sanitize_title(title_val)}",
-    })
-    meta["tags_effective"] = tags_effective
+    # 2. ComfyUI에서 실제 사용된 가사(lyric.txt)를 lyrics_lls_after에 저장
+    if isinstance(outputs, dict):
+        buf: List[str] = []
+        for _nid, node_out in outputs.items():
+            for key in ("text", "txt"):
+                val = node_out.get(key)
+                if isinstance(val, str):
+                    if val.strip():
+                        buf.append(val.strip())
+                elif isinstance(val, list):
+                    for s in val:
+                        if isinstance(s, str) and s.strip():
+                            buf.append(s.strip())
+        if buf:
+            meta["lyrics_lls_after"] = "\n".join(buf).strip()
 
-    meta["lyrics_lls_after"] = "\n\n".join([t for t in text_payloads if t]).strip() if text_payloads else ""
-
-    if not lls_enabled:
-        # 실행 후 항상 비움(과거 흔적 제거)
-        meta["lyrics_lls_now"] = ""
-
+    # 경로 메타 업데이트만(부산물 X)
     if final_path:
         meta.setdefault("paths", {})["vocal"] = str(final_path)
         meta["audio"] = str(final_path)
+    meta.setdefault("comfy_debug", {})
+    meta["comfy_debug"].update({
+        "host": base,
+        "prompt_json": str(ACE_STEP_PROMPT_JSON),
+        "prompt_seconds": seconds,
+        "requested_format": "wav",
+        "requested_ext": ext,
+        "subfolder": f"shorts_make/{sanitize_title(title)}",
+    })
+    meta["tags_effective"] = effective_tags
 
-    save_json(meta_path, meta)
+    # 모든 변경사항을 마지막에 한번에 저장
+    save_json(pj, meta)
 
-    # 요약 로그
     msg = [
         "ACE-Step 완료 ✅",
         f"- 프롬프트: {ACE_STEP_PROMPT_JSON}",
-        f"- 길이:     {seconds_val}s",
-        f"- 태그 수:  {len(tags_effective)}",
+        f"- 길이:     {seconds}s",
+        f"- 태그 수:  {len(effective_tags)}",
     ]
     if final_path:
         msg.append(f"- 저장:     {final_path}")
@@ -3059,7 +2970,6 @@ def generate_music_with_acestep(
     summary = "\n".join(msg)
     _dlog("LEAVE", summary.replace("\n", " | "))
     return summary
-
 
 
 
