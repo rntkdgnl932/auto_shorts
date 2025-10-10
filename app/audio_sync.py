@@ -3135,35 +3135,29 @@ def detect_onsets_percussive_librosa(wav_path: str) -> list[float]:
         return []
 
 
-
-
-# audio_sync.py
+# audio_sync.py 파일에서 sync_lyrics_with_whisper_pro 함수를 찾아 아래 내용으로 전체를 교체하세요.
 
 def sync_lyrics_with_whisper_pro(
-    audio_path: str,
-    lyrics_text: str,
-    *,
-    model_size: str = "medium",
-    # 호출부 호환 파라미터(반환에 보존)
-    min_len: float = 0.5,
-    end_bias_sec: float = 2.5,
-    avg_min_sec_per_unit: float = 2.0,
-    start_preroll: float = 0.30,
-    enable_preprocess: bool = True,
-    enable_demucs: bool = True,
-    enable_calibration: bool = True,
-    anchor_first_line_sec: float | None = None,
-    **extra_kwargs,
+        audio_path: str,
+        lyrics_text: str,
+        *,
+        model_size: str = "medium",
+        # 호출부 호환 파라미터(반환에 보존)
+        min_len: float = 0.5,
+        end_bias_sec: float = 2.5,
+        avg_min_sec_per_unit: float = 2.0,
+        start_preroll: float = 0.30,
+        enable_preprocess: bool = True,
+        enable_demucs: bool = True,
+        enable_calibration: bool = True,
+        anchor_first_line_sec: float | None = None,
+        **extra_kwargs,
 ) -> dict:
     """
     정밀 라인 싱크(Whisper 단어 타임라인 기반) + seg_ready.json/seg.json 저장
-    - 1회차: (옵션) 전처리/디뮤즈된 파일로 ASR (기능 보존용)
-    - 2회차(최종 기준): 원본 vocal.wav로 ASR → 이 결과를 seg_ready.json과 seg.json에 반영
-      * seg_ready.json : EN-SEG(=2회차 ASR 세그먼트) 원문 그대로 저장
-      * seg.json       : 2회차 시간축을 유지하고, 텍스트는 project.json ko 가사와 유사도 매칭(미달 시 "")
-    - project.json의 ko 라인 우선 매핑(기존 정책 유지)
-    - 마지막 라인 종료 + 5s 페이드아웃 후 원본 audio_path로 컷(원본 길이보다 길면 안전 클램프)
-    - 반환 구조(segments/words/onsets/duration 등) 보존
+    - [개선] 보컬 분리(Demucs) 기능을 복원하여 한글 인식 정확도를 높입니다.
+    - [개선] initial_prompt에 원본 가사를 제공하여 분석 정확도를 높입니다.
+    - 가사가 실제 시작되고 끝나는 시간을 lyrics_start, lyrics_end로 계산하여 반환합니다.
     """
     from pathlib import Path
     from typing import Any, Dict, List, Tuple, Optional
@@ -3219,11 +3213,11 @@ def sync_lyrics_with_whisper_pro(
     # ---------- 입력 경로 ----------
     src = Path(audio_path)
 
-    # ---------- (선택) 사전 전처리 ----------
+    # ▼▼▼ 요청사항 반영: 보컬 분리(Demucs) 및 전처리 기능 복원 ▼▼▼
     use_path = str(src)
     if enable_preprocess and callable(globals().get("preprocess_for_analysis")):
         try:
-            pre = preprocess_for_analysis(str(src))  # type: ignore[name-defined]
+            pre = preprocess_for_analysis(str(src))
             if pre and Path(pre).exists():
                 use_path = pre
         except (ValueError, OSError, RuntimeError):
@@ -3232,7 +3226,7 @@ def sync_lyrics_with_whisper_pro(
     vocals_path: Optional[str] = None
     if enable_demucs and callable(globals().get("demucs_vocals_drums")):
         try:
-            stems = demucs_vocals_drums(use_path)  # type: ignore[name-defined]
+            stems = demucs_vocals_drums(use_path)
             cand: Optional[str] = None
             if isinstance(stems, dict) and hasattr(stems, "get"):
                 v = stems.get("vocals")
@@ -3242,75 +3236,65 @@ def sync_lyrics_with_whisper_pro(
         except (ValueError, OSError, RuntimeError, TypeError):
             vocals_path = None
 
-    align_path = vocals_path or use_path  # 1회차 입력
+    align_path = vocals_path or use_path
+    # ▲▲▲ 요청사항 반영 완료 ▲▲▲
 
-    # ---------- 1회차: 기능 보존용 러닝(결과는 반환/참고만) ----------
+    # ---------- 최종 기준 분석 (분리된 보컬 또는 원본 오디오) ----------
     try:
-        tr1 = transcribe_words(
-            path=align_path,
+        transcribe_result = transcribe_words(
+            path=align_path,  # <-- 깨끗한 오디오 파일 경로 사용
             model_size=model_size,
             beam_size=5,
             language="ko",
             print_translate_view=False,
+            initial_prompt=lyrics_text
         )
     except (RuntimeError, OSError, ValueError):
-        tr1 = {"segments": [], "words": []}
+        transcribe_result = {"segments": [], "words": []}
 
-    # ---------- 2회차: 최종 기준(원본 vocal.wav) ----------
-    try:
-        tr2 = transcribe_words(
-            path=str(src),
-            model_size=model_size,
-            beam_size=5,
-            language="ko",
-            print_translate_view=False,
-        )
-    except (RuntimeError, OSError, ValueError):
-        tr2 = {"segments": [], "words": []}
+    # 분석 결과를 최종 기준으로 사용
+    asr_segments: List[Tuple[float, float, str]] = list(transcribe_result.get("segments") or [])
+    asr_words: List[Tuple[float, float, str]] = list(transcribe_result.get("words") or [])
 
-    # 2회차 세그먼트를 최우선으로 사용
-    asr_segments_2: List[Tuple[float, float, str]] = list(tr2.get("segments") or [])
-    asr_words_2: List[Tuple[float, float, str]] = list(tr2.get("words") or [])
+    # 가사 시작/끝 시간 계산
+    lyrics_start_sec = -1.0
+    lyrics_end_sec = -1.0
+    if asr_segments:
+        for start_time, _end_time, text in asr_segments:
+            if (text or "").strip():
+                lyrics_start_sec = float(start_time)
+                break
+        for _start_time, end_time, text in reversed(asr_segments):
+            if (text or "").strip():
+                lyrics_end_sec = float(end_time)
+                break
+    if lyrics_start_sec == -1.0: lyrics_start_sec = 0.0
+    if lyrics_end_sec == -1.0: lyrics_end_sec = 0.0
 
     # ---------- project.json의 ko 라인 읽기 ----------
     def load_project_lines(proj_dir: Path) -> List[str]:
         pj = proj_dir / "project.json"
-        if not pj.exists():
-            return []
+        if not pj.exists(): return []
         try:
             with open(pj, "r", encoding="utf-8") as f:
                 meta_local = json.load(f)
         except (OSError, json.JSONDecodeError, UnicodeDecodeError):
             return []
+
         lines_out: List[str] = []
-        lls = meta_local.get("lyrics_lls")
-        if isinstance(lls, list):
-            ko = next((x for x in lls if isinstance(x, dict) and x.get("lang") == "ko"), None)
-            if ko and isinstance(ko.get("lines"), list):
-                try:
-                    for line in ko["lines"]:
-                        if isinstance(line, str) and line.strip():
-                            lines_out.append(line.strip())
-                except (TypeError, ValueError):
-                    lines_out = []
-        if not lines_out:
-            txtt = meta_local.get("lyrics") or meta_local.get("lyrics_text")
-            if isinstance(txtt, str) and txtt.strip():
-                lines_out = normalize_lines_keep_lyrics(txtt)
+        lyrics_source = meta_local.get("lyrics") or meta_local.get("lyrics_text")
+        if isinstance(lyrics_source, str) and lyrics_source.strip():
+            lines_out = normalize_lines_keep_lyrics(lyrics_source)
         return lines_out
 
     project_lines = load_project_lines(src.parent)
     arg_lines = normalize_lines_keep_lyrics(lyrics_text)
     lyrics_lines = project_lines if project_lines else arg_lines
 
-    # ---------- seg_ready.json (2회차 ASR 원문 그대로) ----------
+    # ---------- seg_ready.json (ASR 원문 그대로) ----------
     seg_ready_payload: List[Dict[str, Any]] = []
-    for a, b, txt in asr_segments_2:
-        seg_ready_payload.append({
-            "start": round2(a),
-            "end": round2(b),
-            "text": str(txt or "").strip(),
-        })
+    for a, b, txt in asr_segments:
+        seg_ready_payload.append({"start": round2(a), "end": round2(b), "text": str(txt or "").strip()})
     try:
         seg_ready_path = src.parent / "seg_ready.json"
         with open(seg_ready_path, "w", encoding="utf-8") as f_sr:
@@ -3319,62 +3303,45 @@ def sync_lyrics_with_whisper_pro(
     except (OSError, ValueError, TypeError):
         pass
 
-    # ---------- seg.json (2회차 시간 + 가사 유사도 매칭 텍스트) ----------
+    # ---------- seg.json (시간 + 가사 유사도 매칭 텍스트) ----------
     sim_threshold = 0.55
     lyric_norms = [norm_for_sim(x) for x in lyrics_lines]
     used_flags = [False] * len(lyrics_lines)
     last_pick_idx = -1
-
     segs_final: List[Dict[str, Any]] = []
-    for a, b, asr_txt in asr_segments_2:
-        start_val = round2(a)
-        end_val = round2(b)
-        text_out = ""
+    for a, b, asr_txt in asr_segments:
+        start_val, end_val, text_out = round2(a), round2(b), ""
         if lyric_norms:
             asr_norm = norm_for_sim(asr_txt)
-            best_sim = 0.0
-            best_idx = -1
+            best_sim, best_idx = 0.0, -1
             search_from = max(0, last_pick_idx + 1)
             for idx in range(search_from, len(lyric_norms)):
-                if used_flags[idx]:
-                    continue
+                if used_flags[idx]: continue
                 line_norm = lyric_norms[idx]
-                if not line_norm:
-                    continue
+                if not line_norm: continue
                 sim = difflib.SequenceMatcher(None, asr_norm, line_norm).ratio()
                 if sim > best_sim:
-                    best_sim = sim
-                    best_idx = idx
+                    best_sim, best_idx = sim, idx
             if best_idx >= 0 and best_sim >= sim_threshold:
                 text_out = lyrics_lines[best_idx].strip()
                 used_flags[best_idx] = True
                 last_pick_idx = best_idx
         segs_final.append({"start": start_val, "end": end_val, "text": text_out})
 
-    # 간단 로그(장문의 "줄별 정합" 출력 제거)
     if segs_final:
-        print("=== 라인-타임 매핑 (lyrics vs ASR: pass2) ===")
+        print("=== 라인-타임 매핑 (lyrics vs ASR) ===")
         for i, item in enumerate(segs_final, start=1):
-            sa = item.get("start", 0.0)
-            sb = item.get("end", 0.0)
-            print(f"[{i:02d}] {sa:05.2f} ~ {sb:05.2f}  <matched lyric>")
+            print(f"[{i:02d}] {item.get('start', 0.0):05.2f} ~ {item.get('end', 0.0):05.2f}  <matched lyric>")
 
-    # ---------- 온셋 ----------
+    # ---------- 온셋, start_at, words payload 등 부가 정보 계산 (기존 로직 유지) ----------
     def _onsets_local(pth: str) -> Tuple[List[float], int]:
         try:
             import librosa
             from librosa.onset import onset_detect as librosa_onset_detect
-        except ImportError:
-            return ([], 0)
-        try:
             y, sr = librosa.load(pth, sr=None, mono=True)
-            if y is None or getattr(y, "size", 0) == 0 or not sr:
-                return ([], 0)
-            onset_times = librosa_onset_detect(
-                y=y, sr=sr, backtrack=True, units="time",
-                pre_max=20, post_max=20, pre_avg=100, post_avg=100,
-                delta=0.2, wait=0,
-            )
+            if y is None or getattr(y, "size", 0) == 0 or not sr: return ([], 0)
+            onset_times = librosa_onset_detect(y=y, sr=sr, backtrack=True, units="time", pre_max=20, post_max=20,
+                                               pre_avg=100, post_avg=100, delta=0.2, wait=0)
             out_times: List[float] = []
             last_t = -1.0
             for t in onset_times:
@@ -3384,71 +3351,42 @@ def sync_lyrics_with_whisper_pro(
                     last_t = tv
             hop = max(0, int(round(0.0025 * len(y))))
             return (out_times, hop)
-        except (ValueError, RuntimeError):
+        except (ImportError, ValueError, RuntimeError):
             return ([], 0)
 
     onsets, onsets_hp = _onsets_local(str(src))
 
-    # ---------- start_at ----------
-    start_at = 0.0
-    for it in segs_final:
-        st = it.get("start")
-        if isinstance(st, (int, float)):
-            start_at = float(st)
-            break
+    start_at = float(segs_final[0]['start']) if segs_final and isinstance(segs_final[0].get('start'),
+                                                                          (int, float)) else 0.0
+    words_payload = [{"text": t, "start": float(a), "end": float(b)} for (a, b, t) in asr_words]
+    compat = {"min_len": min_len, "end_bias_sec": end_bias_sec, "avg_min_sec_per_unit": avg_min_sec_per_unit,
+              "start_preroll": start_preroll, "enable_calibration": enable_calibration,
+              "anchor_first_line_sec": anchor_first_line_sec, "extra_kwargs": extra_kwargs}
 
-    # ---------- words payload (2회차) ----------
-    words_payload = [{"text": t, "start": float(a), "end": float(b)} for (a, b, t) in asr_words_2]
-
-    compat = {
-        "min_len": float(min_len),
-        "end_bias_sec": float(end_bias_sec),
-        "avg_min_sec_per_unit": float(avg_min_sec_per_unit),
-        "start_preroll": float(start_preroll),
-        "enable_calibration": bool(enable_calibration),
-        "anchor_first_line_sec": anchor_first_line_sec
-            if anchor_first_line_sec is None else float(anchor_first_line_sec),
-        "extra_kwargs": dict(extra_kwargs),
-    }
-
-    # ---------- 후반 페이드아웃/컷 (2회차 기준 마지막 구간) ----------
+    # ---------- 후반 페이드아웃/컷 ----------
     try:
-        last_end_sec = 0.0
-        for it in reversed(segs_final):
-            ed = it.get("end")
-            if isinstance(ed, (int, float)):
-                last_end_sec = float(ed)
-                break
+        last_end_sec = float(segs_final[-1]['end']) if segs_final and isinstance(segs_final[-1].get('end'),
+                                                                                 (int, float)) else 0.0
         if last_end_sec > 0.0:
             cut_end_sec = last_end_sec + 5.0
             try:
                 import soundfile as sf
                 import numpy as _np
-                try:
-                    data_arr, sr_hz = sf.read(str(src), dtype="float32", always_2d=True)
-                except (RuntimeError, OSError, ValueError):
-                    data_arr = None
-                    sr_hz = 0
+                data_arr, sr_hz = sf.read(str(src), dtype="float32", always_2d=True)
                 if data_arr is not None and isinstance(sr_hz, int) and sr_hz > 0:
-                    total_len = data_arr.shape[0]
-                    max_time = total_len / float(sr_hz)
+                    total_len, max_time = data_arr.shape[0], data_arr.shape[0] / float(sr_hz)
                     cut_end_sec = max(0.0, min(cut_end_sec, max_time))
-                    to_idx = int(cut_end_sec * sr_hz)
-                    if to_idx <= 0:
-                        to_idx = total_len
-
+                    to_idx = int(cut_end_sec * sr_hz) if cut_end_sec > 0 else total_len
                     trimmed = data_arr[:to_idx, :]
-
                     fade_len = int(min(5.0, cut_end_sec) * sr_hz)
                     if fade_len > 0:
                         fade_start = max(0, trimmed.shape[0] - fade_len)
                         ramp = _np.linspace(1.0, 0.0, trimmed.shape[0] - fade_start, dtype=trimmed.dtype)
                         trimmed[fade_start:, :] *= ramp.reshape(-1, 1)
-
                     sf.write(str(src), trimmed, sr_hz)
-            except (ImportError, OSError):
+            except (ImportError, OSError, RuntimeError, ValueError):
                 pass
-    except (ValueError, OSError, RuntimeError):
+    except (IndexError, ValueError, OSError, RuntimeError):
         pass
 
     # ---------- seg.json 저장 (최종) ----------
@@ -3474,24 +3412,14 @@ def sync_lyrics_with_whisper_pro(
     dur_sec = _dur_sec_local(str(src))
 
     result: Dict[str, Any] = {
-        # 반환은 최종(2회차 매칭) 기준
-        "segments": segs_final,
-        "words": words_payload,
-        "onsets": onsets,
-        "onsets_hp": int(onsets_hp),
-        "duration_sec": float(round3(dur_sec)),
-        "start_at": float(round3(start_at)),
-        "compat": compat,
-        "used_vocals": bool(vocals_path is not None),
-        "align_path": align_path,
-        # 참고용(디버그/호환): 1회차 원본 결과도 함께 반환
-        "pass1_segments": list(tr1.get("segments") or []),
-        "pass1_words": list(tr1.get("words") or []),
-        "pass2_segments": asr_segments_2,
+        "segments": segs_final, "words": words_payload, "onsets": onsets,
+        "onsets_hp": int(onsets_hp), "duration_sec": float(round3(dur_sec)),
+        "start_at": float(round3(start_at)), "compat": compat,
+        "used_vocals": bool(vocals_path is not None), "align_path": align_path,
+        "asr_segments": asr_segments,
+        "lyrics_start": lyrics_start_sec, "lyrics_end": lyrics_end_sec,
     }
     return result
-
-
 
 
 

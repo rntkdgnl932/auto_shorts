@@ -374,10 +374,13 @@ class ProgressLogDialog(QtWidgets.QDialog):
 
 # ──────────────────────────────── Main UI ─────────────────────────────────────
 
+# shorts_ui.py 파일에서 _build_clean_seg_from_ready 함수를 찾아 아래 내용으로 전체를 교체하세요.
+
 def _build_clean_seg_from_ready(proj_dir_arg: str, lyrics_raw_arg: str, lyrics_lls_raw_arg: str) -> None:
     """
     seg_ready.json을 읽어 실제 가사와 유사도 매칭 후
     정상 항목만 남겨 seg.json 저장.
+    - [수정] 가사 비교 시 [verse] 등 섹션 태그를 제외하고 순수 가사만 사용합니다.
     - 기존 기능(정렬/매칭/저장)은 그대로 유지하되, 아래 정제를 강화:
       1) 한글/영문 비율 기반 텍스트 유효성 필터
       2) 최소 길이(기본 0.50s) 미만 구간 제거
@@ -387,6 +390,7 @@ def _build_clean_seg_from_ready(proj_dir_arg: str, lyrics_raw_arg: str, lyrics_l
 
     from pathlib import Path
     import json
+    import re
     from difflib import SequenceMatcher
 
     proj_dir = Path(proj_dir_arg)
@@ -403,7 +407,6 @@ def _build_clean_seg_from_ready(proj_dir_arg: str, lyrics_raw_arg: str, lyrics_l
         try:
             p.write_text(json.dumps(obj, ensure_ascii=False, indent=2), encoding="utf-8")
         except OSError:
-            # 저장 실패해도 예외 전파하지 않음(기존 흐름 보존)
             return
 
     def _is_hangul(ch: str) -> bool:
@@ -412,55 +415,38 @@ def _build_clean_seg_from_ready(proj_dir_arg: str, lyrics_raw_arg: str, lyrics_l
 
     def _valid_text(s: str) -> bool:
         t = (s or "").strip()
-        if not t:
-            return False
-        # 한글/영문/숫자만 평가(기타 기호 제거 전 길이 점검)
+        if not t: return False
         letters = [c for c in t if c.isalpha() or _is_hangul(c)]
-        if len(letters) < 2:
-            return False
-        # 한글 비율(가사 중심) + 예외적으로 허용해야 할 키워드(영문 가사 단어) 허용
+        if len(letters) < 2: return False
         han = sum(1 for c in t if _is_hangul(c))
         ratio = (han / max(1, len(t)))
-        if ratio >= 0.35:
-            return True
+        if ratio >= 0.35: return True
         t_low = t.lower()
-        # 예외: 영어 문구 중 가사에 실제 포함되는 표현(예: "game over sound")
-        if "game over sound" in t_low:
-            return True
-        # 약어/감탄사/브랜드성 짧은 영문은 제거(e.g., "B.A.P.", "ok", "uh")
+        if "game over sound" in t_low: return True
         letters_only = "".join(ch for ch in t_low if ch.isalpha())
         return len(letters_only) >= 4
 
     def _norm_basic(s: str) -> str:
-        # 소문자, 공백/구두점 축약
-        import re as _re
         t = (s or "").lower()
-        t = _re.sub(r"\s+", " ", t)
-        t = _re.sub(r"[^\w\s가-힣]", " ", t)
-        t = _re.sub(r"\s+", " ", t).strip()
+        t = re.sub(r"\s+", " ", t)
+        t = re.sub(r"[^\w\s가-힣]", " ", t)
+        t = re.sub(r"\s+", " ", t).strip()
         return t
 
     def _cv_key(s: str) -> str:
-        # 한글 자모 성/중/종 분해의 간이 대체: 기본 normalization만 사용(가벼운 키)
-        # (기존 로마나이즈보다 가벼운 키. 외부 함수 의존 없음)
-        import re as _re
         t = _norm_basic(s)
-        # 모음/자음 패턴 정도만 유지
-        t = _re.sub(r"[aeiou]", "v", t)
-        t = _re.sub(r"[bcdfghjklmnpqrstvwxyz]", "c", t)
-        t = _re.sub(r"\s+", "", t)
+        t = re.sub(r"[aeiou]", "v", t)
+        t = re.sub(r"[bcdfghjklmnpqrstvwxyz]", "c", t)
+        t = re.sub(r"\s+", "", t)
         return t
 
     def _split_ko_lines_from_lls_text(s: str) -> list[str]:
-        # [ko]로 시작하는 줄만 회수
-        if not s:
-            return []
+        if not s: return []
         raw = s.replace("\r\n", "\n").replace("\r", "\n").split("\n")
         out: list[str] = []
         for ln in raw:
             t = (ln or "").strip()
-            if not t:
-                continue
+            if not t: continue
             if t.startswith("[") and t.endswith("]") and not t.startswith("[ko]"):
                 continue
             if t.startswith("[ko]"):
@@ -471,117 +457,82 @@ def _build_clean_seg_from_ready(proj_dir_arg: str, lyrics_raw_arg: str, lyrics_l
     raw_items = _load_json(seg_ready_path, []) or []
     cleaned: list[dict] = []
     for it in raw_items:
-        if not isinstance(it, dict):
-            continue
+        if not isinstance(it, dict): continue
         try:
             st = float(it.get("start", 0.0))
             ed = float(it.get("end", 0.0))
             tx = str(it.get("text") or "").strip()
         except (ValueError, TypeError, AttributeError):
             continue
-
-        if ed <= st:
+        if ed <= st or (ed - st) < 0.50 or not _valid_text(tx):
             continue
-
-        # 최소 길이 0.50s 미만은 제거(초단편 파편 필터)
-        if (ed - st) < 0.50:
-            continue
-
-        if not _valid_text(tx):
-            continue
-
-        # 기본 정규화 텍스트 보관
         cleaned.append({"start": round(st, 3), "end": round(ed, 3), "text": tx})
 
-    # 시간 정렬 + 역전 보정(보수적으로 오름차순 재정렬)
     cleaned.sort(key=lambda x: (x["start"], x["end"]))
 
-    # --------- 2) 근접 중복 제거(같은 문구가 1초 이내 반복되면 합치고 하나만 남김) ---------
+    # --------- 2) 근접 중복 제거 ---------
     dedup: list[dict] = []
-    last_norm = ""
-    last_end = -1.0
+    last_norm, last_end = "", -1.0
     for it in cleaned:
         tnorm = _norm_basic(it["text"])
-        if dedup:
-            # 같은 문구가 1초 이내 재등장 → 앞 항목에 시간 합치지 않고, 이번 항목만 제거
-            # (seg.json은 가사 매칭으로 재분배되므로 과도한 병합은 피함)
-            if tnorm == last_norm and (it["start"] - last_end) <= 1.00:
-                # 스킵
-                last_end = max(last_end, it["end"])
-                continue
+        if dedup and tnorm == last_norm and (it["start"] - last_end) <= 1.00:
+            last_end = max(last_end, it["end"])
+            continue
         dedup.append(it)
-        last_norm = tnorm
-        last_end = it["end"]
+        last_norm, last_end = tnorm, it["end"]
 
-    # 빈 결과면 바로 종료(기존 흐름 유지)
-    if not dedup:
-        return
+    if not dedup: return
 
-    # --------- 3) 매칭 대상 가사 라인 준비(ko 우선, 없으면 원문) ---------
+    # ▼▼▼ 요청사항 반영: 순수 가사만 필터링하여 비교 대상으로 사용 ▼▼▼
     lyrics_ko_lines = _split_ko_lines_from_lls_text(lyrics_lls_raw_arg)
+
+    source_lyrics_text = lyrics_raw_arg
     if lyrics_ko_lines:
-        merged_lines = [ln.strip() for ln in lyrics_ko_lines if ln.strip()]
-    else:
-        merged_lines = [ln.strip() for ln in (lyrics_raw_arg or "").splitlines() if ln.strip()]
+        # LLS 텍스트가 있으면 원본 텍스트 대신 사용 (kroman 변환된 텍스트 기준)
+        source_lyrics_text = "\n".join(lyrics_ko_lines)
+
+    merged_lines: list[str] = []
+    section_header_re = re.compile(r"^\s*\[[^]]+]\s*$")
+    for line in (source_lyrics_text or "").splitlines():
+        stripped_line = line.strip()
+        # 빈 줄이거나 섹션 태그이면 건너뜁니다.
+        if stripped_line and not section_header_re.match(stripped_line):
+            merged_lines.append(stripped_line)
+    # ▲▲▲ 요청사항 반영 완료 ▲▲▲
+
     if not merged_lines:
-        # 가사 기준이 없으면 seg_ready를 그대로 seg.json으로 보존
         out_path = proj_dir / "seg.json"
         _save_json(out_path, dedup)
         return
 
-    # --------- 4) 유사도 매칭(기존 로직 유지 + 임계 강화) ---------
+    # --------- 4) 유사도 매칭 ---------
     out_items: list[dict] = []
     last_idx = 0
-
     for it in dedup:
-        st = float(it["start"])
-        et = float(it["end"])
-        tx = str(it["text"])
-
-        # 한글 길이에 따라 임계치 상향: 파편/변형이 섞인 줄을 더 엄격히 거름
+        st, et, tx = float(it["start"]), float(it["end"]), str(it["text"])
         han_len = sum(1 for ch in tx if _is_hangul(ch))
         thr = 0.80 if han_len < 4 else 0.60
-
-        best_score = -1.0
-        best_idx = -1
-        best_line = ""
-
-        tx_cv = _cv_key(tx)
-        tx_norm = _norm_basic(tx)
+        best_score, best_idx, best_line = -1.0, -1, ""
+        tx_cv, tx_norm = _cv_key(tx), _norm_basic(tx)
 
         for j in range(last_idx, len(merged_lines)):
             cand = merged_lines[j]
-            if not cand:
-                continue
+            if not cand: continue
             norm_cand = _norm_basic(cand)
-            if not norm_cand:
-                continue
-
+            if not norm_cand: continue
             sc_basic = SequenceMatcher(None, tx_norm, norm_cand).ratio()
             sc_cv = SequenceMatcher(None, tx_cv, _cv_key(cand)).ratio()
             sc = sc_basic if sc_basic >= sc_cv else sc_cv
-
             if sc > best_score:
-                best_score = sc
-                best_idx = j
-                best_line = cand
+                best_score, best_idx, best_line = sc, j, cand
 
         if best_score >= thr and best_idx >= last_idx:
-            out_items.append({
-                "start": round(st, 3),
-                "end": round(et, 3),
-                "text": best_line
-            })
+            out_items.append({"start": round(st, 3), "end": round(et, 3), "text": best_line})
             last_idx = best_idx + 1
 
     # --------- 5) 결과 저장 ---------
     seg_path = proj_dir / "seg.json"
-    try:
-        _save_json(seg_path, out_items if out_items else dedup)
-    except (TypeError, ValueError):
-        # 마지막 폴백: 정제 실패 시 원본이라도 저장
-        _save_json(seg_path, dedup)
-
+    _save_json(seg_path, out_items if out_items else dedup)
 
 
 class MainWindow(QtWidgets.QMainWindow):
@@ -2046,10 +1997,10 @@ class MainWindow(QtWidgets.QMainWindow):
             QtWidgets.QMessageBox.warning(self, "음악 생성 오류", str(e))
 
 
-
-    def on_click_analyze_music(self) -> None:
+    def on_click_analyze_music_old(self) -> None:
         """
         음악분석:
+          - 디버그 로그를 추가하여 진행창 호출 여부 확인
           - 상세 흐름 추적을 위한 CHECKPOINT 로그 유지.
           - Whisper 원본 인식(단어) 로그 출력 유지.
           - project.json::lyrics_lls([ko])가 있으면, WORD 타임스탬프를 이용해
@@ -2063,9 +2014,13 @@ class MainWindow(QtWidgets.QMainWindow):
         from typing import List, Tuple
         from PyQt5 import QtWidgets
 
+        # ▼▼▼ 디버그 로그 추가 ▼▼▼
+        print("\n--- DEBUG: on_click_analyze_music 함수가 성공적으로 호출되었습니다. ---")
+
         print("\n--- CHECKPOINT 1: on_click_analyze_music 함수 시작 ---")
 
-        btn = getattr(self, "btn_analyze_music", None) or getattr(getattr(self, "ui", None), "btn_analyze_music", None)
+        btn = getattr(self, "btn_analyze_music", None) or getattr(getattr(self, "ui", None), "btn_analyze_music",
+                                                                  None)
         if isinstance(btn, QtWidgets.QAbstractButton):
             btn.setEnabled(False)
 
@@ -2189,9 +2144,11 @@ class MainWindow(QtWidgets.QMainWindow):
             return 0xAC00 <= code <= 0xD7A3
 
         l_map = ["g", "kk", "n", "d", "tt", "r", "m", "b", "pp", "s", "ss", "", "j", "jj", "ch", "k", "t", "p", "h"]
-        v_map = ["a", "ae", "ya", "yae", "eo", "e", "yeo", "ye", "o", "wa", "wae", "oe", "yo", "u", "wo", "we", "wi",
+        v_map = ["a", "ae", "ya", "yae", "eo", "e", "yeo", "ye", "o", "wa", "wae", "oe", "yo", "u", "wo", "we",
+                 "wi",
                  "yu", "eu", "ui", "i"]
-        t_map = ["", "k", "k", "k", "n", "n", "n", "t", "l", "lk", "lm", "lp", "ls", "lt", "lp", "lh", "m", "p", "p",
+        t_map = ["", "k", "k", "k", "n", "n", "n", "t", "l", "lk", "lm", "lp", "ls", "lt", "lp", "lh", "m", "p",
+                 "p",
                  "t", "t", "ng", "t", "t", "k", "t", "p", "t"]
 
         def _romanize_token(token: str) -> str:
@@ -2257,10 +2214,9 @@ class MainWindow(QtWidgets.QMainWindow):
             s = t - (m * 60)
             return f"{m:02d}:{s:06.3f}"
 
-
-
         def job(log):
             from pathlib import Path
+            import json
             print("--- CHECKPOINT 7: 'job' 함수 내부 진입 ---")
 
             def slog(tag: str, msg: str) -> None:
@@ -2331,15 +2287,17 @@ class MainWindow(QtWidgets.QMainWindow):
                 print(f"[ERROR] whisper 정렬 실패: {e}")
                 slog("ERROR", f"whisper 정렬 실패: {e}")
 
-            segments = (res or {}).get("segments") or []
+            res_dict = res or {}
+            segments = res_dict.get("segments") or []
             if not isinstance(segments, list):
                 segments = []
 
-            onsets = (res or {}).get("onsets") or []
+            onsets = res_dict.get("onsets") or []
             if not isinstance(onsets, list):
                 onsets = []
 
-            onsets_hp_raw = (res or {}).get("onsets_hp")
+            onsets_hp_raw = res_dict.get("onsets_hp")
+            onsets_hp_count = 0
             if isinstance(onsets_hp_raw, list):
                 onsets_hp_count = len(onsets_hp_raw)
             else:
@@ -2348,9 +2306,9 @@ class MainWindow(QtWidgets.QMainWindow):
                 except (TypeError, ValueError):
                     onsets_hp_count = 0
 
-            duration_sec = float((res or {}).get("duration_sec", 0.0))
-            start_at = float((res or {}).get("start_at", 0.0))
-            pro_info = (res or {}).get("__pro_info__") or {}
+            duration_sec = float(res_dict.get("duration_sec", 0.0))
+            start_at = float(res_dict.get("start_at", 0.0))
+            pro_info = res_dict.get("__pro_info__") or {}
 
             try:
                 from pathlib import Path
@@ -2394,7 +2352,8 @@ class MainWindow(QtWidgets.QMainWindow):
                                 st, et, tx = tpl
                                 item = {"start": float(st), "end": float(et), "text": str(tx)}
                                 seg_ready_items.append(item)
-                                seg_ready_rows.append(f"[{i:02d}] {float(st):.2f} ~ {float(et):.2f}  <matched lyric>")
+                                seg_ready_rows.append(
+                                    f"[{i:02d}] {float(st):.2f} ~ {float(et):.2f}  <matched lyric>")
                             except (TypeError, ValueError):
                                 continue
                         with open(seg_ready_path, "w", encoding="utf-8") as f:
@@ -2406,16 +2365,9 @@ class MainWindow(QtWidgets.QMainWindow):
                     print(f"[WARN] local transcribe_words fallback failed: {e}", flush=True)
 
             try:
-                if segments:
-                    fin_st = float(segments[-1].get("start", 0.0))
-                    fin_ed = float(segments[-1].get("end", 0.0))
-                    print(f"[FLOW] STEP 10) 최종 마지막 줄: start={fin_st:.3f}s, end={fin_ed:.3f}s")
-                    slog("FLOW", f"STEP 10) 최종 마지막 줄: start={fin_st:.3f}s, end={fin_ed:.3f}s")
-            except (RuntimeError, ValueError, TypeError):
-                pass
+                lyrics_start = res_dict.get("lyrics_start")
+                lyrics_end = res_dict.get("lyrics_end")
 
-            try:
-                import json
                 def _probe_duration_seconds(pth_in: str) -> float:
                     try:
                         import mutagen
@@ -2430,38 +2382,37 @@ class MainWindow(QtWidgets.QMainWindow):
                     return 0.0
 
                 duration_actual = _probe_duration_seconds(vocal_path_str)
-                dur_to_store = 0.0
-                if duration_actual > 0.0:
-                    dur_to_store = duration_actual
-                elif isinstance(duration_sec, float) and duration_sec > 0.0:
-                    dur_to_store = duration_sec
-                elif seg_ready_items:
+                dur_to_store = duration_actual if duration_actual > 0.0 else duration_sec
+                pj_data_now = {}
+                if pj.exists():
                     try:
-                        last_end = max(float(x.get("end", 0.0)) for x in seg_ready_items)
-                        if last_end > 0.0:
-                            dur_to_store = last_end
-                    except (ValueError, TypeError):
-                        dur_to_store = 0.0
-
-                if dur_to_store > 0.0:
-                    pj_data_now = {}
-                    if pj.exists():
-                        try:
-                            with open(pj, "r", encoding="utf-8") as f:
-                                pj_data_now = json.load(f) or {}
-                        except (OSError, ValueError, TypeError):
-                            pj_data_now = {}
-                    if isinstance(pj_data_now, dict):
+                        with open(pj, "r", encoding="utf-8") as f:
+                            pj_data_now = json.load(f) or {}
+                    except (OSError, ValueError, TypeError, json.JSONDecodeError):
+                        pj_data_now = {}
+                if isinstance(pj_data_now, dict):
+                    if dur_to_store > 0.0:
                         pj_data_now["time"] = int(round(dur_to_store))
-                        try:
-                            with open(pj, "w", encoding="utf-8") as f:
-                                json.dump(pj_data_now, f, ensure_ascii=False, indent=2)
-                            print(f"[TIME] saved to project.json::time = {pj_data_now['time']}s")
-                        except (OSError, ValueError, TypeError):
-                            print("[WARN] project.json time write failed")
-            except Exception:
+                    if lyrics_start is not None and lyrics_start >= 0:
+                        pj_data_now["lyrics_start"] = round(float(lyrics_start), 3)
+                    if lyrics_end is not None and lyrics_end > 0:
+                        pj_data_now["lyrics_end"] = round(float(lyrics_end), 3)
+                    try:
+                        with open(pj, "w", encoding="utf-8") as f:
+                            json.dump(pj_data_now, f, ensure_ascii=False, indent=2)
+                        print(f"[JSON_SAVE] time, lyrics_start, lyrics_end saved to project.json")
+                    except (OSError, ValueError, TypeError):
+                        print("[WARN] project.json time/lyrics time save failed")
+            except Exception as e:
+                print(f"[WARN] Failed to save time info to project.json: {e}")
+            try:
+                if segments:
+                    fin_st = float(segments[-1].get("start", 0.0))
+                    fin_ed = float(segments[-1].get("end", 0.0))
+                    print(f"[FLOW] STEP 10) 최종 마지막 줄: start={fin_st:.3f}s, end={fin_ed:.3f}s")
+                    slog("FLOW", f"STEP 10) 최종 마지막 줄: start={fin_st:.3f}s, end={fin_ed:.3f}s")
+            except (RuntimeError, ValueError, TypeError):
                 pass
-
             summary: List[str] = []
             summary.append(f"파일: {Path(vocal_path_str).name}")
             if duration_sec > 0:
@@ -2477,7 +2428,6 @@ class MainWindow(QtWidgets.QMainWindow):
                     f"global_shift_applied = {pro_info.get('global_shift_applied_sec', 0.0):.3f}s, "
                     f"affine(a={pro_info.get('affine_a', 1.0):.3f}, b={pro_info.get('affine_b', 0.0):.3f})"
                 )
-
             summary.append("")
             summary.append("=== 줄별 정합 ===")
             korean_lines = [ln for ln in lyrics_raw.splitlines() if
@@ -2508,7 +2458,7 @@ class MainWindow(QtWidgets.QMainWindow):
                     return rows
 
                 wlist: List[Tuple[float, float, str, str]] = []
-                for w_entry in ww_seq:  # ← 기존: for item in ww_seq
+                for w_entry in ww_seq:
                     try:
                         ws, we, tok = w_entry
                         tok_str = str(tok or "").strip()
@@ -2616,7 +2566,8 @@ class MainWindow(QtWidgets.QMainWindow):
                 if isinstance(btn, QtWidgets.QAbstractButton):
                     btn.setEnabled(True)
 
-        print("--- CHECKPOINT 6: 비동기 작업(run_job_with_progress_async) 호출 직전 ---")
+        # ▼▼▼ 디버그 로그 추가 ▼▼▼
+        print("--- DEBUG: run_job_with_progress_async 함수를 호출합니다. ---")
         try:
             from app.utils import run_job_with_progress_async
         except Exception:
@@ -2624,7 +2575,136 @@ class MainWindow(QtWidgets.QMainWindow):
 
         run_job_with_progress_async(self, "음악분석", job, tail_file=tail_path, on_done=done)
 
+        # shorts_ui.py 파일의 기존 on_click_analyze_music 함수를 아래 내용으로 완전히 교체하세요.
 
+    def on_click_analyze_music(self) -> None:
+        """
+        음악분석 (WhisperX 강제 정렬 엔진 사용):
+        - [개선] 더 정교한 WhisperX를 사용하여 '강제 정렬' 방식으로 타임라인을 생성합니다.
+        - WhisperX의 결과를 직접 seg.json과 seg_ready.json에 저장합니다.
+        - 최종 결과에서 lyrics_start, lyrics_end를 계산하여 project.json에 저장합니다.
+        """
+        from pathlib import Path
+        from PyQt5 import QtWidgets
+
+        print("\n--- INFO: on_click_analyze_music (WhisperX Engine) 함수 시작 ---")
+
+        btn = getattr(self, "btn_analyze_music", None) or getattr(getattr(self, "ui", None), "btn_analyze_music",
+                                                                  None)
+        if isinstance(btn, QtWidgets.QAbstractButton):
+            btn.setEnabled(False)
+
+        try:
+            from app.utils import load_json, save_json, run_job_with_progress_async
+            from app.audio_sync import sync_lyrics_with_audio_whisperx
+        except ImportError:
+            from utils import load_json, save_json, run_job_with_progress_async
+            from audio_sync import sync_lyrics_with_audio_whisperx
+
+        try:
+            proj_dir = self._current_project_dir()
+            vocal_path_raw = self._find_latest_vocal()
+        except Exception:
+            proj_dir, vocal_path_raw = None, None
+
+        if not proj_dir or not vocal_path_raw:
+            QtWidgets.QMessageBox.critical(self, "음악분석 실패", "프로젝트 폴더 또는 보컬 파일을 찾을 수 없습니다.")
+            if isinstance(btn, QtWidgets.QAbstractButton): btn.setEnabled(True)
+            return
+
+        vocal_path_str = str(vocal_path_raw)
+        print(f"--- INFO: 분석 대상 파일: {vocal_path_str} ---")
+
+        pj = Path(proj_dir) / "project.json"
+        meta = load_json(pj, {}) or {}
+        lyrics_raw = (meta.get("lyrics") or "").strip()
+
+        if not lyrics_raw:
+            QtWidgets.QMessageBox.critical(self, "음악분석 실패", "프로젝트에 가사가 없습니다.")
+            if isinstance(btn, QtWidgets.QAbstractButton): btn.setEnabled(True)
+            return
+        print(f"--- INFO: 가사 확인 (길이: {len(lyrics_raw)}) ---")
+
+        def get_pure_lyrics(text: str) -> str:
+            lines = []
+            for ln in (text or "").splitlines():
+                s = ln.strip()
+                if s and not (s.startswith('[') and s.endswith(']')):
+                    lines.append(s)
+            return "\n".join(lines)
+
+        pure_lyrics = get_pure_lyrics(lyrics_raw)
+
+        def job(log_cb):
+            def slog(tag: str, msg: str) -> None:
+                try:
+                    log_cb({"msg": f"[{tag}] {msg}"})
+                except Exception:
+                    pass
+
+            slog("WhisperX", "강제 정렬(Forced Alignment) 시작...")
+
+            segments = sync_lyrics_with_audio_whisperx(
+                audio_path=vocal_path_str,
+                lyrics_text=pure_lyrics,
+                whisperx_model="large-v3",
+            )
+
+            if not segments:
+                raise RuntimeError("WhisperX 분석 결과가 없습니다. 오디오 파일을 확인해주세요.")
+
+            slog("WhisperX", f"강제 정렬 완료. {len(segments)}개의 라인 생성.")
+
+            save_json(Path(proj_dir) / "seg.json", segments)
+            save_json(Path(proj_dir) / "seg_ready.json", segments)
+            slog("파일 저장", "seg.json, seg_ready.json 저장 완료")
+
+            lyrics_start = segments[0]['start'] if segments else 0.0
+            lyrics_end = segments[-1]['end'] if segments else 0.0
+
+            meta_now = load_json(pj, {}) or {}
+            meta_now["lyrics_start"] = lyrics_start
+            meta_now["lyrics_end"] = lyrics_end
+            save_json(pj, meta_now)
+            slog("업데이트", f"project.json 저장: start={lyrics_start}, end={lyrics_end}")
+
+            summary_lines = ["파일: " + Path(vocal_path_str).name, "엔진: WhisperX (Forced Alignment)", ""]
+            summary_lines.append("=== 줄별 정합 결과 ===")
+            for i, seg in enumerate(segments, 1):
+                summary_lines.append(f"[{i:02d}] {seg['start']:6.2f}~{seg['end']:6.2f}  {seg['line']}")
+
+            return {"text": "\n".join(summary_lines)}
+
+        def done(ok: bool, payload, err):
+            try:
+                if not ok:
+                    QtWidgets.QMessageBox.critical(self, "음악분석 실패", str(err))
+                    return
+
+                text = (payload or {}).get("text", "결과가 없습니다.")
+                print("\n[음악분석 결과 (WhisperX)]\n" + text, flush=True)
+
+                dlg = QtWidgets.QDialog(self)
+                dlg.setWindowTitle("음악분석 결과 — WhisperX 강제 정렬")
+                dlg.resize(1000, 760)
+                vbox = QtWidgets.QVBoxLayout(dlg)
+                ed = QtWidgets.QPlainTextEdit()
+                ed.setReadOnly(True)
+                ed.setPlainText(text)
+                vbox.addWidget(ed)
+                btn_close = QtWidgets.QPushButton("닫기")
+                btn_close.clicked.connect(dlg.accept)
+                row = QtWidgets.QHBoxLayout()
+                row.addStretch(1)
+                row.addWidget(btn_close)
+                vbox.addLayout(row)
+                dlg.exec_()
+            finally:
+                if isinstance(btn, QtWidgets.QAbstractButton):
+                    btn.setEnabled(True)
+
+        print("--- INFO: WhisperX 비동기 작업 호출 ---")
+        run_job_with_progress_async(self, "음악분석 (WhisperX)", job, on_done=done)
 
     @staticmethod
     def _persist_lyric_sections(*, proj_dir: str, sections: list, last_end: float) -> None:

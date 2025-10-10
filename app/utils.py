@@ -302,7 +302,13 @@ def load_json(p: os.PathLike | str, default: Optional[Dict[str, Any]] = None) ->
     with path.open("r", encoding="utf-8") as f:
         return json.load(f)
 
-def save_json(p: os.PathLike | str, obj: Dict[str, Any]) -> Path:
+# utils.py 파일에서 save_json 함수를 찾아 아래 내용으로 전체를 교체하세요.
+
+def save_json(p: os.PathLike | str, obj: Any) -> Path:
+    """
+    JSON 객체(dict 또는 list)를 파일에 저장합니다.
+    - [수정] obj 타입을 Any로 변경하여 리스트도 저장할 수 있도록 수정했습니다.
+    """
     path = Path(p)
     ensure_parent(path)
     with path.open("w", encoding="utf-8") as f:
