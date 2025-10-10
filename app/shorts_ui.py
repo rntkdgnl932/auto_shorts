@@ -1080,110 +1080,217 @@ class MainWindow(QtWidgets.QMainWindow):
 
     def on_toggle_convert(self, checked: bool) -> None:
         """
-        변환(LLS) 토글.
-        - 오른쪽 변환 패널/에디터는 '항상 보이기' 유지
-        - ON/OFF에 따라 '활성/비활성'만 전환 (위치 흔들림 없음)
-        - meta['lls_enabled'] 기록
-        - OFF 시 project.json의 lyrics_lls 를 빈 문자열로 비워 이후 파이프라인이 lyrics 를 우선 사용
-          (기존 값은 lyrics_lls_backup 으로 보존)
-        - proj_dir 해석 시 Callable(메서드/함수) 가능성까지 모두 정규화
+        변환(LLS) 토글 핸들러.
+        - ON  : 현재 가사를 영어 발음(로마자) 표기로 변환하여 lyrics_lls에 저장, lls_enabled=True
+        - OFF : lyrics_lls 비우고 lls_enabled=False
+        - 우측 변환 에디터/패널은 항상 보이되 enable 상태만 토글
         """
         from pathlib import Path
         import os
         import json
+        import re
         from json import JSONDecodeError
 
-        # --- proj_dir 정규화(반드시 str/PathLike 로 확정) ---
-        # 후보들을 다양하게 시도하되, callable 이면 호출해서 경로 값을 얻는다.
-        proj_dir = None
-        candidates = [
-            "_get_active_project_dir", "_current_project_dir", "current_project_dir",
-            "_active_project_dir", "project_dir", "_forced_project_dir",
-        ]
-        for name in candidates:
-            val = getattr(self, name, None)
-            if val is None:
-                continue
-            # 메서드/함수를 먼저 해석
-            if callable(val):
-                try:
-                    val = val()
-                except Exception:
-                    val = None
-            # 여전히 callable 이면 사용 불가
-            if callable(val):
-                continue
-            # 문자열/PathLike 만 허용
-            if isinstance(val, (str, os.PathLike)):
-                proj_dir = val
-                break
-            # Qt 타입 등은 문자열로 캐스팅 시도
+        # normalize_sections (있으면 사용)
+        try:
+            from app.lyrics_gen import normalize_sections  # type: ignore
+        except ImportError:
             try:
-                s = str(val)
-                if s:
-                    proj_dir = s
-                    break
-            except Exception:
-                continue
+                from lyrics_gen import normalize_sections  # type: ignore
+            except ImportError:
+                def normalize_sections(text_in: str) -> str:  # type: ignore
+                    return text_in
 
+        # 활성 프로젝트 경로 정규화
+        def _active_project_dir() -> str:
+            attr_list = [
+                "_get_active_project_dir", "_current_project_dir", "current_project_dir",
+                "_active_project_dir", "project_dir", "_forced_project_dir",
+            ]
+            for attr_name in attr_list:
+                val = getattr(self, attr_name, None)
+                if val is None:
+                    continue
+                if callable(val):
+                    try:
+                        val = val()
+                    except (TypeError, AttributeError):
+                        val = None
+                if callable(val):
+                    continue
+                if isinstance(val, (str, os.PathLike)):
+                    try:
+                        return os.fspath(val)
+                    except TypeError:
+                        continue
+                try:
+                    as_str = str(val)
+                    if as_str:
+                        return as_str
+                except (TypeError, ValueError):
+                    continue
+            return ""
+
+        proj_dir = _active_project_dir()
         if not proj_dir:
             return
 
-        pj = Path(proj_dir) / "project.json"
+        meta_path = Path(proj_dir) / "project.json"
 
-        # 안전 로드/세이브
-        def _load(p: Path, default=None):
+        # project.json 로드/세이브
+        def _load_meta(p: Path) -> dict:
             try:
-                return json.loads(p.read_text(encoding="utf-8"))
-            except (FileNotFoundError, JSONDecodeError, UnicodeDecodeError, OSError):
-                return default
+                return json.loads(p.read_text(encoding="utf-8")) or {}
+            except (FileNotFoundError, JSONDecodeError, UnicodeDecodeError, OSError, TypeError, ValueError):
+                return {}
 
-        def _save(p: Path, data: dict) -> None:
+        def _save_meta(p: Path, data: dict) -> None:
             try:
                 p.write_text(json.dumps(data, ensure_ascii=False, indent=2), encoding="utf-8")
             except OSError:
                 return
 
-        meta = _load(pj, {}) or {}
-        meta["lls_enabled"] = bool(checked)
+        meta = _load_meta(meta_path)
 
-        # OFF이면 lyrics_lls를 비우고 백업
-        if not checked:
-            prev = str(meta.get("lyrics_lls") or "").strip()
-            if prev:
-                meta["lyrics_lls_backup"] = prev
-            meta["lyrics_lls"] = ""
-
-        _save(pj, meta)
-
-        # 패널/에디터 핸들
-        te_conv = getattr(self, "te_lyrics_converted", None)
-        panel = None
-        for name in ("grp_convert", "box_convert", "frame_convert", "gb_convert", "w_convert"):
-            w = getattr(self, name, None)
+        # 우측 패널/에디터 핸들
+        right_editor = getattr(self, "te_lyrics_converted", None) or getattr(self, "txt_lyrics_converted", None)
+        panel_widget = None
+        for panel_name in ("grp_convert", "box_convert", "frame_convert", "gb_convert", "w_convert"):
+            w = getattr(self, panel_name, None)
             if w is not None:
-                panel = w
+                panel_widget = w
                 break
 
-        # 항상 보이기 유지
+        # 패널은 항상 보이기, enable 상태만 토글
         try:
-            if panel is not None and hasattr(panel, "setVisible"):
-                panel.setVisible(True)
-            if te_conv is not None and hasattr(te_conv, "setVisible"):
-                te_conv.setVisible(True)
-        except Exception:
+            if panel_widget is not None and hasattr(panel_widget, "setVisible"):
+                panel_widget.setVisible(True)
+            if right_editor is not None and hasattr(right_editor, "setVisible"):
+                right_editor.setVisible(True)
+            if panel_widget is not None and hasattr(panel_widget, "setEnabled"):
+                panel_widget.setEnabled(bool(checked))
+            if right_editor is not None and hasattr(right_editor, "setEnabled"):
+                right_editor.setEnabled(bool(checked))
+        except (AttributeError, RuntimeError):
             pass
 
-        # 활성/비활성만 전환
+        # OFF: lyrics_lls 비우기
+        if not checked:
+            meta["lls_enabled"] = False
+            if "lyrics_lls" in meta:
+                meta["lyrics_lls"] = ""
+            _save_meta(meta_path, meta)
+            if right_editor is not None and hasattr(right_editor, "clear"):
+                try:
+                    right_editor.clear()
+                except (AttributeError, RuntimeError):
+                    pass
+            return
+
+        # ===== ON: 변환 수행 =====
+
+        # 1) 원문 가사(왼쪽 에디터 우선, 없으면 project.json: lyrics)
+        src_text = ""
+        left_editor = getattr(self, "te_lyrics", None) or getattr(self, "txt_lyrics", None)
+        if left_editor is not None and hasattr(left_editor, "toPlainText"):
+            try:
+                src_text = (left_editor.toPlainText() or "").strip()
+            except (AttributeError, TypeError, ValueError):
+                src_text = ""
+        if not src_text:
+            src_text = str(meta.get("lyrics") or "").strip()
+
+        # 2) 섹션 정규화
+        norm_text = normalize_sections(src_text)
+
+        # 3) 변환기: kroman → 실패 시 간단 로마자화 fallback
+        def _convert(text_in: str) -> str:
+            # kroman 사용 시
+            try:
+                import kroman  # type: ignore
+                out_lines_k: list[str] = []
+                for line_text in (text_in or "").splitlines():
+                    s_line = (line_text or "").strip()
+                    if not s_line:
+                        continue
+                    # 섹션 헤더는 그대로
+                    if re.match(r"^\s*\[(?:verse|bridge)(?:\s+\d+)?]\s*$", s_line, flags=re.IGNORECASE):
+                        out_lines_k.append(s_line.lower())
+                        continue
+                    # 기존 [xx] 태그 제거 후 본문
+                    m_head = re.match(r"^\s*\[([a-z]{2})]\s*", s_line, flags=re.IGNORECASE)
+                    tail_text = s_line[m_head.end():].lstrip() if m_head else s_line
+                    rom = kroman.parse(tail_text).replace("-", "").strip()
+                    out_lines_k.append("[ko]" + rom if rom else "[ko]")
+                return "\n".join(out_lines_k).strip()
+            except ImportError:
+                # 아래 fallback 사용
+                pass
+
+            # fallback: 간단 로마자화(한글 부분만 분해→매핑)
+            cho_map = ["g", "kk", "n", "d", "tt", "r", "m", "b", "pp", "s", "ss", "", "j", "jj", "ch", "k", "t", "p",
+                       "h"]
+            jung_map = ["a", "ae", "ya", "yae", "eo", "e", "yeo", "ye", "o", "wa", "wae", "oe",
+                        "yo", "u", "wo", "we", "wi", "yu", "eu", "ui", "i"]
+            jong_map = ["", "k", "k", "k", "n", "n", "n", "t", "l", "k", "m", "p", "t", "l", "m", "p", "l", "m", "p",
+                        "t", "t", "ng", "t", "t", "k", "t", "p", "t"]
+
+            def _romanize_korean(seg_text: str) -> str:
+                buf_chars: list[str] = []
+                for ch in seg_text:
+                    code = ord(ch)
+                    if 0xAC00 <= code <= 0xD7A3:
+                        si = code - 0xAC00
+                        cho = si // 588
+                        jung = (si % 588) // 28
+                        jong = si % 28
+                        buf_chars.append(cho_map[cho] + jung_map[jung] + jong_map[jong])
+                    else:
+                        buf_chars.append(ch)
+                merged = "".join(buf_chars)
+                merged = re.sub(r"\s{2,}", " ", merged).strip()
+                return merged.lower()
+
+            out_lines_f: list[str] = []
+            for line_text in (text_in or "").splitlines():
+                s_line = (line_text or "").strip()
+                if not s_line:
+                    continue
+                if re.match(r"^\s*\[(?:verse|bridge)(?:\s+\d+)?]\s*$", s_line, flags=re.IGNORECASE):
+                    out_lines_f.append(s_line.lower())
+                    continue
+                m_head = re.match(r"^\s*\[([a-z]{2})]\s*", s_line, flags=re.IGNORECASE)
+                tail_text = s_line[m_head.end():].lstrip() if m_head else s_line
+                has_ko = bool(re.search(r"[가-힣]", tail_text))
+                if has_ko:
+                    out_lines_f.append("[ko]" + _romanize_korean(tail_text))
+                else:
+                    # 영문/숫자만 있으면 en로 태깅
+                    out_lines_f.append("[en]" + tail_text)
+            return "\n".join(out_lines_f).strip()
+
+        lls_text = _convert(norm_text)
+
+        # 4) 에디터/메타 반영
+        if right_editor is not None and hasattr(right_editor, "setPlainText"):
+            try:
+                right_editor.setPlainText(lls_text)
+            except (AttributeError, RuntimeError):
+                pass
+
+        meta["lls_enabled"] = True
+        meta["lyrics_lls"] = lls_text
+        _save_meta(meta_path, meta)
+
+        # 5) 로그(lyrics_gen.log) 요약
+        log_path = Path(proj_dir) / "lyrics_gen.log"
         try:
-            if panel is not None and hasattr(panel, "setEnabled"):
-                panel.setEnabled(bool(checked))
-            if te_conv is not None and hasattr(te_conv, "setEnabled"):
-                te_conv.setEnabled(bool(checked))
-            # OFF 직후 에디터 내용도 비워 UI 혼동 방지(파일 저장과 일치)
-            if not checked and te_conv is not None and hasattr(te_conv, "clear"):
-                te_conv.clear()
-        except Exception:
+            preview = "\n".join(lls_text.splitlines()[:10])
+            log_path.parent.mkdir(parents=True, exist_ok=True)
+            with log_path.open("a", encoding="utf-8") as fp:
+                fp.write("\n===== CONVERT (LLS) =====\n")
+                fp.write(preview + "\n")
+        except OSError:
             pass
 
     def _apply_convert_ui_from_meta(self, proj_dir: str) -> None:

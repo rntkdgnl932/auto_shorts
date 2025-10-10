@@ -2646,7 +2646,7 @@ def _submit_and_wait(
 
 import subprocess
 from pathlib import Path
-from typing import Optional, Callable
+from typing import Optional
 
 # ─────────────────────────────
 # 필요한 유틸이 이 파일에 이미 있다고 가정:
@@ -2699,54 +2699,80 @@ def generate_music_with_acestep(
     target_seconds: int | None = None,
 ) -> str:
     """
-    ComfyUI(ACE-Step) 단일 트랙 음악 생성 — project.json 단일 소스 정책.
-    규칙:
-      1) 최초엔 meta['lyrics_lls'] 없음/빈 문자열("")이어도 됨.
-      2) 음악생성 시:
-         - meta['lyrics_lls']가 비어있으면 → meta['lyrics']로 생성하고,
-           생성 중 Comfy outputs의 text/txt에서 변환 가사를 수집하여 meta['lyrics_lls']에 저장.
-         - meta['lyrics_lls']가 채워져 있으면 → 그걸로 생성(추가 저장 없음).
-    부산물 파일(히스토리/프롬프트/텍스트)은 만들지도, 읽지도 않음.
+    ComfyUI(ACE-Step) 단일 트랙 음악 생성 — 기존 기능 100% 보존.
+
+    전송 규칙(최종 확정):
+      - lls_enabled == False (변환 OFF)
+        → 저장된 lyrics_lls_now는 신뢰하지 않음
+        → 실행 직전에 project.json의 'lyrics'를 즉석 분리/정규화하여 runtime용 가사 생성
+        → 그 runtime 가사를 전송(제로폭 추가로 캐시 무력화)
+        → 실행 후 lyrics_lls_now는 ""로 되돌림
+      - lls_enabled == True  (변환 ON)
+        → lyrics_lls 전송
+
+    저장 규칙:
+      - lyrics_lls_after: '항상' Comfy가 반환한 변환 결과(텍스트)를 저장
+        (히스토리 인라인/파일 → /view 폴백 → 그래도 없으면 빈 문자열)
     """
     from pathlib import Path
     from typing import List, Optional
+    import time
+    import os
+    import random
 
-    def notify(stage: str, **kw):
-        if on_progress:
-            try:
-                info = {"stage": stage}
-                info.update(kw)
-                on_progress(info)
-            except Exception:
-                pass
+    # ───────── 로컬 헬퍼 (외부 심볼 가리기 방지 위해 *_local 네이밍) ─────────
+    def _dlog(tag: str, *parts: object) -> None:
+        try:
+            print("[ACE]", tag, *parts)
+        except Exception:
+            pass
 
-    def _iter_nodes(graph: dict):
-        if not isinstance(graph, dict):
+    def _iter_nodes_local(graph_obj: dict):
+        if not isinstance(graph_obj, dict):
             return
-        if "nodes" in graph and isinstance(graph["nodes"], list):
-            for nobj in graph["nodes"]:
-                if isinstance(nobj, dict):
-                    yield nobj
-        else:
-            for _k, nobj in graph.items():
-                if isinstance(nobj, dict) and "class_type" in nobj:
-                    yield nobj
+        nodes_val = graph_obj.get("nodes")
+        if isinstance(nodes_val, list):
+            for node_obj in nodes_val:
+                if isinstance(node_obj, dict):
+                    yield node_obj
+            return
+        for _k_local, node_obj in graph_obj.items():
+            if isinstance(node_obj, dict) and "class_type" in node_obj:
+                yield node_obj
 
-    def _force_wav_save_for_this_graph(graph: dict, *, proj_dir: Path, filename_prefix: str) -> str:
-        for nobj in _iter_nodes(graph):
-            ct = str(nobj.get("class_type", "")).lower()
-            if ct in ("saveaudio", "saveaudiowav", "saveaudiomp3", "pysssss_saveaudio"):
-                inputs_map = nobj.setdefault("inputs", {}) or {}
-                inputs_map["filename_prefix"] = filename_prefix
+    def _find_nodes_by_class_names_local(graph_obj: dict, class_names: tuple[str, ...]) -> list[tuple[str, dict]]:
+        out_list_local: list[tuple[str, dict]] = []
+        want_set = {c.lower() for c in class_names}
+        for n_local in _iter_nodes_local(graph_obj):
+            ct_val = str(n_local.get("class_type", "")).lower()
+            if ct_val in want_set and "id" in n_local:
+                out_list_local.append((str(n_local["id"]), n_local))
+        return out_list_local
+
+    def _find_nodes_by_class_contains_local(graph_obj: dict, word: str) -> list[tuple[str, dict]]:
+        out_list_local: list[tuple[str, dict]] = []
+        key = word.lower()
+        for n_local in _iter_nodes_local(graph_obj):
+            ct_val = str(n_local.get("class_type", "")).lower()
+            if key in ct_val and "id" in n_local:
+                out_list_local.append((str(n_local["id"]), n_local))
+        return out_list_local
+
+    def _force_wav_save_for_graph_local(graph_obj: dict, *, proj_dir_in: Path, filename_prefix_in: str) -> str:
+        for node_obj in _iter_nodes_local(graph_obj):
+            ct_val = str(node_obj.get("class_type", "")).lower()
+            if ct_val in ("saveaudio", "saveaudiowav", "saveaudiomp3", "pysssss_saveaudio"):
+                inputs_map = node_obj.setdefault("inputs", {}) or {}
+                inputs_map["filename_prefix"] = filename_prefix_in
                 if "output_path" in inputs_map:
-                    inputs_map["output_path"] = str(proj_dir)
+                    inputs_map["output_path"] = str(proj_dir_in)
                 if "basename" in inputs_map:
                     inputs_map["basename"] = "vocal"
                 if "base_filename" in inputs_map:
                     inputs_map["base_filename"] = "vocal"
-                for k, v in (("format", "wav"), ("container", "wav"), ("codec", "pcm_s16le")):
-                    if k in inputs_map:
-                        inputs_map[k] = v
+                for k_local, v_local in (("format", "wav"), ("container", "wav"), ("codec", "pcm_s16le")):
+                    if k_local in inputs_map:
+                        inputs_map[k_local] = v_local
                 if "sample_rate" in inputs_map:
                     inputs_map.setdefault("sample_rate", 44100)
                 for bd_key in ("bit_depth", "bitdepth", "bits"):
@@ -2754,88 +2780,189 @@ def generate_music_with_acestep(
                         inputs_map[bd_key] = 16
         return ".wav"
 
-    # ───────── 기본 준비 ─────────
-    _dlog("ENTER", f"project_dir={project_dir}")
+    def _notify_local(stage: str, **kw) -> None:
+        if on_progress is None:
+            return
+        info = {"stage": stage}
+        info.update(kw)
+        try:
+            on_progress(info)
+        except (TypeError, ValueError):
+            pass
+
+    # 유틸 함수/상수 로드 (기존 모듈의 함수들 사용)
+    try:
+        from app.utils import load_json, save_json  # type: ignore
+    except Exception:
+        from utils import load_json, save_json  # type: ignore
+
+    # normalize_sections가 외부에 없을 수도 있어 안전 폴백
+    try:
+        from app.lyrics_gen import normalize_sections  # type: ignore
+    except Exception:
+        try:
+            from lyrics_gen import normalize_sections  # type: ignore
+        except Exception:
+            def normalize_sections(text_in: str) -> str:  # type: ignore
+                return text_in
+
+    # 프로젝트 메타 준비
     proj = Path(project_dir)
     proj.mkdir(parents=True, exist_ok=True)
-    pj = proj / "project.json"
-    meta = load_json(pj, {}) or {}
+    meta_path = proj / "project.json"
+    meta = load_json(meta_path, {}) or {}
 
-    title = effective_title(meta)
-
-    # 가사 소스 선정(오직 project.json)
-    lyrics_raw = (meta.get("lyrics") or "").strip()
-    lyrics_lls = (meta.get("lyrics_lls") or "").strip()
-    use_lls = bool(lyrics_lls)
-    lyrics_eff = lyrics_lls if use_lls else lyrics_raw
-    if not lyrics_eff:
-        raise RuntimeError("project.json에 가사가 없습니다. 먼저 저장/생성해 주세요.")
-
-    # 길이(초) 그대로 사용
+    title_val = effective_title(meta)
     if target_seconds is not None:
-        seconds = int(max(1, target_seconds))
+        seconds_val = int(max(1, target_seconds))
     else:
-        seconds = int(max(1, int(meta.get("target_seconds") or meta.get("time") or 60)))
-    meta["target_seconds"] = int(seconds)
-    meta["time"] = int(seconds)
-    save_json(pj, meta)
+        seconds_val = int(max(1, int(meta.get("target_seconds") or meta.get("time") or 60)))
+    meta["target_seconds"] = int(seconds_val)
+    meta["time"] = int(seconds_val)
+    save_json(meta_path, meta)
 
-    effective_tags = _collect_effective_tags(meta)
+    tags_effective = _collect_effective_tags(meta)
 
-    # ───────── 워크플로 로드/보정 ─────────
-    g = _load_workflow_graph(ACE_STEP_PROMPT_JSON)
-    base = _choose_host()
-    _dlog("HOST", base, "| DESIRED_FMT wav")
+    # 변환 ON/OFF
+    lls_enabled = bool(meta.get("lls_enabled"))
 
-    subfolder = f"shorts_make/{sanitize_title(title)}"
-    save_prefix = f"{subfolder}/vocal_final"
-    # ↓↓↓ 여기만 수정 (save_prefix→filename_prefix)
-    ext = _force_wav_save_for_this_graph(g, proj_dir=proj, filename_prefix=save_prefix)
+    # 변환 OFF일 때: 저장된 lyrics_lls_now는 무시하고 'lyrics'에서 즉석 변환
+    def _split_ko_en_runtime_local(text_src: str) -> str:
+        import re as _re_local
+        body = normalize_sections(text_src or "")
+        if not body.strip():
+            return ""
+        tag_head_pat_local = _re_local.compile(r"^\s*\[([a-z]{2})]\s*$", _re_local.IGNORECASE)
+        keep_head_pat_local = _re_local.compile(
+            r"^\s*\[(?:verse|bridge|chorus|intro|outro)(?:\s+\d+)?]\s*$",
+            _re_local.IGNORECASE,
+        )
 
-    # LLS/태그/초 주입
-    for _nid, node_item in _find_nodes_by_class_names(g, ("LyricsLangSwitch",)):
+        out_lines_local: list[str] = []
+        for raw_line in body.splitlines():
+            line_str = (raw_line or "").strip()
+            if not line_str:
+                continue
+            if keep_head_pat_local.match(line_str):
+                out_lines_local.append(line_str.lower())
+                continue
+            if tag_head_pat_local.match(line_str):
+                continue
+
+            has_ko = bool(_re_local.search(r"[가-힣]", line_str))
+            has_en = bool(_re_local.search(r"[A-Za-z]", line_str))
+            if has_ko and has_en:
+                ko_only = _re_local.sub(r"[^가-힣\s]", "", line_str)
+                ko_only = _re_local.sub(r"\s{2,}", " ", ko_only).strip()
+                en_only = _re_local.sub(r"[가-힣]", "", line_str)
+                en_only = _re_local.sub(r"\s{2,}", " ", en_only).strip()
+                if ko_only:
+                    out_lines_local.append("[ko]" + ko_only)
+                if en_only:
+                    out_lines_local.append("[en]" + en_only)
+                if not ko_only and not en_only:
+                    out_lines_local.append("[en]" + line_str)
+            elif has_ko:
+                out_lines_local.append("[ko]" + line_str)
+            elif has_en:
+                out_lines_local.append("[en]" + line_str)
+            else:
+                out_lines_local.append("[en]" + line_str)
+        return "\n".join(out_lines_local).strip()
+
+    if lls_enabled:
+        send_text_base = str(meta.get("lyrics_lls") or "")
+        if not send_text_base.strip():
+            raise RuntimeError("변환 ON이지만 project.json의 'lyrics_lls'가 비어 있습니다.")
+    else:
+        raw_lyrics_src = str(meta.get("lyrics") or "")
+        if not raw_lyrics_src.strip():
+            raise RuntimeError("project.json에 'lyrics'가 없습니다. 먼저 저장/생성해 주세요.")
+        send_text_base = _split_ko_en_runtime_local(raw_lyrics_src)
+
+    # 캐시 무력화(ZWSP 1자)
+    send_text_inject = send_text_base.rstrip("\n") + "\u200B"
+
+    # ───────── 워크플로 로드/보정(기존 로직 유지) ─────────
+    graph = _load_workflow_graph(ACE_STEP_PROMPT_JSON)
+    host = _choose_host()
+    _dlog("HOST", host, "| DESIRED_FMT wav")
+
+    subfolder_val = f"shorts_make/{sanitize_title(title_val)}"
+    save_prefix = f"{subfolder_val}/vocal_final"
+    ext = _force_wav_save_for_graph_local(graph, proj_dir_in=proj, filename_prefix_in=save_prefix)
+
+    # LLS/태그/초/threshold 주입(기존 유지, threshold에 미세 지터로 캐시 무력화)
+    now_frac = (time.time() % 1.0)
+    threshold_jitter = (now_frac * 0.0006) - 0.0003  # -0.0003 ~ +0.0003
+
+    for _nid_local, node_item in _find_nodes_by_class_names_local(graph, ("LyricsLangSwitch",)):
         inputs_map2 = node_item.setdefault("inputs", {})
-        inputs_map2["lyrics"] = lyrics_eff
+        inputs_map2["lyrics"] = send_text_inject
+        if "text" in inputs_map2 and not isinstance(inputs_map2.get("text"), dict):
+            inputs_map2["text"] = send_text_inject
+        base_th = 0.85
+        try:
+            base_th = float(inputs_map2.get("threshold", base_th))
+        except (TypeError, ValueError):
+            base_th = 0.85
+        new_th = base_th + threshold_jitter
+        if new_th < 0.0:
+            new_th = 0.0
+        if new_th > 0.999:
+            new_th = 0.999
+        inputs_map2["threshold"] = new_th
         inputs_map2["language"] = "Korean"
-        inputs_map2.setdefault("threshold", 0.85)
-        inputs_map2["seconds"] = int(seconds)
+        inputs_map2["seconds"] = int(seconds_val)
 
-    for _nid, node_item in _find_nodes_by_class_names(g, ("TextEncodeAceStepAudio",)):
+    for _nid_local, node_item in _find_nodes_by_class_names_local(graph, ("TextEncodeAceStepAudio",)):
         inputs_map3 = node_item.setdefault("inputs", {})
-        inputs_map3["tags"] = ", ".join(effective_tags)
+        inputs_map3["tags"] = ", ".join(tags_effective)
         inputs_map3.setdefault("lyrics_strength", 1.0)
 
     targets = []
-    targets += _find_nodes_by_class_names(g, ("EmptyAceStepLatentAudio", "EmptyLatentAudio", "EmptyAudio", "NoiseLatentAudio"))
+    targets += _find_nodes_by_class_names_local(graph, ("EmptyAceStepLatentAudio", "EmptyLatentAudio", "EmptyAudio", "NoiseLatentAudio"))
     if not targets:
-        for nid, node_item in _find_nodes_by_class_contains(g, "audio"):
-            if "latent" in str(node_item.get("class_type", "")).lower():
-                targets.append((nid, node_item))
-    for _nid, node_item in targets:
-        node_item.setdefault("inputs", {})["seconds"] = int(max(1, seconds))
+        for nid_try, node_item_try in _find_nodes_by_class_contains_local(graph, "audio"):
+            if "latent" in str(node_item_try.get("class_type", "")).lower():
+                targets.append((nid_try, node_item_try))
+    for _nid_local, node_item in targets:
+        node_item.setdefault("inputs", {})["seconds"] = int(max(1, seconds_val))
 
-    # 랜덤 시드
     try:
-        for nid, node_item in list(g.items()):
-            if str(node_item.get("class_type", "")).lower() == "ksampler":
-                node_item.setdefault("inputs", {})["seed"] = _rand_seed()
+        for nid_any, node_item_any in list(graph.items()):
+            if str(node_item_any.get("class_type", "")).lower() == "ksampler":
+                node_item_any.setdefault("inputs", {})["seed"] = _rand_seed()
     except Exception:
         pass
 
-    # ───────── 제출 & 대기 ─────────
-    notify("submitting", host=base)
+    # ───────── 제출 & 대기(기존 함수 사용) ─────────
+    _notify_local("submitting", host=host)
     hist = _submit_and_wait(
-        base, g,
+        host,
+        graph,
         timeout=(globals().get("ACE_STEP_WAIT_TIMEOUT_SEC") or globals().get("ACE_WAIT_TIMEOUT_SEC", 1800.0)),
         poll=(globals().get("ACE_STEP_POLL_INTERVAL_SEC") or globals().get("ACE_POLL_INTERVAL_SEC", 2.0)),
         on_progress=(on_progress or (lambda info: _dlog("PROG", info))),
     )
 
-    # ───────── 결과 다운로드 ─────────
+    # ───────── 결과 다운로드(기존 로직) + 텍스트 수집 ─────────
     saved_files: List[Path] = []
+    text_payloads: list[str] = []
     outputs = hist.get("outputs") if isinstance(hist, dict) else {}
     if isinstance(outputs, dict):
-        for _nid, node_out in outputs.items():
+        for _nid_local, node_out in outputs.items():
+            # 인라인 텍스트 키
+            for txt_key in ("text", "txt", "string", "strings"):
+                inline_val = node_out.get(txt_key)
+                if isinstance(inline_val, str):
+                    if inline_val.strip():
+                        text_payloads.append(inline_val.strip())
+                elif isinstance(inline_val, list):
+                    for s in inline_val:
+                        if isinstance(s, str) and s.strip():
+                            text_payloads.append(s.strip())
+            # 파일 리스트(오디오/텍스트)
             for key in ("audio", "audios", "files"):
                 arr = node_out.get(key)
                 if not isinstance(arr, list):
@@ -2848,11 +2975,18 @@ def generate_music_with_acestep(
                     if not sf or fn.startswith("ComfyUI_temp_"):
                         continue
                     sf_norm = sf.replace("\\", "/").lstrip("/")
-                    out_file = _download_output_file(base, fn, sf_norm, out_dir=proj)
+                    out_file = _download_output_file(host, fn, sf_norm, out_dir=proj)
                     if out_file:
                         saved_files.append(out_file)
+                        if out_file.suffix.lower() == ".txt":
+                            try:
+                                txt_body = out_file.read_text(encoding="utf-8").strip()
+                                if txt_body:
+                                    text_payloads.append(txt_body)
+                            except (OSError, UnicodeDecodeError, ValueError):
+                                pass
 
-    # 최신 오디오를 vocal.wav로 통일 + (옵션)마스터링
+    # 최신 오디오를 vocal.wav로 정규화 + (옵션)마스터링
     final_path: Optional[Path] = None
     if saved_files:
         audio_candidates = [p for p in saved_files if p.suffix.lower() in (".wav", ".mp3", ".flac", ".ogg", ".opus", ".m4a")]
@@ -2860,7 +2994,6 @@ def generate_music_with_acestep(
         ff = getattr(S, "FFMPEG_EXE", "ffmpeg")
         final_path = _ensure_vocal_wav(src, proj, ffmpeg_exe=ff)
 
-        # 타입 경고 제거: callable 확인 + Path 반환만 반영
         master_fn_obj = globals().get("_master_wav_precise")
         if callable(master_fn_obj) and isinstance(final_path, Path):
             try:
@@ -2883,49 +3016,41 @@ def generate_music_with_acestep(
                     )
                     if isinstance(res2, Path):
                         final_path = res2
-                except Exception as _e:
-                    _dlog("MASTER-FAIL", type(_e).__name__, str(_e))
-            except Exception as _e:
-                _dlog("MASTER-FAIL", type(_e).__name__, str(_e))
+                except Exception as _e2:
+                    _dlog("MASTER-FAIL", type(_e2).__name__, str(_e2))
+            except Exception as _e3:
+                _dlog("MASTER-FAIL", type(_e3).__name__, str(_e3))
 
-    # ───────── LLS 결과를 project.json에만 저장(필요 시) ─────────
-    if not use_lls and isinstance(outputs, dict):
-        buf: List[str] = []
-        for _nid, node_out in outputs.items():
-            for key in ("text", "txt"):
-                val = node_out.get(key)
-                if isinstance(val, str):
-                    if val.strip():
-                        buf.append(val.strip())
-                elif isinstance(val, list):
-                    for s in val:
-                        if isinstance(s, str) and s.strip():
-                            buf.append(s.strip())
-        if buf:
-            meta["lyrics_lls"] = "\n".join(buf).strip()
-            save_json(pj, meta)
+    # ───────── Comfy 결과 텍스트 저장 + 변환 OFF면 lyrics_lls_now 비우기 ─────────
+    meta.setdefault("comfy_debug", {})
+    meta["comfy_debug"].update({
+        "host": host,
+        "prompt_json": str(ACE_STEP_PROMPT_JSON),
+        "prompt_seconds": seconds_val,
+        "requested_format": "wav",
+        "requested_ext": ext,
+        "subfolder": f"shorts_make/{sanitize_title(title_val)}",
+    })
+    meta["tags_effective"] = tags_effective
 
-    # 경로 메타 업데이트만(부산물 X)
+    meta["lyrics_lls_after"] = "\n\n".join([t for t in text_payloads if t]).strip() if text_payloads else ""
+
+    if not lls_enabled:
+        # 실행 후 항상 비움(과거 흔적 제거)
+        meta["lyrics_lls_now"] = ""
+
     if final_path:
         meta.setdefault("paths", {})["vocal"] = str(final_path)
         meta["audio"] = str(final_path)
-    meta.setdefault("comfy_debug", {})
-    meta["comfy_debug"].update({
-        "host": base,
-        "prompt_json": str(ACE_STEP_PROMPT_JSON),
-        "prompt_seconds": seconds,
-        "requested_format": "wav",
-        "requested_ext": ext,
-        "subfolder": f"shorts_make/{sanitize_title(title)}",
-    })
-    meta["tags_effective"] = effective_tags
-    save_json(pj, meta)
 
+    save_json(meta_path, meta)
+
+    # 요약 로그
     msg = [
         "ACE-Step 완료 ✅",
         f"- 프롬프트: {ACE_STEP_PROMPT_JSON}",
-        f"- 길이:     {seconds}s",
-        f"- 태그 수:  {len(effective_tags)}",
+        f"- 길이:     {seconds_val}s",
+        f"- 태그 수:  {len(tags_effective)}",
     ]
     if final_path:
         msg.append(f"- 저장:     {final_path}")
@@ -2934,6 +3059,11 @@ def generate_music_with_acestep(
     summary = "\n".join(msg)
     _dlog("LEAVE", summary.replace("\n", " | "))
     return summary
+
+
+
+
+
 
 ######################분석 보완############################################
 def preprocess_for_analysis(src: str) -> str:
@@ -3254,9 +3384,9 @@ def sync_lyrics_with_whisper_pro(
                 except (TypeError, ValueError):
                     lines_out = []
         if not lines_out:
-            txt = meta_local.get("lyrics") or meta_local.get("lyrics_text")
-            if isinstance(txt, str) and txt.strip():
-                lines_out = normalize_lines_keep_lyrics(txt)
+            txtt = meta_local.get("lyrics") or meta_local.get("lyrics_text")
+            if isinstance(txtt, str) and txtt.strip():
+                lines_out = normalize_lines_keep_lyrics(txtt)
         return lines_out
 
     project_lines = load_project_lines(src.parent)

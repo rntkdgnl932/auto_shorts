@@ -6,7 +6,7 @@
         "74",
         0
       ],
-      "lyrics_strength": 0.9900000000000002,
+      "lyrics_strength": 0.99,
       "clip": [
         "40",
         1
@@ -82,7 +82,7 @@
   },
   "50": {
     "inputs": {
-      "multiplier": 1.0000000000000002
+      "multiplier": 1
     },
     "class_type": "LatentOperationTonemapReinhard",
     "_meta": {
@@ -91,7 +91,7 @@
   },
   "51": {
     "inputs": {
-      "shift": 5.000000000000001,
+      "shift": 5,
       "model": [
         "40",
         0
@@ -172,7 +172,7 @@
   },
   "79": {
     "inputs": {
-      "root_dir": "input",
+      "root_dir": "output",
       "file": "lyric.txt",
       "append": "overwrite",
       "insert": true,
