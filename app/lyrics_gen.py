@@ -219,7 +219,7 @@ def normalize_sections(lyrics: str) -> str:
 
 # ───────── 공개 API ─────────
 
-# 맨 위에 이미 import re 되어 있으면 생략
+# lyrics_gen.py 파일에서 이 함수를 찾아 아래 내용으로 전체를 교체하세요.
 
 def generate_title_lyrics_tags(
     *,
@@ -236,12 +236,7 @@ def generate_title_lyrics_tags(
     가사 생성:
       - 1줄≈5초 기준으로 '본문 줄수(헤더 제외)' 가이드를 제시
       - 허용 섹션: [verse], [bridge] (그 외 헤더는 제거/치환)
-      - 본문 라인 ko/en 언어태그 '강제 교정'
-        * 한글만 -> [ko], 영문만 -> [en]
-        * 혼합(한글+영문) -> [ko]줄과 [en]줄로 분리하여 2줄 생성
-          - ko줄: 라틴 알파벳 제거 후 공백 정리
-          - en줄: 한글 제거 후 공백 정리
-          - 둘 중 하나가 비면 남은 한 줄만 출력
+      - 본문 라인에 [ko]/[en] 언어 태그를 붙이지 않음
       - 변환 '최종본'을 BASE_DIR/_debug/lyrics_gen.log 에 기록
     출력: {"title":".", "lyrics":".", "tags":[...], "tags_pick":[...]}
     """
@@ -275,11 +270,11 @@ def generate_title_lyrics_tags(
                 sec_val = None
     if sec_val is None or sec_val <= 0:
         try:
-            duration_min = int(duration_min)
+            duration_min_val = int(duration_min)
         except (TypeError, ValueError):
-            duration_min = 2
-        duration_min = max(1, min(3, duration_min))
-        sec_val = duration_min * 60
+            duration_min_val = 2
+        duration_min_val = max(1, min(3, duration_min_val))
+        sec_val = duration_min_val * 60
 
     # ---- 1줄≈5초: '본문 줄수' 가이드(헤더 제외) ----
     base_lines = max(1, round(sec_val / 5))
@@ -327,12 +322,12 @@ def generate_title_lyrics_tags(
     # ---- JSON 파싱(관대한 추출) ----
     emit("parse:begin", f"text_len={len(reply_text)}")
     try:
-        a = reply_text.find("{")
-        b = reply_text.rfind("}")
-        if a == -1 or b == -1 or b <= a:
+        a_pos = reply_text.find("{")
+        b_pos = reply_text.rfind("}")
+        if a_pos == -1 or b_pos == -1 or b_pos <= a_pos:
             data_obj = json.loads(reply_text)
         else:
-            data_obj = json.loads(reply_text[a:b + 1])
+            data_obj = json.loads(reply_text[a_pos:b_pos + 1])
     except json.JSONDecodeError:
         data_obj = {"title": title_in or "untitled", "lyrics_ko": reply_text}
     emit("parse:end", "ok")
@@ -406,51 +401,19 @@ def generate_title_lyrics_tags(
     else:
         picks = picks_raw[:10]
 
-    # ---- ko/en 강제 교정 + 혼합 분리 ----
-    tag_head_pat = re.compile(r"^\s*\[([a-z]{2})]\s*", re.IGNORECASE)
-
-    def _split_and_tag(line_text: str) -> List[str]:
-        body = (line_text or "").strip()
-        if not body:
-            return []
-        match_lang = tag_head_pat.match(body)
-        tail = body[match_lang.end():].lstrip() if match_lang else body
-
-        # 문자 수 집계
-        n_ko = len(re.findall(r"[가-힣]", tail))
-        n_en = len(re.findall(r"[A-Za-z]", tail))
-
-        # 단일 언어 라인
-        if n_ko > 0 and n_en == 0:
-            return ["[ko]" + tail]
-        if n_en > 0 and n_ko == 0:
-            return ["[en]" + tail]
-
-        # 혼합 라인 -> ko/en 두 줄로 분리
-        if n_ko > 0 and n_en > 0:
-            ko_tail = re.sub(r"[A-Za-z]+", "", tail)
-            en_tail = re.sub(r"[가-힣]+", "", tail)
-            ko_tail = re.sub(r"\s{2,}", " ", ko_tail).strip()
-            en_tail = re.sub(r"\s{2,}", " ", en_tail).strip()
-            outs: List[str] = []
-            if ko_tail:
-                outs.append("[ko]" + ko_tail)
-            if en_tail:
-                outs.append("[en]" + en_tail)
-            # 둘 다 비어버린 엣지 케이스(기호만 등) → 기본 en 한 줄
-            return outs if outs else ["[en]" + tail]
-
-        # 둘 다 0 (숫자/기호만): 보수적으로 en
-        return ["[en]" + tail]
-
-    final_lines: List[str] = []
-    for ln in lyrics_body.splitlines():
-        if keep_head_pat.match(ln.strip()):
-            final_lines.append(ln.strip().lower())
+    # ---- 가사 라인 정리 (언어 태그 없이) ----
+    final_lines_generate: List[str] = []
+    for line_item in lyrics_body.splitlines():
+        # [verse], [bridge] 같은 섹션 헤더는 소문자로 통일하여 그대로 유지합니다.
+        stripped_line = line_item.strip()
+        if keep_head_pat.match(stripped_line):
+            final_lines_generate.append(stripped_line.lower())
+        # 나머지 가사 라인은 원본을 그대로 추가합니다.
         else:
-            final_lines.extend(_split_and_tag(ln))
+            final_lines_generate.append(line_item)
 
-    lyrics_out = "\n".join(final_lines)
+    lyrics_out = "\n".join(final_lines_generate)
+
 
     # ---- 디버그 로그(최종본 기록) ----
     try:
@@ -463,13 +426,13 @@ def generate_title_lyrics_tags(
         dbg_dir = base_dir / "_debug"
         dbg_dir.mkdir(parents=True, exist_ok=True)
         with (dbg_dir / "lyrics_gen.log").open("a", encoding="utf-8") as fp:
-            fp.write("\n===== LYRICS NORMALIZE (final ko/en with split) =====\n")
+            fp.write("\n===== LYRICS GENERATED (no lang tags) =====\n")
             fp.write(f"title: {title}\n")
             fp.write(lyrics_out + "\n")
     except (OSError, ValueError, TypeError, ImportError):
         pass
 
-    emit("normalize:done", "lyrics ko/en forced; mixed lines split")
+    emit("normalize:done", "lyrics generated without language tags")
 
     return {"title": title, "lyrics": lyrics_out, "tags": tags, "tags_pick": picks}
 

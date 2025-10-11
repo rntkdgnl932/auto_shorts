@@ -1,7 +1,7 @@
 {
   "14": {
     "inputs": {
-      "tags": "\"pop\",\n\"110 bpm\",\n    \"acoustic guitar\",\n    \"soft electric drums\",\n    \"electric bass\",\n    \"clean vocals\",\n    \"clear diction\",\n    \"warm emotional tone\",\n    \"melodic\",\n    \"balanced mixing\",\n    \"studio reverb light\"\t\n",
+      "tags": "",
       "lyrics": [
         "74",
         0
@@ -14,7 +14,21 @@
     },
     "class_type": "TextEncodeAceStepAudio",
     "_meta": {
-      "title": "TextEncodeAceStepAudio"
+      "title": "Positive Text Encode"
+    }
+  },
+  "15": {
+    "inputs": {
+      "tags": "chorus, hook, refrain, background vocals, choir, repeating melody, 후렴",
+      "lyrics_strength": 1.0,
+      "clip": [
+        "40",
+        1
+      ]
+    },
+    "class_type": "TextEncodeAceStepAudio",
+    "_meta": {
+      "title": "Negative Text Encode"
     }
   },
   "17": {
@@ -50,18 +64,6 @@
     "class_type": "CheckpointLoaderSimple",
     "_meta": {
       "title": "체크포인트 로드"
-    }
-  },
-  "44": {
-    "inputs": {
-      "conditioning": [
-        "14",
-        0
-      ]
-    },
-    "class_type": "ConditioningZeroOut",
-    "_meta": {
-      "title": "조건 (0으로 출력)"
     }
   },
   "49": {
@@ -119,7 +121,7 @@
         0
       ],
       "negative": [
-        "44",
+        "15",
         0
       ],
       "latent_image": [

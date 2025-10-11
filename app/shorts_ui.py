@@ -1828,12 +1828,14 @@ class MainWindow(QtWidgets.QMainWindow):
         # ★ 확인되지 않은 참조 수정: tail_file에 지역변수 comfy_log_file 사용
         run_job_with_progress_async(self, "누락 이미지 생성", job, tail_file=comfy_log_file, on_done=done)
 
+    # shorts_ui.py 파일에서 on_click_generate_music 함수를 찾아 아래 내용으로 전체를 교체하세요.
+
     def on_click_generate_music(self) -> None:
-        """음악 생성 버튼 핸들러 — 중복 실행 가드 추가(기능 불변)."""
+        """음악 생성 버튼 핸들러 — 중복 실행 가드 추가 및 부정적 프롬프트 저장."""
         from PyQt5 import QtWidgets
         try:
             from app.utils import run_job_with_progress_async
-        except Exception:
+        except ImportError:
             from utils import run_job_with_progress_async  # type: ignore
 
         if getattr(self, "_music_inflight", False):
@@ -1845,26 +1847,26 @@ class MainWindow(QtWidgets.QMainWindow):
         if btn:
             try:
                 btn.setEnabled(False)
-            except Exception:
+            except (AttributeError, RuntimeError):
                 pass
 
         def job(progress):
             from pathlib import Path
             try:
                 from app.utils import load_json, save_json  # type: ignore
-            except Exception:
+            except ImportError:
                 from utils import load_json, save_json  # type: ignore
 
             try:
                 progress({"msg": "[ui] 음악 생성 시작"})
-            except Exception:
+            except (AttributeError, RuntimeError, TypeError):
                 pass
 
             project_dir = None
             if hasattr(self, "_current_project_dir"):
                 try:
                     project_dir = self._current_project_dir()
-                except Exception:
+                except (AttributeError, RuntimeError, TypeError):
                     project_dir = None
             if not project_dir:
                 raise RuntimeError("프로젝트 폴더를 찾을 수 없습니다.")
@@ -1872,6 +1874,16 @@ class MainWindow(QtWidgets.QMainWindow):
             secs = int(self._current_seconds()) if hasattr(self, "_current_seconds") else 60
             pj = Path(project_dir) / "project.json"
             meta = load_json(pj, {}) or {}
+
+            # ▼▼▼ 부정적 프롬프트 읽기 및 저장 추가 ▼▼▼
+            neg_prompt = ""
+            if hasattr(self, "te_prompt_neg") and hasattr(self.te_prompt_neg, "toPlainText"):
+                try:
+                    neg_prompt = self.te_prompt_neg.toPlainText().strip()
+                except (AttributeError, RuntimeError):
+                    neg_prompt = ""
+            meta['prompt_neg'] = neg_prompt
+            # ▲▲▲ 부정적 프롬프트 읽기 및 저장 완료 ▲▲▲
 
             auto_on = False
             cb_auto = getattr(self, "cb_auto_tags", None) or getattr(self, "chk_auto_tags", None)
@@ -1898,7 +1910,7 @@ class MainWindow(QtWidgets.QMainWindow):
                                     label = getattr(cb, "text", lambda: "")()
                                     if label:
                                         picked_manual.append(label)
-                        except Exception:
+                        except (AttributeError, TypeError, ValueError):
                             pass
                 try:
                     if getattr(self, "rb_vocal_female", None) and self.rb_vocal_female.isChecked():
@@ -1923,8 +1935,6 @@ class MainWindow(QtWidgets.QMainWindow):
                 meta["auto_tags"] = False
                 meta["manual_tags"] = list(dict.fromkeys(picked_manual))
 
-            meta["time"] = secs
-            meta["target_seconds"] = secs
             save_json(pj, meta)
 
             def forward(info) -> None:
@@ -1936,12 +1946,12 @@ class MainWindow(QtWidgets.QMainWindow):
                         progress({"msg": msg})
                     else:
                         progress({"msg": str(info)})
-                except Exception:
+                except (AttributeError, RuntimeError, TypeError):
                     pass
 
             try:
                 from app.audio_sync import generate_music_with_acestep
-            except Exception:
+            except ImportError:
                 from audio_sync import generate_music_with_acestep  # type: ignore
 
             import os as _os
@@ -1957,30 +1967,29 @@ class MainWindow(QtWidgets.QMainWindow):
             if btn:
                 try:
                     btn.setEnabled(True)
-                except Exception:
+                except (AttributeError, RuntimeError):
                     pass
             if not ok and err is not None:
                 QtWidgets.QMessageBox.warning(self, "음악 생성 오류", str(err))
             else:
                 try:
                     setattr(self, "_project_context_ready", True)
-                except Exception:
+                except (AttributeError, RuntimeError):
                     pass
 
-                # ★ 자동태그 잠금 재적용 — 통일된 chk_auto_tags 사용
                 auto_on = False
                 auto_chk = getattr(self, "chk_auto_tags", None)
                 if auto_chk is not None and hasattr(auto_chk, "isChecked"):
                     try:
                         auto_on = bool(auto_chk.isChecked())
-                    except Exception:
+                    except (AttributeError, RuntimeError, ValueError):
                         auto_on = False
                 tag_boxes = getattr(self, "_tag_boxes", None)
                 if isinstance(tag_boxes, dict):
                     for _label, box in tag_boxes.items():
                         try:
                             box.setEnabled(not auto_on)
-                        except Exception:
+                        except (AttributeError, RuntimeError):
                             pass
 
             self._music_inflight = False
@@ -1991,13 +2000,12 @@ class MainWindow(QtWidgets.QMainWindow):
             if btn:
                 try:
                     btn.setEnabled(True)
-                except Exception:
+                except (AttributeError, RuntimeError):
                     pass
             self._music_inflight = False
             QtWidgets.QMessageBox.warning(self, "음악 생성 오류", str(e))
 
-
-    def on_click_analyze_music_old(self) -> None:
+    def on_click_analyze_music(self) -> None:
         """
         음악분석:
           - 디버그 로그를 추가하여 진행창 호출 여부 확인
@@ -2577,134 +2585,7 @@ class MainWindow(QtWidgets.QMainWindow):
 
         # shorts_ui.py 파일의 기존 on_click_analyze_music 함수를 아래 내용으로 완전히 교체하세요.
 
-    def on_click_analyze_music(self) -> None:
-        """
-        음악분석 (WhisperX 강제 정렬 엔진 사용):
-        - [개선] 더 정교한 WhisperX를 사용하여 '강제 정렬' 방식으로 타임라인을 생성합니다.
-        - WhisperX의 결과를 직접 seg.json과 seg_ready.json에 저장합니다.
-        - 최종 결과에서 lyrics_start, lyrics_end를 계산하여 project.json에 저장합니다.
-        """
-        from pathlib import Path
-        from PyQt5 import QtWidgets
 
-        print("\n--- INFO: on_click_analyze_music (WhisperX Engine) 함수 시작 ---")
-
-        btn = getattr(self, "btn_analyze_music", None) or getattr(getattr(self, "ui", None), "btn_analyze_music",
-                                                                  None)
-        if isinstance(btn, QtWidgets.QAbstractButton):
-            btn.setEnabled(False)
-
-        try:
-            from app.utils import load_json, save_json, run_job_with_progress_async
-            from app.audio_sync import sync_lyrics_with_audio_whisperx
-        except ImportError:
-            from utils import load_json, save_json, run_job_with_progress_async
-            from audio_sync import sync_lyrics_with_audio_whisperx
-
-        try:
-            proj_dir = self._current_project_dir()
-            vocal_path_raw = self._find_latest_vocal()
-        except Exception:
-            proj_dir, vocal_path_raw = None, None
-
-        if not proj_dir or not vocal_path_raw:
-            QtWidgets.QMessageBox.critical(self, "음악분석 실패", "프로젝트 폴더 또는 보컬 파일을 찾을 수 없습니다.")
-            if isinstance(btn, QtWidgets.QAbstractButton): btn.setEnabled(True)
-            return
-
-        vocal_path_str = str(vocal_path_raw)
-        print(f"--- INFO: 분석 대상 파일: {vocal_path_str} ---")
-
-        pj = Path(proj_dir) / "project.json"
-        meta = load_json(pj, {}) or {}
-        lyrics_raw = (meta.get("lyrics") or "").strip()
-
-        if not lyrics_raw:
-            QtWidgets.QMessageBox.critical(self, "음악분석 실패", "프로젝트에 가사가 없습니다.")
-            if isinstance(btn, QtWidgets.QAbstractButton): btn.setEnabled(True)
-            return
-        print(f"--- INFO: 가사 확인 (길이: {len(lyrics_raw)}) ---")
-
-        def get_pure_lyrics(text: str) -> str:
-            lines = []
-            for ln in (text or "").splitlines():
-                s = ln.strip()
-                if s and not (s.startswith('[') and s.endswith(']')):
-                    lines.append(s)
-            return "\n".join(lines)
-
-        pure_lyrics = get_pure_lyrics(lyrics_raw)
-
-        def job(log_cb):
-            def slog(tag: str, msg: str) -> None:
-                try:
-                    log_cb({"msg": f"[{tag}] {msg}"})
-                except Exception:
-                    pass
-
-            slog("WhisperX", "강제 정렬(Forced Alignment) 시작...")
-
-            segments = sync_lyrics_with_audio_whisperx(
-                audio_path=vocal_path_str,
-                lyrics_text=pure_lyrics,
-                whisperx_model="large-v3",
-            )
-
-            if not segments:
-                raise RuntimeError("WhisperX 분석 결과가 없습니다. 오디오 파일을 확인해주세요.")
-
-            slog("WhisperX", f"강제 정렬 완료. {len(segments)}개의 라인 생성.")
-
-            save_json(Path(proj_dir) / "seg.json", segments)
-            save_json(Path(proj_dir) / "seg_ready.json", segments)
-            slog("파일 저장", "seg.json, seg_ready.json 저장 완료")
-
-            lyrics_start = segments[0]['start'] if segments else 0.0
-            lyrics_end = segments[-1]['end'] if segments else 0.0
-
-            meta_now = load_json(pj, {}) or {}
-            meta_now["lyrics_start"] = lyrics_start
-            meta_now["lyrics_end"] = lyrics_end
-            save_json(pj, meta_now)
-            slog("업데이트", f"project.json 저장: start={lyrics_start}, end={lyrics_end}")
-
-            summary_lines = ["파일: " + Path(vocal_path_str).name, "엔진: WhisperX (Forced Alignment)", ""]
-            summary_lines.append("=== 줄별 정합 결과 ===")
-            for i, seg in enumerate(segments, 1):
-                summary_lines.append(f"[{i:02d}] {seg['start']:6.2f}~{seg['end']:6.2f}  {seg['line']}")
-
-            return {"text": "\n".join(summary_lines)}
-
-        def done(ok: bool, payload, err):
-            try:
-                if not ok:
-                    QtWidgets.QMessageBox.critical(self, "음악분석 실패", str(err))
-                    return
-
-                text = (payload or {}).get("text", "결과가 없습니다.")
-                print("\n[음악분석 결과 (WhisperX)]\n" + text, flush=True)
-
-                dlg = QtWidgets.QDialog(self)
-                dlg.setWindowTitle("음악분석 결과 — WhisperX 강제 정렬")
-                dlg.resize(1000, 760)
-                vbox = QtWidgets.QVBoxLayout(dlg)
-                ed = QtWidgets.QPlainTextEdit()
-                ed.setReadOnly(True)
-                ed.setPlainText(text)
-                vbox.addWidget(ed)
-                btn_close = QtWidgets.QPushButton("닫기")
-                btn_close.clicked.connect(dlg.accept)
-                row = QtWidgets.QHBoxLayout()
-                row.addStretch(1)
-                row.addWidget(btn_close)
-                vbox.addLayout(row)
-                dlg.exec_()
-            finally:
-                if isinstance(btn, QtWidgets.QAbstractButton):
-                    btn.setEnabled(True)
-
-        print("--- INFO: WhisperX 비동기 작업 호출 ---")
-        run_job_with_progress_async(self, "음악분석 (WhisperX)", job, on_done=done)
 
     @staticmethod
     def _persist_lyric_sections(*, proj_dir: str, sections: list, last_end: float) -> None:

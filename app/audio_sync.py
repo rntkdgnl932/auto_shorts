@@ -2688,7 +2688,7 @@ def _ensure_vocal_wav(src_path: Path, proj_dir: Path, ffmpeg_exe: str = "ffmpeg"
     return out_wav
 
 
-# audio_sync.py 파일에서 이 함수를 찾아 아래 내용으로 전체를 교체하세요.
+# audio_sync.py 파일에서 generate_music_with_acestep 함수를 찾아 아래 내용으로 전체를 교체하세요.
 
 def generate_music_with_acestep(
         project_dir: str,
@@ -2698,13 +2698,12 @@ def generate_music_with_acestep(
 ) -> str:
     """
     ComfyUI(ACE-Step) 단일 트랙 음악 생성 — project.json 단일 소스 정책.
-    - comfyui 전송 직전 가사를 'lyrics_lls_now'에 저장합니다.
-    - comfyui 작업 후 실제 사용된 가사를 'lyrics_lls_after'에 저장합니다.
-    - 변환 OFF 시, 한/영 혼용 가사를 분석하여 영어 앞에만 [en] 태그를 부착합니다.
+    - [수정] project.json의 'prompt_neg'를 읽어 부정적 프롬프트로 주입합니다.
+    - [수정] 워크플로의 TextEncode 노드를 'Positive'와 'Negative'로 구분하여 처리합니다.
     """
     from pathlib import Path
     import re
-    from typing import List, Optional
+    from typing import List, Optional, Callable
 
     def notify(stage: str, **kw):
         if on_progress:
@@ -2712,7 +2711,7 @@ def generate_music_with_acestep(
                 info = {"stage": stage}
                 info.update(kw)
                 on_progress(info)
-            except Exception:
+            except (TypeError, ValueError, RuntimeError):
                 pass
 
     def _iter_nodes(graph: dict):
@@ -2749,7 +2748,6 @@ def generate_music_with_acestep(
                         inputs_map[bd_key] = 16
         return ".wav"
 
-    # ───────── 기본 준비 ─────────
     _dlog("ENTER", f"project_dir={project_dir}")
     proj = Path(project_dir)
     proj.mkdir(parents=True, exist_ok=True)
@@ -2758,51 +2756,39 @@ def generate_music_with_acestep(
 
     title = effective_title(meta)
 
-    # 가사 소스 선정(오직 project.json)
     lyrics_raw = (meta.get("lyrics") or "").strip()
     lyrics_lls = (meta.get("lyrics_lls") or "").strip()
     use_lls = bool(lyrics_lls)
 
-    # ▼▼▼ 요청사항 반영: 변환 OFF일 때의 처리 로직 수정 ▼▼▼
     if use_lls:
-        # 변환 ON: 기존과 동일하게 lyrics_lls 사용
         lyrics_eff = lyrics_lls
     else:
-        # 변환 OFF: lyrics_raw를 분석하여 영어 앞에만 [en] 태그 부착
         processed_lines: List[str] = []
-        # 한글, 영어/숫자/공백을 포함하는 텍스트 덩어리를 찾습니다.
-        lang_pattern = re.compile(r'([가-힣\s]+|[a-zA-Z0-9\s]+)')
-
         for line in lyrics_raw.splitlines():
             stripped_line = line.strip()
             if not stripped_line:
                 continue
-
-            # 섹션 태그([verse] 등)는 그대로 유지합니다.
             if stripped_line.startswith('[') and stripped_line.endswith(']'):
                 processed_lines.append(stripped_line)
                 continue
-
-            chunks = lang_pattern.findall(stripped_line)
-            for chunk in chunks:
-                trimmed_chunk = chunk.strip()
-                if not trimmed_chunk:
-                    continue
-
-                # 한글 문자가 포함되지 않은 경우에만 [en] 태그를 붙입니다.
-                if not re.search(r'[가-힣]', trimmed_chunk):
-                    processed_lines.append(f"[en]{trimmed_chunk}")
-                else:
-                    # 한글 덩어리는 접두사 없이 그대로 추가합니다.
-                    processed_lines.append(trimmed_chunk)
-
+            new_line = stripped_line
+            for match in reversed(list(re.finditer(r'[^가-힣]+', stripped_line))):
+                chunk = match.group(0)
+                if re.search(r'[a-zA-Z]', chunk):
+                    start, end = match.span()
+                    content = chunk.strip()
+                    content_start_in_chunk = chunk.find(content)
+                    content_end_in_chunk = content_start_in_chunk + len(content)
+                    tagged_chunk = (
+                        chunk[:content_start_in_chunk] + '[en]' + content + chunk[content_end_in_chunk:]
+                    )
+                    new_line = new_line[:start] + tagged_chunk + new_line[end:]
+            processed_lines.append(new_line)
         lyrics_eff = "\n".join(processed_lines)
-    # ▲▲▲ 요청사항 반영 완료 ▲▲▲
 
     if not lyrics_eff:
         raise RuntimeError("project.json에 가사가 없습니다. 먼저 저장/생성해 주세요.")
 
-    # 길이(초) 그대로 사용
     if target_seconds is not None:
         seconds = int(max(1, target_seconds))
     else:
@@ -2810,14 +2796,13 @@ def generate_music_with_acestep(
     meta["target_seconds"] = int(seconds)
     meta["time"] = int(seconds)
 
-    # 1. comfyui api에 보내기 전, 실제 전송될 가사를 lyrics_lls_now에 저장
     meta["lyrics_lls_now"] = lyrics_eff
-
     save_json(pj, meta)
 
-    effective_tags = _collect_effective_tags(meta)
+    positive_tags = _collect_effective_tags(meta)
+    neg_prompt = (meta.get("prompt_neg") or "").strip()
+    negative_tags = [tag.strip() for tag in re.split(r'[,;\n]+', neg_prompt) if tag.strip()]
 
-    # ───────── 워크플로 로드/보정 ─────────
     g = _load_workflow_graph(ACE_STEP_PROMPT_JSON)
     base = _choose_host()
     _dlog("HOST", base, "| DESIRED_FMT wav")
@@ -2826,22 +2811,24 @@ def generate_music_with_acestep(
     save_prefix = f"{subfolder}/vocal_final"
     ext = _force_wav_save_for_this_graph(g, proj_dir=proj, filename_prefix=save_prefix)
 
-    # LLS/태그/초 주입
     for _nid, node_item in _find_nodes_by_class_names(g, ("LyricsLangSwitch",)):
-        inputs_map2 = node_item.setdefault("inputs", {})
-        inputs_map2["lyrics"] = lyrics_eff
-        inputs_map2["language"] = "Korean"  # 기본 언어는 한국어로 설정
-        inputs_map2.setdefault("threshold", 0.85)
-        inputs_map2["seconds"] = int(seconds)
+        inputs_map_lls = node_item.setdefault("inputs", {})
+        inputs_map_lls["lyrics"] = lyrics_eff
+        inputs_map_lls["language"] = "Korean"
+        inputs_map_lls.setdefault("threshold", 0.85)
+        inputs_map_lls["seconds"] = int(seconds)
 
     for _nid, node_item in _find_nodes_by_class_names(g, ("TextEncodeAceStepAudio",)):
-        inputs_map3 = node_item.setdefault("inputs", {})
-        inputs_map3["tags"] = ", ".join(effective_tags)
-        inputs_map3.setdefault("lyrics_strength", 1.0)
+        inputs_map_text = node_item.setdefault("inputs", {})
+        meta_title = (node_item.get("_meta", {}).get("title") or "").lower()
+        if "negative" in meta_title:
+            inputs_map_text["tags"] = ", ".join(negative_tags)
+        else:
+            inputs_map_text["tags"] = ", ".join(positive_tags)
+        inputs_map_text.setdefault("lyrics_strength", 1.0)
 
     targets = []
-    targets += _find_nodes_by_class_names(g, ("EmptyAceStepLatentAudio", "EmptyLatentAudio", "EmptyAudio",
-                                              "NoiseLatentAudio"))
+    targets.extend(_find_nodes_by_class_names(g, ("EmptyAceStepLatentAudio", "EmptyLatentAudio", "EmptyAudio", "NoiseLatentAudio")))
     if not targets:
         for nid, node_item in _find_nodes_by_class_contains(g, "audio"):
             if "latent" in str(node_item.get("class_type", "")).lower():
@@ -2849,15 +2836,13 @@ def generate_music_with_acestep(
     for _nid, node_item in targets:
         node_item.setdefault("inputs", {})["seconds"] = int(max(1, seconds))
 
-    # 랜덤 시드
     try:
         for nid, node_item in list(g.items()):
             if str(node_item.get("class_type", "")).lower() == "ksampler":
                 node_item.setdefault("inputs", {})["seed"] = _rand_seed()
-    except Exception:
+    except (KeyError, AttributeError):
         pass
 
-    # ───────── 제출 & 대기 ─────────
     notify("submitting", host=base)
     hist = _submit_and_wait(
         base, g,
@@ -2866,7 +2851,6 @@ def generate_music_with_acestep(
         on_progress=(on_progress or (lambda info: _dlog("PROG", info))),
     )
 
-    # ───────── 결과 다운로드 ─────────
     saved_files: List[Path] = []
     outputs = hist.get("outputs") if isinstance(hist, dict) else {}
     if isinstance(outputs, dict):
@@ -2887,11 +2871,9 @@ def generate_music_with_acestep(
                     if out_file:
                         saved_files.append(out_file)
 
-    # 최신 오디오를 vocal.wav로 통일 + (옵션)마스터링
     final_path: Optional[Path] = None
     if saved_files:
-        audio_candidates = [p for p in saved_files if
-                            p.suffix.lower() in (".wav", ".mp3", ".flac", ".ogg", ".opus", ".m4a")]
+        audio_candidates = [p for p in saved_files if p.suffix.lower() in (".wav", ".mp3", ".flac", ".ogg", ".opus", ".m4a")]
         src = max(audio_candidates or saved_files, key=lambda p: p.stat().st_mtime)
         ff = getattr(S, "FFMPEG_EXE", "ffmpeg")
         final_path = _ensure_vocal_wav(src, proj, ffmpeg_exe=ff)
@@ -2923,15 +2905,13 @@ def generate_music_with_acestep(
             except Exception as _e:
                 _dlog("MASTER-FAIL", type(_e).__name__, str(_e))
 
-    # 2. ComfyUI에서 실제 사용된 가사(lyric.txt)를 lyrics_lls_after에 저장
     if isinstance(outputs, dict):
         buf: List[str] = []
         for _nid, node_out in outputs.items():
             for key in ("text", "txt"):
                 val = node_out.get(key)
-                if isinstance(val, str):
-                    if val.strip():
-                        buf.append(val.strip())
+                if isinstance(val, str) and val.strip():
+                    buf.append(val.strip())
                 elif isinstance(val, list):
                     for s in val:
                         if isinstance(s, str) and s.strip():
@@ -2939,7 +2919,6 @@ def generate_music_with_acestep(
         if buf:
             meta["lyrics_lls_after"] = "\n".join(buf).strip()
 
-    # 경로 메타 업데이트만(부산물 X)
     if final_path:
         meta.setdefault("paths", {})["vocal"] = str(final_path)
         meta["audio"] = str(final_path)
@@ -2952,16 +2931,16 @@ def generate_music_with_acestep(
         "requested_ext": ext,
         "subfolder": f"shorts_make/{sanitize_title(title)}",
     })
-    meta["tags_effective"] = effective_tags
 
-    # 모든 변경사항을 마지막에 한번에 저장
+    meta["tags_effective"] = {"positive": positive_tags, "negative": negative_tags}
     save_json(pj, meta)
 
     msg = [
         "ACE-Step 완료 ✅",
         f"- 프롬프트: {ACE_STEP_PROMPT_JSON}",
         f"- 길이:     {seconds}s",
-        f"- 태그 수:  {len(effective_tags)}",
+        f"- 긍정 태그: {len(positive_tags)}",
+        f"- 부정 태그: {len(negative_tags)}",
     ]
     if final_path:
         msg.append(f"- 저장:     {final_path}")
