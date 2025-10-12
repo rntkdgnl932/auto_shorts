@@ -1828,7 +1828,6 @@ class MainWindow(QtWidgets.QMainWindow):
         # ★ 확인되지 않은 참조 수정: tail_file에 지역변수 comfy_log_file 사용
         run_job_with_progress_async(self, "누락 이미지 생성", job, tail_file=comfy_log_file, on_done=done)
 
-    # shorts_ui.py 파일에서 on_click_generate_music 함수를 찾아 아래 내용으로 전체를 교체하세요.
 
     def on_click_generate_music(self) -> None:
         """음악 생성 버튼 핸들러 — 중복 실행 가드 추가 및 부정적 프롬프트 저장."""
