@@ -3117,6 +3117,8 @@ def detect_onsets_percussive_librosa(wav_path: str) -> list[float]:
 #######################테스트중##################################
 ###################################################################
 
+# audio_sync.py 파일에서 이 함수를 찾아 아래 내용으로 전체를 교체하세요.
+
 def sync_lyrics_with_whisper_pro(
         audio_path: str,
         lyrics_text: str,
@@ -3126,14 +3128,13 @@ def sync_lyrics_with_whisper_pro(
         enable_demucs: bool = True
 ) -> dict:
     """
-    (최종 수정) 가장 안정적이었던 'align_words_to_lyrics_lines' 로직으로 복귀합니다.
-    - Whisper는 안정적인 원본 vocal.wav, large-v3 모델로 분석합니다.
-    - '시간 간격 기반 단두대 필터'로 유령 세그먼트와 단어를 제거하여 깨끗한 asr_words를 확보합니다.
-    - 기존의 안정적인 align_words_to_lyrics_lines 함수를 사용해 최종 6줄짜리 seg.json을 생성합니다.
+    (통합 개선) Whisper 분석부터 최종 가사 정제까지 한 번에 처리하는 통합 파이프라인.
+    - 1단계: 오디오를 분석하여 중간 결과물인 seg_ready.json을 생성합니다.
+    - 2단계: 별도의 헬퍼 함수(_create_final_segments_from_ready)를 호출하여
+             seg_ready 데이터와 원본 가사를 매칭시켜 최종 seg.json을 생성합니다.
     """
     from pathlib import Path
     import json
-    import difflib
 
     # --- 내부 유틸리티 ---
     def _round3_local(x_val: float) -> float:
@@ -3156,7 +3157,7 @@ def sync_lyrics_with_whisper_pro(
     src_path_obj = Path(audio_path)
     project_dir_obj = src_path_obj.parent
     project_json_path_obj = project_dir_obj / "project.json"
-    print(f"[SYNC-PRO] init: {src_path_obj}")
+    print(f"[SYNC-PRO] 통합 파이프라인 시작: {src_path_obj}")
 
     try:
         meta = json.loads(project_json_path_obj.read_text(encoding="utf-8")) if project_json_path_obj.exists() else {}
@@ -3167,28 +3168,22 @@ def sync_lyrics_with_whisper_pro(
     meta["lyrics_compare"] = clean_lyrics_lines
     try:
         project_json_path_obj.write_text(json.dumps(meta, ensure_ascii=False, indent=2), encoding="utf-8")
-        print(f"[SYNC-PRO] project.json updated (lyrics_compare lines={len(clean_lyrics_lines)})")
     except OSError:
         print("[WARN] failed to write project.json (lyrics_compare)")
 
     # --- 2. 오디오 분석 대상 확정 ---
     align_path_str = audio_path
-    print(f"[SYNC-PRO] 분석 대상 오디오(고정): {align_path_str}")
-
     if enable_demucs:
-        separate_vocals_demucs(str(src_path_obj))
+        vocal_path = separate_vocals_demucs(str(src_path_obj))
+        if vocal_path and Path(vocal_path).exists():
+            align_path_str = vocal_path
+    print(f"[SYNC-PRO] 분석 대상 오디오: {align_path_str}")
 
-    # --- 3. 음성 인식 ---
+    # --- 3. 음성 인식 (Whisper) ---
     try:
-        print(f"[SYNC-PRO] Whisper 분석 시작 (model={model_size}, temp=0.0)")
         transcribe_result = transcribe_words(
-            path=align_path_str,
-            model_size=model_size,
-            beam_size=5,
-            language="ko",
-            print_translate_view=True,
-            initial_prompt="",
-            temperature=0.0
+            path=align_path_str, model_size=model_size, beam_size=5, language="ko",
+            print_translate_view=True, initial_prompt="", temperature=0.0
         )
     except (RuntimeError, OSError, ValueError) as err_transcribe:
         print(f"[ERROR] transcribe_words failed: {err_transcribe}")
@@ -3197,209 +3192,137 @@ def sync_lyrics_with_whisper_pro(
     unfiltered_segments = list(transcribe_result.get("segments") or [])
     unfiltered_words = list(transcribe_result.get("words") or [])
 
-    # --- 4. '단두대 필터링'으로 유령 세그먼트 및 단어 제거 ---
+    # --- 4. '시간 간격 필터'로 유령 데이터 제거 ---
     final_filtered_segments = []
     cut_off_time = -1.0
     if unfiltered_segments:
-        print("\n--- [SYNC-FILTER] '시간 간격 기반 단두대 필터링' 시작 ---")
-        last_end_time = unfiltered_segments[0][1]
-        final_filtered_segments.append(list(unfiltered_segments[0]))
-
-        for i in range(1, len(unfiltered_segments)):
-            current_start_time = unfiltered_segments[i][0]
-            gap = current_start_time - last_end_time
-            print(
-                f"[SYNC-FILTER] > 검사 #{i + 1}: 이전 끝({last_end_time:.2f}s) ~ 현재 시작({current_start_time:.2f}s) -> 간격: {gap:.2f}s")
-
-            if gap >= 5.0:
-                print(f"[SYNC-FILTER] > 5초 이상 간격 감지. 이 지점({last_end_time:.2f}s) 이후를 모두 제거합니다.")
+        last_end_time = 0.0
+        for i, (start, end, text) in enumerate(unfiltered_segments):
+            if i > 0 and (start - last_end_time) >= 5.0:
+                print(f"[SYNC-FILTER] > 5초 이상 간격 감지({last_end_time:.2f}s). 이후 세그먼트 제거.")
                 cut_off_time = last_end_time
                 break
+            final_filtered_segments.append({"start": start, "end": end, "text": text})
+            last_end_time = end
 
-            final_filtered_segments.append(list(unfiltered_segments[i]))
-            last_end_time = unfiltered_segments[i][1]
+    clean_asr_words = [word for word in unfiltered_words if cut_off_time < 0 or word[0] < cut_off_time]
+    print(f"[SYNC-FILTER] 최종 유효 세그먼트: {len(final_filtered_segments)}개, 단어: {len(clean_asr_words)}개")
 
-    # 필터링된 단어 목록 생성
-    clean_asr_words = []
-    if cut_off_time > 0:
-        for word_start, word_end, word_text in unfiltered_words:
-            if word_start < cut_off_time:
-                clean_asr_words.append((word_start, word_end, word_text))
-    else:  # 필터링이 발생하지 않았으면 모든 단어 사용
-        clean_asr_words = unfiltered_words
-
-    print(f"[SYNC-FILTER] 최종 유효 세그먼트 수: {len(final_filtered_segments)} / {len(unfiltered_segments)}")
-    print(f"[SYNC-FILTER] 최종 유효 단어 수: {len(clean_asr_words)} / {len(unfiltered_words)}")
-
-    # --- 5. `seg_ready.json` 저장 (참고용) ---
-    seg_ready_payload = [{"start": _round3_local(s), "end": _round3_local(e), "text": t} for s, e, t in
-                         final_filtered_segments]
+    # --- 5. `seg_ready.json` 저장 (중간 결과) ---
     seg_ready_path_obj = project_dir_obj / "seg_ready.json"
     try:
-        seg_ready_path_obj.write_text(json.dumps(seg_ready_payload, ensure_ascii=False, indent=2), encoding="utf-8")
-        print(f"[SYNC-PRO] seg_ready.json saved: {seg_ready_path_obj} (lines={len(seg_ready_payload)})")
+        seg_ready_path_obj.write_text(json.dumps(final_filtered_segments, ensure_ascii=False, indent=2), encoding="utf-8")
+        print(f"[SYNC-PRO] seg_ready.json 저장됨: {seg_ready_path_obj}")
     except OSError:
         print("[WARN] failed to write seg_ready.json")
 
-    # --- 6. 최종 `seg.json` 생성 (안정적인 기존 로직으로 복귀) ---
-    print("\n--- [SYNC-PRO] align_words_to_lyrics_lines 함수로 최종 seg.json 생성 시작 ---")
-    aligned_lines = align_words_to_lyrics_lines(lyrics_text, clean_asr_words)
+    # --- 6. (핵심) 헬퍼 함수를 호출하여 최종 seg.json 생성 ---
+    final_segments_for_json = _create_final_segments_from_ready(final_filtered_segments, clean_lyrics_lines)
 
-    final_segments_for_json = []
-    for start_val, end_val, line_text in aligned_lines:
-        if start_val is not None and end_val is not None:
-            final_segments_for_json.append({
-                "start": _round3_local(start_val),
-                "end": _round3_local(end_val),
-                "text": line_text,
-                "line_ko": line_text
-            })
-
+    # 반올림 적용 및 저장
+    rounded_segments = [
+        {"start": _round3_local(s.get("start")), "end": _round3_local(s.get("end")), "text": s.get("text"), "line_ko": s.get("line_ko")}
+        for s in final_segments_for_json
+    ]
     seg_json_path_obj = project_dir_obj / "seg.json"
     try:
-        seg_json_path_obj.write_text(json.dumps(final_segments_for_json, ensure_ascii=False, indent=2),
-                                     encoding="utf-8")
-        print(f"[SYNC-PRO] seg.json saved: {seg_json_path_obj} (lines={len(final_segments_for_json)})")
+        seg_json_path_obj.write_text(json.dumps(rounded_segments, ensure_ascii=False, indent=2), encoding="utf-8")
+        print(f"[SYNC-PRO] 최종 seg.json 저장됨: {seg_json_path_obj} ({len(rounded_segments)}줄)")
     except OSError:
         print("[WARN] failed to write seg.json")
 
     # --- 7. `project.json`에 최종 시간 정보 동기화 ---
-    lyrics_start_final = final_segments_for_json[0]['start'] if final_segments_for_json else 0.0
-    lyrics_end_final = final_segments_for_json[-1]['end'] if final_segments_for_json else 0.0
-
-    meta["lyrics_start"] = lyrics_start_final
-    meta["lyrics_end"] = lyrics_end_final
-    try:
-        project_json_path_obj.write_text(json.dumps(meta, ensure_ascii=False, indent=2), encoding="utf-8")
-        print(f"[SYNC-PRO] project.json final times updated (start={lyrics_start_final}, end={lyrics_end_final})")
-    except OSError:
-        print("[WARN] failed to write final times to project.json")
+    if rounded_segments:
+        meta["lyrics_start"] = rounded_segments[0]['start']
+        meta["lyrics_end"] = rounded_segments[-1]['end']
+        try:
+            project_json_path_obj.write_text(json.dumps(meta, ensure_ascii=False, indent=2), encoding="utf-8")
+        except OSError:
+            print("[WARN] failed to write final times to project.json")
 
     # --- 8. UI 요약 정보 반환 ---
     duration_sec_val = _probe_duration_seconds(audio_path)
     summary_lines = [
         f"파일: {src_path_obj.name}",
         f"오디오 길이: {_round3_local(duration_sec_val)}s",
-        f"최종 유효 세그먼트: {len(final_segments_for_json)}개 (원본 가사 기준)",
-        "",
-        "=== 최종 줄별 정합 (seg.json) ==="
+        f"최종 유효 세그먼트: {len(rounded_segments)}개 (원본 가사 기준)",
+        "", "=== 최종 줄별 정합 (seg.json) ==="
     ]
-    if final_segments_for_json:
-        for i, seg in enumerate(final_segments_for_json, 1):
-            summary_lines.append(
-                f"[{i:02d}] {_round3_local(seg['start']):6.2f}~{_round3_local(seg['end']):6.2f}  {seg['text']}")
-    else:
-        summary_lines.append("(줄별 정합 결과 없음)")
+    summary_lines.extend(
+        [f"[{i:02d}] {s['start']:6.2f}~{s['end']:6.2f}  {s['text']}" for i, s in enumerate(rounded_segments, 1)]
+        if rounded_segments else ["(줄별 정합 결과 없음)"]
+    )
 
     return {
         "summary_text": "\n".join(summary_lines),
-        "segments": final_segments_for_json,
+        "segments": rounded_segments,
         "words": clean_asr_words,
         "duration_sec": duration_sec_val,
-        "start_at": lyrics_start_final
+        "start_at": meta.get("lyrics_start", 0.0)
     }
 
 
-# audio_sync.py 파일에서 이 함수를 찾아 아래 내용으로 전체를 교체하세요.
+# audio_sync.py 파일의 sync_lyrics_with_whisper_pro 함수 바로 위에 이 코드를 추가하세요.
 
-def _create_final_segments_from_ready(seg_ready_payload: list, clean_lyrics_lines: list) -> list:
+def _create_final_segments_from_ready(
+        seg_ready_payload: list,
+        clean_lyrics_lines: list
+) -> list:
     """
-    (개선) seg_ready.json 데이터를 기반으로, 원본 가사와의 유사도 매칭을 통해 최종 seg.json 데이터를 생성합니다.
-    - AI가 생성한 반복적인 구절(코러스 등)에 대응하기 위해, 고정된 커서 대신 '슬라이딩 윈도우' 방식으로 탐색하여
-      가장 적합한 원본 가사 라인을 유연하게 찾아 치환합니다.
-    - 시간 정보는 seg_ready.json의 것을 그대로 사용하며, 텍스트만 원본 가사로 교체합니다.
+    (헬퍼) seg_ready 데이터를 기반으로, 슬라이딩 윈도우 매칭을 통해 최종 seg.json 데이터를 생성합니다.
+    - AI가 생성한 반복 구절(코러스)에 대응하기 위해, 마지막 매칭 위치 주변을 유연하게 탐색합니다.
+    - 시간 정보는 seg_ready의 것을 그대로 사용하며, 텍스트만 원본 가사로 교체합니다.
     """
     import difflib
 
-    # --- 내부 헬퍼 함수: 문자열 유사도 계산 ---
     def _sim_local(str_a: str, str_b: str) -> float:
-        # 공백, 구두점 등을 정규화하여 비교 정확도 향상
         norm_a = " ".join((str_a or "").lower().replace(",", "").split())
         norm_b = " ".join((str_b or "").lower().replace(",", "").split())
-        # SequenceMatcher는 간단하면서도 준수한 성능을 보임
         return difflib.SequenceMatcher(None, norm_a, norm_b).ratio()
 
-    final_segments_for_json = []
+    final_segments = []
     if not seg_ready_payload or not clean_lyrics_lines:
         return []
 
-    # --- 슬라이딩 윈도우 로직 ---
-    last_matched_lyric_index = -1  # 마지막으로 매칭된 원본 가사의 인덱스
+    last_matched_lyric_index = -1
+    print("\n--- [HELPER] 슬라이딩 윈도우 매칭으로 최종 seg.json 생성 시작 ---")
 
-    print("\n--- [HELPER] seg.json 생성 시작 (개선된 슬라이딩 윈도우 방식) ---")
-    print(f"입력: seg_ready {len(seg_ready_payload)}줄, 원본 가사 {len(clean_lyrics_lines)}줄")
+    for i, asr_item in enumerate(seg_ready_payload):
+        asr_text = asr_item.get("text", "")
+        best_match_line, best_sim_score, best_match_index = "", 0.35, -1
 
-    for i, seg_ready_item in enumerate(seg_ready_payload):
-        asr_text = seg_ready_item.get("text", "")
-        if not asr_text:
-            continue
+        # 탐색 범위 설정 (뒤로 3칸, 앞으로 7칸)
+        search_start = max(0, last_matched_lyric_index - 3)
+        search_end = min(len(clean_lyrics_lines), last_matched_lyric_index + 7)
 
-        print(f"\n[HELPER] 처리 중인 ASR 세그먼트 #{i + 1}: \"{asr_text}\"")
-
-        best_match_line = ""
-        best_sim_score = 0.3  # 최소 유사도 임계값 (이 점수 미만은 매칭하지 않음)
-        best_match_index = -1
-
-        # <<< 핵심 개선: 탐색 범위를 유연하게 설정 >>>
-        # 일반적으로는 순차 진행되므로, 마지막 매칭 위치 주변을 집중적으로 탐색
-        # 반복 구절을 위해 약간 뒤로 돌아갈 수 있는 여유(look_behind)를 둠
-        look_behind = 2
-        look_ahead = 5
-
-        search_start_index = max(0, last_matched_lyric_index - look_behind)
-        search_end_index = min(len(clean_lyrics_lines), last_matched_lyric_index + look_ahead)
-
-        # 만약 탐색 범위가 너무 좁으면 전체 범위로 확장
-        if search_end_index - search_start_index < 1:
-            search_start_index = 0
-            search_end_index = len(clean_lyrics_lines)
-
-        print(f"[HELPER] > 원본 가사 탐색 범위: {search_start_index + 1}번 ~ {search_end_index}번 줄")
-
-        # 정의된 탐색 범위 내에서 가장 비슷한 가사 검색
-        for lyric_idx in range(search_start_index, search_end_index):
-            lyric_line = clean_lyrics_lines[lyric_idx]
-            sim_score = _sim_local(asr_text, lyric_line)
-
+        # 1차 탐색: 제한된 범위
+        for lyric_idx in range(search_start, search_end):
+            sim_score = _sim_local(asr_text, clean_lyrics_lines[lyric_idx])
             if sim_score > best_sim_score:
-                best_sim_score = sim_score
-                best_match_line = lyric_line
-                best_match_index = lyric_idx
+                best_sim_score, best_match_line, best_match_index = sim_score, clean_lyrics_lines[lyric_idx], lyric_idx
 
-        # 만약 제한된 범위에서 좋은 매칭을 못 찾았다면, 전체 가사에서 다시 한번 탐색
+        # 2차 탐색: 실패 시 전체 범위
         if best_match_index == -1:
             for lyric_idx, lyric_line in enumerate(clean_lyrics_lines):
                 sim_score = _sim_local(asr_text, lyric_line)
                 if sim_score > best_sim_score:
-                    best_sim_score = sim_score
-                    best_match_line = lyric_line
-                    best_match_index = lyric_idx
+                    best_sim_score, best_match_line, best_match_index = sim_score, lyric_line, lyric_idx
 
-        # 최종 매칭 결과 처리
+        # 결과 저장
+        text_to_save = best_match_line if best_match_index != -1 else asr_text
+        final_segments.append({
+            "start": asr_item.get("start", 0.0),
+            "end": asr_item.get("end", 0.0),
+            "text": text_to_save,
+            "line_ko": text_to_save
+        })
         if best_match_index != -1:
-            print(f"[HELPER] > 최종 매칭: (점수 {best_sim_score:.2f}) -> 원본 {best_match_index + 1}번 줄 \"{best_match_line}\"")
-            # 최종 결과 리스트에 추가 (시간은 ASR 기준, 텍스트는 원본 가사)
-            final_segments_for_json.append({
-                "start": seg_ready_item.get("start"),
-                "end": seg_ready_item.get("end"),
-                "text": best_match_line,
-                "line_ko": best_match_line  # 하위 호환성을 위해 추가
-            })
-            # 다음 탐색을 위해 마지막 매칭 위치 업데이트
             last_matched_lyric_index = best_match_index
+            print(f"[HELPER] ASR #{i + 1} -> 가사 #{best_match_index + 1} 매칭 (점수: {best_sim_score:.2f})")
         else:
-            # 임계값을 넘는 매칭을 못 찾은 경우
-            print(f"[HELPER] > 최종 매칭: 유사도 임계값({best_sim_score:.2f})을 넘는 가사 없음")
-            # 이런 경우, ASR 텍스트를 그대로 사용하거나 비워둘 수 있음 (여기서는 비워두는 대신 원본 유지)
-            final_segments_for_json.append({
-                "start": seg_ready_item.get("start"),
-                "end": seg_ready_item.get("end"),
-                "text": asr_text,  # 매칭 실패 시 원본 ASR 텍스트 사용
-                "line_ko": asr_text
-            })
+            print(f"[HELPER] ASR #{i + 1} -> 매칭 실패, 원본 텍스트 사용")
 
-    print("\n--- [HELPER] seg.json 생성 완료 ---")
-    return final_segments_for_json
+    return final_segments
 
 ###################################################################
 ###################################################################
