@@ -3262,65 +3262,119 @@ def sync_lyrics_with_whisper_pro(
     }
 
 
-# audio_sync.py 파일의 sync_lyrics_with_whisper_pro 함수 바로 위에 이 코드를 추가하세요.
+# audio_sync.py 파일에서 이 헬퍼 함수를 찾아 아래 내용으로 전체를 교체하세요.
 
 def _create_final_segments_from_ready(
         seg_ready_payload: list,
         clean_lyrics_lines: list
 ) -> list:
     """
-    (헬퍼) seg_ready 데이터를 기반으로, 슬라이딩 윈도우 매칭을 통해 최종 seg.json 데이터를 생성합니다.
-    - AI가 생성한 반복 구절(코러스)에 대응하기 위해, 마지막 매칭 위치 주변을 유연하게 탐색합니다.
-    - 시간 정보는 seg_ready의 것을 그대로 사용하며, 텍스트만 원본 가사로 교체합니다.
+    (최종 개선) 4단계 교정 규칙을 적용하여 seg_ready 데이터의 단어를 지능적으로 교정합니다.
+    - 구조와 애드립은 보존하면서, 발음이 유사한 틀린 단어만 원본 가사를 참조하여 수정합니다.
     """
     import difflib
+    import re
+    from collections import defaultdict
 
-    def _sim_local(str_a: str, str_b: str) -> float:
-        norm_a = " ".join((str_a or "").lower().replace(",", "").split())
-        norm_b = " ".join((str_b or "").lower().replace(",", "").split())
-        return difflib.SequenceMatcher(None, norm_a, norm_b).ratio()
+    # --- 1단계: 교정 규칙에 필요한 헬퍼 함수 및 데이터 구조 준비 ---
+
+    # 한글 자모 분해를 위한 상수
+    CHOSUNG = [
+        'ㄱ', 'ㄲ', 'ㄴ', 'ㄷ', 'ㄸ', 'ㄹ', 'ㅁ', 'ㅂ', 'ㅃ', 'ㅅ', 'ㅆ', 'ㅇ', 'ㅈ', 'ㅉ', 'ㅊ', 'ㅋ', 'ㅌ', 'ㅍ', 'ㅎ'
+    ]
+    JUNGSUNG = [
+        'ㅏ', 'ㅐ', 'ㅑ', 'ㅒ', 'ㅓ', 'ㅔ', 'ㅕ', 'ㅖ', 'ㅗ', 'ㅘ', 'ㅙ', 'ㅚ', 'ㅛ', 'ㅜ', 'ㅝ', 'ㅞ', 'ㅟ', 'ㅠ', 'ㅡ', 'ㅢ', 'ㅣ'
+    ]
+    JONGSUNG = [
+        '', 'ㄱ', 'ㄲ', 'ㄳ', 'ㄴ', 'ㄵ', 'ㄶ', 'ㄷ', 'ㄹ', 'ㄺ', 'ㄻ', 'ㄼ', 'ㄽ', 'ㄾ', 'ㄿ', 'ㅀ', 'ㅁ', 'ㅂ', 'ㅄ', 'ㅅ', 'ㅆ', 'ㅇ',
+        'ㅈ', 'ㅊ', 'ㅋ', 'ㅌ', 'ㅍ', 'ㅎ'
+    ]
+
+    def decompose_char(char: str) -> str:
+        """한글 한 글자를 자음과 모음으로 분해합니다."""
+        if '가' <= char <= '힣':
+            char_code = ord(char) - ord('가')
+            cho = char_code // 588
+            jung = (char_code - (cho * 588)) // 28
+            jong = char_code % 28
+            return CHOSUNG[cho] + JUNGSUNG[jung] + JONGSUNG[jong]
+        return char
+
+    def decompose_word(word: str) -> str:
+        """단어를 자모 분해하여 발음 유사도 비교에 사용합니다."""
+        # 영어, 숫자 등 비한글은 소문자로 통일
+        return "".join(decompose_char(c) for c in word.lower())
+
+    if not seg_ready_payload or not clean_lyrics_lines:
+        return seg_ready_payload
+
+    # '정답 단어 사전' 및 발음(자모 분해) 버전 사전 생성
+    correct_words_set = set()
+    decomposed_word_map = {}
+    for line in clean_lyrics_lines:
+        words = re.findall(r"[\w'-]+", line)
+        for word in words:
+            correct_words_set.add(word)
+            decomposed_word_map[word] = decompose_word(word)
+
+    # --- 2단계: 교정 작업 수행 ---
 
     final_segments = []
-    if not seg_ready_payload or not clean_lyrics_lines:
-        return []
+    print("\n--- [HELPER] '4단계 지능형 교정'으로 최종 seg.json 생성 시작 ---")
 
-    last_matched_lyric_index = -1
-    print("\n--- [HELPER] 슬라이딩 윈도우 매칭으로 최종 seg.json 생성 시작 ---")
-
-    for i, asr_item in enumerate(seg_ready_payload):
+    for asr_item in seg_ready_payload:
         asr_text = asr_item.get("text", "")
-        best_match_line, best_sim_score, best_match_index = "", 0.35, -1
+        if not asr_text:
+            final_segments.append(asr_item)
+            continue
 
-        # 탐색 범위 설정 (뒤로 3칸, 앞으로 7칸)
-        search_start = max(0, last_matched_lyric_index - 3)
-        search_end = min(len(clean_lyrics_lines), last_matched_lyric_index + 7)
+        asr_words = re.findall(r"[\w'-]+", asr_text)
+        corrected_words = []
 
-        # 1차 탐색: 제한된 범위
-        for lyric_idx in range(search_start, search_end):
-            sim_score = _sim_local(asr_text, clean_lyrics_lines[lyric_idx])
-            if sim_score > best_sim_score:
-                best_sim_score, best_match_line, best_match_index = sim_score, clean_lyrics_lines[lyric_idx], lyric_idx
+        for asr_word in asr_words:
+            # 규칙 1: 단어가 정답 사전에 그대로 있는가? (대소문자 무시)
+            if any(asr_word.lower() == cw.lower() for cw in correct_words_set):
+                corrected_words.append(asr_word)
+                continue
 
-        # 2차 탐색: 실패 시 전체 범위
-        if best_match_index == -1:
-            for lyric_idx, lyric_line in enumerate(clean_lyrics_lines):
-                sim_score = _sim_local(asr_text, lyric_line)
-                if sim_score > best_sim_score:
-                    best_sim_score, best_match_line, best_match_index = sim_score, lyric_line, lyric_idx
+            # 규칙 2: 단어가 정답 단어의 일부인가? (예: '실은' in '현실은')
+            is_substring = False
+            for cw in correct_words_set:
+                if asr_word in cw:
+                    is_substring = True
+                    break
+            if is_substring:
+                corrected_words.append(asr_word)
+                continue
 
-        # 결과 저장
-        text_to_save = best_match_line if best_match_index != -1 else asr_text
+            # 규칙 3: 발음 기반 유사어 교정
+            decomposed_asr = decompose_word(asr_word)
+            best_match_word = None
+            highest_sim = 0.6  # 최소 유사도 임계값
+
+            for correct_word, decomposed_correct in decomposed_word_map.items():
+                matcher = difflib.SequenceMatcher(None, decomposed_asr, decomposed_correct)
+                sim = matcher.ratio()
+                if sim > highest_sim:
+                    highest_sim = sim
+                    best_match_word = correct_word
+
+            if best_match_word:
+                # 가장 유사한 단어로 교체
+                corrected_words.append(best_match_word)
+                print(f"[HELPER] 교정: '{asr_word}' -> '{best_match_word}' (발음 유사도: {highest_sim:.2f})")
+            else:
+                # 규칙 4: 모든 규칙에 해당 없으면 애드립으로 간주하고 원본 유지
+                corrected_words.append(asr_word)
+
+        corrected_text = " ".join(corrected_words)
+
         final_segments.append({
-            "start": asr_item.get("start", 0.0),
-            "end": asr_item.get("end", 0.0),
-            "text": text_to_save,
-            "line_ko": text_to_save
+            "start": asr_item.get("start"),
+            "end": asr_item.get("end"),
+            "text": corrected_text,
+            "line_ko": corrected_text
         })
-        if best_match_index != -1:
-            last_matched_lyric_index = best_match_index
-            print(f"[HELPER] ASR #{i + 1} -> 가사 #{best_match_index + 1} 매칭 (점수: {best_sim_score:.2f})")
-        else:
-            print(f"[HELPER] ASR #{i + 1} -> 매칭 실패, 원본 텍스트 사용")
 
     return final_segments
 
