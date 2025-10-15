@@ -3262,6 +3262,13 @@ def sync_lyrics_with_whisper_pro(
     }
 
 
+
+# 한글 자모 분해를 위한 전역 상수
+CHOSUNG = ['ㄱ', 'ㄲ', 'ㄴ', 'ㄷ', 'ㄸ', 'ㄹ', 'ㅁ', 'ㅂ', 'ㅃ', 'ㅅ', 'ㅆ', 'ㅇ', 'ㅈ', 'ㅉ', 'ㅊ', 'ㅋ', 'ㅌ', 'ㅍ', 'ㅎ']
+JUNGSUNG = ['ㅏ', 'ㅐ', 'ㅑ', 'ㅒ', 'ㅓ', 'ㅔ', 'ㅕ', 'ㅖ', 'ㅗ', 'ㅘ', 'ㅙ', 'ㅚ', 'ㅛ', 'ㅜ', 'ㅝ', 'ㅞ', 'ㅟ', 'ㅠ', 'ㅡ', 'ㅢ', 'ㅣ']
+JONGSUNG = ['', 'ㄱ', 'ㄲ', 'ㄳ', 'ㄴ', 'ㄵ', 'ㄶ', 'ㄷ', 'ㄹ', 'ㄺ', 'ㄻ', 'ㄼ', 'ㄽ', 'ㄾ', 'ㄿ', 'ㅀ', 'ㅁ', 'ㅂ', 'ㅄ', 'ㅅ', 'ㅆ', 'ㅇ', 'ㅈ', 'ㅊ', 'ㅋ', 'ㅌ', 'ㅍ', 'ㅎ']
+
+
 # audio_sync.py 파일에서 이 헬퍼 함수를 찾아 아래 내용으로 전체를 교체하세요.
 
 def _create_final_segments_from_ready(
@@ -3269,58 +3276,64 @@ def _create_final_segments_from_ready(
         clean_lyrics_lines: list
 ) -> list:
     """
-    (최종 개선) 4단계 교정 규칙을 적용하여 seg_ready 데이터의 단어를 지능적으로 교정합니다.
-    - 구조와 애드립은 보존하면서, 발음이 유사한 틀린 단어만 원본 가사를 참조하여 수정합니다.
+    (최종 개선) '문맥 우선' 교정 방식으로, 모든 경고를 해결하고 안정성을 확보합니다.
     """
     import difflib
     import re
-    from collections import defaultdict
 
-    # --- 1단계: 교정 규칙에 필요한 헬퍼 함수 및 데이터 구조 준비 ---
+    # --- 1단계: 교정 규칙에 필요한 헬퍼 함수 및 라이브러리 준비 ---
 
-    # 한글 자모 분해를 위한 상수
-    CHOSUNG = [
-        'ㄱ', 'ㄲ', 'ㄴ', 'ㄷ', 'ㄸ', 'ㄹ', 'ㅁ', 'ㅂ', 'ㅃ', 'ㅅ', 'ㅆ', 'ㅇ', 'ㅈ', 'ㅉ', 'ㅊ', 'ㅋ', 'ㅌ', 'ㅍ', 'ㅎ'
-    ]
-    JUNGSUNG = [
-        'ㅏ', 'ㅐ', 'ㅑ', 'ㅒ', 'ㅓ', 'ㅔ', 'ㅕ', 'ㅖ', 'ㅗ', 'ㅘ', 'ㅙ', 'ㅚ', 'ㅛ', 'ㅜ', 'ㅝ', 'ㅞ', 'ㅟ', 'ㅠ', 'ㅡ', 'ㅢ', 'ㅣ'
-    ]
-    JONGSUNG = [
-        '', 'ㄱ', 'ㄲ', 'ㄳ', 'ㄴ', 'ㄵ', 'ㄶ', 'ㄷ', 'ㄹ', 'ㄺ', 'ㄻ', 'ㄼ', 'ㄽ', 'ㄾ', 'ㄿ', 'ㅀ', 'ㅁ', 'ㅂ', 'ㅄ', 'ㅅ', 'ㅆ', 'ㅇ',
-        'ㅈ', 'ㅊ', 'ㅋ', 'ㅌ', 'ㅍ', 'ㅎ'
-    ]
+    # ⚠️ 경고 해결: 변수를 try 구문 이전에 None으로 초기화합니다.
+    kroman = None
+    jellyfish = None
+    kroman_available = False
+    jellyfish_available = False
+
+    try:
+        import kroman
+        kroman_available = True
+    except ImportError:
+        print("[HELPER_WARN] 'kroman'이 없어 영어 발음 비교 정확도가 저하됩니다. (pip install kroman)")
+
+    try:
+        import jellyfish
+        jellyfish_available = True
+    except ImportError:
+        print("[HELPER_WARN] 'jellyfish'가 없어 영어 발음 비교 정확도가 저하됩니다. (pip install jellyfish)")
+
+    # ⚠️ 경고 해결: 함수 내 상수를 소문자로 변경합니다.
+    chosung = ['ㄱ', 'ㄲ', 'ㄴ', 'ㄷ', 'ㄸ', 'ㄹ', 'ㅁ', 'ㅂ', 'ㅃ', 'ㅅ', 'ㅆ', 'ㅇ', 'ㅈ', 'ㅉ', 'ㅊ', 'ㅋ', 'ㅌ', 'ㅍ', 'ㅎ']
+    jungsung = ['ㅏ', 'ㅐ', 'ㅑ', 'ㅒ', 'ㅓ', 'ㅔ', 'ㅕ', 'ㅖ', 'ㅗ', 'ㅘ', 'ㅙ', 'ㅚ', 'ㅛ', 'ㅜ', 'ㅝ', 'ㅞ', 'ㅟ', 'ㅠ', 'ㅡ', 'ㅢ', 'ㅣ']
+    jongsung = ['', 'ㄱ', 'ㄲ', 'ㄳ', 'ㄴ', 'ㄵ', 'ㄶ', 'ㄷ', 'ㄹ', 'ㄺ', 'ㄻ', 'ㄼ', 'ㄽ', 'ㄾ', 'ㄿ', 'ㅀ', 'ㅁ', 'ㅂ', 'ㅄ', 'ㅅ', 'ㅆ',
+                'ㅇ', 'ㅈ', 'ㅊ', 'ㅋ', 'ㅌ', 'ㅍ', 'ㅎ']
 
     def decompose_char(char: str) -> str:
-        """한글 한 글자를 자음과 모음으로 분해합니다."""
         if '가' <= char <= '힣':
             char_code = ord(char) - ord('가')
-            cho = char_code // 588
-            jung = (char_code - (cho * 588)) // 28
-            jong = char_code % 28
-            return CHOSUNG[cho] + JUNGSUNG[jung] + JONGSUNG[jong]
+            cho_idx = char_code // 588
+            jung_idx = (char_code - (cho_idx * 588)) // 28
+            jong_idx = char_code % 28
+            return chosung[cho_idx] + jungsung[jung_idx] + jongsung[jong_idx]
         return char
 
     def decompose_word(word: str) -> str:
-        """단어를 자모 분해하여 발음 유사도 비교에 사용합니다."""
-        # 영어, 숫자 등 비한글은 소문자로 통일
         return "".join(decompose_char(c) for c in word.lower())
+
+    def is_korean(word: str) -> bool:
+        return bool(re.search("[ㄱ-힣]", word))
+
+    def is_english(word: str) -> bool:
+        return bool(re.match(r'^[a-zA-Z\']+$', word))
+
+    def _norm_for_compare(s: str) -> str:
+        return re.sub(r'[\s.,\'"!?]', '', (s or "").lower())
 
     if not seg_ready_payload or not clean_lyrics_lines:
         return seg_ready_payload
 
-    # '정답 단어 사전' 및 발음(자모 분해) 버전 사전 생성
-    correct_words_set = set()
-    decomposed_word_map = {}
-    for line in clean_lyrics_lines:
-        words = re.findall(r"[\w'-]+", line)
-        for word in words:
-            correct_words_set.add(word)
-            decomposed_word_map[word] = decompose_word(word)
-
     # --- 2단계: 교정 작업 수행 ---
-
     final_segments = []
-    print("\n--- [HELPER] '4단계 지능형 교정'으로 최종 seg.json 생성 시작 ---")
+    print("\n--- [HELPER] '문맥 우선 단어 교정'으로 최종 seg.json 생성 시작 ---")
 
     for asr_item in seg_ready_payload:
         asr_text = asr_item.get("text", "")
@@ -3328,46 +3341,70 @@ def _create_final_segments_from_ready(
             final_segments.append(asr_item)
             continue
 
-        asr_words = re.findall(r"[\w'-]+", asr_text)
-        corrected_words = []
+        print(f"\n[HELPER_DEBUG] 교정 대상: \"{asr_text}\"")
 
-        for asr_word in asr_words:
-            # 규칙 1: 단어가 정답 사전에 그대로 있는가? (대소문자 무시)
-            if any(asr_word.lower() == cw.lower() for cw in correct_words_set):
-                corrected_words.append(asr_word)
-                continue
+        # 1. 문맥 찾기: ASR 라인과 가장 유사한 원본 가사 라인('정답지') 탐색
+        best_lyric_line = ""
+        highest_line_sim = 0.3
+        norm_asr_text = _norm_for_compare(asr_text)
 
-            # 규칙 2: 단어가 정답 단어의 일부인가? (예: '실은' in '현실은')
-            is_substring = False
-            for cw in correct_words_set:
-                if asr_word in cw:
-                    is_substring = True
-                    break
-            if is_substring:
-                corrected_words.append(asr_word)
-                continue
+        for lyric_line in clean_lyrics_lines:
+            sim = difflib.SequenceMatcher(None, norm_asr_text, _norm_for_compare(lyric_line)).ratio()
+            if sim > highest_line_sim:
+                highest_line_sim = sim
+                best_lyric_line = lyric_line
 
-            # 규칙 3: 발음 기반 유사어 교정
-            decomposed_asr = decompose_word(asr_word)
-            best_match_word = None
-            highest_sim = 0.6  # 최소 유사도 임계값
+        corrected_text = asr_text
 
-            for correct_word, decomposed_correct in decomposed_word_map.items():
-                matcher = difflib.SequenceMatcher(None, decomposed_asr, decomposed_correct)
-                sim = matcher.ratio()
-                if sim > highest_sim:
-                    highest_sim = sim
-                    best_match_word = correct_word
+        # 2. 문맥 안에서 단어 교정: '정답지'를 찾았을 경우에만 실행
+        if best_lyric_line:
+            print(f"[HELPER_DEBUG] -> 가장 유사한 문맥(정답지): \"{best_lyric_line}\" (유사도: {highest_line_sim:.2f})")
 
-            if best_match_word:
-                # 가장 유사한 단어로 교체
-                corrected_words.append(best_match_word)
-                print(f"[HELPER] 교정: '{asr_word}' -> '{best_match_word}' (발음 유사도: {highest_sim:.2f})")
-            else:
-                # 규칙 4: 모든 규칙에 해당 없으면 애드립으로 간주하고 원본 유지
-                corrected_words.append(asr_word)
+            asr_words = re.findall(r"[\w'-]+", asr_text)
+            lyric_words = re.findall(r"[\w'-]+", best_lyric_line)
+            temp_corrected_words = []
 
-        corrected_text = " ".join(corrected_words)
+            for asr_word in asr_words:
+                best_match_word = None
+                highest_word_sim = 0.60
+                correction_method = "None"
+
+                # 2.1 한글 단어 비교
+                decomposed_asr = decompose_word(asr_word)
+                for lyric_word in lyric_words:
+                    if is_korean(lyric_word):
+                        decomposed_lyric = decompose_word(lyric_word)
+                        sim = difflib.SequenceMatcher(None, decomposed_asr, decomposed_lyric).ratio()
+                        if sim > highest_word_sim:
+                            highest_word_sim = sim
+                            best_match_word = lyric_word
+                            correction_method = "Korean Jamo"
+
+                # 2.2 영어 단어 비교
+                if kroman_available and kroman is not None and is_korean(asr_word):
+                    try:
+                        romanized_asr = kroman.parse(asr_word)
+                        for lyric_word in lyric_words:
+                            if is_english(lyric_word):
+                                sim_jaro = jellyfish.jaro_winkler_similarity(romanized_asr,
+                                                                             lyric_word) if jellyfish_available and jellyfish is not None else 0.0
+                                if sim_jaro > highest_word_sim:
+                                    highest_word_sim = sim_jaro
+                                    best_match_word = lyric_word
+                                    correction_method = f"English Romanization (jaro={sim_jaro:.2f})"
+                    except Exception:
+                        pass
+
+                if best_match_word:
+                    temp_corrected_words.append(best_match_word)
+                    print(
+                        f"✅ [HELPER]   '{asr_word}' -> '{best_match_word}' (방식: {correction_method}, 점수: {highest_word_sim:.2f})")
+                else:
+                    temp_corrected_words.append(asr_word)
+
+            corrected_text = " ".join(temp_corrected_words)
+        else:
+            print(f"❌ [HELPER] 교정 포기: \"{asr_text}\" (유사한 문맥 없음)")
 
         final_segments.append({
             "start": asr_item.get("start"),
