@@ -2688,8 +2688,6 @@ def _ensure_vocal_wav(src_path: Path, proj_dir: Path, ffmpeg_exe: str = "ffmpeg"
     return out_wav
 
 
-# audio_sync.py 파일에서 generate_music_with_acestep 함수를 찾아 아래 내용으로 전체를 교체하세요.
-
 def generate_music_with_acestep(
         project_dir: str,
         *,
@@ -2954,6 +2952,13 @@ def generate_music_with_acestep(
 
 
 
+
+
+
+
+
+
+
 ######################분석 보완############################################
 def preprocess_for_analysis(src: str) -> str:
     """
@@ -3116,6 +3121,9 @@ def detect_onsets_percussive_librosa(wav_path: str) -> list[float]:
 ###################################################################
 #######################테스트중##################################
 ###################################################################
+
+
+# audio_sync.py 파일에서 이 함수를 찾아 아래 내용으로 전체를 교체하세요.
 
 # audio_sync.py 파일에서 이 함수를 찾아 아래 내용으로 전체를 교체하세요.
 
@@ -3281,11 +3289,13 @@ def _create_final_segments_from_ready(
     import difflib
     import re
 
+
+
     # --- 1단계: 교정 규칙에 필요한 헬퍼 함수 및 라이브러리 준비 ---
 
     # ⚠️ 경고 해결: 변수를 try 구문 이전에 None으로 초기화합니다.
-    kroman = None
-    jellyfish = None
+    # kroman = None
+    # jellyfish = None
     kroman_available = False
     jellyfish_available = False
 
@@ -3293,12 +3303,14 @@ def _create_final_segments_from_ready(
         import kroman
         kroman_available = True
     except ImportError:
+        import kroman
         print("[HELPER_WARN] 'kroman'이 없어 영어 발음 비교 정확도가 저하됩니다. (pip install kroman)")
 
     try:
         import jellyfish
         jellyfish_available = True
     except ImportError:
+        import jellyfish
         print("[HELPER_WARN] 'jellyfish'가 없어 영어 발음 비교 정확도가 저하됩니다. (pip install jellyfish)")
 
     # ⚠️ 경고 해결: 함수 내 상수를 소문자로 변경합니다.

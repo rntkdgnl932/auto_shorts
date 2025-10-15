@@ -14,21 +14,7 @@
     },
     "class_type": "TextEncodeAceStepAudio",
     "_meta": {
-      "title": "Positive Text Encode"
-    }
-  },
-  "15": {
-    "inputs": {
-      "tags": "chorus, hook, refrain, background vocals, choir, repeating melody, 후렴",
-      "lyrics_strength": 1.0,
-      "clip": [
-        "40",
-        1
-      ]
-    },
-    "class_type": "TextEncodeAceStepAudio",
-    "_meta": {
-      "title": "Negative Text Encode"
+      "title": "TextEncodeAceStepAudio"
     }
   },
   "17": {
@@ -64,6 +50,18 @@
     "class_type": "CheckpointLoaderSimple",
     "_meta": {
       "title": "체크포인트 로드"
+    }
+  },
+  "44": {
+    "inputs": {
+      "conditioning": [
+        "14",
+        0
+      ]
+    },
+    "class_type": "ConditioningZeroOut",
+    "_meta": {
+      "title": "조건 (0으로 출력)"
     }
   },
   "49": {
@@ -121,7 +119,7 @@
         0
       ],
       "negative": [
-        "15",
+        "44",
         0
       ],
       "latent_image": [
