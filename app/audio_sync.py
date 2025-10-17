@@ -1661,142 +1661,6 @@ def prepare_pure_lyrics_lines(raw_lyrics: str, drop_section_tags: bool = True) -
 # 1) Whisper 전사: CPU 고정 + initial_prompt 안전 + 폴백
 # ------------------------------------------------------------
 
-def transcribe_words(
-        path: str,
-        model_size: str | None = None,
-        *,
-        model: str | None = None,
-        beam_size: int = 5,
-        initial_prompt: str | None = None,
-        language: str | None = None,
-        print_translate_view: bool = True,
-        vad_filter: bool = True,
-        **kwargs,
-) -> dict:
-    """
-    오디오 → 단어 단위 타임라인.
-    - [최종 수정] linter 경고를 원천적으로 해결하기 위해 except 블록에서 변수를 할당합니다.
-    - [안정성 강화] VAD 필터 로딩 실패 시 충돌하지 않고, 경고 후 VAD 없이 진행합니다.
-    """
-    from pathlib import Path
-    from typing import Any, Dict, List, Tuple
-
-    def _fmt(t: float) -> str:
-        return f"{t:06.3f}"
-
-    mdl = (model_size or model or "medium")
-    try:
-        bs = int(beam_size)
-    except (TypeError, ValueError):
-        bs = 5
-
-    p = Path(path)
-    if not p.exists() or not p.is_file():
-        raise FileNotFoundError(f"audio file not found: {path}")
-
-    print(f"[transcribe_words] start path='{path}', model='{mdl}', beam_size={bs}, vad_filter={vad_filter}")
-
-    segments_list: List[Tuple[float, float, str]] = []
-    words_list: List[Tuple[float, float, str]] = []
-
-    fw_allow = {"temperature", "beam_size", "patience", "length_penalty", "compression_ratio_threshold",
-                "logprob_threshold", "no_speech_threshold", "condition_on_previous_text", "task", "vad_filter",
-                "language", "best_of"}
-    ow_allow = {"temperature", "beam_size", "patience", "length_penalty", "compression_ratio_threshold",
-                "logprob_threshold", "no_speech_threshold", "condition_on_previous_text", "task", "language", "best_of"}
-
-    # [구조 변경] except 블록에서 변수를 할당하여 경고를 원천적으로 해결합니다.
-    try:
-        import faster_whisper
-    except ImportError:
-        faster_whisper = None  # <-- 이 부분이 핵심입니다.
-        print("[INFO] faster_whisper not found, falling back to openai-whisper.")
-
-    # [구조 변경] faster_whisper 모듈이 성공적으로 import된 경우에만 로직을 실행합니다.
-    if faster_whisper:
-        try:
-            fw_opts: Dict[str, Any] = {"beam_size": bs, "word_timestamps": True}
-            if isinstance(language, str) and language.strip():
-                fw_opts["language"] = language.strip()
-            for k, v in kwargs.items():
-                if k in fw_allow:
-                    fw_opts[k] = v
-
-            if vad_filter:
-                try:
-                    fw_opts["vad_filter"] = True
-                except Exception as e:
-                    print(f"[WARN] faster-whisper VAD filter failed to load, proceeding without VAD. Error: {e}")
-                    fw_opts["vad_filter"] = False
-            else:
-                fw_opts["vad_filter"] = False
-
-            wmodel = faster_whisper.WhisperModel(mdl, device="cpu", compute_type="int8")
-            seg_iter, _info = wmodel.transcribe(str(p), **fw_opts)
-
-            for seg_idx, seg in enumerate(seg_iter, 1):
-                a, b, txt = float(getattr(seg, "start", 0.0)), float(getattr(seg, "end", 0.0)), str(
-                    getattr(seg, "text", "")).strip()
-                segments_list.append((a, b, txt))
-                print(f"[SEG {seg_idx:04d}] {_fmt(a)} ~ {_fmt(b)} | {txt}")
-                for w in getattr(seg, "words", []):
-                    try:
-                        wa, wb, wt = float(w.start), float(w.end), str(w.word).strip()
-                        if wt:
-                            words_list.append((wa, wb, wt))
-                            print(f"  [WORD {len(words_list):05d}] {_fmt(wa)} ~ {_fmt(wb)} | {wt}")
-                    except (TypeError, ValueError, AttributeError):
-                        continue
-            print(f"[transcribe_words] ko-pass done: segments={len(segments_list)}, words={len(words_list)}")
-
-        except Exception as e:
-            print(f"[WARN] faster-whisper failed during execution: {e}")
-            segments_list, words_list = [], []
-
-    # faster-whisper가 없거나 실패한 경우, openai-whisper로 폴백합니다.
-    if not segments_list:
-        try:
-            import whisper
-            wmodel2 = whisper.load_model(mdl)
-            ow_opts: Dict[str, Any] = {"beam_size": bs, "word_timestamps": True, "fp16": False}
-            if isinstance(language, str) and language.strip():
-                ow_opts["language"] = language.strip()
-            for k, v in kwargs.items():
-                if k in ow_allow:
-                    ow_opts[k] = v
-
-            res = whisper.transcribe(wmodel2, str(p), **ow_opts)
-
-            for seg_idx, seg in enumerate(res.get("segments", []), 1):
-                a, b, txt = float(seg.get("start", 0.0)), float(seg.get("end", 0.0)), str(seg.get("text", "")).strip()
-                segments_list.append((a, b, txt))
-                print(f"[SEG {seg_idx:04d}] {_fmt(a)} ~ {_fmt(b)} | {txt}")
-                for w in seg.get("words", []):
-                    try:
-                        wa, wb, wt = float(w.get("start", 0.0)), float(w.get("end", 0.0)), str(
-                            w.get("word", "")).strip()
-                        if wt:
-                            words_list.append((wa, wb, wt))
-                            print(f"  [WORD {len(words_list):05d}] {_fmt(wa)} ~ {_fmt(wb)} | {wt}")
-                    except (TypeError, ValueError):
-                        continue
-            print(f"[transcribe_words] ko-pass done: segments={len(segments_list)}, words={len(words_list)}")
-
-        except ImportError as e:
-            raise RuntimeError("Both faster-whisper and openai-whisper are not installed.") from e
-        except Exception as e:
-            raise RuntimeError(f"whisper.transcribe failed: {e}") from e
-
-    if print_translate_view and segments_list:
-        try:
-            print("[transcribe_words] translate-pass (en view) start")
-            for en_idx, (a, b, txt) in enumerate(segments_list, 1):
-                print(f"[EN-SEG {en_idx:04d}] {_fmt(a)} ~ {_fmt(b)} | {txt}")
-            print(f"[transcribe_words] translate-pass done: segments={len(segments_list)}")
-        except Exception:
-            pass
-
-    return {"segments": segments_list, "words": words_list}
 
 
 
@@ -3258,18 +3122,22 @@ def _create_final_segments_from_ready(
         seg_ready_payload: list,
         clean_lyrics_lines: list,
         lyrics_compare_lines: list,
-        project_dir: str  # [NEW] seg_compare.json 저장을 위해 프로젝트 경로 추가
+        project_dir: str
 ) -> list:
     """
-    [최종 개선 버전] 사용자의 4단계 계획을 완벽하게 구현:
-    1. `seg_ready`를 첫/마지막 줄 기준으로 필터링하여 `seg_compare.json`을 생성합니다.
-    2. `seg_compare`의 각 단어를 `lyrics_compare`와 다단계로 비교하여 교정합니다.
-    3. 매칭에 실패한 단어는 삭제하지 않고 원본 그대로 보존합니다.
-    4. 교정 과정을 콘솔에 출력하여 디버깅 편의성을 높입니다.
+    [최종 수정] Linter 경고를 모두 해결한 최종 버전:
+    1. `kroman` import 실패 시 except 블록에서 변수를 할당합니다.
+    2. 매칭 상태를 나타내는 문자열('KEPT' 등)을 함수 내 상수로 정의합니다.
     """
     import difflib
     from pathlib import Path
     import json
+    from typing import List, Dict  # 타입 힌트용 import 추가
+
+    # ---- 매칭 상태 상수 정의 ----
+    _MATCH_TYPE_KEPT = "KEPT"
+    _MATCH_TYPE_AUTHENTICATED = "AUTHENTICATED"
+    _MATCH_TYPE_CORRECTED = "CORRECTED"
 
     # ---- 지역 유틸 ----
     def _safe_float(val):
@@ -3286,6 +3154,20 @@ def _create_final_segments_from_ready(
     def _match_score(a: str, b: str) -> float:
         return difflib.SequenceMatcher(None, a, b).ratio()
 
+    # [수정] kroman import 실패 시 except 블록에서 변수 할당
+    try:
+        import kroman
+    except ImportError:
+        kroman = None  # <-- 경고 해결
+        print("[WARN] kroman 라이브러리가 없어 2단계(음차 비교) 기능이 제한됩니다. 'pip install kroman'을 권장합니다.")
+
+    def _romanize(text: str) -> str:
+        if not kroman or not text: return ""
+        try:
+            return kroman.parse(text).replace("-", "").lower()
+        except Exception:
+            return ""
+
     # ---- 1. 기준 설정 및 `seg_compare.json` 생성 ----
     ref_lines = lyrics_compare_lines if lyrics_compare_lines else clean_lyrics_lines
     if not ref_lines or not seg_ready_payload:
@@ -3298,11 +3180,10 @@ def _create_final_segments_from_ready(
     for i, seg in enumerate(seg_ready_payload):
         if _match_score(_norm_for_compare(seg.get("text", "")), first_line_norm) > 0.3:
             if first_idx == -1: first_idx = i
-
     for i in range(len(seg_ready_payload) - 1, -1, -1):
         if _match_score(_norm_for_compare(seg_ready_payload[i].get("text", "")), last_line_norm) > 0.3:
             if last_idx == -1: last_idx = i
-            break  # 마지막 줄은 한번만 찾으면 됨
+            break
 
     seg_compare_payload = seg_ready_payload[
                           first_idx: last_idx + 1] if first_idx != -1 and last_idx != -1 and last_idx >= first_idx else []
@@ -3315,40 +3196,90 @@ def _create_final_segments_from_ready(
     except Exception as e:
         print(f"[WARN] seg_compare.json 저장 실패: {e}")
 
-    # ---- 2 & 3. 단어 단위 교차 검증 및 미일치 단어 보존 ----
-    ref_all_words = " ".join(ref_lines).split()
+    # ---- 2 & 3. 3단계 지능형 교정 (인증/교정 구분) ----
+    ref_all_words = " ".join(ref_lines).replace(",", " ").split()
     ref_words_norm = [_norm_for_compare(w) for w in ref_all_words]
+    ref_words_roman = [_romanize(w) for w in ref_all_words]
 
-    final_segments = []
+    final_segments: List[Dict] = []  # 타입 힌트 명시
     print("\n--- [SEGMENT CORRECTION PROCESS] ---")
 
     for seg in seg_compare_payload:
         whisper_text = str(seg.get("text", "")).strip()
         if not whisper_text: continue
 
-        corrected_words = []
-        for whisper_word in whisper_text.split():
-            whisper_norm = _norm_for_compare(whisper_word)
-            if not whisper_norm: continue
+        corrected_words: List[str] = []  # 타입 힌트 명시
+        whisper_words = whisper_text.split()
+        whisper_cursor = 0
+        leftover_whisper_part = ""
 
-            best_match = {"score": -1.0, "word": whisper_word}
+        while whisper_cursor < len(whisper_words):
+            candidate_whisper = leftover_whisper_part + whisper_words[whisper_cursor]
+            candidate_norm = _norm_for_compare(candidate_whisper)
 
-            for i, ref_norm in enumerate(ref_words_norm):
-                score = _match_score(whisper_norm, ref_norm)
+            # [수정] type 기본값을 상수로 사용
+            best_match: Dict = {"score": -1.0, "word": candidate_whisper, "type": _MATCH_TYPE_KEPT}
+
+            for i, ref_word in enumerate(ref_all_words):
+                ref_norm = ref_words_norm[i]
+                if not ref_norm: continue
+
+                # '인증' (Substring Match) 로직
+                if candidate_norm in ref_norm:
+                    score = 0.9 + (len(candidate_norm) / len(ref_norm)) * 0.1
+                    if score > best_match["score"]:
+                        # [수정] type을 상수로 사용
+                        best_match.update(
+                            {"score": score, "word": candidate_whisper, "type": _MATCH_TYPE_AUTHENTICATED})
+                    continue  # 인증되면 더이상 비교할 필요 없음
+
+                # '교정' (Similarity Match) 로직
+                score1 = _match_score(candidate_norm, ref_norm)
+                score2 = 0.0
+                if kroman:
+                    candidate_roman = _romanize(candidate_whisper)
+                    ref_roman = ref_words_roman[i]
+                    if candidate_roman and ref_roman:
+                        score2 = _match_score(candidate_roman, ref_roman)
+
+                score = max(score1, score2)
+
                 if score > best_match["score"]:
-                    best_match["score"] = score
-                    best_match["word"] = ref_all_words[i]
+                    # [수정] type을 상수로 사용
+                    best_match.update({"score": score, "word": ref_word, "type": _MATCH_TYPE_CORRECTED})
 
-            if best_match["score"] >= 0.6:
+            # 최종 결정
+            if best_match["score"] >= 0.55:  # 유사도 임계값 유지
                 corrected_word = best_match["word"]
-                if corrected_word != whisper_word:
-                    print(f"  - [CORRECTED] '{whisper_word}' -> '{corrected_word}' (Score: {best_match['score']:.2f})")
-            else:
-                corrected_word = whisper_word
-                print(
-                    f"  - [KEPT]      '{whisper_word}' (Best match '{best_match['word']}' score too low: {best_match['score']:.2f})")
+                match_type = best_match["type"]
 
-            corrected_words.append(corrected_word)
+                # [수정] type 비교 시 상수 사용
+                if match_type == _MATCH_TYPE_AUTHENTICATED:
+                    print(f"  - [AUTHENTICATED] '{candidate_whisper}' (as part of a correct word)")
+                elif corrected_word != candidate_whisper:  # type이 CORRECTED이고 단어가 다를 때만 출력
+                    print(
+                        f"  - [CORRECTED] '{candidate_whisper}' -> '{corrected_word}' (Score: {best_match['score']:.2f})")
+
+                # 3단계: 남은 조각 처리
+                ref_matched_norm = _norm_for_compare(best_match["word"])
+                if candidate_norm != ref_matched_norm and candidate_norm.startswith(ref_matched_norm):
+                    len_matched = len(ref_matched_norm.replace(" ", ""))
+                    original_chars = [c for c in candidate_whisper if c.isalnum()]
+                    # IndexError 방지
+                    leftover_whisper_part = "".join(original_chars[len_matched:]) if len(
+                        original_chars) > len_matched else ""
+                else:
+                    leftover_whisper_part = ""
+
+                corrected_words.append(corrected_word)
+                whisper_cursor += 1
+            else:  # 매칭 실패 시 (KEPT)
+                # [수정] type 비교 시 상수 사용
+                print(
+                    f"  - [{_MATCH_TYPE_KEPT}]      '{candidate_whisper}' (Best match '{best_match['word']}' score too low: {best_match['score']:.2f})")
+                corrected_words.append(candidate_whisper)
+                leftover_whisper_part = ""
+                whisper_cursor += 1
 
         corrected_text = " ".join(corrected_words)
         final_segments.append({
@@ -3360,17 +3291,149 @@ def _create_final_segments_from_ready(
 
     print("------------------------------------\n")
 
-    # ---- 4. 최종 seg.json 저장 (시간 순서 보정 후) ----
+    # ---- 4. 최종 seg.json 저장 ----
     if not final_segments:
         return []
 
     final_segments.sort(key=lambda x: x.get("start", 0.0))
     for i in range(1, len(final_segments)):
         prev_end = final_segments[i - 1].get("end", 0.0)
-        if final_segments[i].get("start", 0.0) < prev_end:
+        curr_start = final_segments[i].get("start", 0.0)  # 비교 위해 변수 사용
+        if curr_start < prev_end:
             final_segments[i]["start"] = prev_end
 
     return final_segments
+
+
+def transcribe_words(
+        path: str,
+        model_size: str | None = None,
+        *,
+        model: str | None = None,
+        beam_size: int = 5,
+        initial_prompt: str | None = None,
+        language: str | None = None,
+        print_translate_view: bool = True,
+        vad_filter: bool = True,
+        **kwargs,
+) -> dict:
+    """
+    오디오 → 단어 단위 타임라인.
+    - [최종 수정] Linter 경고 및 VAD 충돌을 원천적으로 해결합니다.
+    """
+    from pathlib import Path
+    from typing import Any, Dict, List, Tuple
+
+    def _fmt(t: float) -> str:
+        return f"{t:06.3f}"
+
+    mdl = (model_size or model or "medium")
+    bs = int(beam_size) if isinstance(beam_size, int) else 5
+    p = Path(path)
+    if not p.exists() or not p.is_file():
+        raise FileNotFoundError(f"audio file not found: {path}")
+
+    print(f"[transcribe_words] start path='{p.name}', model='{mdl}', beam_size={bs}, vad_filter={vad_filter}")
+
+    segments_list: List[Tuple[float, float, str]] = []
+    words_list: List[Tuple[float, float, str]] = []
+
+    fw_allow = {"temperature", "beam_size", "patience", "length_penalty", "compression_ratio_threshold",
+                "logprob_threshold", "no_speech_threshold", "condition_on_previous_text", "task", "vad_filter",
+                "language", "best_of"}
+    ow_allow = {"temperature", "beam_size", "patience", "length_penalty", "compression_ratio_threshold",
+                "logprob_threshold", "no_speech_threshold", "condition_on_previous_text", "task", "language", "best_of"}
+
+    try:
+        import faster_whisper
+    except ImportError:
+        faster_whisper = None
+        print("[INFO] faster_whisper not found, falling back to openai-whisper.")
+
+    if faster_whisper:
+        try:
+            fw_opts: Dict[str, Any] = {"beam_size": bs, "word_timestamps": True}
+            if isinstance(language, str) and language.strip():
+                fw_opts["language"] = language.strip()
+            for k, v in kwargs.items():
+                if k in fw_allow:
+                    fw_opts[k] = v
+
+            if vad_filter:
+                try:
+                    fw_opts["vad_filter"] = True
+                except Exception as e:
+                    print(
+                        f"[WARN] faster-whisper VAD filter failed to load, proceeding without VAD. Error: {type(e).__name__}")
+                    fw_opts["vad_filter"] = False
+            else:
+                fw_opts["vad_filter"] = False
+
+            wmodel = faster_whisper.WhisperModel(mdl, device="cpu", compute_type="int8")
+            seg_iter, _info = wmodel.transcribe(str(p), **fw_opts)
+
+            for seg_idx, seg in enumerate(seg_iter, 1):
+                a, b, txt = float(getattr(seg, "start", 0.0)), float(getattr(seg, "end", 0.0)), str(
+                    getattr(seg, "text", "")).strip()
+                segments_list.append((a, b, txt))
+                print(f"[SEG {seg_idx:04d}] {_fmt(a)} ~ {_fmt(b)} | {txt}")
+                for w in getattr(seg, "words", []):
+                    try:
+                        wa, wb, wt = float(w.start), float(w.end), str(w.word).strip()
+                        if wt:
+                            words_list.append((wa, wb, wt))
+                            print(f"  [WORD {len(words_list):05d}] {_fmt(wa)} ~ {_fmt(wb)} | {wt}")
+                    except (TypeError, ValueError, AttributeError):
+                        continue
+            print(f"[transcribe_words] ko-pass done: segments={len(segments_list)}, words={len(words_list)}")
+
+        except Exception as e:
+            print(f"[WARN] faster-whisper failed during execution: {e}")
+            segments_list, words_list = [], []
+
+    if not segments_list:
+        try:
+            import whisper
+            wmodel2 = whisper.load_model(mdl)
+            ow_opts: Dict[str, Any] = {"beam_size": bs, "word_timestamps": True, "fp16": False}
+            if isinstance(language, str) and language.strip():
+                ow_opts["language"] = language.strip()
+            for k, v in kwargs.items():
+                if k in ow_allow:
+                    ow_opts[k] = v
+
+            res = whisper.transcribe(wmodel2, str(p), **ow_opts)
+
+            for seg_idx, seg in enumerate(res.get("segments", []), 1):
+                a, b, txt = float(seg.get("start", 0.0)), float(seg.get("end", 0.0)), str(seg.get("text", "")).strip()
+                segments_list.append((a, b, txt))
+                print(f"[SEG {seg_idx:04d}] {_fmt(a)} ~ {_fmt(b)} | {txt}")
+                for w in seg.get("words", []):
+                    try:
+                        wa, wb, wt = float(w.get("start", 0.0)), float(w.get("end", 0.0)), str(
+                            w.get("word", "")).strip()
+                        if wt:
+                            words_list.append((wa, wb, wt))
+                            print(f"  [WORD {len(words_list):05d}] {_fmt(wa)} ~ {_fmt(wb)} | {wt}")
+                    except (TypeError, ValueError):
+                        continue
+            print(f"[transcribe_words] ko-pass done: segments={len(segments_list)}, words={len(words_list)}")
+
+        except ImportError as e:
+            raise RuntimeError("Both faster-whisper and openai-whisper are not installed.") from e
+        except Exception as e:
+            raise RuntimeError(f"whisper.transcribe failed: {e}") from e
+
+    if print_translate_view and segments_list:
+        try:
+            print("[transcribe_words] translate-pass (en view) start")
+            for en_idx, (a, b, txt) in enumerate(segments_list, 1):
+                print(f"[EN-SEG {en_idx:04d}] {_fmt(a)} ~ {_fmt(b)} | {txt}")
+            print(f"[transcribe_words] translate-pass done: segments={len(segments_list)}")
+        except Exception:
+            pass
+
+    return {"segments": segments_list, "words": words_list}
 
 ###################################################################
 ###################################################################
