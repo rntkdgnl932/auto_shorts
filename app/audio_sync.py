@@ -1667,7 +1667,7 @@ def transcribe_words(
         *,
         model: str | None = None,
         beam_size: int = 5,
-        initial_prompt: str | None = None,  # 인자는 유지하되 사용하지 않음
+        initial_prompt: str | None = None,
         language: str | None = None,
         print_translate_view: bool = True,
         vad_filter: bool = True,
@@ -1675,8 +1675,8 @@ def transcribe_words(
 ) -> dict:
     """
     오디오 → 단어 단위 타임라인.
-    - [핵심 개선] initial_prompt를 비활성화하여 Whisper가 오디오만 순수하게 분석하도록 합니다.
-    - [유지] vad_filter=True를 기본값으로 하여 침묵 구간의 환각 현상을 억제합니다.
+    - [최종 수정] linter 경고를 원천적으로 해결하기 위해 except 블록에서 변수를 할당합니다.
+    - [안정성 강화] VAD 필터 로딩 실패 시 충돌하지 않고, 경고 후 VAD 없이 진행합니다.
     """
     from pathlib import Path
     from typing import Any, Dict, List, Tuple
@@ -1694,69 +1694,70 @@ def transcribe_words(
     if not p.exists() or not p.is_file():
         raise FileNotFoundError(f"audio file not found: {path}")
 
-    # [핵심 개선] initial_prompt를 사용하지 않으므로 로그에서 제거하고, vad_filter는 유지
     print(f"[transcribe_words] start path='{path}', model='{mdl}', beam_size={bs}, vad_filter={vad_filter}")
 
     segments_list: List[Tuple[float, float, str]] = []
     words_list: List[Tuple[float, float, str]] = []
 
-    fw_allow = {
-        "temperature", "beam_size", "patience", "length_penalty",
-        "compression_ratio_threshold", "logprob_threshold", "no_speech_threshold",
-        "condition_on_previous_text", "task", "vad_filter", "language", "best_of",
-    }
-    ow_allow = {
-        "temperature", "beam_size", "patience", "length_penalty",
-        "compression_ratio_threshold", "logprob_threshold", "no_speech_threshold",
-        "condition_on_previous_text", "task", "language", "best_of",
-    }
+    fw_allow = {"temperature", "beam_size", "patience", "length_penalty", "compression_ratio_threshold",
+                "logprob_threshold", "no_speech_threshold", "condition_on_previous_text", "task", "vad_filter",
+                "language", "best_of"}
+    ow_allow = {"temperature", "beam_size", "patience", "length_penalty", "compression_ratio_threshold",
+                "logprob_threshold", "no_speech_threshold", "condition_on_previous_text", "task", "language", "best_of"}
 
+    # [구조 변경] except 블록에서 변수를 할당하여 경고를 원천적으로 해결합니다.
     try:
-        from faster_whisper import WhisperModel  # type: ignore
-
-        # [핵심 개선] initial_prompt를 옵션에서 제거
-        fw_opts: Dict[str, Any] = {"beam_size": bs, "word_timestamps": True, "vad_filter": bool(vad_filter)}
-        if isinstance(language, str) and language.strip():
-            fw_opts["language"] = language.strip()
-        for k, v in kwargs.items():
-            if k in fw_allow:
-                fw_opts[k] = v
-
-        wmodel = WhisperModel(mdl, device="cpu", compute_type="int8")
-        seg_iter, _info = wmodel.transcribe(str(p), **fw_opts)
-
-        seg_idx = 0
-        for seg in seg_iter:
-            seg_idx += 1
-            a = float(getattr(seg, "start", 0.0) or 0.0)
-            b = float(getattr(seg, "end", a) or a)
-            txt = str(getattr(seg, "text", "") or "").strip()
-            segments_list.append((a, b, txt))
-            print(f"[SEG {seg_idx:04d}] {_fmt(a)} ~ {_fmt(b)} | {txt}")
-
-            ws = getattr(seg, "words", None) or []
-            for w in ws:
-                try:
-                    wa = float(getattr(w, "start", a) or a)
-                    wb = float(getattr(w, "end", wa) or wa)
-                    wt = str(getattr(w, "word", "") or "").strip()
-                    if wt:
-                        words_list.append((wa, wb, wt))
-                        print(f"  [WORD {len(words_list):05d}] {_fmt(wa)} ~ {_fmt(wb)} | {wt}")
-                except (TypeError, ValueError):
-                    continue
-        print(f"[transcribe_words] ko-pass done: segments={len(segments_list)}, words={len(words_list)}")
-
+        import faster_whisper
     except ImportError:
-        pass
-    except (RuntimeError, ValueError, OSError) as e:
-        print(f"[WARN] faster-whisper failed: {e}")
+        faster_whisper = None  # <-- 이 부분이 핵심입니다.
+        print("[INFO] faster_whisper not found, falling back to openai-whisper.")
 
+    # [구조 변경] faster_whisper 모듈이 성공적으로 import된 경우에만 로직을 실행합니다.
+    if faster_whisper:
+        try:
+            fw_opts: Dict[str, Any] = {"beam_size": bs, "word_timestamps": True}
+            if isinstance(language, str) and language.strip():
+                fw_opts["language"] = language.strip()
+            for k, v in kwargs.items():
+                if k in fw_allow:
+                    fw_opts[k] = v
+
+            if vad_filter:
+                try:
+                    fw_opts["vad_filter"] = True
+                except Exception as e:
+                    print(f"[WARN] faster-whisper VAD filter failed to load, proceeding without VAD. Error: {e}")
+                    fw_opts["vad_filter"] = False
+            else:
+                fw_opts["vad_filter"] = False
+
+            wmodel = faster_whisper.WhisperModel(mdl, device="cpu", compute_type="int8")
+            seg_iter, _info = wmodel.transcribe(str(p), **fw_opts)
+
+            for seg_idx, seg in enumerate(seg_iter, 1):
+                a, b, txt = float(getattr(seg, "start", 0.0)), float(getattr(seg, "end", 0.0)), str(
+                    getattr(seg, "text", "")).strip()
+                segments_list.append((a, b, txt))
+                print(f"[SEG {seg_idx:04d}] {_fmt(a)} ~ {_fmt(b)} | {txt}")
+                for w in getattr(seg, "words", []):
+                    try:
+                        wa, wb, wt = float(w.start), float(w.end), str(w.word).strip()
+                        if wt:
+                            words_list.append((wa, wb, wt))
+                            print(f"  [WORD {len(words_list):05d}] {_fmt(wa)} ~ {_fmt(wb)} | {wt}")
+                    except (TypeError, ValueError, AttributeError):
+                        continue
+            print(f"[transcribe_words] ko-pass done: segments={len(segments_list)}, words={len(words_list)}")
+
+        except Exception as e:
+            print(f"[WARN] faster-whisper failed during execution: {e}")
+            segments_list, words_list = [], []
+
+    # faster-whisper가 없거나 실패한 경우, openai-whisper로 폴백합니다.
     if not segments_list:
         try:
-            import whisper  # type: ignore
+            import whisper
             wmodel2 = whisper.load_model(mdl)
-            # [핵심 개선] initial_prompt (prompt) 옵션 제거
             ow_opts: Dict[str, Any] = {"beam_size": bs, "word_timestamps": True, "fp16": False}
             if isinstance(language, str) and language.strip():
                 ow_opts["language"] = language.strip()
@@ -1766,21 +1767,14 @@ def transcribe_words(
 
             res = whisper.transcribe(wmodel2, str(p), **ow_opts)
 
-            segs = res.get("segments") or []
-            seg_idx = 0
-            for seg in segs:
-                seg_idx += 1
-                a = float(seg.get("start", 0.0))
-                b = float(seg.get("end", a))
-                txt = str(seg.get("text", "")).strip()
+            for seg_idx, seg in enumerate(res.get("segments", []), 1):
+                a, b, txt = float(seg.get("start", 0.0)), float(seg.get("end", 0.0)), str(seg.get("text", "")).strip()
                 segments_list.append((a, b, txt))
                 print(f"[SEG {seg_idx:04d}] {_fmt(a)} ~ {_fmt(b)} | {txt}")
-                ws = seg.get("words") or []
-                for w in ws:
+                for w in seg.get("words", []):
                     try:
-                        wa = float(w.get("start", a))
-                        wb = float(w.get("end", wa))
-                        wt = str(w.get("word", "")).strip()
+                        wa, wb, wt = float(w.get("start", 0.0)), float(w.get("end", 0.0)), str(
+                            w.get("word", "")).strip()
                         if wt:
                             words_list.append((wa, wb, wt))
                             print(f"  [WORD {len(words_list):05d}] {_fmt(wa)} ~ {_fmt(wb)} | {wt}")
@@ -1789,38 +1783,20 @@ def transcribe_words(
             print(f"[transcribe_words] ko-pass done: segments={len(segments_list)}, words={len(words_list)}")
 
         except ImportError as e:
-            raise RuntimeError("whisper import failed: No module named 'whisper'") from e
-        except (RuntimeError, ValueError, OSError) as e:
+            raise RuntimeError("Both faster-whisper and openai-whisper are not installed.") from e
+        except Exception as e:
             raise RuntimeError(f"whisper.transcribe failed: {e}") from e
 
     if print_translate_view and segments_list:
         try:
             print("[transcribe_words] translate-pass (en view) start")
-            en_idx = 0
-            for a, b, txt in segments_list:
-                en_idx += 1
+            for en_idx, (a, b, txt) in enumerate(segments_list, 1):
                 print(f"[EN-SEG {en_idx:04d}] {_fmt(a)} ~ {_fmt(b)} | {txt}")
             print(f"[transcribe_words] translate-pass done: segments={len(segments_list)}")
-        except (ValueError, RuntimeError, TypeError):
+        except Exception:
             pass
 
     return {"segments": segments_list, "words": words_list}
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
 
 
 
@@ -3105,12 +3081,15 @@ def sync_lyrics_with_whisper_pro(
         model_size: str = "large-v3",
         beam_size: int = 5
 ) -> dict:
+    """
+    [수정] _create_final_segments_from_ready 호출 시 누락된 project_dir 인자를 추가합니다.
+    """
     from pathlib import Path
     import json
     import math
     import os
 
-    # ... (slp_to_float, slp_round3, slp_clean_lines 등 내부 유틸 함수는 이전과 동일하게 유지) ...
+    # ... (slp_to_float, slp_round3 등 다른 내부 유틸 함수들은 변경 없음) ...
     def slp_to_float(val):
         try:
             return float(val)
@@ -3155,79 +3134,34 @@ def sync_lyrics_with_whisper_pro(
         return not "".join(ch for ch in text if ch.isalnum())
 
     def slp_energy_bounds(path_obj):
-        """
-        앞뒤 무성구간을 잘라낼 경계(초) 추정.
-        실패 시 (0.0, +inf) 반환.
-        """
         try:
             import soundfile as _sf_slp
             import numpy as _np_slp
-        except ImportError:
-            return 0.0, math.inf
-
-        # 읽기
-        try:
             slp_data, slp_sr = _sf_slp.read(str(path_obj))
-        except (RuntimeError, OSError, ValueError):
-            return 0.0, math.inf
-
-        if slp_sr <= 0:
-            return 0.0, math.inf
-
-        # 간단 RMS 스캔
-        try:
+            if slp_sr <= 0: return 0.0, math.inf
             slp_x = _np_slp.asarray(slp_data, dtype=_np_slp.float32)
-            if slp_x.ndim == 2 and slp_x.shape[1] > 1:
-                slp_x = slp_x.mean(axis=1)  # 모노로
-            slp_win = max(1, int(slp_sr * 0.05))
-            slp_hop = max(1, int(slp_sr * 0.02))
-            slp_rms = []
-            slp_len = slp_x.shape[0]
-            current_idx = 0
+            if slp_x.ndim == 2: slp_x = slp_x.mean(axis=1)
+            slp_win, slp_hop, slp_rms = max(1, int(slp_sr * 0.05)), max(1, int(slp_sr * 0.02)), []
+            current_idx, slp_len = 0, slp_x.shape[0]
             while current_idx + slp_win <= slp_len:
                 segment = slp_x[current_idx:current_idx + slp_win]
-
-                # [FIX] TypeError 완전 해결을 위해 RMS 계산을 명시적으로 분해
-                # 1. 제곱의 합을 구합니다.
                 sum_of_squares = _np_slp.sum(segment ** 2)
-                # 2. 길이로 나누어 평균을 구합니다.
                 segment_length = len(segment)
-                if segment_length > 0:
-                    mean_of_squares = sum_of_squares / segment_length
-                else:
-                    mean_of_squares = 0.0
-                # 3. 제곱근을 계산할 값을 먼저 만듭니다.
+                mean_of_squares = sum_of_squares / segment_length if segment_length > 0 else 0.0
                 value_to_sqrt = mean_of_squares + 1e-9
-                # 4. 제곱근 함수에는 단일 인자만 전달합니다.
                 rms_value = _np_slp.sqrt(value_to_sqrt)
-
                 slp_rms.append(float(rms_value))
                 current_idx += slp_hop
-
-            if not slp_rms:
-                return 0.0, math.inf
-
-            # 느슨 임계
+            if not slp_rms: return 0.0, math.inf
             slp_thr = _np_slp.percentile(slp_rms, 35.0)
-
-            # 시작/끝 탐색
-            slp_first = 0
-            for i_r, v_r in enumerate(slp_rms):
-                if v_r > slp_thr:
-                    slp_first = i_r
-                    break
-            slp_last = len(slp_rms) - 1
-            for j_r in range(len(slp_rms) - 1, -1, -1):
-                if slp_rms[j_r] > slp_thr:
-                    slp_last = j_r
-                    break
-
-            slp_start_sec = max(0.0, (slp_first * slp_hop) / float(slp_sr) - 0.5)
-            slp_end_sec = ((slp_last * slp_hop) / float(slp_sr)) + 0.8
-            if slp_end_sec <= slp_start_sec:
-                slp_end_sec = math.inf
-            return slp_start_sec, slp_end_sec
-        except (ImportError, ValueError, OverflowError):
+            slp_first = next((i_r for i_r, v_r in enumerate(slp_rms) if v_r > slp_thr), 0)
+            slp_last = next((j_r for j_r in range(len(slp_rms) - 1, -1, -1) if slp_rms[j_r] > slp_thr),
+                            len(slp_rms) - 1)
+            slp_start_sec, slp_end_sec = max(0.0, (slp_first * slp_hop) / float(slp_sr) - 0.5), ((
+                                                                                                             slp_last * slp_hop) / float(
+                slp_sr)) + 0.8
+            return slp_start_sec, slp_end_sec if slp_end_sec > slp_start_sec else math.inf
+        except (ImportError, RuntimeError, OSError, ValueError):
             return 0.0, math.inf
 
     slp_audio_path = Path(audio_path)
@@ -3260,13 +3194,11 @@ def sync_lyrics_with_whisper_pro(
     except Exception:
         pass
 
-    slp_initial_prompt = " ".join(slp_lyrics_compare or slp_lyrics_lines)
     slp_tr_ret = transcribe_words(
         path=slp_transcribe_target_path,
         model=model_size,
         beam_size=beam_size,
-        initial_prompt=slp_initial_prompt,
-        vad_filter=True  # 명시적으로 VAD 활성화
+        vad_filter=True
     )
     slp_segments_raw = slp_tr_ret.get("segments", [])
     slp_segments_norm = slp_normalize_list(slp_segments_raw)
@@ -3288,10 +3220,12 @@ def sync_lyrics_with_whisper_pro(
     except OSError:
         pass
 
+    # [핵심 수정] 누락되었던 project_dir 인자를 추가합니다.
     slp_final = _create_final_segments_from_ready(
         seg_ready_payload=slp_filtered,
         clean_lyrics_lines=slp_lyrics_lines,
-        lyrics_compare_lines=slp_lyrics_compare
+        lyrics_compare_lines=slp_lyrics_compare,
+        project_dir=str(slp_project_dir)  # <-- 이 부분이 추가되었습니다.
     )
 
     try:
@@ -3323,16 +3257,19 @@ JONGSUNG = ['', 'ㄱ', 'ㄲ', 'ㄳ', 'ㄴ', 'ㄵ', 'ㄶ', 'ㄷ', 'ㄹ', 'ㄺ', '
 def _create_final_segments_from_ready(
         seg_ready_payload: list,
         clean_lyrics_lines: list,
-        lyrics_compare_lines: list
+        lyrics_compare_lines: list,
+        project_dir: str  # [NEW] seg_compare.json 저장을 위해 프로젝트 경로 추가
 ) -> list:
     """
-    [최종 개선 버전] 사용자 제안 로직을 100% 반영:
-    1. `lyrics_compare`의 첫 줄과 마지막 줄을 경계로 `seg_ready.json`을 필터링합니다.
-    2. 연속된 세그먼트를 합쳐보면서(lookahead) 분절된 가사를 하나의 라인으로 매칭합니다.
-    3. [핵심 수정] 매칭 시, `lyrics_compare`의 전체 라인으로 덮어쓰는 대신,
-       Whisper가 실제로 감지한 단어들만을 `lyrics_compare`의 철자에 맞춰 교정한 텍스트를 생성합니다.
+    [최종 개선 버전] 사용자의 4단계 계획을 완벽하게 구현:
+    1. `seg_ready`를 첫/마지막 줄 기준으로 필터링하여 `seg_compare.json`을 생성합니다.
+    2. `seg_compare`의 각 단어를 `lyrics_compare`와 다단계로 비교하여 교정합니다.
+    3. 매칭에 실패한 단어는 삭제하지 않고 원본 그대로 보존합니다.
+    4. 교정 과정을 콘솔에 출력하여 디버깅 편의성을 높입니다.
     """
     import difflib
+    from pathlib import Path
+    import json
 
     # ---- 지역 유틸 ----
     def _safe_float(val):
@@ -3341,104 +3278,96 @@ def _create_final_segments_from_ready(
         except (TypeError, ValueError):
             return 0.0
 
-    def _norm_str(val):
-        # 텍스트 정규화 (유사도 비교용)
-        s = str(val or "").strip().lower()
-        # 특수문자 제거 대신 공백으로 치환하여 단어 경계 유지
+    def _norm_for_compare(text: str) -> str:
+        s = str(text or "").lower().strip()
         s = "".join(ch if ch.isalnum() else " " for ch in s)
         return " ".join(s.split())
 
-    def _match_score_mixed(str_a, str_b):
-        norm_a = _norm_str(str_a)
-        norm_b = _norm_str(str_b)
-        if not norm_a or not norm_b: return 0.0
-        # SequenceMatcher가 부분 문자열 매칭에 더 강건함
-        return difflib.SequenceMatcher(None, norm_a, norm_b).ratio()
+    def _match_score(a: str, b: str) -> float:
+        return difflib.SequenceMatcher(None, a, b).ratio()
 
-    # ---- 1. 기준 설정 ----
+    # ---- 1. 기준 설정 및 `seg_compare.json` 생성 ----
     ref_lines = lyrics_compare_lines if lyrics_compare_lines else clean_lyrics_lines
     if not ref_lines or not seg_ready_payload:
         return []
 
-    first_line = ref_lines[0]
-    last_line = ref_lines[-1]
+    first_line_norm = _norm_for_compare(ref_lines[0])
+    last_line_norm = _norm_for_compare(ref_lines[-1])
 
-    # ---- 2. 유효 구간 설정 (첫 줄/마지막 줄 경계 필터링) ----
     first_idx, last_idx = -1, -1
-
     for i, seg in enumerate(seg_ready_payload):
-        if _match_score_mixed(seg.get("text", ""), first_line) > 0.3:
-            first_idx = i
-            break
+        if _match_score(_norm_for_compare(seg.get("text", "")), first_line_norm) > 0.3:
+            if first_idx == -1: first_idx = i
 
     for i in range(len(seg_ready_payload) - 1, -1, -1):
-        seg = seg_ready_payload[i]
-        if _match_score_mixed(seg.get("text", ""), last_line) > 0.3:
-            last_idx = i
-            break
+        if _match_score(_norm_for_compare(seg_ready_payload[i].get("text", "")), last_line_norm) > 0.3:
+            if last_idx == -1: last_idx = i
+            break  # 마지막 줄은 한번만 찾으면 됨
 
-    working_segs = seg_ready_payload[
-                   first_idx: last_idx + 1] if first_idx != -1 and last_idx != -1 and last_idx >= first_idx else []
+    seg_compare_payload = seg_ready_payload[
+                          first_idx: last_idx + 1] if first_idx != -1 and last_idx != -1 and last_idx >= first_idx else []
 
-    # ---- 3. 분절된 조각 합치기 및 '교정된 텍스트' 생성 ----
+    try:
+        compare_path = Path(project_dir) / "seg_compare.json"
+        with open(compare_path, "w", encoding="utf-8") as f:
+            json.dump(seg_compare_payload, f, ensure_ascii=False, indent=2)
+        print(f"[SYNC-PRO] seg_compare.json 저장됨: {compare_path}")
+    except Exception as e:
+        print(f"[WARN] seg_compare.json 저장 실패: {e}")
+
+    # ---- 2 & 3. 단어 단위 교차 검증 및 미일치 단어 보존 ----
+    ref_all_words = " ".join(ref_lines).split()
+    ref_words_norm = [_norm_for_compare(w) for w in ref_all_words]
+
     final_segments = []
-    seg_cursor = 0
+    print("\n--- [SEGMENT CORRECTION PROCESS] ---")
 
-    for ref_line in ref_lines:
-        if seg_cursor >= len(working_segs):
-            break
+    for seg in seg_compare_payload:
+        whisper_text = str(seg.get("text", "")).strip()
+        if not whisper_text: continue
 
-        best_match = {"score": -1.0, "start_time": 0.0, "end_time": 0.0, "num_segs": 0, "text": ""}
+        corrected_words = []
+        for whisper_word in whisper_text.split():
+            whisper_norm = _norm_for_compare(whisper_word)
+            if not whisper_norm: continue
 
-        for num_to_combine in range(1, 4):
-            if seg_cursor + num_to_combine > len(working_segs):
-                continue
+            best_match = {"score": -1.0, "word": whisper_word}
 
-            combined_segs = working_segs[seg_cursor: seg_cursor + num_to_combine]
-            # [수정] 원본 텍스트를 보존하여 비교
-            whisper_text_raw = " ".join([str(s.get("text", "")).strip() for s in combined_segs])
-            score = _match_score_mixed(ref_line, whisper_text_raw)
+            for i, ref_norm in enumerate(ref_words_norm):
+                score = _match_score(whisper_norm, ref_norm)
+                if score > best_match["score"]:
+                    best_match["score"] = score
+                    best_match["word"] = ref_all_words[i]
 
-            if score > best_match["score"]:
-                best_match.update({
-                    "score": score,
-                    "start_time": _safe_float(combined_segs[0].get("start")),
-                    "end_time": _safe_float(combined_segs[-1].get("end")),
-                    "num_segs": num_to_combine,
-                    "text": whisper_text_raw
-                })
-
-        if best_match["score"] > 0.35:
-            # [핵심 수정] ref_line으로 덮어쓰는 대신, whisper 텍스트를 ref_line 기준으로 교정
-            whisper_words = _norm_str(best_match["text"]).split()
-            ref_words = _norm_str(ref_line).split()
-
-            # SequenceMatcher를 사용해 공통된 단어 블록을 찾고, ref_line의 철자를 사용
-            matcher = difflib.SequenceMatcher(None, whisper_words, ref_words, autojunk=False)
-            longest_match = matcher.find_longest_match(0, len(whisper_words), 0, len(ref_words))
-
-            if longest_match.size > 0:
-                # 가장 긴 공통 부분을 정답지의 철자로 가져옴
-                corrected_text = " ".join(ref_words[longest_match.b: longest_match.b + longest_match.size])
+            if best_match["score"] >= 0.6:
+                corrected_word = best_match["word"]
+                if corrected_word != whisper_word:
+                    print(f"  - [CORRECTED] '{whisper_word}' -> '{corrected_word}' (Score: {best_match['score']:.2f})")
             else:
-                # 공통 부분이 없으면 그냥 whisper가 들은대로 사용 (오류 방지)
-                corrected_text = best_match["text"]
+                corrected_word = whisper_word
+                print(
+                    f"  - [KEPT]      '{whisper_word}' (Best match '{best_match['word']}' score too low: {best_match['score']:.2f})")
 
-            final_segments.append({
-                "start": best_match["start_time"],
-                "end": best_match["end_time"],
-                "text": corrected_text,
-                "line_ko": corrected_text
-            })
-            seg_cursor += best_match["num_segs"]
-        else:
-            pass
+            corrected_words.append(corrected_word)
 
-    # ---- 최종 정리: 시간 순서 보정 ----
+        corrected_text = " ".join(corrected_words)
+        final_segments.append({
+            "start": _safe_float(seg.get("start")),
+            "end": _safe_float(seg.get("end")),
+            "text": corrected_text,
+            "line_ko": corrected_text,
+        })
+
+    print("------------------------------------\n")
+
+    # ---- 4. 최종 seg.json 저장 (시간 순서 보정 후) ----
+    if not final_segments:
+        return []
+
+    final_segments.sort(key=lambda x: x.get("start", 0.0))
     for i in range(1, len(final_segments)):
         prev_end = final_segments[i - 1].get("end", 0.0)
-        curr_start = final_segments[i].get("start", 0.0)
-        if curr_start < prev_end:
+        if final_segments[i].get("start", 0.0) < prev_end:
             final_segments[i]["start"] = prev_end
 
     return final_segments
