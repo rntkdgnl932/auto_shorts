@@ -9,6 +9,9 @@ import re
 from pathlib import Path
 from typing import Any, Callable, Dict, List, Optional, Tuple, cast
 import numpy as np
+import shutil
+import tempfile
+import json  # json 임포트 추가
 # ───────────────────────── utils 안전 import ─────────────────────────
 try:
     from app.utils import audio_duration_sec, save_json, load_json, ensure_dir, sanitize_title
@@ -2946,7 +2949,7 @@ def sync_lyrics_with_whisper_pro(
         beam_size: int = 5
 ) -> dict:
     """
-    [수정] _create_final_segments_from_ready 호출 시 누락된 project_dir 인자를 추가합니다.
+    [최종 수정] 올바른 후처리 함수 이름(_finalize_audio_and_update_time)을 호출하도록 수정합니다.
     """
     from pathlib import Path
     import json
@@ -3026,6 +3029,7 @@ def sync_lyrics_with_whisper_pro(
                 slp_sr)) + 0.8
             return slp_start_sec, slp_end_sec if slp_end_sec > slp_start_sec else math.inf
         except (ImportError, RuntimeError, OSError, ValueError):
+            print("[WARN] Failed to calculate energy bounds. Proceeding without boundary filtering.")
             return 0.0, math.inf
 
     slp_audio_path = Path(audio_path)
@@ -3038,14 +3042,15 @@ def sync_lyrics_with_whisper_pro(
     try:
         slp_pj_path = slp_project_dir / "project.json"
         if slp_pj_path.exists():
-            slp_meta = json.loads(slp_pj_path.read_text(encoding="utf-8"))
+            with open(slp_pj_path, "r", encoding="utf-8") as f:
+                slp_meta = json.load(f)
             slp_compare_data = slp_meta.get("lyrics_compare")
             if isinstance(slp_compare_data, list):
                 slp_lyrics_compare = [str(line) for line in slp_compare_data if str(line).strip()]
                 if slp_lyrics_compare:
                     print("[SYNC-PRO] project.json의 'lyrics_compare'를 기준으로 환각을 제거합니다.")
-    except (json.JSONDecodeError, OSError, KeyError):
-        pass
+    except (json.JSONDecodeError, OSError, KeyError, FileNotFoundError) as e:
+        print(f"[WARN] project.json 로드 실패 ({type(e).__name__}), 원본 가사 텍스트를 사용합니다.")
 
     slp_transcribe_target_path = str(slp_audio_path)
     try:
@@ -3054,61 +3059,78 @@ def sync_lyrics_with_whisper_pro(
             slp_transcribe_target_path = slp_vocal_stem_path
             print(f"[SYNC-PRO] Demucs 보컬 스템을 분석 대상으로 사용합니다: {Path(slp_vocal_stem_path).name}")
     except NameError:
-        pass
-    except Exception:
-        pass
+        print("[INFO] separate_vocals_demucs 함수를 찾을 수 없어 원본 오디오로 분석합니다.")
+    except Exception as e:
+        print(f"[WARN] Demucs 실행 중 오류 발생 ({type(e).__name__}), 원본 오디오로 분석합니다.")
 
-    slp_tr_ret = transcribe_words(
-        path=slp_transcribe_target_path,
-        model=model_size,
-        beam_size=beam_size,
-        vad_filter=True
-    )
+    slp_tr_ret = transcribe_words(path=slp_transcribe_target_path, model=model_size, beam_size=beam_size,
+                                  vad_filter=True)
     slp_segments_raw = slp_tr_ret.get("segments", [])
     slp_segments_norm = slp_normalize_list(slp_segments_raw)
 
     slp_begin_sec, slp_valid_end_sec = slp_energy_bounds(slp_audio_path)
-    slp_filtered = []
-    for slp_seg_item in slp_segments_norm:
-        slp_start, slp_end, slp_text = slp_to_float(slp_seg_item.get("start")), slp_to_float(
-            slp_seg_item.get("end")), str(slp_seg_item.get("text", "") or "")
-        if slp_end <= slp_start or not (slp_start < slp_valid_end_sec and slp_end > slp_begin_sec) or slp_is_punct_only(
-            slp_text): continue
-        slp_s_clamp, slp_e_clamp = max(slp_start, slp_begin_sec), min(slp_end, slp_valid_end_sec)
-        if slp_e_clamp - slp_s_clamp >= 0.08:
-            slp_filtered.append({"start": slp_s_clamp, "end": slp_e_clamp, "text": slp_text})
+    slp_filtered = [
+        {"start": max(slp_to_float(s.get("start")), slp_begin_sec),
+         "end": min(slp_to_float(s.get("end")), slp_valid_end_sec),
+         "text": str(s.get("text", ""))}
+        for s in slp_segments_norm
+        if (isinstance(s, dict) and
+            slp_to_float(s.get("end", 0.0)) > slp_to_float(s.get("start", 0.0)) and
+            slp_to_float(s.get("start", 0.0)) < slp_valid_end_sec and
+            slp_to_float(s.get("end", 0.0)) > slp_begin_sec and
+            not slp_is_punct_only(str(s.get("text", ""))))
+    ]
 
     try:
-        slp_seg_ready_path.write_text(json.dumps(slp_filtered, ensure_ascii=False, indent=2), encoding="utf-8")
+        with open(slp_seg_ready_path, "w", encoding="utf-8") as f:
+            json.dump(slp_filtered, f, ensure_ascii=False, indent=2)
         print(f"[SYNC-PRO] seg_ready.json 저장됨: {slp_seg_ready_path}")
-    except OSError:
-        pass
+    except OSError as e:
+        print(f"[WARN] seg_ready.json 저장 실패: {e}")
 
-    # [핵심 수정] 누락되었던 project_dir 인자를 추가합니다.
-    slp_final = _create_final_segments_from_ready(
+    slp_intermediate_final = _create_final_segments_from_ready(
         seg_ready_payload=slp_filtered,
         clean_lyrics_lines=slp_lyrics_lines,
         lyrics_compare_lines=slp_lyrics_compare,
-        project_dir=str(slp_project_dir)  # <-- 이 부분이 추가되었습니다.
+        project_dir=str(slp_project_dir)
+    )
+
+    # [핵심 수정] 올바른 함수 이름으로 호출하고, 반환값을 올바르게 처리합니다.
+    print("\n--- [FINAL ORGANIZING PROCESS] ---")
+    slp_final_organized = _finalize_audio_and_update_time(  # <-- 이름 수정됨
+        final_segments=slp_intermediate_final,
+        project_dir=str(slp_project_dir),
+        audio_path=str(slp_audio_path)
     )
 
     try:
-        slp_seg_json_path.write_text(json.dumps(slp_final, ensure_ascii=False, indent=2), encoding="utf-8")
-        print(f"[SYNC-PRO] 최종 seg.json 저장됨: {slp_seg_json_path} ({len(slp_final)}줄)")
-    except OSError:
-        pass
+        with open(slp_seg_json_path, "w", encoding="utf-8") as f:
+            json.dump(slp_final_organized, f, ensure_ascii=False, indent=2)
+        print(f"[SYNC-PRO] 최종 seg.json 저장됨: {slp_seg_json_path} ({len(slp_final_organized)}줄)")
+    except OSError as e:
+        print(f"[WARN] 최종 seg.json 저장 실패: {e}")
 
-    slp_audio_len = get_audio_duration(str(slp_audio_path))
-    summary_lines = [f"\n[음악분석 결과]", f"파일: {slp_audio_path.name}", f"오디오 길이: {slp_round3(slp_audio_len)}s",
-                     f"최종 유효 세그먼트: {len(slp_final)}개 (원본 가사 기준)\n", "=== 최종 줄별 정합 (seg.json) ==="]
-    for idx, seg in enumerate(slp_final, start=1):
+    final_audio_duration_after_processing = get_audio_duration(str(slp_audio_path))
+    summary_lines = [
+        f"\n[음악분석 결과]",
+        f"파일: {slp_audio_path.name}",
+        f"최종 오디오 길이: {slp_round3(final_audio_duration_after_processing)}s",
+        f"최종 유효 세그먼트: {len(slp_final_organized)}개 (원본 가사 기준)\n",
+        "=== 최종 줄별 정합 (seg.json) ==="
+    ]
+    for idx, seg in enumerate(slp_final_organized, start=1):
         summary_lines.append(
-            f"[{idx:02d}] {slp_round3(seg.get('start', 0.0)):5.2f}~{slp_round3(seg.get('end', 0.0)):6.2f}  {str(seg.get('text', '') or '')}")
+            f"[{idx:02d}] {seg.get('start', 0.0):5.2f}~{seg.get('end', 0.0):6.2f}  {str(seg.get('text', '') or '')}")
     summary_text = "\n".join(summary_lines)
     print(summary_text)
 
-    return {"seg_ready_path": str(slp_seg_ready_path), "seg_json_path": str(slp_seg_json_path),
-            "segments": slp_filtered, "final_segments": slp_final, "summary_text": summary_text}
+    return {
+        "seg_ready_path": str(slp_seg_ready_path),
+        "seg_json_path": str(slp_seg_json_path),
+        "segments": slp_filtered,
+        "final_segments": slp_final_organized,
+        "summary_text": summary_text
+    }
 
 
 
@@ -3125,9 +3147,9 @@ def _create_final_segments_from_ready(
         project_dir: str
 ) -> list:
     """
-    [최종 수정] Linter 경고를 모두 해결한 최종 버전:
+    [최종 수정] 모든 Linter 경고를 해결한 최종 버전:
     1. `kroman` import 실패 시 except 블록에서 변수를 할당합니다.
-    2. 매칭 상태를 나타내는 문자열('KEPT' 등)을 함수 내 상수로 정의합니다.
+    2. 'ref_word' 변수를 사용 전에 초기화합니다.
     """
     import difflib
     from pathlib import Path
@@ -3201,14 +3223,14 @@ def _create_final_segments_from_ready(
     ref_words_norm = [_norm_for_compare(w) for w in ref_all_words]
     ref_words_roman = [_romanize(w) for w in ref_all_words]
 
-    final_segments: List[Dict] = []  # 타입 힌트 명시
+    final_segments: List[Dict] = []
     print("\n--- [SEGMENT CORRECTION PROCESS] ---")
 
     for seg in seg_compare_payload:
         whisper_text = str(seg.get("text", "")).strip()
         if not whisper_text: continue
 
-        corrected_words: List[str] = []  # 타입 힌트 명시
+        corrected_words: List[str] = []
         whisper_words = whisper_text.split()
         whisper_cursor = 0
         leftover_whisper_part = ""
@@ -3217,10 +3239,12 @@ def _create_final_segments_from_ready(
             candidate_whisper = leftover_whisper_part + whisper_words[whisper_cursor]
             candidate_norm = _norm_for_compare(candidate_whisper)
 
-            # [수정] type 기본값을 상수로 사용
             best_match: Dict = {"score": -1.0, "word": candidate_whisper, "type": _MATCH_TYPE_KEPT}
 
-            for i, ref_word in enumerate(ref_all_words):
+            # [수정] ref_word 변수 사용 전 초기화
+            ref_word: str = ""  # 루프 전에 초기화
+
+            for i, ref_word in enumerate(ref_all_words):  # 루프 변수 ref_word 사용
                 ref_norm = ref_words_norm[i]
                 if not ref_norm: continue
 
@@ -3228,12 +3252,11 @@ def _create_final_segments_from_ready(
                 if candidate_norm in ref_norm:
                     score = 0.9 + (len(candidate_norm) / len(ref_norm)) * 0.1
                     if score > best_match["score"]:
-                        # [수정] type을 상수로 사용
                         best_match.update(
                             {"score": score, "word": candidate_whisper, "type": _MATCH_TYPE_AUTHENTICATED})
-                    continue  # 인증되면 더이상 비교할 필요 없음
+                    continue
 
-                # '교정' (Similarity Match) 로직
+                    # '교정' (Similarity Match) 로직
                 score1 = _match_score(candidate_norm, ref_norm)
                 score2 = 0.0
                 if kroman:
@@ -3245,27 +3268,24 @@ def _create_final_segments_from_ready(
                 score = max(score1, score2)
 
                 if score > best_match["score"]:
-                    # [수정] type을 상수로 사용
                     best_match.update({"score": score, "word": ref_word, "type": _MATCH_TYPE_CORRECTED})
 
             # 최종 결정
-            if best_match["score"] >= 0.55:  # 유사도 임계값 유지
+            if best_match["score"] >= 0.55:
                 corrected_word = best_match["word"]
                 match_type = best_match["type"]
 
-                # [수정] type 비교 시 상수 사용
                 if match_type == _MATCH_TYPE_AUTHENTICATED:
-                    print(f"  - [AUTHENTICATED] '{candidate_whisper}' (as part of a correct word)")
-                elif corrected_word != candidate_whisper:  # type이 CORRECTED이고 단어가 다를 때만 출력
+                    # 인증 시에는 어떤 정답 단어의 일부인지 명시적으로 보여줌 (ref_word 사용)
+                    print(f"  - [AUTHENTICATED] '{candidate_whisper}' (as part of '{ref_word}')")
+                elif corrected_word != candidate_whisper:
                     print(
                         f"  - [CORRECTED] '{candidate_whisper}' -> '{corrected_word}' (Score: {best_match['score']:.2f})")
 
-                # 3단계: 남은 조각 처리
                 ref_matched_norm = _norm_for_compare(best_match["word"])
                 if candidate_norm != ref_matched_norm and candidate_norm.startswith(ref_matched_norm):
                     len_matched = len(ref_matched_norm.replace(" ", ""))
                     original_chars = [c for c in candidate_whisper if c.isalnum()]
-                    # IndexError 방지
                     leftover_whisper_part = "".join(original_chars[len_matched:]) if len(
                         original_chars) > len_matched else ""
                 else:
@@ -3273,8 +3293,7 @@ def _create_final_segments_from_ready(
 
                 corrected_words.append(corrected_word)
                 whisper_cursor += 1
-            else:  # 매칭 실패 시 (KEPT)
-                # [수정] type 비교 시 상수 사용
+            else:
                 print(
                     f"  - [{_MATCH_TYPE_KEPT}]      '{candidate_whisper}' (Best match '{best_match['word']}' score too low: {best_match['score']:.2f})")
                 corrected_words.append(candidate_whisper)
@@ -3298,7 +3317,7 @@ def _create_final_segments_from_ready(
     final_segments.sort(key=lambda x: x.get("start", 0.0))
     for i in range(1, len(final_segments)):
         prev_end = final_segments[i - 1].get("end", 0.0)
-        curr_start = final_segments[i].get("start", 0.0)  # 비교 위해 변수 사용
+        curr_start = final_segments[i].get("start", 0.0)
         if curr_start < prev_end:
             final_segments[i]["start"] = prev_end
 
@@ -3311,7 +3330,7 @@ def transcribe_words(
         *,
         model: str | None = None,
         beam_size: int = 5,
-        initial_prompt: str | None = None,
+        initial_prompt: str | None = None,  # [수정] 매개변수는 유지하되, 사용 안 함을 명시 (호환성)
         language: str | None = None,
         print_translate_view: bool = True,
         vad_filter: bool = True,
@@ -3319,10 +3338,12 @@ def transcribe_words(
 ) -> dict:
     """
     오디오 → 단어 단위 타임라인.
-    - [최종 수정] Linter 경고 및 VAD 충돌을 원천적으로 해결합니다.
+    - [최종 수정] 모든 Linter 경고 해결 및 안정성 강화.
+    - initial_prompt는 더 이상 사용되지 않지만, 호환성을 위해 매개변수는 유지합니다.
     """
     from pathlib import Path
     from typing import Any, Dict, List, Tuple
+    import sys  # stderr 출력을 위해 추가
 
     def _fmt(t: float) -> str:
         return f"{t:06.3f}"
@@ -3332,6 +3353,9 @@ def transcribe_words(
     p = Path(path)
     if not p.exists() or not p.is_file():
         raise FileNotFoundError(f"audio file not found: {path}")
+
+    # 사용되지 않는 initial_prompt에 대한 주석 (Linter 경고 방지)
+    _ = initial_prompt  # This parameter is intentionally unused
 
     print(f"[transcribe_words] start path='{p.name}', model='{mdl}', beam_size={bs}, vad_filter={vad_filter}")
 
@@ -3359,12 +3383,18 @@ def transcribe_words(
                 if k in fw_allow:
                     fw_opts[k] = v
 
+            # [수정] VAD 로딩 실패 시 구체적인 예외 처리
             if vad_filter:
                 try:
                     fw_opts["vad_filter"] = True
-                except Exception as e:
+                except RuntimeError as e:  # onnxruntime 관련 오류는 보통 RuntimeError
+                    print(f"[WARN] faster-whisper VAD filter failed (RuntimeError), proceeding without VAD. Error: {e}",
+                          file=sys.stderr)
+                    fw_opts["vad_filter"] = False
+                except Exception as e:  # 다른 예상치 못한 오류
                     print(
-                        f"[WARN] faster-whisper VAD filter failed to load, proceeding without VAD. Error: {type(e).__name__}")
+                        f"[WARN] faster-whisper VAD filter failed unexpectedly, proceeding without VAD. Error: {type(e).__name__}: {e}",
+                        file=sys.stderr)
                     fw_opts["vad_filter"] = False
             else:
                 fw_opts["vad_filter"] = False
@@ -3384,17 +3414,22 @@ def transcribe_words(
                             words_list.append((wa, wb, wt))
                             print(f"  [WORD {len(words_list):05d}] {_fmt(wa)} ~ {_fmt(wb)} | {wt}")
                     except (TypeError, ValueError, AttributeError):
-                        continue
+                        continue  # 개별 단어 오류는 건너뜀
             print(f"[transcribe_words] ko-pass done: segments={len(segments_list)}, words={len(words_list)}")
 
-        except Exception as e:
-            print(f"[WARN] faster-whisper failed during execution: {e}")
-            segments_list, words_list = [], []
+        except Exception as e:  # faster_whisper 실행 중 다른 오류
+            print(f"[WARN] faster-whisper failed during execution: {type(e).__name__}: {e}", file=sys.stderr)
+            segments_list, words_list = [], []  # 폴백을 위해 초기화
 
     if not segments_list:
         try:
             import whisper
-            wmodel2 = whisper.load_model(mdl)
+            # openai-whisper 로드 실패 시에도 예외 처리
+            try:
+                wmodel2 = whisper.load_model(mdl)
+            except Exception as load_err:
+                raise RuntimeError(f"Failed to load openai-whisper model '{mdl}'.") from load_err
+
             ow_opts: Dict[str, Any] = {"beam_size": bs, "word_timestamps": True, "fp16": False}
             if isinstance(language, str) and language.strip():
                 ow_opts["language"] = language.strip()
@@ -3416,13 +3451,14 @@ def transcribe_words(
                             words_list.append((wa, wb, wt))
                             print(f"  [WORD {len(words_list):05d}] {_fmt(wa)} ~ {_fmt(wb)} | {wt}")
                     except (TypeError, ValueError):
-                        continue
+                        continue  # 개별 단어 오류는 건너뜀
             print(f"[transcribe_words] ko-pass done: segments={len(segments_list)}, words={len(words_list)}")
 
         except ImportError as e:
+            # 두 라이브러리 모두 없는 경우
             raise RuntimeError("Both faster-whisper and openai-whisper are not installed.") from e
-        except Exception as e:
-            raise RuntimeError(f"whisper.transcribe failed: {e}") from e
+        except Exception as e:  # openai-whisper 실행 중 다른 오류
+            raise RuntimeError(f"openai-whisper transcribe failed: {type(e).__name__}: {e}") from e
 
     if print_translate_view and segments_list:
         try:
@@ -3430,10 +3466,154 @@ def transcribe_words(
             for en_idx, (a, b, txt) in enumerate(segments_list, 1):
                 print(f"[EN-SEG {en_idx:04d}] {_fmt(a)} ~ {_fmt(b)} | {txt}")
             print(f"[transcribe_words] translate-pass done: segments={len(segments_list)}")
-        except Exception:
-            pass
+        except Exception as e:  # 출력 중 오류 발생 대비
+            print(f"[WARN] Failed to print translate view: {type(e).__name__}: {e}", file=sys.stderr)
 
     return {"segments": segments_list, "words": words_list}
+
+
+
+
+
+# (다른 함수 정의들...)
+
+# ============================================================
+# 최종 오디오 처리 및 시간 업데이트 함수 (모든 경고 해결 최종 버전)
+# ============================================================
+def _finalize_audio_and_update_time(
+        final_segments: List[Dict[str, Any]],  # 타입 힌트 명시
+        project_dir: str,
+        audio_path: str
+) -> List[Dict[str, Any]]:  # [수정] 처리된 세그먼트 리스트를 반환하도록 변경
+    """
+    [최종 수정] 모든 Linter 경고를 해결하고, 처리된 세그먼트 리스트를 반환합니다.
+    """
+
+    # ---- 지역 유틸 함수 정의 ----
+    def _safe_float(val: Any) -> float:
+        try:
+            return float(val)
+        except (TypeError, ValueError):
+            return 0.0
+
+    # ---- 1. 무의미한 의성어 제거 ----
+    _FILTER_WORDS = {'a', 'ah', 'oh', 'uh', 'hm', 'hmm', 'um', 'o', 'eh', '음'}
+
+    organized_segments: List[Dict[str, Any]] = []
+    if not final_segments:
+        print("[FINALIZE] No segments to process.")
+    else:
+        for seg in final_segments:
+            text_to_check = str(seg.get("text", "")).lower().strip()
+            if text_to_check in _FILTER_WORDS:
+                print(f"  - [FILTERED] Segment removed (short interjection): '{text_to_check}'")
+                continue
+            organized_segments.append(seg)
+
+    if not organized_segments:
+        print("[WARN] All segments were filtered out.")
+        return []  # 빈 리스트 반환
+
+    # ---- 2. 타임스탬프 포맷팅 ----
+    for seg in organized_segments:
+        seg["start"] = round(_safe_float(seg.get("start", 0.0)), 2)
+        seg["end"] = round(_safe_float(seg.get("end", 0.0)), 2)
+
+    # ---- ffmpeg 경로 처리 ----
+    ffmpeg_exe = "ffmpeg"
+    try:
+        try:
+            from app import settings as app_settings_local
+        except ImportError:
+            app_settings_local = None
+
+        try:
+            import settings as root_settings_local
+        except ImportError:
+            root_settings_local = None
+
+        if app_settings_local and hasattr(app_settings_local, "FFMPEG_EXE"):
+            ffmpeg_exe = getattr(app_settings_local, "FFMPEG_EXE") or "ffmpeg"
+        elif root_settings_local and hasattr(root_settings_local, "FFMPEG_EXE"):
+            ffmpeg_exe = getattr(root_settings_local, "FFMPEG_EXE") or "ffmpeg"
+    except Exception as e:
+        print(f"[WARN] Error loading settings for FFMPEG_EXE: {e}. Using default.")
+
+    # ---- 3. 오디오 처리 및 'time' 업데이트 ----
+    last_lyric_end = _safe_float(organized_segments[-1].get("end", 0.0))
+    target_duration = last_lyric_end + 5.0
+    actual_duration = get_audio_duration(audio_path)
+    final_audio_duration = actual_duration if actual_duration > 0 else target_duration
+
+    print(
+        f"[FINALIZE] Last lyric end: {last_lyric_end:.2f}s, Target: {target_duration:.2f}s, Actual: {actual_duration:.2f}s")
+
+    ffmpeg_cmd: list[str] = []
+    if actual_duration > 0:
+        if target_duration < actual_duration and not (abs(target_duration - actual_duration) < 0.5):
+            print("[FINALIZE] Case A: Trimming audio and applying fade-out.")
+            final_audio_duration = target_duration
+            fade_start = max(0.0, target_duration - 2.0)
+            ffmpeg_cmd = [ffmpeg_exe, "-y", "-i", str(audio_path), "-to", f"{target_duration:.3f}", "-af",
+                          f"afade=t=out:st={fade_start:.3f}:d=2.0", "-c:a", "pcm_s16le", "-ar", "44100", "-ac", "2"]
+        elif abs(target_duration - actual_duration) < 0.5:
+            print("[FINALIZE] Case B: Applying fade-out only.")
+            final_audio_duration = actual_duration
+            fade_start = max(0.0, actual_duration - 2.0)
+            ffmpeg_cmd = [ffmpeg_exe, "-y", "-i", str(audio_path), "-af", f"afade=t=out:st={fade_start:.3f}:d=2.0",
+                          "-c:a", "pcm_s16le", "-ar", "44100", "-ac", "2"]
+        else:
+            print("[FINALIZE] Case C: No audio processing needed.")
+            final_audio_duration = actual_duration
+
+    if ffmpeg_cmd:
+        temp_output_path = ""
+        try:
+            with tempfile.NamedTemporaryFile(suffix=Path(audio_path).suffix or ".wav", delete=False) as temp_file:
+                temp_output_path = temp_file.name
+            ffmpeg_cmd.append(temp_output_path)
+            print(f"[FINALIZE] Running FFmpeg: {' '.join(ffmpeg_cmd)}")
+            subprocess.run(ffmpeg_cmd, check=True, capture_output=True, text=True, encoding='utf-8', errors='ignore')
+
+            processed_path = Path(temp_output_path)
+            if processed_path.exists() and processed_path.stat().st_size > 0:
+                shutil.move(str(processed_path), str(audio_path))
+                print(f"[FINALIZE] Audio file processed: {Path(audio_path).name}")
+            else:
+                if processed_path.exists(): processed_path.unlink()
+        except (subprocess.CalledProcessError, FileNotFoundError, OSError) as e:
+            error_output = getattr(e, 'stderr', str(e))
+            print(f"[ERROR] FFmpeg/File operation failed. Original file kept. Error: {error_output.strip()}")
+            if temp_output_path and Path(temp_output_path).exists(): Path(temp_output_path).unlink()
+
+    # ---- 4. project.json 업데이트 ----
+    try:
+        pj_path = Path(project_dir) / "project.json"
+        meta = {}
+        if pj_path.exists():
+            try:
+                with open(pj_path, "r", encoding="utf-8") as f:
+                    meta = json.load(f)
+            except (json.JSONDecodeError, OSError) as read_err:
+                meta = {}
+                print(f"[WARN] Failed to read project.json: {read_err}.")
+
+        meta["lyrics_result"] = "\n".join([str(seg.get("text", "")) for seg in organized_segments])
+        new_time_int = int(round(final_audio_duration))
+        meta["time"] = new_time_int
+
+        try:
+            with open(pj_path, "w", encoding="utf-8") as f:
+                json.dump(meta, f, ensure_ascii=False, indent=2)
+            print(f"[SYNC-PRO] 'lyrics_result' and 'time' ({new_time_int}s) updated in project.json.")
+        except OSError as write_err:
+            print(f"[ERROR] Failed to write to project.json: {write_err}")
+
+    except (KeyError, FileNotFoundError) as e:
+        print(f"[WARN] Could not update project.json: {e}")
+
+    return organized_segments  # [수정] 처리된 세그먼트 리스트 반환
+
 
 ###################################################################
 ###################################################################
