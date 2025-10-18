@@ -3147,21 +3147,18 @@ def _create_final_segments_from_ready(
         project_dir: str
 ) -> list:
     """
-    [최종 완성 버전] 모든 버그 및 경고 수정:
-    1. _romanize 함수 버그 수정: "Zero"와 같은 영어 단어도 "zero"로 올바르게 변환합니다.
-    2. '인증'/'교정' 로직 통합: 'Yum' -> 'Yummy' 교정이 가능하도록 수정합니다.
-    3. 3단계(철자, 음차, 재조합) 비교 수행.
-    4. 한국어 -> 단일 영어 알파벳 교정 방지 규칙 유지.
-    5. 매칭 실패 단어는 원본 보존, 짧은 의성어는 필터링합니다.
-    6. 최종 결과에서 첫/마지막 줄 경계 재확인.
-    7. 교정 과정을 콘솔에 상세히 출력합니다.
-    8. 모든 Linter 경고('kroman', 'ref_word', 'seg' 참조 등)를 해결합니다.
+    [최종 버전 + 필터링 개선]
+    1. _romanize 함수 버그 수정 (영어 단어 처리).
+    2. '인증'/'교정' 로직 통합 (Yum -> Yummy).
+    3. [New] 정답지(`ref_all_words`)에서 따옴표를 미리 제거.
+    4. [New] 짧은 단어 필터는 'KEPT' 상태의 단어에만 적용.
+    5. 모든 Linter 경고 해결.
     """
     import difflib
     from pathlib import Path
     import json
-    from typing import List, Dict, Pattern  # 타입 힌트용 import 추가
-    import re  # re 임포트 추가
+    from typing import List, Dict, Pattern
+    import re
 
     # ---- 매칭 상태 상수 정의 ----
     _MATCH_TYPE_KEPT = "KEPT"
@@ -3188,12 +3185,11 @@ def _create_final_segments_from_ready(
         if not a or not b: return 0.0
         return difflib.SequenceMatcher(None, a, b).ratio()
 
-    # [수정] kroman import 및 관련 함수 정의 (경고 해결)
     kroman = None
     try:
         import kroman
     except ImportError:
-        kroman = None  # except 블록에서 정의
+        kroman = None
         print("[WARN] kroman 라이브러리가 없어 2단계(음차 비교) 기능이 제한됩니다. 'pip install kroman'을 권장합니다.")
 
     _KOREAN_PATTERN: Pattern[str] = re.compile(r'[\uac00-\ud7a3]')
@@ -3202,26 +3198,16 @@ def _create_final_segments_from_ready(
         return bool(_KOREAN_PATTERN.search(str(word or "")))
 
     def _romanize(text: str) -> str:
-        """
-        [수정] 한글은 로마자로, 영어는 정규화된 소문자로 변환
-        """
         if not text: return ""
-
-        # 한글이 포함된 경우 kroman 사용
         if _is_korean(text) and kroman:
             korean_chars = "".join(re.findall(r'[\uac00-\ud7a3]', text))
-            if not korean_chars and not re.search(r'[a-zA-Z]', text):  # 한글도 없고 영어도 없으면 빈 문자열
-                return ""
+            if not korean_chars and not re.search(r'[a-zA-Z]', text): return ""
             if korean_chars:
                 try:
                     parsed = kroman.parse(korean_chars)
                     return parsed.replace("-", "").lower() if parsed else ""
                 except Exception:
-                    # kroman 실패 시 영어/숫자 처리로 폴백
                     pass
-
-        # 한글이 없거나, kroman이 없거나, kroman 변환 실패 시
-        # 영어/숫자 등은 정규화된 소문자/숫자 문자열 반환
         return _norm_for_compare(text)
 
     # ---- 1. 기준 설정 및 `seg_compare.json` 생성 ----
@@ -3237,7 +3223,6 @@ def _create_final_segments_from_ready(
         if _match_score(_norm_for_compare(seg.get("text", "")), first_line_norm) > 0.3:
             if first_idx == -1: first_idx = i
     for i in range(len(seg_ready_payload) - 1, -1, -1):
-        # [수정] seg 변수 참조 오류 해결
         current_seg = seg_ready_payload[i]
         if _match_score(_norm_for_compare(current_seg.get("text", "")), last_line_norm) > 0.3:
             if last_idx == -1: last_idx = i
@@ -3254,8 +3239,10 @@ def _create_final_segments_from_ready(
     except OSError as e:
         print(f"[WARN] seg_compare.json 저장 실패: {e}")
 
-    # ---- 2 & 3. 3단계 지능형 교정 (인증/교정 통합 비교) ----
-    ref_all_words = " ".join(ref_lines).replace(",", "").split()
+    # ---- 2 & 3. 3단계 지능형 교정 (필터링 로직 수정) ----
+
+    # [수정] 정답지에서 쉼표와 작은따옴표를 미리 제거
+    ref_all_words = " ".join(ref_lines).replace(",", "").replace("'", "").split()
     ref_all_words = [w for w in ref_all_words if w]
     ref_words_norm = [_norm_for_compare(w) for w in ref_all_words]
     ref_words_roman = [_romanize(w) for w in ref_all_words]
@@ -3286,13 +3273,11 @@ def _create_final_segments_from_ready(
 
             for i, loop_ref_word in enumerate(ref_all_words):
                 ref_norm = ref_words_norm[i]
-                ref_roman = ref_words_roman[i]
+                ref_roman = ref_words_roman[i] if kroman else ""
                 if not ref_norm: continue
 
                 auth_score = -1.0
                 if candidate_norm in ref_norm:
-                    # [수정] '인증' 점수. (Yum vs Yummy -> 0.9 + 3/5*0.1 = 0.96)
-                    # (실은 vs 현실은 -> 0.9 + 2/3*0.1 = 0.97)
                     auth_score = 0.9 + (len(candidate_norm) / len(ref_norm)) * 0.1
 
                 spell_score = _match_score(candidate_norm, ref_norm)
@@ -3304,28 +3289,19 @@ def _create_final_segments_from_ready(
                     if candidate_roman and ref_roman:
                         roman_score = _match_score(candidate_roman, ref_roman)
                     elif not _is_korean(candidate_whisper) and ref_roman:
-                        # [수정] 영어 vs 한글로마자 비교 (Unchicken vs chikin)
-                        # candidate_norm ('unchicken') vs ref_roman ('chikin')
-                        roman_score = _match_score(_norm_for_compare(candidate_whisper), ref_roman)
+                        roman_score = _match_score(candidate_norm, ref_roman)
 
-                # 교정 점수 = 철자 점수와 음차 점수 중 높은 값
                 correction_score = max(spell_score, roman_score)
 
                 print(
                     f"    [DEBUG] vs '{loop_ref_word}' (RefNorm:'{ref_norm}', RefRoman:'{ref_roman}'): Auth={auth_score:.2f}, Spell={spell_score:.2f}, Roman='{candidate_roman}'={roman_score:.2f} -> (Best: {best_match['score']:.2f})")
 
-                # [핵심 수정] 인증 점수와 교정 점수 중 더 높은 것을 채택
-
-                # Case 1: 인증 점수가 교정 점수보다 높고, 최고 점수일 때
                 if auth_score > correction_score and auth_score > best_match["score"]:
                     best_match.update(
                         {"score": auth_score, "word": candidate_whisper, "type": _MATCH_TYPE_AUTHENTICATED,
                          "ref_origin": loop_ref_word})
                     print(f"      [DEBUG] New Best (Auth): '{candidate_whisper}' (Score: {auth_score:.2f})")
-
-                # Case 2: 교정 점수가 인증 점수보다 높고, 최고 점수일 때
                 elif correction_score >= auth_score and correction_score > best_match["score"]:
-                    # [규칙] 한국어 -> 단일 영어 알파벳 교정 방지
                     is_candidate_korean = _is_korean(candidate_whisper)
                     is_ref_single_eng = len(loop_ref_word) == 1 and 'a' <= loop_ref_word.lower() <= 'z'
 
@@ -3335,20 +3311,26 @@ def _create_final_segments_from_ready(
                              "ref_origin": loop_ref_word})
                         print(f"      [DEBUG] New Best (Corrected): '{loop_ref_word}' (Score: {correction_score:.2f})")
 
-            # 최종 결정 및 필터링
+            # ---- [수정] 필터링 로직 변경 ----
             match_type = best_match["type"]
             word_to_process = best_match["word"]
             word_to_append = ""
 
-            # [수정] 임계값을 0.55로 복원 (Zero vs 새로 0.50, 안에 vs 새로 0.50 -> 둘다 탈락)
-            # [재수정] Zero(zero) vs 새로(saero)는 0.5, 안에(ane) vs 새로(saero)는 0.5. 둘다 0.55 탈락.
-            #          Yum(yum) vs Yummy(yummy)는 0.8. 통과.
-            #          0.55 유지
-            if best_match["score"] >= 0.55:
-                if word_to_process.lower() in _FILTER_SHORT_WORDS:
-                    print(f"  - [FILTERED]  '{candidate_whisper}' (Excluded short word: '{word_to_process}')")
+            if match_type == _MATCH_TYPE_KEPT:
+                # [수정] KEPT 상태일 때만 필터링 시도
+                if candidate_whisper.lower() in _FILTER_SHORT_WORDS:
+                    print(f"  - [FILTERED]  '{candidate_whisper}' (Excluded short word)")
                 else:
-                    word_to_append = word_to_process
+                    word_to_append = candidate_whisper  # 원본 보존
+                    print(
+                        f"  - [{_MATCH_TYPE_KEPT}]      '{candidate_whisper}' (Best match '{best_match['ref_origin'] or 'N/A'}' score too low: {best_match['score']:.2f})")
+                leftover_whisper_part = ""
+
+            else:  # AUTHENTICATED 또는 CORRECTED
+                # [수정] 임계값을 0.55로 유지 (Zero/새로, 안에/새로 모두 0.50이라 탈락)
+                if best_match["score"] >= 0.55:
+                    word_to_append = word_to_process  # 교정/인증된 단어는 필터링하지 않음
+
                     if match_type == _MATCH_TYPE_AUTHENTICATED:
                         print(
                             f"  - [AUTHENTICATED] '{word_to_append}' (using original, part of '{best_match['ref_origin']}')")
@@ -3359,32 +3341,33 @@ def _create_final_segments_from_ready(
                         print(
                             f"  - [CONFIRMED] '{candidate_whisper}' matches '{best_match['ref_origin']}' (Score: {best_match['score']:.2f})")
 
-                ref_matched_norm = _norm_for_compare(best_match["ref_origin"])
-                candidate_actual_norm = _norm_for_compare(candidate_whisper)
-                leftover_whisper_part = ""
-                if candidate_actual_norm != ref_matched_norm and candidate_actual_norm.startswith(ref_matched_norm):
-                    try:
-                        pattern_text = "".join(
-                            r"\s*".join(re.escape(c) for c in char) for char in ref_matched_norm.split())
-                        pattern = r'^(' + pattern_text + r')'
-                        match = re.search(pattern, candidate_whisper, flags=re.IGNORECASE | re.UNICODE)
-                        if match:
-                            leftover_whisper_part = candidate_whisper[match.end(1):].strip()
-                    except re.error:
-                        leftover_whisper_part = ""
-            else:  # 매칭 실패 (KEPT)
-                if candidate_whisper.lower() in _FILTER_SHORT_WORDS:
-                    print(f"  - [FILTERED]  '{candidate_whisper}' (Excluded short word)")
-                else:
-                    word_to_append = candidate_whisper
-                    print(
-                        f"  - [{_MATCH_TYPE_KEPT}]      '{candidate_whisper}' (Best match '{best_match['ref_origin'] or 'N/A'}' score too low: {best_match['score']:.2f})")
-                leftover_whisper_part = ""
+                    ref_matched_norm = _norm_for_compare(best_match["ref_origin"])
+                    candidate_actual_norm = _norm_for_compare(candidate_whisper)
+                    leftover_whisper_part = ""
+                    if candidate_actual_norm != ref_matched_norm and candidate_actual_norm.startswith(ref_matched_norm):
+                        try:
+                            pattern_text = "".join(
+                                r"\s*".join(re.escape(c) for c in char) for char in ref_matched_norm.split())
+                            pattern = r'^(' + pattern_text + r')'
+                            match = re.search(pattern, candidate_whisper, flags=re.IGNORECASE | re.UNICODE)
+                            if match:
+                                leftover_whisper_part = candidate_whisper[match.end(1):].strip()
+                        except re.error:
+                            leftover_whisper_part = ""
+                else:  # 임계값 미달
+                    if candidate_whisper.lower() in _FILTER_SHORT_WORDS:
+                        print(f"  - [FILTERED]  '{candidate_whisper}' (Excluded short word)")
+                    else:
+                        word_to_append = candidate_whisper  # 원본 보존
+                        print(
+                            f"  - [{_MATCH_TYPE_KEPT}]      '{candidate_whisper}' (Best match '{best_match['ref_origin'] or 'N/A'}' score too low: {best_match['score']:.2f})")
+                    leftover_whisper_part = ""
 
             if word_to_append:
                 segment_corrected_words.append(word_to_append)
 
             whisper_cursor += 1
+            # 남은 조각 없으면 다음 루프는 빈 문자열로 시작
 
         corrected_text = " ".join(segment_corrected_words)
         if corrected_text:
@@ -3432,20 +3415,23 @@ def transcribe_words(
         *,
         model: str | None = None,
         beam_size: int = 5,
-        initial_prompt: str | None = None,  # [수정] 매개변수는 유지하되, 사용 안 함을 명시 (호환성)
+        initial_prompt: str | None = None,
         language: str | None = None,
         print_translate_view: bool = True,
-        vad_filter: bool = True,
+        vad_filter: bool = True,  # 이 인자는 외부 호환성을 위해 남겨둡니다.
         **kwargs,
 ) -> dict:
     """
     오디오 → 단어 단위 타임라인.
-    - [최종 수정] 모든 Linter 경고 해결 및 안정성 강화.
-    - initial_prompt는 더 이상 사용되지 않지만, 호환성을 위해 매개변수는 유지합니다.
+    - [최종 수정] VAD 충돌 문제를 해결하기 위해 vad_filter 옵션을 내부적으로 False로 강제합니다.
+    - Linter 경고를 해결하기 위해 except 블록에서 변수를 할당합니다.
     """
     from pathlib import Path
     from typing import Any, Dict, List, Tuple
-    import sys  # stderr 출력을 위해 추가
+    import sys
+
+    # 사용되지 않는 매개변수를 명시적으로 처리 (Linter 경고 방지)
+    _ = initial_prompt
 
     def _fmt(t: float) -> str:
         return f"{t:06.3f}"
@@ -3456,10 +3442,10 @@ def transcribe_words(
     if not p.exists() or not p.is_file():
         raise FileNotFoundError(f"audio file not found: {path}")
 
-    # 사용되지 않는 initial_prompt에 대한 주석 (Linter 경고 방지)
-    _ = initial_prompt  # This parameter is intentionally unused
-
-    print(f"[transcribe_words] start path='{p.name}', model='{mdl}', beam_size={bs}, vad_filter={vad_filter}")
+    # [핵심 수정] VAD 충돌을 막기 위해 vad_filter를 False로 강제합니다.
+    use_vad = False
+    print(
+        f"[transcribe_words] start path='{p.name}', model='{mdl}', beam_size={bs}, vad_filter={use_vad} (Forced False)")
 
     segments_list: List[Tuple[float, float, str]] = []
     words_list: List[Tuple[float, float, str]] = []
@@ -3485,21 +3471,8 @@ def transcribe_words(
                 if k in fw_allow:
                     fw_opts[k] = v
 
-            # [수정] VAD 로딩 실패 시 구체적인 예외 처리
-            if vad_filter:
-                try:
-                    fw_opts["vad_filter"] = True
-                except RuntimeError as e:  # onnxruntime 관련 오류는 보통 RuntimeError
-                    print(f"[WARN] faster-whisper VAD filter failed (RuntimeError), proceeding without VAD. Error: {e}",
-                          file=sys.stderr)
-                    fw_opts["vad_filter"] = False
-                except Exception as e:  # 다른 예상치 못한 오류
-                    print(
-                        f"[WARN] faster-whisper VAD filter failed unexpectedly, proceeding without VAD. Error: {type(e).__name__}: {e}",
-                        file=sys.stderr)
-                    fw_opts["vad_filter"] = False
-            else:
-                fw_opts["vad_filter"] = False
+            # [핵심 수정] VAD 옵션을 강제로 끕니다.
+            fw_opts["vad_filter"] = use_vad
 
             wmodel = faster_whisper.WhisperModel(mdl, device="cpu", compute_type="int8")
             seg_iter, _info = wmodel.transcribe(str(p), **fw_opts)
@@ -3516,17 +3489,16 @@ def transcribe_words(
                             words_list.append((wa, wb, wt))
                             print(f"  [WORD {len(words_list):05d}] {_fmt(wa)} ~ {_fmt(wb)} | {wt}")
                     except (TypeError, ValueError, AttributeError):
-                        continue  # 개별 단어 오류는 건너뜀
+                        continue
             print(f"[transcribe_words] ko-pass done: segments={len(segments_list)}, words={len(words_list)}")
 
-        except Exception as e:  # faster_whisper 실행 중 다른 오류
+        except Exception as e:
             print(f"[WARN] faster-whisper failed during execution: {type(e).__name__}: {e}", file=sys.stderr)
-            segments_list, words_list = [], []  # 폴백을 위해 초기화
+            segments_list, words_list = [], []
 
     if not segments_list:
         try:
             import whisper
-            # openai-whisper 로드 실패 시에도 예외 처리
             try:
                 wmodel2 = whisper.load_model(mdl)
             except Exception as load_err:
@@ -3553,13 +3525,12 @@ def transcribe_words(
                             words_list.append((wa, wb, wt))
                             print(f"  [WORD {len(words_list):05d}] {_fmt(wa)} ~ {_fmt(wb)} | {wt}")
                     except (TypeError, ValueError):
-                        continue  # 개별 단어 오류는 건너뜀
+                        continue
             print(f"[transcribe_words] ko-pass done: segments={len(segments_list)}, words={len(words_list)}")
 
         except ImportError as e:
-            # 두 라이브러리 모두 없는 경우
             raise RuntimeError("Both faster-whisper and openai-whisper are not installed.") from e
-        except Exception as e:  # openai-whisper 실행 중 다른 오류
+        except Exception as e:
             raise RuntimeError(f"openai-whisper transcribe failed: {type(e).__name__}: {e}") from e
 
     if print_translate_view and segments_list:
@@ -3568,7 +3539,7 @@ def transcribe_words(
             for en_idx, (a, b, txt) in enumerate(segments_list, 1):
                 print(f"[EN-SEG {en_idx:04d}] {_fmt(a)} ~ {_fmt(b)} | {txt}")
             print(f"[transcribe_words] translate-pass done: segments={len(segments_list)}")
-        except Exception as e:  # 출력 중 오류 발생 대비
+        except Exception as e:
             print(f"[WARN] Failed to print translate view: {type(e).__name__}: {e}", file=sys.stderr)
 
     return {"segments": segments_list, "words": words_list}
