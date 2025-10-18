@@ -3147,19 +3147,21 @@ def _create_final_segments_from_ready(
         project_dir: str
 ) -> list:
     """
-    [최종 수정] 모든 Linter 경고를 해결한 최종 버전:
-    1. `kroman` import 실패 시 except 블록에서 변수를 할당합니다.
-    2. 'ref_word' 변수를 사용 전에 초기화합니다.
+    [최종 수정] 모든 Linter 경고(unused variable 포함)를 해결한 최종 버전.
     """
     import difflib
     from pathlib import Path
     import json
-    from typing import List, Dict  # 타입 힌트용 import 추가
+    from typing import List, Dict, Pattern  # 타입 힌트용 import 추가
+    import re  # re 임포트 추가
 
     # ---- 매칭 상태 상수 정의 ----
     _MATCH_TYPE_KEPT = "KEPT"
     _MATCH_TYPE_AUTHENTICATED = "AUTHENTICATED"
     _MATCH_TYPE_CORRECTED = "CORRECTED"
+
+    # ---- 제외할 짧은 단어 목록 (소문자) ----
+    _FILTER_SHORT_WORDS = {'a', 'ah', 'oh', 'uh', 'hm', 'hmm', 'um', 'o', 'eh', '음'}
 
     # ---- 지역 유틸 ----
     def _safe_float(val):
@@ -3170,25 +3172,34 @@ def _create_final_segments_from_ready(
 
     def _norm_for_compare(text: str) -> str:
         s = str(text or "").lower().strip()
+        s = " ".join(s.split())
         s = "".join(ch if ch.isalnum() else " " for ch in s)
         return " ".join(s.split())
 
     def _match_score(a: str, b: str) -> float:
         return difflib.SequenceMatcher(None, a, b).ratio()
 
-    # [수정] kroman import 실패 시 except 블록에서 변수 할당
+    kroman = None
     try:
         import kroman
     except ImportError:
-        kroman = None  # <-- 경고 해결
+        kroman = None
         print("[WARN] kroman 라이브러리가 없어 2단계(음차 비교) 기능이 제한됩니다. 'pip install kroman'을 권장합니다.")
 
     def _romanize(text: str) -> str:
         if not kroman or not text: return ""
+        korean_chars = "".join(re.findall(r'[\uac00-\ud7a3]', text))
+        if not korean_chars: return ""
         try:
-            return kroman.parse(text).replace("-", "").lower()
+            parsed = kroman.parse(korean_chars)
+            return parsed.replace("-", "").lower() if parsed else ""
         except Exception:
             return ""
+
+    _KOREAN_PATTERN: Pattern[str] = re.compile(r'[\uac00-\ud7a3]')
+
+    def _is_korean(word: str) -> bool:
+        return bool(_KOREAN_PATTERN.search(str(word or "")))
 
     # ---- 1. 기준 설정 및 `seg_compare.json` 생성 ----
     ref_lines = lyrics_compare_lines if lyrics_compare_lines else clean_lyrics_lines
@@ -3215,22 +3226,22 @@ def _create_final_segments_from_ready(
         with open(compare_path, "w", encoding="utf-8") as f:
             json.dump(seg_compare_payload, f, ensure_ascii=False, indent=2)
         print(f"[SYNC-PRO] seg_compare.json 저장됨: {compare_path}")
-    except Exception as e:
+    except OSError as e:
         print(f"[WARN] seg_compare.json 저장 실패: {e}")
 
-    # ---- 2 & 3. 3단계 지능형 교정 (인증/교정 구분) ----
-    ref_all_words = " ".join(ref_lines).replace(",", " ").split()
+    # ---- 2 & 3. 3단계 지능형 교정 (인증/교정 + 새 규칙) ----
+    ref_all_words = " ".join(ref_lines).replace(",", "").split()
     ref_words_norm = [_norm_for_compare(w) for w in ref_all_words]
     ref_words_roman = [_romanize(w) for w in ref_all_words]
 
-    final_segments: List[Dict] = []
+    intermediate_segments: List[Dict] = []
     print("\n--- [SEGMENT CORRECTION PROCESS] ---")
 
     for seg in seg_compare_payload:
         whisper_text = str(seg.get("text", "")).strip()
         if not whisper_text: continue
 
-        corrected_words: List[str] = []
+        segment_corrected_words: List[str] = []
         whisper_words = whisper_text.split()
         whisper_cursor = 0
         leftover_whisper_part = ""
@@ -3238,81 +3249,142 @@ def _create_final_segments_from_ready(
         while whisper_cursor < len(whisper_words):
             candidate_whisper = leftover_whisper_part + whisper_words[whisper_cursor]
             candidate_norm = _norm_for_compare(candidate_whisper)
+            if not candidate_norm:
+                whisper_cursor += 1
+                leftover_whisper_part = ""
+                continue
 
-            best_match: Dict = {"score": -1.0, "word": candidate_whisper, "type": _MATCH_TYPE_KEPT}
+            best_match: Dict = {"score": -1.0, "word": candidate_whisper, "type": _MATCH_TYPE_KEPT, "ref_origin": ""}
+            # current_ref_word 초기화 제거 (아래 루프에서 직접 할당)
 
-            # [수정] ref_word 변수 사용 전 초기화
-            ref_word: str = ""  # 루프 전에 초기화
-
-            for i, ref_word in enumerate(ref_all_words):  # 루프 변수 ref_word 사용
+            # [수정] current_ref_word 변수 사용 방식 변경 (경고 해결)
+            for i, loop_ref_word in enumerate(ref_all_words):  # 루프 변수 이름 변경
                 ref_norm = ref_words_norm[i]
                 if not ref_norm: continue
 
-                # '인증' (Substring Match) 로직
+                # '인증' (Substring Match)
                 if candidate_norm in ref_norm:
                     score = 0.9 + (len(candidate_norm) / len(ref_norm)) * 0.1
                     if score > best_match["score"]:
-                        best_match.update(
-                            {"score": score, "word": candidate_whisper, "type": _MATCH_TYPE_AUTHENTICATED})
+                        # 인증 성공 시, Whisper가 들은 단어와 원본 참조 단어를 저장
+                        best_match.update({"score": score, "word": candidate_whisper, "type": _MATCH_TYPE_AUTHENTICATED,
+                                           "ref_origin": loop_ref_word})
                     continue
 
-                    # '교정' (Similarity Match) 로직
+                # '교정' (Similarity Match)
                 score1 = _match_score(candidate_norm, ref_norm)
                 score2 = 0.0
                 if kroman:
                     candidate_roman = _romanize(candidate_whisper)
                     ref_roman = ref_words_roman[i]
                     if candidate_roman and ref_roman:
-                        score2 = _match_score(candidate_roman, ref_roman)
+                        score2 = _match_score(candidate_roman, ref_roman) * 0.9
+                    elif not _is_korean(candidate_whisper) and ref_roman:
+                        score2 = _match_score(candidate_norm, ref_roman) * 0.85
 
                 score = max(score1, score2)
 
                 if score > best_match["score"]:
-                    best_match.update({"score": score, "word": ref_word, "type": _MATCH_TYPE_CORRECTED})
+                    is_candidate_korean = _is_korean(candidate_whisper)
+                    # 교정 대상 단어(정답지 단어)가 단일 영어 알파벳인지 확인
+                    is_ref_single_eng = len(loop_ref_word) == 1 and 'a' <= loop_ref_word.lower() <= 'z'
 
-            # 최종 결정
-            if best_match["score"] >= 0.55:
-                corrected_word = best_match["word"]
-                match_type = best_match["type"]
+                    if not (is_candidate_korean and is_ref_single_eng):
+                        # 교정 성공 시, 교정될 단어(정답지 단어)와 원본 참조 단어를 저장
+                        best_match.update({"score": score, "word": loop_ref_word, "type": _MATCH_TYPE_CORRECTED,
+                                           "ref_origin": loop_ref_word})
 
-                if match_type == _MATCH_TYPE_AUTHENTICATED:
-                    # 인증 시에는 어떤 정답 단어의 일부인지 명시적으로 보여줌 (ref_word 사용)
-                    print(f"  - [AUTHENTICATED] '{candidate_whisper}' (as part of '{ref_word}')")
-                elif corrected_word != candidate_whisper:
-                    print(
-                        f"  - [CORRECTED] '{candidate_whisper}' -> '{corrected_word}' (Score: {best_match['score']:.2f})")
+            # 최종 결정 및 필터링
+            match_type = best_match["type"]
+            word_to_process = best_match["word"]  # 최종 결정된 단어 (인증된 원본 또는 교정된 단어 또는 KEPT 원본)
 
-                ref_matched_norm = _norm_for_compare(best_match["word"])
-                if candidate_norm != ref_matched_norm and candidate_norm.startswith(ref_matched_norm):
-                    len_matched = len(ref_matched_norm.replace(" ", ""))
-                    original_chars = [c for c in candidate_whisper if c.isalnum()]
-                    leftover_whisper_part = "".join(original_chars[len_matched:]) if len(
-                        original_chars) > len_matched else ""
+            # [수정] final_word 대신 word_to_append 사용 (경고 해결)
+            word_to_append = ""  # 추가할 단어 초기화
+
+            # 유사도 임계값 이상이거나 인증된 경우
+            if best_match["score"] >= 0.55 or match_type == _MATCH_TYPE_AUTHENTICATED:
+                # 짧은 단어 필터링
+                if word_to_process.lower() in _FILTER_SHORT_WORDS:
+                    print(f"  - [FILTERED]  '{candidate_whisper}' (Excluded short word: '{word_to_process}')")
+                    word_to_append = ""  # 필터링되면 추가 안 함
+                else:
+                    word_to_append = word_to_process  # 필터링 안되면 사용
+                    if match_type == _MATCH_TYPE_AUTHENTICATED:
+                        # 인증 시에는 best_match에 저장된 원본 참조 단어 사용
+                        print(f"  - [AUTHENTICATED] '{candidate_whisper}' (as part of '{best_match['ref_origin']}')")
+                    elif word_to_append != candidate_whisper:  # type이 CORRECTED이고 단어가 다를 때
+                        print(
+                            f"  - [CORRECTED] '{candidate_whisper}' -> '{word_to_append}' (Score: {best_match['score']:.2f})")
+
+                # 남은 조각 처리
+                ref_matched_norm = _norm_for_compare(
+                    best_match["word"] if match_type == _MATCH_TYPE_CORRECTED else candidate_whisper)
+                candidate_actual_norm = _norm_for_compare(candidate_whisper)
+
+                if candidate_actual_norm != ref_matched_norm and candidate_actual_norm.startswith(ref_matched_norm):
+                    len_matched = 0
+                    temp_ref_chars = list(ref_matched_norm.replace(" ", ""))
+                    temp_cand_chars = list(candidate_actual_norm.replace(" ", ""))
+                    while temp_ref_chars and temp_cand_chars and temp_ref_chars[0] == temp_cand_chars[0]:
+                        len_matched += 1
+                        temp_ref_chars.pop(0)
+                        temp_cand_chars.pop(0)
+                    original_chars = list(candidate_whisper)
+                    processed_count = 0
+                    remaining_part = []
+                    for char in original_chars:
+                        if char.isalnum(): processed_count += 1
+                        if processed_count > len_matched: remaining_part.append(char)
+                    leftover_whisper_part = "".join(remaining_part).strip()
                 else:
                     leftover_whisper_part = ""
-
-                corrected_words.append(corrected_word)
-                whisper_cursor += 1
-            else:
-                print(
-                    f"  - [{_MATCH_TYPE_KEPT}]      '{candidate_whisper}' (Best match '{best_match['word']}' score too low: {best_match['score']:.2f})")
-                corrected_words.append(candidate_whisper)
+            else:  # 매칭 실패 시 (KEPT)
+                if candidate_whisper.lower() in _FILTER_SHORT_WORDS:
+                    print(f"  - [FILTERED]  '{candidate_whisper}' (Excluded short word)")
+                    word_to_append = ""
+                else:
+                    word_to_append = candidate_whisper  # 원본 보존
+                    print(
+                        f"  - [{_MATCH_TYPE_KEPT}]      '{candidate_whisper}' (Best match '{best_match['word']}' score too low: {best_match['score']:.2f})")
                 leftover_whisper_part = ""
-                whisper_cursor += 1
 
-        corrected_text = " ".join(corrected_words)
-        final_segments.append({
-            "start": _safe_float(seg.get("start")),
-            "end": _safe_float(seg.get("end")),
-            "text": corrected_text,
-            "line_ko": corrected_text,
-        })
+            # 최종적으로 추가할 단어가 결정되었으면 리스트에 추가
+            if word_to_append:
+                segment_corrected_words.append(word_to_append)
+
+            whisper_cursor += 1
+            # 남은 조각이 없으면 다음 루프에서 leftover_whisper_part는 빈 문자열로 시작됨
+
+        corrected_text = " ".join(segment_corrected_words)
+        if corrected_text:
+            intermediate_segments.append({
+                "start": _safe_float(seg.get("start")),
+                "end": _safe_float(seg.get("end")),
+                "text": corrected_text,
+                "line_ko": corrected_text,
+            })
 
     print("------------------------------------\n")
 
-    # ---- 4. 최종 seg.json 저장 ----
-    if not final_segments:
+    # ---- 4. 최종 경계 재확인 및 seg.json 저장 ----
+    if not intermediate_segments:
         return []
+
+    final_start_idx, final_end_idx = -1, -1
+    for i, seg in enumerate(intermediate_segments):
+        if _match_score(_norm_for_compare(seg.get("text", "")), first_line_norm) > 0.5:
+            if final_start_idx == -1: final_start_idx = i
+    for i in range(len(intermediate_segments) - 1, -1, -1):
+        if _match_score(_norm_for_compare(intermediate_segments[i].get("text", "")), last_line_norm) > 0.5:
+            final_end_idx = i
+            break
+
+    if final_start_idx != -1 and final_end_idx != -1 and final_end_idx >= final_start_idx:
+        final_segments = intermediate_segments[final_start_idx: final_end_idx + 1]
+        print(f"[SYNC-PRO] Final boundary check: Kept segments from index {final_start_idx} to {final_end_idx}.")
+    else:
+        final_segments = intermediate_segments
+        print("[WARN] Final boundary check failed, using all corrected segments.")
 
     final_segments.sort(key=lambda x: x.get("start", 0.0))
     for i in range(1, len(final_segments)):
