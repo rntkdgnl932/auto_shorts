@@ -2029,10 +2029,10 @@ def run_job_with_progress_async(
 
         # 소유자에 보관했던 스레드 참조 제거
         try:
-            jobs = getattr(owner, "_progress_jobs", [])
-            if th in jobs:
-                jobs.remove(th)
-            setattr(owner, "_progress_jobs", jobs)
+            jobss = getattr(owner, "_progress_jobs", [])
+            if th in jobss:
+                jobss.remove(th)
+            setattr(owner, "_progress_jobs", jobss)
         except Exception:
             pass
 
