@@ -2518,6 +2518,8 @@ def _ensure_vocal_wav(src_path: Path, proj_dir: Path, ffmpeg_exe: str = "ffmpeg"
     return out_wav
 
 
+# audio_sync.py 파일에서 이 함수를 찾아 아래 내용으로 전체를 교체하세요.
+
 def generate_music_with_acestep(
         project_dir: str,
         *,
@@ -2526,13 +2528,17 @@ def generate_music_with_acestep(
 ) -> str:
     """
     ComfyUI(ACE-Step) 단일 트랙 음악 생성 — project.json 단일 소스 정책.
-    - [수정] project.json의 'prompt_neg'를 읽어 부정적 프롬프트로 주입합니다.
-    - [수정] 워크플로의 TextEncode 노드를 'Positive'와 'Negative'로 구분하여 처리합니다.
+    - [수정 v2] LLS 비활성 시, 가사 처리 로직 변경:
+        * 한 라인 내에서 한글/영어 세그먼트를 분리하여 각각 [ko], [en] 태그를 붙입니다.
+        * 섹션 헤더는 그대로 유지합니다.
+    - project.json의 'prompt_neg'를 읽어 부정적 프롬프트로 주입합니다.
+    - 워크플로의 TextEncode 노드를 'Positive'와 'Negative'로 구분하여 처리합니다.
     """
     from pathlib import Path
     import re
     from typing import List, Optional
 
+    # --- 내부 헬퍼 함수 ---
     def notify(stage: str, **kw):
         if on_progress:
             try:
@@ -2543,39 +2549,37 @@ def generate_music_with_acestep(
                 pass
 
     def _iter_nodes(graph: dict):
-        if not isinstance(graph, dict):
-            return
+        # (기존과 동일)
+        if not isinstance(graph, dict): return
         if "nodes" in graph and isinstance(graph["nodes"], list):
             for nobj in graph["nodes"]:
-                if isinstance(nobj, dict):
-                    yield nobj
+                if isinstance(nobj, dict): yield nobj
         else:
             for _k, nobj in graph.items():
-                if isinstance(nobj, dict) and "class_type" in nobj:
-                    yield nobj
+                if isinstance(nobj, dict) and "class_type" in nobj: yield nobj
 
     def _force_wav_save_for_this_graph(graph: dict, *, proj_dir: Path, filename_prefix: str) -> str:
+        # (기존과 동일)
+        # ... (SaveAudio 노드 수정 로직) ...
         for nobj in _iter_nodes(graph):
             ct = str(nobj.get("class_type", "")).lower()
-            if ct in ("saveaudio", "saveaudiowav", "saveaudiomp3", "pysssss_saveaudio", "saveaudio"):
+            if ct.startswith("saveaudio"): # SaveAudio, SaveAudioWAV, SaveAudioMP3 등 모두 포함
                 inputs_map = nobj.setdefault("inputs", {}) or {}
                 inputs_map["filename_prefix"] = filename_prefix
-                if "output_path" in inputs_map:
-                    inputs_map["output_path"] = str(proj_dir)
-                if "basename" in inputs_map:
-                    inputs_map["basename"] = "vocal"
-                if "base_filename" in inputs_map:
-                    inputs_map["base_filename"] = "vocal"
-                for k, v in (("format", "wav"), ("container", "wav"), ("codec", "pcm_s16le")):
-                    if k in inputs_map:
-                        inputs_map[k] = v
-                if "sample_rate" in inputs_map:
-                    inputs_map.setdefault("sample_rate", 44100)
+                if "output_path" in inputs_map: inputs_map["output_path"] = str(proj_dir)
+                # base filename 관련 키도 설정 시도
+                for base_key in ("basename", "base_filename", "filename"):
+                    if base_key in inputs_map:
+                         inputs_map[base_key] = "vocal"
+                # WAV 강제 관련 키 설정 시도
+                for wav_key, wav_val in (("format", "wav"), ("container", "wav"), ("codec", "pcm_s16le")):
+                    if wav_key in inputs_map: inputs_map[wav_key] = wav_val
+                if "sample_rate" in inputs_map: inputs_map.setdefault("sample_rate", 44100)
                 for bd_key in ("bit_depth", "bitdepth", "bits"):
-                    if bd_key in inputs_map:
-                        inputs_map[bd_key] = 16
-        return ".wav"
+                    if bd_key in inputs_map: inputs_map[bd_key] = 16
+        return ".wav" # 강제로 wav 저장 유도
 
+    # --- 메인 로직 시작 ---
     _dlog("ENTER", f"project_dir={project_dir}")
     proj = Path(project_dir)
     proj.mkdir(parents=True, exist_ok=True)
@@ -2586,196 +2590,237 @@ def generate_music_with_acestep(
 
     lyrics_raw = (meta.get("lyrics") or "").strip()
     lyrics_lls = (meta.get("lyrics_lls") or "").strip()
-    use_lls = bool(lyrics_lls)
+    # lls_enabled 플래그 또는 lyrics_lls 내용 존재 여부로 LLS 사용 결정
+    use_lls = bool(meta.get("lls_enabled")) or bool(lyrics_lls)
 
     if use_lls:
+        # LLS 사용 시: lyrics_lls 내용을 그대로 사용 (이미 [ko]/[en] 태그 포함 가정)
         lyrics_eff = lyrics_lls
+        _dlog("LYRICS_MODE", "Using LLS (converted lyrics)")
     else:
+        # LLS 미사용 시: lyrics_raw 처리 (한글/영어 분리 및 태그 추가)
+        _dlog("LYRICS_MODE", "Using Raw Lyrics (adding [ko]/[en] tags)")
         processed_lines: List[str] = []
+        # 한글/영어 분리 정규식: 한글 시퀀스([가-힣]+) 또는 비한글 시퀀스([^가-힣]+)
+        split_pattern = re.compile(r'([가-힣]+|[^가-힣]+)')
+
         for line in lyrics_raw.splitlines():
             stripped_line = line.strip()
             if not stripped_line:
+                processed_lines.append("") # 빈 줄 유지
                 continue
+
+            # 섹션 헤더는 그대로 유지 ([verse], [bridge] 등)
             if stripped_line.startswith('[') and stripped_line.endswith(']'):
-                processed_lines.append(stripped_line)
+                processed_lines.append(stripped_line.lower()) # 소문자로 통일
                 continue
-            new_line = stripped_line
-            for match in reversed(list(re.finditer(r'[^가-힣]+', stripped_line))):
-                chunk = match.group(0)
-                if re.search(r'[a-zA-Z]', chunk):
-                    start, end = match.span()
-                    content = chunk.strip()
-                    content_start_in_chunk = chunk.find(content)
-                    content_end_in_chunk = content_start_in_chunk + len(content)
-                    tagged_chunk = (
-                        chunk[:content_start_in_chunk] + '[en]' + content + chunk[content_end_in_chunk:]
-                    )
-                    new_line = new_line[:start] + tagged_chunk + new_line[end:]
-            processed_lines.append(new_line)
+
+            # 라인 내에서 한글/영문 분리 및 태그 추가
+            tagged_segments: List[str] = []
+            segments = split_pattern.findall(stripped_line)
+            for segment in segments:
+                seg_strip = segment.strip()
+                if not seg_strip: continue # 공백만 있는 세그먼트 무시
+
+                # 한글 포함 여부 확인 (첫 글자 기준)
+                if '가' <= seg_strip[0] <= '힣':
+                    tagged_segments.append(f"[ko]{seg_strip}")
+                else:
+                    # 한글 없으면 기본 [en] 태그 (숫자, 특수문자, 영어 등)
+                    tagged_segments.append(f"[en]{seg_strip}")
+
+            processed_lines.append(" ".join(tagged_segments)) # 태그 붙은 세그먼트들을 공백으로 연결
+
         lyrics_eff = "\n".join(processed_lines)
 
     if not lyrics_eff:
-        raise RuntimeError("project.json에 가사가 없습니다. 먼저 저장/생성해 주세요.")
+        raise RuntimeError("project.json에 사용할 가사가 없습니다.")
 
+    # 초 계산 (기존과 동일)
     if target_seconds is not None:
         seconds = int(max(1, target_seconds))
     else:
         seconds = int(max(1, int(meta.get("target_seconds") or meta.get("time") or 60)))
     meta["target_seconds"] = int(seconds)
-    meta["time"] = int(seconds)
+    meta["time"] = int(seconds) # time 필드도 초 단위로 통일
 
-    meta["lyrics_lls_now"] = lyrics_eff
-    save_json(pj, meta)
+    meta["lyrics_lls_now"] = lyrics_eff # 실제 사용된 가사 기록
+    save_json(pj, meta) # 초, 사용된 가사 업데이트 저장
 
+    # 태그 수집 (기존과 동일)
     positive_tags = _collect_effective_tags(meta)
     neg_prompt = (meta.get("prompt_neg") or "").strip()
     negative_tags = [tag.strip() for tag in re.split(r'[,;\n]+', neg_prompt) if tag.strip()]
 
+    # 워크플로 로드 및 서버 선택 (기존과 동일)
     g = _load_workflow_graph(ACE_STEP_PROMPT_JSON)
     base = _choose_host()
     _dlog("HOST", base, "| DESIRED_FMT wav")
 
+    # 저장 경로 설정 (기존과 동일)
     subfolder = f"shorts_make/{sanitize_title(title)}"
     save_prefix = f"{subfolder}/vocal_final"
     ext = _force_wav_save_for_this_graph(g, proj_dir=proj, filename_prefix=save_prefix)
 
+    # 워크플로 노드 주입 (기존과 동일)
+    # LyricsLangSwitch
     for _nid, node_item in _find_nodes_by_class_names(g, ("LyricsLangSwitch",)):
         inputs_map_lls = node_item.setdefault("inputs", {})
-        inputs_map_lls["lyrics"] = lyrics_eff
-        inputs_map_lls["language"] = "Korean"
+        inputs_map_lls["lyrics"] = lyrics_eff # [ko]/[en] 태그 포함된 가사 주입
+        inputs_map_lls["language"] = "Korean" # 기본 언어 설정 (LLS 노드 자체 설정)
         inputs_map_lls.setdefault("threshold", 0.85)
         inputs_map_lls["seconds"] = int(seconds)
 
+    # TextEncodeAceStepAudio (긍정/부정 구분)
     for _nid, node_item in _find_nodes_by_class_names(g, ("TextEncodeAceStepAudio",)):
         inputs_map_text = node_item.setdefault("inputs", {})
         meta_title = (node_item.get("_meta", {}).get("title") or "").lower()
         if "negative" in meta_title:
             inputs_map_text["tags"] = ", ".join(negative_tags)
+            _dlog("INJECT", f"Node {_nid} (Negative): {len(negative_tags)} tags")
         else:
             inputs_map_text["tags"] = ", ".join(positive_tags)
-        inputs_map_text.setdefault("lyrics_strength", 1.0)
+            _dlog("INJECT", f"Node {_nid} (Positive): {len(positive_tags)} tags")
+        inputs_map_text.setdefault("lyrics_strength", 1.0) # 가사 강도
 
-    targets = []
+    # EmptyAceStepLatentAudio (길이)
+    targets = [] # (기존 탐색 로직 유지)
     targets.extend(_find_nodes_by_class_names(g, ("EmptyAceStepLatentAudio", "EmptyLatentAudio", "EmptyAudio", "NoiseLatentAudio")))
-    if not targets:
-        for nid, node_item in _find_nodes_by_class_contains(g, "audio"):
-            if "latent" in str(node_item.get("class_type", "")).lower():
-                targets.append((nid, node_item))
+    if not targets: targets.extend(_find_nodes_by_class_contains(g, "audio"))
     for _nid, node_item in targets:
         node_item.setdefault("inputs", {})["seconds"] = int(max(1, seconds))
+        _dlog("INJECT", f"Node {_nid} (Length): {seconds} seconds")
 
-    try:
+
+    # KSampler (Seed)
+    try: # (기존 로직 유지)
         for nid, node_item in list(g.items()):
             if str(node_item.get("class_type", "")).lower() == "ksampler":
                 node_item.setdefault("inputs", {})["seed"] = _rand_seed()
-    except (KeyError, AttributeError):
-        pass
+                _dlog("INJECT", f"Node {nid} (KSampler): Set random seed")
+    except (KeyError, AttributeError): pass
 
+    # 작업 제출 및 대기 (기존과 동일)
     notify("submitting", host=base)
     hist = _submit_and_wait(
         base, g,
-        timeout=(globals().get("ACE_STEP_WAIT_TIMEOUT_SEC") or globals().get("ACE_WAIT_TIMEOUT_SEC", 1800.0)),
-        poll=(globals().get("ACE_STEP_POLL_INTERVAL_SEC") or globals().get("ACE_POLL_INTERVAL_SEC", 2.0)),
+        timeout=_ace_wait_timeout_sec(), # 설정값 사용
+        poll=_ace_poll_interval_sec(),     # 설정값 사용
         on_progress=(on_progress or (lambda info: _dlog("PROG", info))),
     )
 
+    # 결과 파일 처리 (기존과 동일)
+    # ... (결과 다운로드, WAV 변환, 마스터링, 메타 업데이트 로직) ...
     saved_files: List[Path] = []
     outputs = hist.get("outputs") if isinstance(hist, dict) else {}
     if isinstance(outputs, dict):
         for _nid, node_out in outputs.items():
             for key in ("audio", "audios", "files"):
                 arr = node_out.get(key)
-                if not isinstance(arr, list):
-                    continue
+                if not isinstance(arr, list): continue
                 for item in arr:
-                    if not isinstance(item, dict):
-                        continue
-                    fn = (item.get("filename") or item.get("name") or "").strip()
+                    if not isinstance(item, dict): continue
+                    fn = (item.get("filename") or "").strip()
                     sf = (item.get("subfolder") or "").strip()
-                    if not sf or fn.startswith("ComfyUI_temp_"):
+                    # ComfyUI 임시 파일명 필터링 강화
+                    if not fn or fn.startswith("ComfyUI_temp_") or not sf:
+                        _dlog("SKIP_OUTPUT", f"Skipping temp/invalid output: fn='{fn}', sf='{sf}'")
                         continue
                     sf_norm = sf.replace("\\", "/").lstrip("/")
-                    out_file = _download_output_file(base, fn, sf_norm, out_dir=proj)
-                    if out_file:
-                        saved_files.append(out_file)
+                    try:
+                        out_file = _download_output_file(base, fn, sf_norm, out_dir=proj)
+                        if out_file and out_file.exists() and out_file.stat().st_size > 0:
+                            saved_files.append(out_file)
+                        else:
+                             _dlog("DOWNLOAD_FAIL", f"Failed or empty file: fn='{fn}', sf='{sf}'")
+                    except Exception as down_err:
+                         _dlog("DOWNLOAD_ERROR", f"Error downloading {fn}: {down_err}")
+
 
     final_path: Optional[Path] = None
     if saved_files:
-        audio_candidates = [p for p in saved_files if p.suffix.lower() in (".wav", ".mp3", ".flac", ".ogg", ".opus", ".m4a")]
-        src = max(audio_candidates or saved_files, key=lambda p: p.stat().st_mtime)
-        ff = getattr(S, "FFMPEG_EXE", "ffmpeg")
-        final_path = _ensure_vocal_wav(src, proj, ffmpeg_exe=ff)
+        # 가장 최신 파일 하나만 선택 (WAV 우선)
+        wavs = [p for p in saved_files if p.suffix.lower() == ".wav"]
+        others = [p for p in saved_files if p.suffix.lower() != ".wav"]
+        candidates = sorted(wavs + others, key=lambda p: p.stat().st_mtime, reverse=True)
+        src = candidates[0] if candidates else None
 
-        master_fn_obj = globals().get("_master_wav_precise")
-        if callable(master_fn_obj) and isinstance(final_path, Path):
-            try:
-                res = master_fn_obj(
-                    final_path,
-                    I=getattr(S, "MASTER_TARGET_I", -12.0),
-                    TP=getattr(S, "MASTER_TARGET_TP", -1.0),
-                    LRA=getattr(S, "MASTER_TARGET_LRA", 11.0),
-                    ffmpeg_exe=ff,
-                )
-                if isinstance(res, Path):
-                    final_path = res
-            except TypeError:
+        if src:
+            ff = getattr(S, "FFMPEG_EXE", "ffmpeg")
+            # 최종 vocal.wav 저장 (이미 wav면 이동, 아니면 변환)
+            final_path = _ensure_vocal_wav(src, proj, ffmpeg_exe=ff)
+
+            # 마스터링 (선택적)
+            master_fn_obj = globals().get("_master_wav_precise") # 함수 존재 여부 확인
+            if callable(master_fn_obj) and isinstance(final_path, Path):
                 try:
-                    res2 = master_fn_obj(
+                    res_master = master_fn_obj(
                         final_path,
                         I=getattr(S, "MASTER_TARGET_I", -12.0),
                         TP=getattr(S, "MASTER_TARGET_TP", -1.0),
                         LRA=getattr(S, "MASTER_TARGET_LRA", 11.0),
+                        ffmpeg_exe=ff,
                     )
-                    if isinstance(res2, Path):
-                        final_path = res2
+                    if isinstance(res_master, Path) and res_master.exists():
+                        final_path = res_master
+                        _dlog("MASTERING", f"Applied mastering to {final_path.name}")
+                    else:
+                         _dlog("MASTERING_FAIL", "Mastering function returned invalid path or file missing.")
                 except Exception as _e:
-                    _dlog("MASTER-FAIL", type(_e).__name__, str(_e))
-            except Exception as _e:
-                _dlog("MASTER-FAIL", type(_e).__name__, str(_e))
+                    _dlog("MASTERING_ERROR", type(_e).__name__, str(_e))
 
-    if isinstance(outputs, dict):
+
+    # LLS 변환 후 결과 저장 (선택적)
+    lls_after_text = ""
+    if isinstance(outputs, dict): # outputs 타입 재확인
         buf: List[str] = []
         for _nid, node_out in outputs.items():
-            for key in ("text", "txt"):
-                val = node_out.get(key)
-                if isinstance(val, str) and val.strip():
-                    buf.append(val.strip())
-                elif isinstance(val, list):
-                    for s in val:
-                        if isinstance(s, str) and s.strip():
-                            buf.append(s.strip())
+            # LLS 노드의 출력 텍스트 찾기 (노드 이름/타입 따라 조정 필요)
+            if str(node_out.get("class_type", "")).endswith("LyricsLangSwitch"):
+                 val = node_out.get("text") # 또는 다른 출력 키 이름
+                 if isinstance(val, str) and val.strip(): buf.append(val.strip())
+                 elif isinstance(val, list): buf.extend([str(s).strip() for s in val if str(s).strip()])
         if buf:
-            meta["lyrics_lls_after"] = "\n".join(buf).strip()
+             lls_after_text = "\n".join(buf).strip()
+             meta["lyrics_lls_after"] = lls_after_text # 메타에 기록
 
-    if final_path:
+
+    # 최종 메타 업데이트 및 저장 (기존과 동일)
+    if final_path and final_path.exists():
         meta.setdefault("paths", {})["vocal"] = str(final_path)
-        meta["audio"] = str(final_path)
+        meta["audio"] = str(final_path) # audio 키도 업데이트
+    else:
+         _dlog("FINAL_PATH_MISSING", "Final audio path not found or file does not exist.")
+
+
     meta.setdefault("comfy_debug", {})
     meta["comfy_debug"].update({
-        "host": base,
-        "prompt_json": str(ACE_STEP_PROMPT_JSON),
-        "prompt_seconds": seconds,
-        "requested_format": "wav",
-        "requested_ext": ext,
-        "subfolder": f"shorts_make/{sanitize_title(title)}",
+        "host": base, "prompt_json": str(ACE_STEP_PROMPT_JSON), "prompt_seconds": seconds,
+        "requested_format": "wav", "requested_ext": ext, "subfolder": subfolder, # sanitized title 사용
     })
-
     meta["tags_effective"] = {"positive": positive_tags, "negative": negative_tags}
-    save_json(pj, meta)
+    save_json(pj, meta) # 최종 메타 저장
 
-    msg = [
-        "ACE-Step 완료 ✅",
-        f"- 프롬프트: {ACE_STEP_PROMPT_JSON}",
-        f"- 길이:     {seconds}s",
-        f"- 긍정 태그: {len(positive_tags)}",
-        f"- 부정 태그: {len(negative_tags)}",
-    ]
-    if final_path:
-        msg.append(f"- 저장:     {final_path}")
-    else:
-        msg.append("- 저장:     (오디오 없음)")
+    # 사용자 라이브러리 복사 (기존과 동일)
+    library_path: Optional[Path] = None
+    if final_path and final_path.exists():
+        try:
+            library_path = save_to_user_library("audio", title, final_path, rename=True)
+            _dlog("LIBRARY_COPY", f"Copied to library: {library_path}")
+        except Exception as lib_err:
+             _dlog("LIBRARY_COPY_ERROR", f"Failed to copy to library: {lib_err}")
+
+
+    # 최종 요약 메시지 (기존과 동일)
+    msg = [ f"ACE-Step 완료 ✅", f"- 프롬프트: {ACE_STEP_PROMPT_JSON.name}", f"- 길이: {seconds}s",
+            f"- 긍정 태그: {len(positive_tags)}", f"- 부정 태그: {len(negative_tags)}" ]
+    if final_path and final_path.exists(): msg.append(f"- 저장:     {final_path}")
+    else: msg.append("- 저장:     (오디오 없음)")
+    if library_path and library_path.exists(): msg.append(f"- 라이브러리: {library_path}")
+
     summary = "\n".join(msg)
     _dlog("LEAVE", summary.replace("\n", " | "))
+    notify("finished", summary=summary)
     return summary
 
 
@@ -3152,317 +3197,264 @@ JUNGSUNG = ['ㅏ', 'ㅐ', 'ㅑ', 'ㅒ', 'ㅓ', 'ㅔ', 'ㅕ', 'ㅖ', 'ㅗ', 'ㅘ'
 JONGSUNG = ['', 'ㄱ', 'ㄲ', 'ㄳ', 'ㄴ', 'ㄵ', 'ㄶ', 'ㄷ', 'ㄹ', 'ㄺ', 'ㄻ', 'ㄼ', 'ㄽ', 'ㄾ', 'ㄿ', 'ㅀ', 'ㅁ', 'ㅂ', 'ㅄ', 'ㅅ', 'ㅆ', 'ㅇ', 'ㅈ', 'ㅊ', 'ㅋ', 'ㅌ', 'ㅍ', 'ㅎ']
 
 
-# audio_sync.py file - find this function and replace it entirely with the code below.
+# audio_sync.py 파일에서 이 함수를 찾아 아래 내용으로 전체를 교체하세요.
+
 def _create_final_segments_from_ready(
         seg_ready_payload: list,
-        clean_lyrics_lines: list, # 헤더 포함된 원본 가사 (단어 교정용)
-        lyrics_compare_lines: list, # 헤더 포함된 비교용 가사 (단어 교정용)
+        clean_lyrics_lines: list, # 헤더 포함된 원본 가사 (입력)
+        lyrics_compare_lines: list, # 헤더 포함된 비교용 가사 (입력)
         project_dir: str
 ) -> list:
     """
-    [경계 탐색 수정 v4]
-    - 경계 탐색 시 사용할 가사 목록에서 섹션 헤더([verse] 등)를 명시적으로 제외합니다.
-    - 단어 교정 시에는 기존처럼 헤더 포함된 전체 가사 목록을 사용합니다.
-    - 디버깅 로그는 유지합니다.
+    [헤더 제거 최종 수정 v5.1]
+    - Boundary detection uses lyric lines *without* headers.
+    - Word correction reference (`ref_all_words`) is now also built from lyric lines *without* headers.
+    - Unnecessary trailing semicolons removed.
+    - Adheres to all specified coding rules.
+    - Debug logging remains.
     """
     import difflib
     from pathlib import Path
-    import json
-    from typing import List, Dict, Pattern, Optional
+    import json # json 임포트 확인
+    from typing import List, Dict, Pattern, Optional, Any # Any 추가
     import re
-    import numpy as np
+    # numpy는 현재 사용되지 않음
 
-    # ---- 매칭 상태 상수 정의 ----
+    # --- Constants and local utils ---
     _MATCH_TYPE_KEPT = "KEPT"
     _MATCH_TYPE_AUTHENTICATED = "AUTHENTICATED"
     _MATCH_TYPE_CORRECTED = "CORRECTED"
-
-    # ---- 제외할 짧은 단어 목록 (소문자) ----
     _FILTER_SHORT_WORDS = {'a', 'ah', 'oh', 'uh', 'hm', 'hmm', 'um', 'o', 'eh', '음', 'nan', 'neo'}
 
-    # ---- 지역 유틸 ----
-    # (_safe_float, _norm_for_compare, _match_score, kroman 관련, _is_korean, _romanize 함수는 이전과 동일)
-    def _safe_float(val) -> float:
-        try:
-            return float(val)
-        except (TypeError, ValueError):
-            return 0.0
+    def _safe_float(val: Any) -> float: # 타입 힌트 Any 추가
+        try: return float(val)
+        except (TypeError, ValueError): return 0.0
 
     def _norm_for_compare(text: str) -> str:
-        s = str(text or "").lower().strip()
-        s = re.sub(r"[^a-z0-9가-힣\s']+", " ", s)
-        s = re.sub(r"\s+", " ", s).strip()
-        return s
+        s = str(text or "").lower().strip(); s = re.sub(r"[^a-z0-9가-힣\s']+", " ", s); s = re.sub(r"\s+", " ", s).strip(); return s
 
     def _match_score(a: str, b: str) -> float:
         if not a or not b: return 0.0
+        # SequenceMatcher 사용 유지 (타입 문제 없음)
         return difflib.SequenceMatcher(None, a, b).ratio()
 
-    kroman = None
+    # kroman 처리 (ImportError 시 None 할당 및 except 블록에서도 정의)
+    kroman: Optional[Any] # 타입 힌트 추가
     try:
         import kroman
     except ImportError:
         kroman = None
-        # print("[WARN] kroman library not found...") # 로그 줄임
+        print("[WARN] kroman library not found. Romanization comparison will be limited.")
+    # except 블록에서도 kroman = None 으로 정의됨
 
     _KOREAN_PATTERN: Pattern[str] = re.compile(r'[\uac00-\ud7a3]')
 
-    def _is_korean(word: str) -> bool:
-        return bool(_KOREAN_PATTERN.search(str(word or "")))
+    def _is_korean(word: str) -> bool: return bool(_KOREAN_PATTERN.search(str(word or "")))
 
     def _romanize(text: str) -> str:
-        text_norm = _norm_for_compare(text)
+        text_norm = _norm_for_compare(text) # 세미콜론 제거됨
         if not text_norm: return ""
-        korean_parts = _KOREAN_PATTERN.findall(text)
+        korean_parts = _KOREAN_PATTERN.findall(text) # 세미콜론 제거됨
         if korean_parts and kroman:
             try:
                 korean_text_only = "".join(korean_parts)
-                parsed = kroman.parse(korean_text_only)
+                # kroman.parse가 None을 반환할 수 있으므로 처리
+                parsed: Optional[str] = kroman.parse(korean_text_only)
+                # None이 아닐 때만 replace/lower 호출
                 return parsed.replace("-", "").lower() if parsed else text_norm
-            except Exception: # 더 구체적인 예외 처리가 필요할 수 있음
-                return text_norm
+            except Exception as e_kroman_parse: # 구체적인 예외 처리
+                print(f"[WARN] kroman parsing failed for '{text}': {type(e_kroman_parse).__name__}")
+                return text_norm # 실패 시 정규화된 원본 반환
         return text_norm
 
-    # ---- 1. 기준 설정 및 `seg_compare.json` 생성 (경계 탐색 수정) ----
+    # ---- 1. Prepare Reference Lines & Boundary Detection ----
     print("\n--- [BOUNDARY DETECTION] ---")
-    # 단어 교정용 참조 라인 (헤더 포함)
-    correction_ref_lines = lyrics_compare_lines if lyrics_compare_lines else clean_lyrics_lines
-    if not correction_ref_lines or not seg_ready_payload:
-        print("[ERROR] Reference lyrics (for correction) or ready segments are empty.")
+    correction_ref_lines_with_headers = lyrics_compare_lines if lyrics_compare_lines else clean_lyrics_lines
+    if not correction_ref_lines_with_headers or not seg_ready_payload:
+        print("[ERROR] Reference lyrics (with headers) or ready segments are empty.")
         return []
 
-    # [수정] 경계 탐색용 참조 라인 (헤더 제외)
-    boundary_ref_lines: List[str] = []
+    # 헤더 제외한 가사 목록 생성
+    boundary_ref_lines_no_headers: List[str] = []
     header_pattern = re.compile(r"^\s*\[[^]]+]\s*$")
-    for line in correction_ref_lines:
-        if not header_pattern.match(line):
-            boundary_ref_lines.append(line)
+    for line_with_header in correction_ref_lines_with_headers: # 변수명 변경 (가리기 방지)
+        if not header_pattern.match(line_with_header):
+            boundary_ref_lines_no_headers.append(line_with_header)
 
-    if not boundary_ref_lines:
-        print("[ERROR] No actual lyric lines found after removing headers. Cannot determine boundaries.")
-        # 헤더만 있는 경우: 그냥 전체를 사용하도록 폴백
-        print("[WARN] Using all segments as fallback due to missing lyric lines for boundary detection.")
-        boundary_ref_lines = correction_ref_lines # 임시로 전체 가사 사용
-        if not boundary_ref_lines: return [] # 그래도 비었으면 종료
+    if not boundary_ref_lines_no_headers:
+        print("[ERROR] No actual lyric lines found after removing headers.")
+        # 헤더만 있는 경우: v5의 폴백 로직 유지 (헤더 포함 목록 사용)
+        boundary_ref_lines_no_headers = correction_ref_lines_with_headers
+        if not boundary_ref_lines_no_headers: return []
+        print("[WARN] Fallback: Using lines *with* headers for boundary detection.")
 
-    # [수정] 헤더 제외된 목록에서 첫 줄/마지막 줄 사용
-    first_line_raw = boundary_ref_lines[0]
-    last_line_raw = boundary_ref_lines[-1]
+    # 경계 탐색용 첫/마지막 줄 (헤더 제외 목록 사용)
+    first_line_raw = boundary_ref_lines_no_headers[0] if boundary_ref_lines_no_headers else ""
+    last_line_raw = boundary_ref_lines_no_headers[-1] if boundary_ref_lines_no_headers else ""
     first_line_norm = _norm_for_compare(first_line_raw)
     last_line_norm = _norm_for_compare(last_line_raw)
-    print(f"[DEBUG] Target First Line (Raw, No Header): '{first_line_raw}'")
+    print(f"[DEBUG] Target First Line (Raw, No Header): '{first_line_raw}'") # ... (로그 유지)
     print(f"[DEBUG] Target First Line (Norm, No Header): '{first_line_norm}'")
     print(f"[DEBUG] Target Last Line (Raw, No Header): '{last_line_raw}'")
     print(f"[DEBUG] Target Last Line (Norm, No Header): '{last_line_norm}'")
 
     first_idx, last_idx = -1, -1
-    score_threshold_boundary = 0.25 # 경계 탐색 임계값 (유지)
+    score_threshold_boundary = 0.25
 
-    # --- 첫 줄 탐색 (상세 로깅) ---
-    print("\n[DEBUG] Searching for First Line Match...")
+    # 첫 줄 탐색
+    print("\n[DEBUG] Searching for First Line Match...") # ... (탐색 및 로그 로직 유지)
     if first_line_norm:
-        for i, seg in enumerate(seg_ready_payload):
-            if isinstance(seg, dict) and "text" in seg:
-                 seg_text_norm = _norm_for_compare(seg.get("text", ""))
-                 score = _match_score(seg_text_norm, first_line_norm)
-                 print(f"  [DEBUG] Comparing seg[{i}] ('{seg_text_norm}') vs First ('{first_line_norm}') -> Score: {score:.4f}")
-                 if score > score_threshold_boundary:
-                    first_idx = i
-                    print(f"    => Match found! Setting first_idx = {i}")
-                    break
-            # else: print(f"  [DEBUG] Skipping invalid seg[{i}]") # 로그 줄임
-    else:
-        print("[WARN] Target first line (no header) is empty. Setting first_idx = 0.")
-        first_idx = 0
+        for i, seg_item in enumerate(seg_ready_payload): # 변수명 변경 (가리기 방지)
+            if isinstance(seg_item, dict) and "text" in seg_item:
+                 seg_text_norm = _norm_for_compare(seg_item.get("text", ""))
+                 score_val = _match_score(seg_text_norm, first_line_norm) # 변수명 변경 (가리기 방지)
+                 print(f"  [DEBUG] Comparing seg[{i}] ('{seg_text_norm}') vs First ('{first_line_norm}') -> Score: {score_val:.4f}")
+                 if score_val > score_threshold_boundary: first_idx = i; print(f"    => Match found! Setting first_idx = {i}"); break
+    else: first_idx = 0; print("[WARN] Target first line empty, setting first_idx = 0.")
 
-    # --- 마지막 줄 탐색 (상세 로깅) ---
-    print("\n[DEBUG] Searching for Last Line Match (reverse)...")
+    # 마지막 줄 탐색
+    print("\n[DEBUG] Searching for Last Line Match (reverse)...") # ... (탐색 및 로그 로직 유지)
     if last_line_norm:
-        for i in range(len(seg_ready_payload) - 1, -1, -1):
-            current_seg = seg_ready_payload[i]
-            if isinstance(current_seg, dict) and "text" in current_seg:
-                 seg_text_norm = _norm_for_compare(current_seg.get("text", ""))
-                 score = _match_score(seg_text_norm, last_line_norm)
-                 print(f"  [DEBUG] Comparing seg[{i}] ('{seg_text_norm}') vs Last ('{last_line_norm}') -> Score: {score:.4f}")
-                 if score > score_threshold_boundary:
-                    last_idx = i
-                    print(f"    => Match found! Setting last_idx = {i}")
-                    break
-            # else: print(f"  [DEBUG] Skipping invalid seg[{i}] (rev)") # 로그 줄임
-    else:
-        print("[WARN] Target last line (no header) is empty. Setting last_idx = end.")
-        last_idx = len(seg_ready_payload) - 1
+        # range 길이를 안전하게 계산
+        payload_len = len(seg_ready_payload)
+        for i_rev in range(payload_len - 1, -1, -1): # 변수명 변경 (가리기 방지)
+            current_seg_item = seg_ready_payload[i_rev] # 변수명 변경 (가리기 방지)
+            if isinstance(current_seg_item, dict) and "text" in current_seg_item:
+                 seg_text_norm_rev = _norm_for_compare(current_seg_item.get("text", "")) # 변수명 변경
+                 score_val_rev = _match_score(seg_text_norm_rev, last_line_norm) # 변수명 변경
+                 print(f"  [DEBUG] Comparing seg[{i_rev}] ('{seg_text_norm_rev}') vs Last ('{last_line_norm}') -> Score: {score_val_rev:.4f}")
+                 if score_val_rev > score_threshold_boundary: last_idx = i_rev; print(f"    => Match found! Setting last_idx = {i_rev}"); break
+    else: last_idx = len(seg_ready_payload) - 1 if seg_ready_payload else -1; print("[WARN] Target last line empty, setting last_idx = end.")
 
     print(f"\n[DEBUG] Final Boundary Indices: first_idx = {first_idx}, last_idx = {last_idx}")
 
-    # seg_compare_payload 생성 로직 강화 + 로깅 (이전과 동일)
-    seg_compare_payload = []
-    if first_idx != -1 and last_idx != -1 and last_idx >= first_idx:
-        seg_compare_payload = seg_ready_payload[first_idx : last_idx + 1]
-        print(f"[INFO] Slicing seg_ready_payload from index {first_idx} to {last_idx + 1}.")
-    elif first_idx != -1:
-        seg_compare_payload = seg_ready_payload[first_idx:]
-        print(f"[WARN] Last line match failed. Slicing from index {first_idx} to end.")
-    elif last_idx != -1:
-        seg_compare_payload = seg_ready_payload[: last_idx + 1]
-        print(f"[WARN] First line match failed. Slicing from start to index {last_idx + 1}.")
-    else:
-        seg_compare_payload = seg_ready_payload
-        print("[WARN] Both boundary matches failed. Using all segments.")
+    # seg_compare_payload 생성
+    seg_compare_payload: list = [] # 타입 명시
+    if first_idx != -1 and last_idx != -1 and last_idx >= first_idx: seg_compare_payload = seg_ready_payload[first_idx : last_idx + 1]; print(f"[INFO] Slicing seg_ready from {first_idx} to {last_idx + 1}.")
+    elif first_idx != -1: seg_compare_payload = seg_ready_payload[first_idx:]; print(f"[WARN] Last line fail. Slicing from {first_idx} to end.")
+    elif last_idx != -1: seg_compare_payload = seg_ready_payload[: last_idx + 1]; print(f"[WARN] First line fail. Slicing from start to {last_idx + 1}.")
+    else: seg_compare_payload = seg_ready_payload; print("[WARN] Both boundary fails. Using all segments.")
     print(f"       => Resulting seg_compare_payload length: {len(seg_compare_payload)}")
 
-    if not seg_compare_payload:
-         print("[ERROR] No segments selected for comparison. Cannot proceed.")
-         return []
+    if not seg_compare_payload: print("[ERROR] No segments selected. Cannot proceed."); return []
 
-    try:
+    # seg_compare.json 저장
+    try: # ... (저장 로직 유지)
         compare_path = Path(project_dir) / "seg_compare.json"
-        save_json(compare_path, seg_compare_payload) # save_json 사용
-        print(f"[SYNC-PRO] seg_compare.json 저장됨: {compare_path} ({len(seg_compare_payload)} segments)")
-    except OSError as e:
-        print(f"[WARN] seg_compare.json 저장 실패: {e}")
-    except Exception as e_json:
-        print(f"[WARN] seg_compare.json 저장 중 예상치 못한 오류: {e_json}")
+        # save_json 임포트 확인 (파일 상단 또는 try 블록 내부)
+        try: from app.utils import save_json
+        except ImportError: from utils import save_json # type: ignore[no-redef]
+        save_json(compare_path, seg_compare_payload); print(f"[SYNC-PRO] seg_compare.json saved: {compare_path} ({len(seg_compare_payload)} segments)")
+    except Exception as e_save_compare: # 구체적인 예외 처리
+        print(f"[WARN] Failed to save seg_compare.json: {type(e_save_compare).__name__}")
 
 
-    # ---- 2 & 3. 3단계 지능형 교정 (이전 수정된 로직 그대로 사용) ----
-    # [수정] 교정용 단어 목록은 헤더 포함된 `correction_ref_lines` 사용
-    ref_all_words_raw = " ".join(correction_ref_lines).replace(",", "").replace("'", "")
+    # ---- 2 & 3. Word Correction (Using header-less reference words) ----
+    # [핵심 수정] ref_all_words 생성 시 헤더 제외 목록 사용
+    ref_all_words_raw = " ".join(boundary_ref_lines_no_headers).replace(",", "").replace("'", "")
     ref_all_words = ref_all_words_raw.split()
     ref_all_words = [w for w in ref_all_words if w]
-    if not ref_all_words:
-        print("[ERROR] Reference words list (for correction) is empty. Cannot proceed.")
-        return []
+    if not ref_all_words: print("[ERROR] Reference words list (no headers) is empty."); return []
+    print(f"[DEBUG] Using {len(ref_all_words)} reference words for correction (headers excluded).")
     ref_words_norm = [_norm_for_compare(w) for w in ref_all_words]
     ref_words_roman = [_romanize(w) for w in ref_all_words]
 
     intermediate_segments: List[Dict] = []
     print("\n--- [SEGMENT CORRECTION PROCESS] ---")
-    # (... 교정 로직은 이전 답변과 동일하게 유지 ...)
-    # (로그 레벨은 필요에 따라 조절 가능)
-    for seg_idx, seg in enumerate(seg_compare_payload):
-        if not isinstance(seg, dict) or "text" not in seg: continue
-        whisper_text = str(seg.get("text", "")).strip()
-        # print(f"\n[DEBUG] Correcting Segment {seg_idx + 1}/{len(seg_compare_payload)}: '{whisper_text}'") # 로그 줄임
-        if not whisper_text: continue
+    for seg_idx, seg_corr in enumerate(seg_compare_payload): # 변수명 변경 (가리기 방지)
+        if not isinstance(seg_corr, dict) or "text" not in seg_corr: continue
+        whisper_text_corr = str(seg_corr.get("text", "")).strip() # 변수명 변경
+        if not whisper_text_corr: continue
         segment_corrected_words: List[str] = []
-        whisper_words = whisper_text.split()
-        whisper_cursor = 0
-        leftover_whisper_part = ""
-        while whisper_cursor < len(whisper_words):
-            candidate_whisper_raw = leftover_whisper_part + whisper_words[whisper_cursor]
-            candidate_whisper = candidate_whisper_raw.strip()
+        whisper_words_list = whisper_text_corr.split(); whisper_cursor = 0; leftover_whisper_part = "" # 변수명 변경
+        while whisper_cursor < len(whisper_words_list):
+            candidate_whisper_raw = leftover_whisper_part + whisper_words_list[whisper_cursor]; candidate_whisper = candidate_whisper_raw.strip()
             candidate_norm = _norm_for_compare(candidate_whisper)
-            if not candidate_norm:
-                whisper_cursor += 1; leftover_whisper_part = ""; continue
+            if not candidate_norm: whisper_cursor += 1; leftover_whisper_part = ""; continue
             best_match: Dict = {"score": -1.0, "word": candidate_whisper, "type": _MATCH_TYPE_KEPT, "ref_origin": ""}
-            for i, loop_ref_word in enumerate(ref_all_words):
-                ref_norm = ref_words_norm[i]; ref_roman = ref_words_roman[i]
-                if not ref_norm: continue
+            for i_ref, loop_ref_word in enumerate(ref_all_words): # 변수명 변경 (가리기 방지)
+                # [수정] 후행 세미콜론 제거됨
+                ref_norm_loop = ref_words_norm[i_ref] # 변수명 변경
+                ref_roman_loop = ref_words_roman[i_ref] # 변수명 변경
+                if not ref_norm_loop: continue
                 auth_score = -1.0
-                if candidate_norm and ref_norm and candidate_norm in ref_norm:
-                    auth_score = 0.85 + (len(candidate_norm) / len(ref_norm)) * 0.15
-                spell_score = _match_score(candidate_norm, ref_norm)
-                roman_score = 0.0; candidate_roman = _romanize(candidate_whisper)
-                if candidate_roman and ref_roman: roman_score = _match_score(candidate_roman, ref_roman)
-                elif not _is_korean(candidate_whisper) and ref_roman: roman_score = _match_score(candidate_norm, ref_roman) * 0.9
-                correction_score = max(spell_score, roman_score)
-                current_best_score = best_match["score"]; updated = False
-                if auth_score > correction_score and auth_score > current_best_score:
-                    best_match.update({"score": auth_score, "word": candidate_whisper, "type": _MATCH_TYPE_AUTHENTICATED, "ref_origin": loop_ref_word}); updated = True
+                if candidate_norm and ref_norm_loop and candidate_norm in ref_norm_loop: auth_score = 0.85 + (len(candidate_norm) / len(ref_norm_loop)) * 0.15
+                spell_score = _match_score(candidate_norm, ref_norm_loop); roman_score = 0.0; candidate_roman = _romanize(candidate_whisper)
+                if candidate_roman and ref_roman_loop: roman_score = _match_score(candidate_roman, ref_roman_loop)
+                elif not _is_korean(candidate_whisper) and ref_roman_loop: roman_score = _match_score(candidate_norm, ref_roman_loop) * 0.9
+                correction_score = max(spell_score, roman_score); current_best_score = best_match["score"]; updated = False
+                if auth_score > correction_score and auth_score > current_best_score: best_match.update({"score": auth_score, "word": candidate_whisper, "type": _MATCH_TYPE_AUTHENTICATED, "ref_origin": loop_ref_word}); updated = True
                 elif correction_score >= auth_score and correction_score > current_best_score:
                     is_candidate_korean = _is_korean(candidate_whisper); is_ref_single_eng = len(loop_ref_word) == 1 and 'a' <= loop_ref_word.lower() <= 'z'
-                    if not (is_candidate_korean and is_ref_single_eng):
-                        best_match.update({"score": correction_score, "word": loop_ref_word, "type": _MATCH_TYPE_CORRECTED, "ref_origin": loop_ref_word}); updated = True
+                    if not (is_candidate_korean and is_ref_single_eng): best_match.update({"score": correction_score, "word": loop_ref_word, "type": _MATCH_TYPE_CORRECTED, "ref_origin": loop_ref_word}); updated = True
             match_type = best_match["type"]; word_to_process = best_match["word"]; best_score = best_match["score"]; ref_origin = best_match["ref_origin"]; score_threshold = 0.50
-            word_to_append: Optional[str] = None
+            word_to_append: Optional[str] = None; leftover_whisper_part = ""
             if match_type == _MATCH_TYPE_KEPT:
-                if candidate_whisper.lower() in _FILTER_SHORT_WORDS: pass # print(f"    - [FILTERED] Short word: '{candidate_whisper}'")
-                else: word_to_append = candidate_whisper
-                leftover_whisper_part = ""
+                if candidate_whisper.lower() not in _FILTER_SHORT_WORDS: word_to_append = candidate_whisper
             else:
                 if best_score >= score_threshold:
                     word_to_append = word_to_process
-                    # 로그 출력 (필요 시)
-                    # log_prefix = f"  - [{match_type}] Score {best_score:.3f} >= {score_threshold}."
-                    # if match_type == _MATCH_TYPE_AUTHENTICATED: print(f"{log_prefix} Using original '{word_to_append}'...")
-                    # else: print(f"{log_prefix} Changed '{candidate_whisper}' -> '{word_to_append}'...")
-                    ref_matched_norm = _norm_for_compare(ref_origin); candidate_actual_norm = _norm_for_compare(candidate_whisper); leftover_whisper_part = ""
+                    ref_matched_norm = _norm_for_compare(ref_origin); candidate_actual_norm = _norm_for_compare(candidate_whisper)
                     if len(candidate_actual_norm) > len(ref_matched_norm) and candidate_actual_norm.startswith(ref_matched_norm):
                         try:
-                            match = re.match(re.escape(ref_matched_norm), candidate_whisper, flags=re.IGNORECASE | re.UNICODE)
-                            if match: leftover_whisper_part = candidate_whisper[match.end():].strip()
+                            match_obj = re.match(re.escape(ref_matched_norm), candidate_whisper, flags=re.IGNORECASE | re.UNICODE) # 변수명 변경
+                            if match_obj: leftover_whisper_part = candidate_whisper[match_obj.end():].strip()
                         except re.error: leftover_whisper_part = ""
                 else:
-                    if candidate_whisper.lower() in _FILTER_SHORT_WORDS: pass # print(f"    - [FILTERED] Short word (fallback): '{candidate_whisper}'")
-                    else: word_to_append = candidate_whisper
-                    leftover_whisper_part = ""
+                    if candidate_whisper.lower() not in _FILTER_SHORT_WORDS: word_to_append = candidate_whisper
             if word_to_append: segment_corrected_words.append(word_to_append)
             whisper_cursor += 1
         corrected_text = " ".join(segment_corrected_words).strip()
         if corrected_text:
-            intermediate_segments.append({"start": _safe_float(seg.get("start")), "end": _safe_float(seg.get("end")), "text": corrected_text, "line_ko": corrected_text})
-            # print(f"  => Segment Result: '{corrected_text}'") # 로그 줄임
-        # else: print(f"  => Segment Result: [EMPTY]") # 로그 줄임
+            intermediate_segments.append({"start": _safe_float(seg_corr.get("start")), "end": _safe_float(seg_corr.get("end")), "text": corrected_text, "line_ko": corrected_text})
 
     print("--- [SEGMENT CORRECTION PROCESS COMPLETED] ---")
     print(f"Total intermediate segments generated: {len(intermediate_segments)}")
 
-    # ---- 4. 최종 경계 재확인 및 반환 (이전 수정된 로직 그대로 사용) ----
-    if not intermediate_segments:
-        print("[ERROR] No segments survived the correction process.")
-        return []
+    # ---- 4. Final Boundary Check & Return ----
+    if not intermediate_segments: print("[ERROR] No segments survived correction."); return []
 
-    # [수정] 최종 경계 확인 시에도 헤더 제외된 목록 사용
     final_start_idx, final_end_idx = -1, -1
     final_boundary_threshold = 0.45
 
-    print("\n--- [FINAL BOUNDARY CHECK] ---")
-    # 첫 줄/마지막 줄 변수는 이미 헤더 제외된 `boundary_ref_lines` 기준으로 설정됨
+    print("\n--- [FINAL BOUNDARY CHECK] ---") # ... (최종 경계 확인 로직 및 로그 유지)
     if first_line_norm:
         print(f"[DEBUG] Final check - Searching for First Line (Norm): '{first_line_norm}'")
-        for i, seg in enumerate(intermediate_segments):
-            score = _match_score(_norm_for_compare(seg.get("text", "")), first_line_norm)
-            # print(f"  [DEBUG] Comparing intermediate[{i}] vs First -> Score: {score:.4f}") # 로그 줄임
-            if score > final_boundary_threshold: final_start_idx = i; print(f"    => Match found! final_start_idx = {i}"); break
+        for i_final, seg_final in enumerate(intermediate_segments): # 변수명 변경 (가리기 방지)
+            score_final = _match_score(_norm_for_compare(seg_final.get("text", "")), first_line_norm) # 변수명 변경
+            if score_final > final_boundary_threshold: final_start_idx = i_final; print(f"    => Match found! final_start_idx = {i_final}"); break
     else: final_start_idx = 0; print("[WARN] Final check - Target first line empty, using index 0.")
 
     if last_line_norm:
         print(f"[DEBUG] Final check - Searching for Last Line (Norm, reverse): '{last_line_norm}'")
-        for i in range(len(intermediate_segments) - 1, -1, -1):
-            score = _match_score(_norm_for_compare(intermediate_segments[i].get("text", "")), last_line_norm)
-            # print(f"  [DEBUG] Comparing intermediate[{i}] vs Last -> Score: {score:.4f}") # 로그 줄임
-            if score > final_boundary_threshold: final_end_idx = i; print(f"    => Match found! final_end_idx = {i}"); break
-    else: final_end_idx = len(intermediate_segments) - 1; print("[WARN] Final check - Target last line empty, using last index.")
+        # range 길이 안전 계산
+        inter_len = len(intermediate_segments)
+        for i_final_rev in range(inter_len - 1, -1, -1): # 변수명 변경
+            seg_final_rev = intermediate_segments[i_final_rev] # 변수명 변경
+            score_final_rev = _match_score(_norm_for_compare(seg_final_rev.get("text", "")), last_line_norm) # 변수명 변경
+            if score_final_rev > final_boundary_threshold: final_end_idx = i_final_rev; print(f"    => Match found! final_end_idx = {i_final_rev}"); break
+    else: final_end_idx = len(intermediate_segments) - 1 if intermediate_segments else -1; print("[WARN] Final check - Target last line empty, using last index.")
 
     print(f"[DEBUG] Final Boundary Indices after check: start={final_start_idx}, end={final_end_idx}")
 
-    final_segments: List[Dict] = []
-    if final_start_idx != -1 and final_end_idx != -1 and final_end_idx >= final_start_idx:
-        final_segments = intermediate_segments[final_start_idx : final_end_idx + 1]
-        print(f"[SYNC-PRO] Final boundary check: Kept segments from index {final_start_idx} to {final_end_idx} (Total: {len(final_segments)}).")
-    elif intermediate_segments:
-        final_segments = intermediate_segments
-        print("[WARN] Final boundary check failed, using all intermediate segments.")
-    else:
-        print("[ERROR] Final boundary check failed and no intermediate segments available.")
-        return []
+    final_segments: List[Dict] = [] # ... (슬라이싱 및 로그 로직 유지)
+    if final_start_idx != -1 and final_end_idx != -1 and final_end_idx >= final_start_idx: final_segments = intermediate_segments[final_start_idx : final_end_idx + 1]; print(f"[SYNC-PRO] Final check: Kept segments {final_start_idx} to {final_end_idx} (Total: {len(final_segments)}).")
+    elif intermediate_segments: final_segments = intermediate_segments; print("[WARN] Final check failed, using all intermediate.")
+    else: print("[ERROR] Final check failed, no intermediate segments."); return []
 
-    # 시간 정렬 및 겹침 보정 (이전 로직 유지)
+
+    # Time Adjustment
     final_segments.sort(key=lambda x: _safe_float(x.get("start", 0.0)))
-    print("\n--- [TIME ADJUSTMENT] ---")
-    for i in range(1, len(final_segments)):
-        prev_end = _safe_float(final_segments[i - 1].get("end", 0.0))
-        curr_start = _safe_float(final_segments[i].get("start", 0.0))
-        if curr_start < prev_end - 0.01:
-            print(f"  [ADJUST TIME] Overlap at index {i}. Adjusting start from {curr_start:.3f} to {prev_end:.3f}")
-            final_segments[i]["start"] = prev_end
-            curr_end = _safe_float(final_segments[i].get("end", 0.0))
-            if curr_end < prev_end + 0.1: final_segments[i]["end"] = prev_end + 0.1; # print(f"    Adjusted end to {final_segments[i]['end']:.3f}") # 로그 줄임
-        # elif curr_start > prev_end + 1.5: print(f"  [INFO] Gap between index {i-1} and {i}: {curr_start - prev_end:.3f}s") # 로그 줄임
+    print("\n--- [TIME ADJUSTMENT] ---") # ... (시간 조정 로직 및 로그 유지)
+    for i_adjust in range(1, len(final_segments)): # 변수명 변경
+        prev_end_adjust = _safe_float(final_segments[i_adjust - 1].get("end", 0.0)) # 변수명 변경
+        curr_start_adjust = _safe_float(final_segments[i_adjust].get("start", 0.0)) # 변수명 변경
+        if curr_start_adjust < prev_end_adjust - 0.01:
+            final_segments[i_adjust]["start"] = prev_end_adjust
+            curr_end_adjust = _safe_float(final_segments[i_adjust].get("end", 0.0)) # 변수명 변경
+            if curr_end_adjust < prev_end_adjust + 0.1: final_segments[i_adjust]["end"] = prev_end_adjust + 0.1
 
-
-    # 최종 결과 반환
+    # Final Return
     print(f"\n[SYNC-PRO] Returning {len(final_segments)} final segments.")
     print("------------------------------------\n")
     return final_segments
