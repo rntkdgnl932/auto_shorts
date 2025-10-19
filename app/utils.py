@@ -293,14 +293,39 @@ def ensure_dir(p: os.PathLike | str) -> Path:
     d.mkdir(parents=True, exist_ok=True)
     return d
 
-def load_json(p: os.PathLike | str, default: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
+def load_json(p: os.PathLike | str, default: Optional[Any] = None) -> Union[Dict[str, Any], List[Any], None]:
+    """
+    JSON 파일을 로드합니다. 객체(dict) 또는 배열(list)을 반환할 수 있습니다.
+    파일이 없거나 오류 발생 시 default 값을 반환합니다 (기본값은 None).
+    - [수정] 반환 타입을 Union[Dict, List, None]으로 명시하여 seg.json 같은 리스트 루트 파일 지원.
+    - [수정] default 반환 시 None 대신 {}을 반환하던 것을 default 인자(기본 None)를 따르도록 수정.
+    """
     path = Path(p)
     if path.is_dir():
-        raise IsADirectoryError(f"load_json: 폴더 경로입니다: {path}")
+        # 폴더 경로에 대한 오류 처리를 명확하게 유지
+        raise IsADirectoryError(f"load_json: 제공된 경로는 폴더입니다: {path}")
     if not path.exists():
-        return {} if default is None else default
-    with path.open("r", encoding="utf-8") as f:
-        return json.load(f)
+        # 파일이 없으면 명시적으로 default 반환 (기본값은 None)
+        return default
+
+    try:
+        with path.open("r", encoding="utf-8") as f:
+            # json.load는 dict 또는 list 등 다양한 타입을 반환할 수 있음
+            content: Any = json.load(f)
+            # 로드된 내용이 dict 또는 list인 경우만 그대로 반환
+            if isinstance(content, (dict, list)):
+                return content
+            else:
+                # 예상치 못한 타입(예: 숫자, 문자열)이면 default 반환
+                return default
+    except (json.JSONDecodeError, UnicodeDecodeError, OSError) as e:
+        # 파일 읽기 또는 JSON 파싱 오류 시 default 반환
+        print(f"[WARN] load_json 실패 ({path.name}): {type(e).__name__}. 기본값 반환.") # 오류 로그 추가 (선택 사항)
+        return default
+    except Exception as e_unexpected:
+        # 기타 예외 처리
+        print(f"[ERROR] load_json 중 예상치 못한 오류 ({path.name}): {type(e_unexpected).__name__}. 기본값 반환.")
+        return default
 
 # utils.py 파일에서 save_json 함수를 찾아 아래 내용으로 전체를 교체하세요.
 

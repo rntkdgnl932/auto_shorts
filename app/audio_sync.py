@@ -7,7 +7,7 @@ audio_sync.py
 from __future__ import annotations
 import re
 from pathlib import Path
-from typing import Any, Callable, Dict, List, Optional, Tuple, cast
+from typing import Any, Callable, Dict, List, Optional, Tuple, cast, Union
 import numpy as np
 import shutil
 import tempfile
@@ -20,11 +20,23 @@ except (ImportError, ModuleNotFoundError):
     import json as _json
     from pathlib import Path as _Path
 
-    def load_json(p: _Path, default=None):
+    def load_json(p: _Path, default: Optional[Any] = None) -> Union[Dict[str, Any], List[Any], None]:
+        """
+        [수정됨] JSON 파일 로드 (대체 구현). 객체(dict) 또는 배열(list) 반환 가능.
+        """
         try:
             with open(p, "r", encoding="utf-8") as f:
-                return _json.load(f)
+                content: Any = _json.load(f)
+                # dict 또는 list 타입만 유효한 JSON 내용으로 간주
+                if isinstance(content, (dict, list)):
+                    return content
+                else:
+                    return default # 그 외 타입은 default 반환
         except (FileNotFoundError, OSError, _json.JSONDecodeError):
+            # 파일 없거나 JSON 오류 시 default 반환
+            return default
+        except Exception:
+            # 예상치 못한 오류 발생 시에도 default 반환 (안정성)
             return default
 
     def save_json(p: _Path, obj: Any):

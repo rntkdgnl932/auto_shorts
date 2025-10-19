@@ -22,7 +22,7 @@ print("GPU_LOCK:", os.getenv("CUDA_VISIBLE_DEVICES"), os.getenv("CT2_FORCE_CPU")
 
 import subprocess
 import json
-from typing import Optional, Dict, Set
+from typing import Optional, Dict, Set, Callable
 import requests
 import shutil
 import sys
@@ -2085,282 +2085,472 @@ class MainWindow(QtWidgets.QMainWindow):
 
         return max(uniq, key=_mtime_safe)
 
+    # shorts_ui.py 파일에서 이 함수를 찾아 아래 내용으로 전체를 교체하세요.
     def on_click_build_story_from_seg_async(self) -> None:
         """
-        seg.json → story.json 생성 후 AI로 강화하고 프롬프트를 주입한다.
+        [수정됨] seg.json → story.json 생성 후 AI로 강화하고 프롬프트를 주입한다.
+        - 표준 진행률 표시창(run_job_with_progress_async) 사용으로 UI 일관성 확보.
+        - AI 강화 후 seg.json의 원본 text를 lyric 필드에 재주입하여 가사 누락 문제 해결.
         - intro: 첫 줄 start < 1.0s 이면 intro 없음, 아니면 0~start intro
         - outro: 마지막 end 이후 +5.0s
-        - QThread 비동기 실행, 스레드/워커/다이얼로그 참조 self에 보관(GC 방지)
         """
         from pathlib import Path
-        from typing import Any, Dict, List
-        from PyQt5 import QtCore
+        from typing import Any, Dict, List, Optional
+        from PyQt5 import QtCore, QtWidgets
+        import json  # json 임포트 추가
 
+        # --- 표준 비동기 작업 실행기 import ---
+        try:
+            from app.utils import run_job_with_progress_async
+        except ImportError:
+            try:
+                from utils import run_job_with_progress_async
+            except ImportError as import_err:
+                # 진행률 표시기 자체를 로드할 수 없으면 치명적 오류로 간주
+                QtWidgets.QMessageBox.critical(self, "오류", f"진행률 표시기 로드 실패: {import_err}")
+                return
+
+        # --- 재진입 방지 ---
+        # 기존 _seg_story_busy 대신 표준 가드(_task_busy, _try_begin, _task_done) 사용 고려
+        # 여기서는 기존 플래그 유지
         if getattr(self, "_seg_story_busy", False):
+            QtWidgets.QMessageBox.information(self, "알림", "프로젝트 분석 작업이 이미 진행 중입니다.")
             return
         self._seg_story_busy = True
 
-        # 진행창: 현재 파일에 정의된 ProgressLogDialog 직접 사용 (임포트 금지)
-        dlg = ProgressLogDialog(self)  # shorts_ui.py 내부 클래스 사용
-        dlg.set_title("프로젝트분석 (seg→AI)")
-        dlg.enter_determinate(4)
-        dlg.set_status("준비 중…")
-        try:
-            dlg.setWindowModality(QtCore.Qt.NonModal)
-        except Exception:
-            pass
-        dlg.show()
-        QtCore.QCoreApplication.processEvents()
-
-        # 버튼 보호
-        btn = getattr(self, "btn_test1_story", None) or getattr(getattr(self, "ui", None), "btn_test1_story", None)
-        if btn is not None:
+        # --- 버튼 비활성화 ---
+        btn_build_story = getattr(self, "btn_test1_story", None) or getattr(getattr(self, "ui", None),
+                                                                            "btn_test1_story", None)
+        if btn_build_story is not None:
             try:
-                btn.setEnabled(False)
-            except Exception:
+                btn_build_story.setEnabled(False)
+            except RuntimeError:  # 위젯이 삭제된 경우 등
                 pass
 
-        # 유틸/AI/강화기
+        # --- 필요한 유틸/AI/강화기 import ---
         try:
-            from utils import load_json, save_json, save_story_overwrite_with_prompts  # type: ignore
-        except (ImportError, ModuleNotFoundError):
-            from app.utils import load_json, save_json, save_story_overwrite_with_prompts  # type: ignore
-        try:
-            from story_enrich import apply_gpt_to_story_v11  # type: ignore
-        except (ImportError, ModuleNotFoundError):
-            from app.story_enrich import apply_gpt_to_story_v11  # type: ignore
-
-        # AI: 우선 app.ai → ai → utils.AI (현재 저장소에 ai.py 있음)
-        try:
-            from app.ai import AI  # type: ignore
-        except (ImportError, ModuleNotFoundError):
             try:
-                from ai import AI  # type: ignore
-            except (ImportError, ModuleNotFoundError):
-                from utils import AI  # type: ignore
+                from app.utils import load_json, save_json, save_story_overwrite_with_prompts
+            except ImportError:
+                from utils import load_json, save_json, save_story_overwrite_with_prompts  # type: ignore
 
-        # 프로젝트/seg.json 확인
+            try:
+                from app.story_enrich import apply_gpt_to_story_v11
+            except ImportError:
+                from story_enrich import apply_gpt_to_story_v11  # type: ignore
+
+            # AI: app.ai → ai → utils.AI 순서로 안전하게 로드
+            try:
+                from app.ai import AI as ai_class  # type: ignore
+            except ImportError:
+                try:
+                    from ai import AI as ai_class  # type: ignore
+                except ImportError:
+                    from utils import AI as ai_class  # type: ignore
+
+        except ImportError as import_err_libs:
+            QtWidgets.QMessageBox.critical(self, "오류", f"필수 라이브러리 로드 실패: {import_err_libs}")
+            self._seg_story_busy = False
+            if btn_build_story is not None:
+                try:
+                    btn_build_story.setEnabled(True)
+                except RuntimeError:
+                    pass
+            return
+
+        # --- 프로젝트 경로 및 seg.json 확인 ---
         proj_dir_str = ""
         try:
-            proj_dir_str = self._current_project_dir()
+            # _current_project_dir이 메서드일 수 있으므로 호출 시도
+            proj_dir_callable = getattr(self, "_current_project_dir", None)
+            if callable(proj_dir_callable):
+                proj_dir_str = proj_dir_callable()
+            else:
+                # 메서드가 아니면 속성으로 직접 접근 시도
+                proj_dir_str = proj_dir_callable or getattr(self, "project_dir", "") or ""
         except AttributeError:
             proj_dir_str = getattr(self, "project_dir", "") or ""
+        except Exception as e_proj_dir:
+            # 경로 얻기 실패 시 안전하게 빈 문자열로 초기화
+            print(f"[WARN] 프로젝트 경로 확인 중 오류: {e_proj_dir}")
+            proj_dir_str = ""
+
         if not proj_dir_str:
-            dlg.append_log("[UI][ERROR] 프로젝트 폴더를 선택/생성해 주세요.")
-            if btn is not None:
-                try:
-                    btn.setEnabled(True)
-                except Exception:
-                    pass
+            QtWidgets.QMessageBox.warning(self, "오류", "프로젝트 폴더를 선택하거나 생성해 주세요.")
             self._seg_story_busy = False
-            return
-        pdir = Path(proj_dir_str)
-        seg_path = pdir / "seg.json"
-        if not seg_path.exists():
-            dlg.append_log(f"[UI][ERROR] seg.json이 없습니다: {seg_path}")
-            if btn is not None:
+            if btn_build_story is not None:
                 try:
-                    btn.setEnabled(True)
-                except Exception:
+                    btn_build_story.setEnabled(True)
+                except RuntimeError:
                     pass
-            self._seg_story_busy = False
             return
 
-        # ───────── Worker ─────────
-        class _worker(QtCore.QObject):
-            done = QtCore.pyqtSignal()
-            fail = QtCore.pyqtSignal(str)
-            log = QtCore.pyqtSignal(str)
-            step = QtCore.pyqtSignal(str)
-
-            def __init__(self, project_dir: Path):
-                super().__init__()
-                self.project_dir = project_dir
-
-            def _build_story_from_seg(self) -> Path:
-                seg_doc = load_json(self.project_dir / "seg.json", None)
-                if not isinstance(seg_doc, list) or not seg_doc:
-                    raise RuntimeError("seg.json이 비어있거나 형식이 올바르지 않습니다.")
-
-                meta = load_json(self.project_dir / "project.json", {}) or {}
-                if not isinstance(meta, dict):
-                    meta = {}
-                imgs = self.project_dir / "imgs"
+        proj_dir_path = Path(proj_dir_str)
+        seg_json_path = proj_dir_path / "seg.json"
+        if not seg_json_path.exists():
+            QtWidgets.QMessageBox.warning(self, "오류", f"seg.json 파일을 찾을 수 없습니다:\n{seg_json_path}")
+            self._seg_story_busy = False
+            if btn_build_story is not None:
                 try:
-                    imgs.mkdir(parents=True, exist_ok=True)
-                except OSError:
+                    btn_build_story.setEnabled(True)
+                except RuntimeError:
                     pass
+            return
 
-                scenes: List[Dict[str, Any]] = []
-                cursor = 0.0
-                first_start = float(seg_doc[0].get("start") or 0.0)
-                if first_start >= 1.0:
-                    scenes.append({
-                        "id": "t_000",
-                        "section": "intro",
-                        "label": "Intro",
-                        "start": 0.0,
-                        "end": round(first_start, 3),
-                        "duration": round(first_start, 3),
-                        "scene": "intro",
-                        "characters": [],
+        def _reinject_lyrics_from_seg(story_file_path: Path, seg_file_path: Path, log_fn: Callable[[str], None]):
+            """[수정됨] AI 강화 후 story.json의 lyric을 seg.json 원본 text로 복원 (isinstance 사용)"""
+            # typing.cast 제거
+
+            try:
+                # story.json은 dict | None 반환 예상
+                story_data_raw = load_json(story_file_path, None)
+                if not isinstance(story_data_raw, dict):
+                    log_fn("[WARN] 가사 재주입 실패: story.json 형식이 올바르지 않거나 파일을 읽을 수 없습니다.")
+                    return
+                story_data = story_data_raw # 이제 story_data는 dict 타입
+
+                # seg.json은 list | None 반환 예상 (수정된 load_json 사용)
+                seg_data_raw = load_json(seg_file_path, None)
+                if not isinstance(seg_data_raw, list):
+                    log_fn("[WARN] 가사 재주입 실패: seg.json 형식이 올바르지 않거나 파일을 읽을 수 없습니다.")
+                    # 빈 리스트로 처리하여 이후 로직 안전하게 진행
+                    seg_data: List[Dict[str, Any]] = []
+                else:
+                    # 타입이 list 이므로 그대로 사용 (cast 불필요)
+                    seg_data = seg_data_raw
+
+                # 'scenes' 키 존재 및 타입 확인
+                scenes_raw = story_data.get("scenes")
+                if not isinstance(scenes_raw, list):
+                    log_fn("[WARN] 가사 재주입 실패: story.json에 'scenes' 리스트가 없습니다.")
+                    scenes = [] # 빈 리스트로 처리
+                else:
+                    scenes = scenes_raw
+
+                # seg.json 데이터를 start 시간 기준으로 빠르게 찾을 수 있도록 딕셔너리 생성
+                seg_map: Dict[str, str] = {}
+                for seg_item in seg_data: # seg_data는 이제 List[Dict] | List[] 타입
+                    if isinstance(seg_item, dict):
+                        start_time_float = 0.0
+                        try:
+                            start_time_float = float(seg_item.get("start", 0.0))
+                        except (ValueError, TypeError):
+                            pass
+                        start_key = f"{start_time_float:.3f}"
+                        text_val = str(seg_item.get("text", "")).strip()
+                        if text_val:
+                            seg_map[start_key] = text_val
+
+                reinjected_count = 0
+                for scene_item in scenes: # scenes는 이제 List[Dict] | List[] 타입
+                    if isinstance(scene_item, dict):
+                        scene_start_float = 0.0
+                        try:
+                           scene_start_float = float(scene_item.get("start", 0.0))
+                        except (ValueError, TypeError):
+                           pass
+                        scene_start_key = f"{scene_start_float:.3f}"
+                        if scene_start_key in seg_map:
+                            original_text = seg_map[scene_start_key]
+                            current_lyric = scene_item.get("lyric", "")
+                            if original_text and original_text != current_lyric:
+                                scene_item["lyric"] = original_text
+                                reinjected_count += 1
+
+                if reinjected_count > 0:
+                    # story_data['scenes']를 업데이트된 scenes로 교체 (필요한 경우)
+                    story_data['scenes'] = scenes # scenes 리스트 자체가 수정되었으므로 재할당은 선택적
+                    save_json(story_file_path, story_data)
+                    log_fn(f"[INFO] 가사 재주입 완료: {reinjected_count}개 장면의 lyric 필드를 seg.json 원본으로 복원했습니다.")
+                else:
+                    log_fn("[INFO] 가사 재주입: 변경된 lyric 필드가 없습니다.")
+
+            except (FileNotFoundError, json.JSONDecodeError, OSError, TypeError, ValueError) as e_reinject:
+                log_fn(f"[ERROR] 가사 재주입 중 오류 발생: {type(e_reinject).__name__}: {e_reinject}")
+            except Exception as e_unexpected:
+                log_fn(f"[ERROR] 가사 재주입 중 예기치 않은 오류 발생: {type(e_unexpected).__name__}: {e_unexpected}")
+
+        # shorts_ui.py 파일 내 on_click_build_story_from_seg_async 함수 안에 있는
+        # 내부 함수 job 를 찾아 아래 코드로 교체하세요.
+        def job(on_progress: Callable[[dict], None]):
+            """[수정됨] run_job_with_progress_async 를 위한 작업 함수 (isinstance 사용)"""
+            # typing.cast 제거
+            from typing import List, Dict, Any # 필요한 타입 임포트 확인
+
+            # --- 로깅 헬퍼 ---
+            def _log(message: str):
+                on_progress({"msg": message})
+
+            # --- 1. seg.json -> story.json 스켈레톤 생성 ---
+            def _build_story_skeleton(seg_doc_list: list, project_dir: Path) -> Path:
+                """기존 _build_story_from_seg 로직 (내부 함수화)"""
+                _log("[1/4] story.json 스켈레톤 생성 시작...")
+                if not seg_doc_list: # 리스트가 비어있는지 확인
+                    raise RuntimeError("seg.json 내용이 비어있습니다.")
+
+                meta_path = project_dir / "project.json"
+                # load_json은 dict | None 반환, meta_info는 dict 타입이어야 함
+                meta_info_raw = load_json(meta_path, None)
+                if not isinstance(meta_info_raw, dict):
+                     _log("[WARN] project.json을 읽는데 실패했거나 형식이 잘못되었습니다. 빈 메타정보를 사용합니다.")
+                     meta_info: Dict[str, Any] = {} # 타입 명시
+                else:
+                     meta_info = meta_info_raw
+
+
+                imgs_dir = project_dir / "imgs"
+                try:
+                    imgs_dir.mkdir(parents=True, exist_ok=True)
+                except OSError as e_mkdir:
+                    _log(f"[WARN] 이미지 폴더 생성 실패: {e_mkdir}")
+
+                scenes_list: List[Dict[str, Any]] = []
+                cursor_time = 0.0
+                first_start_time = 0.0
+                # seg_doc_list[0] 접근 전 비어있는지 확인 (위에서 이미 처리됨)
+                try:
+                    # seg_doc_list[0]이 dict인지 확인
+                    first_seg = seg_doc_list[0]
+                    if isinstance(first_seg, dict):
+                         first_start_time = float(first_seg.get("start", 0.0))
+                    else:
+                         _log("[WARN] seg.json의 첫번째 항목이 딕셔너리가 아닙니다.")
+                except (ValueError, TypeError, IndexError):
+                    first_start_time = 0.0
+
+                # 인트로 생성
+                if first_start_time >= 1.0:
+                    intro_end_time = round(first_start_time, 3)
+                    scenes_list.append({
+                        "id": "t_000", "section": "intro", "label": "Intro",
+                        "start": 0.0, "end": intro_end_time, "duration": intro_end_time,
+                        "scene": "intro", "characters": [],
                         "effect": ["soft light", "film grain", "gentle camera pan"],
                         "screen_transition": True,
-                        "img_file": str(imgs / "t_000.png"),
-                        "prompt": None,
-                        "needs_character_asset": False,
+                        "img_file": str(imgs_dir / "t_000.png"),
+                        "prompt": "인트로: 부드러운 전환과 분위기 암시",
                         "lyric": "",
                     })
-                    cursor = first_start
+                    cursor_time = first_start_time
 
-                for i, row in enumerate(seg_doc, start=1):
-                    s0 = float(row.get("start") or 0.0)
-                    s1 = float(row.get("end") or s0)
-                    if s1 < s0:
-                        s1 = s0
-                    if s0 < cursor:
-                        s0 = cursor
-                    sid = f"t_{i:03d}"
-                    scenes.append({
-                        "id": sid,
-                        "section": "verse",
-                        "label": "Verse",
-                        "start": round(s0, 3),
-                        "end": round(s1, 3),
-                        "duration": round(s1 - s0, 3),
+                # 각 세그먼트를 씬으로 변환
+                for i_seg, row_data in enumerate(seg_doc_list, start=1):
+                    if not isinstance(row_data, dict):
+                        _log(f"[WARN] seg.json의 {i_seg}번째 항목이 딕셔너리가 아닙니다. 건너<0xEB><0x9B><0x84>니다.")
+                        continue
+
+                    start_time_val = 0.0
+                    end_time_val = 0.0
+                    try:
+                        start_time_val = float(row_data.get("start", 0.0))
+                        end_time_val = float(row_data.get("end", start_time_val))
+                    except (ValueError, TypeError):
+                        start_time_val = 0.0
+                        end_time_val = 0.0
+
+                    if end_time_val < start_time_val: end_time_val = start_time_val
+                    if start_time_val < cursor_time: start_time_val = cursor_time
+
+                    scene_id_str = f"t_{i_seg:03d}"
+                    duration_val = round(max(0.0, end_time_val - start_time_val), 3)
+
+                    lyric_text_val = str(row_data.get("text", "")).strip()
+
+                    scenes_list.append({
+                        "id": scene_id_str, "section": "verse", "label": "Verse",
+                        "start": round(start_time_val, 3), "end": round(end_time_val, 3), "duration": duration_val,
                         "scene": "verse",
                         "characters": ["female_01"],
                         "effect": ["bokeh", "slow push-in"],
                         "screen_transition": False,
-                        "img_file": str(imgs / f"{sid}.png"),
-                        "prompt": None,
-                        "needs_character_asset": True,
-                        "lyric": str(row.get("text") or "").strip(),
+                        "img_file": str(imgs_dir / f"{scene_id_str}.png"),
+                        "prompt": "장면 묘사 필요",
+                        "lyric": lyric_text_val,
                     })
-                    cursor = s1
+                    cursor_time = end_time_val
 
-                last_end = float(seg_doc[-1].get("end") or cursor)
-                outro_start = last_end
-                outro_end = last_end + 5.0
-                sid_outro = f"t_{len(scenes) + 1:03d}"
-                scenes.append({
-                    "id": sid_outro,
-                    "section": "outro",
-                    "label": "Outro",
-                    "start": round(outro_start, 3),
-                    "end": round(outro_end, 3),
-                    "duration": round(outro_end - outro_start, 3),
-                    "scene": "outro",
-                    "characters": [],
+                # 아웃트로 생성
+                last_end_time = cursor_time
+                outro_start_time = last_end_time
+                outro_end_time = last_end_time + 5.0
+                outro_id_str = f"t_{len(seg_doc_list) + 1:03d}"
+                scenes_list.append({
+                    "id": outro_id_str, "section": "outro", "label": "Outro",
+                    "start": round(outro_start_time, 3), "end": round(outro_end_time, 3),
+                    "duration": round(max(0.0, outro_end_time - outro_start_time), 3),
+                    "scene": "outro", "characters": [],
                     "effect": ["fade-out", "soft glow"],
                     "screen_transition": True,
-                    "img_file": str(imgs / f"{sid_outro}.png"),
-                    "prompt": None,
-                    "needs_character_asset": False,
+                    "img_file": str(imgs_dir / f"{outro_id_str}.png"),
+                    "prompt": "아웃트로: 여운과 마무리",
                     "lyric": "",
                 })
 
-                record: Dict[str, Any] = {
-                    "title": str(meta.get("title") or self.project_dir.name),
-                    "duration": round(outro_end, 3),
+                # story.json 기본 구조
+                story_record: Dict[str, Any] = {
+                    "title": str(meta_info.get("title") or project_dir.name),
+                    "duration": round(outro_end_time, 3),
                     "offset": 0.0,
-                    "lyrics": str(meta.get("lyrics") or ""),
-                    "characters": meta.get("characters") or ["female_01"],
-                    "character_styles": meta.get("character_styles") or {},
-                    "global_context": {
-                        "themes": meta.get("themes") or [],
-                        "palette": meta.get("palette") or "",
-                        "style_guide": meta.get("style_guide") or "",
-                        "negative_bank": meta.get("negative_bank") or "",
-                        "section_moods": {
-                            "intro": "도입, 암시, 미니멀",
-                            "verse": "잔잔함, 근접, 친밀감",
-                            "chorus": "개방감, 광각, 확장",
-                            "bridge": "전환감, 대비, 변화",
-                            "outro": "여운, 잔상, 감쇠",
-                        },
-                        "effect": meta.get("effect") or [],
+                    "lyrics": str(meta_info.get("lyrics") or ""),
+                    "characters": meta_info.get("characters") or ["female_01"],
+                    "character_styles": meta_info.get("character_styles") or {},
+                    "global_context": meta_info.get("global_context") or {
+                        "themes": [], "palette": "", "style_guide": "", "negative_bank": "",
+                        "section_moods": { "intro": "", "verse": "", "chorus": "", "bridge": "", "outro": ""},
+                        "effect": [],
                     },
-                    "defaults": {"image": {"width": 1080, "height": 1920, "negative": "@global"}},
-                    "scenes": scenes,
+                    "defaults": meta_info.get("defaults") or {"image": {"width": 1080, "height": 1920, "negative": "@global"}},
+                    "scenes": scenes_list,
                     "audit": {"built_from": "seg.json", "ai_used": False},
                 }
 
-                story_path = self.project_dir / "story.json"
-                save_json(story_path, record)
-                return story_path
+                story_file_path = project_dir / "story.json"
+                save_json(story_file_path, story_record)
+                _log(f"[1/4] story.json 스켈레톤 생성 완료: {story_file_path}")
+                return story_file_path
 
-            @QtCore.pyqtSlot()
-            def run(self) -> None:
+            # --- 작업 시작 ---
+            on_progress({"stage": "start", "msg": f"프로젝트 분석 시작: {proj_dir_path.name}"})
+
+            # 1. seg.json 읽기
+            # --- 타입 경고 수정 시작 ---
+            seg_content_raw = load_json(seg_json_path, None) # None을 기본값으로 사용
+            if not isinstance(seg_content_raw, list):
+                # 파일이 없거나, 내용이 리스트가 아니거나, 읽기 실패 시 None 반환됨
+                # 이 경우 오류 처리
+                raise ValueError(f"seg.json 파일 내용이 비어있거나 리스트 형식이 아닙니다: {seg_json_path}")
+            else:
+                # 타입이 list 이므로 그대로 사용
+                seg_content: List[Dict[str, Any]] = seg_content_raw # 타입 명시
+            # --- 타입 경고 수정 끝 ---
+
+            # 2. story.json 스켈레톤 생성
+            story_path = _build_story_skeleton(seg_content, proj_dir_path)
+            on_progress({"stage": "skeleton_done", "msg": "story.json 스켈레톤 생성 완료"})
+
+            # 3. AI 강화
+            _log("[2/4] AI로 story.json 강화 시작...")
+            # load_json은 dict | None 반환, story_doc_skel은 dict 타입이어야 함
+            story_doc_skel_raw = load_json(story_path, None)
+            if not isinstance(story_doc_skel_raw, dict):
+                raise TypeError("생성된 story.json 스켈레톤 형식이 dict가 아닙니다.")
+            story_doc_skel = story_doc_skel_raw
+
+            ai_client = ai_class()
+
+            # _ask_wrapper 정의는 이전과 동일하게 유지
+            def _ask_wrapper(system: str, user: str, *, prefer: Optional[str] = None,
+                             allow_fallback: Optional[bool] = None, trace: Optional[Any] = None) -> str:
+                def trace_to_progress(tag: str, msg: str):
+                    on_progress({"stage": "ai_trace", "msg": f"[{tag}] {msg}"})
+
+                actual_prefer = prefer if prefer is not None else getattr(ai_client, 'default_prefer', 'openai')
+                actual_fallback = allow_fallback if allow_fallback is not None else True
+
+                import inspect
+                sig = inspect.signature(ai_client.ask_smart)
+                valid_kwargs = {k: v for k, v in {'prefer': actual_prefer, 'allow_fallback': actual_fallback, 'trace': trace_to_progress}.items() if k in sig.parameters}
+
                 try:
-                    self.log.emit(f"[1/4] 프로젝트: {self.project_dir}")
-                    self.log.emit(f"[1/4] seg.json: {self.project_dir / 'seg.json'}")
-                    self.step.emit("입력 확인 완료")
+                    return ai_client.ask_smart(system=system, user=user, **valid_kwargs)
+                except Exception as e_ask_smart:
+                    _log(f"[ERROR] AI 호출(_ask_wrapper) 실패: {e_ask_smart}")
+                    raise
 
-                    self.step.emit("seg.json에서 story.json 생성 중…")
-                    story_path = self._build_story_from_seg()
-                    self.log.emit(f"[2/4] story.json 생성: {story_path}")
-                    self.step.emit("스토리 생성 완료")
+            try:
+                story_ai_enhanced = apply_gpt_to_story_v11(
+                    story_doc_skel, ask=_ask_wrapper, prefer=None, allow_fallback=None, trace=None,
+                )
+                story_ai_enhanced.setdefault("audit", {})
+                story_ai_enhanced["audit"]["ai_used"] = True
+                save_json(story_path, story_ai_enhanced)
+                _log("[2/4] AI 강화 완료")
+                on_progress({"stage": "ai_done", "msg": "AI 강화 완료"})
+            except (RuntimeError, TypeError, ValueError) as e_ai:
+                 _log(f"[WARN] AI 강화 중 오류 발생 (진행 계속): {type(e_ai).__name__}: {e_ai}")
+                 on_progress({"stage": "ai_error", "msg": f"AI 강화 실패: {e_ai}"})
+            except Exception as e_ai_unexpected:
+                 _log(f"[ERROR] AI 강화 중 예기치 않은 오류: {type(e_ai_unexpected).__name__}: {e_ai_unexpected}")
+                 raise
 
-                    self.step.emit("AI로 스토리 강화 중…")
-                    story_doc = load_json(story_path, None) or {}
-                    if not isinstance(story_doc, dict):
-                        raise TypeError("story.json 내용이 올바르지 않습니다(dict 필요).")
+            # 4. 프롬프트 주입/정규화
+            _log("[3/4] 프롬프트 주입/정규화 시작...")
+            try:
+                save_story_overwrite_with_prompts(story_path)
+                _log("[3/4] 프롬프트 주입 완료")
+                on_progress({"stage": "prompt_inject_done", "msg": "프롬프트 주입 완료"})
+            except (RuntimeError, ValueError, TypeError) as e_prompt:
+                _log(f"[WARN] 프롬프트 주입 중 오류 발생: {type(e_prompt).__name__}: {e_prompt}")
+                on_progress({"stage": "prompt_inject_error", "msg": f"프롬프트 주입 실패: {e_prompt}"})
+            except Exception as e_prompt_unexpected:
+                _log(f"[ERROR] 프롬프트 주입 중 예기치 않은 오류: {type(e_prompt_unexpected).__name__}: {e_prompt_unexpected}")
 
-                    ai_client = AI()
+            # 5. 가사 재주입
+            _log("[4/4] 가사 재주입 시작...")
+            try:
+                 _reinject_lyrics_from_seg(story_path, seg_json_path, _log)
+                 _log("[4/4] 가사 재주입 완료")
+                 on_progress({"stage": "lyric_reinject_done", "msg": "가사 재주입 시도 완료"})
+            except Exception as e_reinject_call:
+                 _log(f"[ERROR] 가사 재주입 함수 호출 중 오류: {type(e_reinject_call).__name__}: {e_reinject_call}")
+                 on_progress({"stage": "lyric_reinject_error", "msg": f"가사 재주입 호출 오류: {e_reinject_call}"})
 
-                    def _ask(system: str, user: str, *, prefer: str | None = None,
-                             allow_fallback: bool | None = None, trace: Any | None = None) -> str:
-                        return ai_client.ask_smart(system=system, user=user, prefer=prefer,
-                                                   allow_fallback=allow_fallback, trace=trace)
+            # 최종 결과 반환
+            return {"story_path": str(story_path)}
 
-                    story_ai = apply_gpt_to_story_v11(
-                        story_doc,
-                        ask=_ask,
-                        prefer=None,
-                        allow_fallback=True,
-                        trace=lambda t, m: self.log.emit(f"[AI][{t}] {m}"),
-                    )
-                    story_ai.setdefault("audit", {})
-                    story_ai["audit"]["ai_used"] = True
-                    save_json(story_path, story_ai)
-                    self.log.emit("[3/4] AI 강화 완료")
-                    self.step.emit("AI 단계 완료")
+        # --- 작업 완료 후 콜백 정의 ---
+        def done(ok: bool, payload: Optional[dict], err: Optional[Exception]):
+            """run_job_with_progress_async 를 위한 완료 콜백 함수"""
+            # 작업 완료 플래그 해제
+            self._seg_story_busy = False
 
-                    self.step.emit("프롬프트 주입/정규화 중…")
-                    try:
-                        save_story_overwrite_with_prompts(story_path)
-                    except (RuntimeError, ValueError, TypeError) as e:
-                        self.log.emit(f"[WARN] 프롬프트 주입 경고: {e}")
-                    self.log.emit("[4/4] 프롬프트 주입 완료")
-                    self.step.emit("완료")
-                    self.done.emit()
+            # 버튼 복구
+            if btn_build_story is not None:
+                try:
+                    btn_build_story.setEnabled(True)
+                except RuntimeError:
+                    pass  # 위젯이 삭제된 경우 등
 
-                except (RuntimeError, FileNotFoundError, TypeError, ValueError, ImportError, ModuleNotFoundError) as e:
-                    self.fail.emit(f"{type(e).__name__}: {e}")
+            # 최종 상태 메시지 (진행률 표시창은 run_job_with_progress_async가 자동으로 닫음)
+            if ok and payload and payload.get("story_path"):
+                final_path = payload["story_path"]
+                msg = f"프로젝트 분석 완료: {final_path}"
+                print(f"[UI] {msg}")
+                try:
+                    # 상태 표시줄이 있다면 업데이트
+                    status_bar = getattr(self, "status", None) or getattr(self, "statusBar", None)
+                    if status_bar and callable(status_bar): status_bar = status_bar()  # statusBar는 메서드일 수 있음
+                    if status_bar and hasattr(status_bar, "showMessage"):
+                        status_bar.showMessage(msg, 5000)  # 5초간 표시
+                except AttributeError:
+                    pass  # 상태 표시줄 없어도 계속 진행
+                except Exception as e_status:
+                    print(f"[WARN] 상태 표시줄 업데이트 중 오류: {e_status}")
 
-        # QThread 구성 + 참조 유지(GC 방지)
-        th = QtCore.QThread(self)
-        wk = _worker(pdir)
-        wk.moveToThread(th)
-        self._seg_thread = th
-        self._seg_worker = wk
-        self._seg_dlg = dlg
+                # QtWidgets.QMessageBox.information(self, "완료", msg) # 완료 팝업은 필요시 활성화
+            elif err is not None:
+                err_msg = f"프로젝트 분석 실패: {err}"
+                print(f"[UI][ERROR] {err_msg}")
+                # 실패 시에는 오류 메시지 박스를 띄워 사용자에게 알림
+                QtWidgets.QMessageBox.critical(self, "오류", err_msg)
+                try:
+                    status_bar = getattr(self, "status", None) or getattr(self, "statusBar", None)
+                    if status_bar and callable(status_bar): status_bar = status_bar()
+                    if status_bar and hasattr(status_bar, "showMessage"):
+                        status_bar.showMessage(err_msg, 5000)
+                except AttributeError:
+                    pass
+                except Exception as e_status_err:
+                    print(f"[WARN] 상태 표시줄 업데이트 중 오류(오류 메시지): {e_status_err}")
 
-        wk.log.connect(dlg.append_log)
-        wk.step.connect(dlg.set_status)
-        wk.done.connect(th.quit)
-        wk.done.connect(lambda: dlg.set_completed("완료"))
-        wk.done.connect(lambda: setattr(self, "_seg_story_busy", False))
-        wk.done.connect(lambda: btn.setEnabled(True) if btn is not None else None)
-        wk.fail.connect(lambda m: dlg.append_log(f"[UI][ERROR] {m}"))
-        wk.fail.connect(lambda m: setattr(self, "_seg_story_busy", False))
-        wk.fail.connect(lambda m: btn.setEnabled(True) if btn is not None else None)
-        wk.fail.connect(th.quit)
-        th.finished.connect(lambda: setattr(self, "_seg_thread", None))
-        th.finished.connect(lambda: setattr(self, "_seg_worker", None))
-        th.started.connect(wk.run)
-        th.start()
+        # --- 비동기 작업 실행 ---
+        run_job_with_progress_async(
+            owner=self,
+            title="프로젝트 분석 (seg.json → story.json)",
+            job=job,
+            on_done=done
+            # tail_file 옵션은 필요 시 추가 가능
+        )
 
     def on_click_test1_analyze(self) -> None:
         """
