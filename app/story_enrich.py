@@ -315,267 +315,242 @@ def apply_gpt_to_story_v11(
     **kwargs,
 ) -> dict:
     """
-    [수정됨] GPT-5를 호출하여 story.json을 강화하고, 최종 이미지/영상 프롬프트를 완성합니다.
-    - AI로부터 장면별 기본 프롬프트와 전역 컨텍스트를 받습니다.
-    - 전역 스타일, 캐릭터 정보, 품질 태그를 조합하여 최종 prompt_img, prompt_movie를 생성합니다. (호출 방식 수정)
-    - 네거티브 프롬프트는 prompt_negative 필드에 별도로 조합하여 저장합니다.
+    [수정됨 v5] AI가 장면별 핵심 영어 태그(배경/인물/행동/모션)를 제안하고, 코드가 이를 조합/보강합니다.
+    - AI 지침 수정: prompt(한글 설명), prompt_img_base(영어 태그), motion_hint(영어 태그) 생성 요청.
+    - 최종 프롬프트 조합: AI 제안 베이스 + 캐릭터 스타일(영어 변환) + 품질 태그 결합.
+    - _convert_ko_desc_to_tags 함수 제거 (더 이상 사용 안 함).
     """
-    if temperature is not None:
-        _t(trace, "warn", f"ignored kw: temperature={temperature}")
-    if kwargs:
-        _t(trace, "warn", f"ignored extra kwargs: {list(kwargs.keys())}")
+    if temperature is not None: _t(trace, "warn", f"ignored kw: temperature={temperature}")
+    if kwargs: _t(trace, "warn", f"ignored extra kwargs: {list(kwargs.keys())}")
 
     import re
     import json
     from typing import List, Dict, Any, Set
 
     # ──────────────────────────────────────────────────────────────
-    # 내부 유틸리티 함수들 (이 함수 내에서만 사용)
+    # 내부 유틸리티 함수들
     # ──────────────────────────────────────────────────────────────
     def _clean_and_split_tags(text_input: str) -> List[str]:
-        """쉼표/공백/줄바꿈으로 구분된 문자열을 태그 리스트로 변환합니다."""
-        if not isinstance(text_input, str):
-            return []
-        # \u200b (zero-width space) 등 보이지 않는 문자 제거
+        # (변경 없음)
+        if not isinstance(text_input, str): return []
         text_cleaned = text_input.replace("\u200b", " ")
-        # 구분자를 모두 쉼표로 통일 후 분리
         tags_raw = re.split(r'[,/\n\s]+', text_cleaned)
-        # 각 태그의 앞뒤 공백 제거 및 빈 태그 필터링
         return [tag.strip() for tag in tags_raw if tag.strip()]
 
     def _combine_unique_tags(*tag_groups: Any) -> str:
-        """여러 태그 그룹(리스트 또는 문자열)을 받아 중복을 제거하고 하나의 문자열로 합칩니다."""
+        # (변경 없음)
         seen_tags: Set[str] = set()
         ordered_tags: List[str] = []
-        for group in tag_groups: # *tag_groups로 받았으므로, group은 각 인자(str 또는 list[str])가 됨
+        for group in tag_groups:
             tags_to_process: List[str] = []
             if isinstance(group, list):
-                # group이 list[str]일 경우, 각 문자열을 처리
                 tags_to_process = [str(item) for item in group if isinstance(item, str)]
             elif isinstance(group, str):
-                # group이 str일 경우, 분리해서 처리
                 tags_to_process = _clean_and_split_tags(group)
-
-            for tag in tags_to_process: # tag는 항상 문자열이어야 함
+            for tag in tags_to_process:
                 tag_cleaned = tag.strip()
-                if not tag_cleaned: continue # 빈 태그 건너뛰기
-                # 소문자 기준으로 중복 검사하여 원본 대소문자는 유지
+                if not tag_cleaned: continue
                 tag_lower = tag_cleaned.lower()
                 if tag_lower not in seen_tags:
                     seen_tags.add(tag_lower)
-                    ordered_tags.append(tag_cleaned) # .strip() 된 버전 저장
-        return ", ".join(ordered_tags)
+                    ordered_tags.append(tag_cleaned)
+        # 최종 반환 시 중복 쉼표 및 앞뒤 공백 정리
+        final_str = ", ".join(ordered_tags)
+        return re.sub(r'\s*,\s*', ', ', final_str).strip(', ')
 
-    def _extract_motion_hint(movie_prompt_str: str) -> str:
-        """AI가 생성한 movie 프롬프트에서 'motion:', 'camera:' 등 움직임 힌트만 추출합니다."""
-        if not isinstance(movie_prompt_str, str):
-            return ""
-        # 'motion:', 'camera:', '|' 등을 기준으로 뒷부분을 움직임 힌트로 간주
-        motion_match = re.search(r'(motion:|camera:|\|\s*camera|\s*\|\s*motion)', movie_prompt_str, re.IGNORECASE)
-        if motion_match:
-            # 추출된 부분의 앞뒤 공백 제거
-            return movie_prompt_str[motion_match.start():].strip()
-        return ""
+
+    # [신규] 캐릭터 스타일 한국어 설명을 영어 태그로 변환 (간단 버전)
+    def _convert_char_style_ko_to_en(style_ko: str) -> List[str]:
+        """간단한 규칙과 키워드 매핑으로 한국어 설명을 영어 태그 리스트로 변환"""
+        if not style_ko: return []
+        tags: List[str] = []
+        style_lower = style_ko.lower()
+
+        # 성별
+        if "여성" in style_ko or "female" in style_lower: tags.append("young woman")
+        elif "남성" in style_ko or "male" in style_lower: tags.append("young man")
+
+        # 필수 태그 (여성)
+        if "young woman" in tags:
+            tags.extend(["huge breasts", "slim legs"]) # 필수 태그 추가
+
+        # 헤어 스타일
+        hair_map = {"긴": "long hair", "짧은": "short hair", "중간": "medium hair", "웨이브": "wavy hair", "펌": "permed hair", "생머리": "straight hair"}
+        for ko, en in hair_map.items():
+            if ko in style_ko: tags.append(en)
+
+        # 헤어 색상
+        color_map = {"갈색": "brown hair", "검정": "black hair", "금발": "blonde hair", "밝은": "light hair"} # '밝은 갈색'은 'light hair, brown hair'
+        for ko, en in color_map.items():
+            if ko in style_ko: tags.append(en)
+
+        # 의상 (간단 키워드)
+        clothing_map = {"후드티": "hoodie", "진": "jeans", "조거": "jogger pants", "팬츠": "pants", "드레스": "dress", "셔츠": "shirt", "자켓": "jacket"}
+        for ko, en in clothing_map.items():
+            if ko in style_ko: tags.append(en)
+
+        # 기타 특징
+        if "게이머" in style_ko: tags.append("gamer style")
+        if "안경" in style_ko: tags.append("wearing glasses")
+        if "모자" in style_ko: tags.append("wearing hat")
+        if "피곤" in style_ko: tags.append("tired expression")
+        if "집중" in style_ko: tags.append("focused expression")
+        if "미소" in style_ko: tags.append("slight smile")
+
+        return _clean_and_split_tags(_combine_unique_tags(tags)) # 중복 제거 및 정리
 
     # --------------------------------------------------------------
-    # - 안전 복사 및 페이로드 구성 (기존 로직과 동일)
+    # - 안전 복사 및 페이로드 구성 (rules 수정)
     # --------------------------------------------------------------
-    story_data: dict = json.loads(json.dumps(story, ensure_ascii=False))
-
-    title = story_data.get('title') or ''
-    lyrics_all = (story_data.get('lyrics') or '').strip()
-    scenes = story_data.get('scenes') or []
-    # 등장하는 모든 캐릭터의 고유 ID 추출
-    characters_in_scenes = sorted(set([
-        (c.split(':',1)[0] if isinstance(c, str) else (c.get('id', '') if isinstance(c, dict) else ''))
-        for sc in scenes if isinstance(sc, dict) for c in (sc.get('characters') or []) # 타입 검사 추가
-    ]))
-
+    story_data = json.loads(json.dumps(story, ensure_ascii=False))
+    title = story_data.get('title') or ''; lyrics_all = (story_data.get('lyrics') or '').strip(); scenes = story_data.get('scenes') or []
+    characters_in_scenes = sorted(set([(c.split(':',1)[0] if isinstance(c, str) else (c.get('id', '') if isinstance(c, dict) else '')) for sc in scenes if isinstance(sc, dict) for c in (sc.get('characters') or [])]))
     payload_scenes: List[dict] = []
     for sc_item in scenes:
-        # sc_item이 딕셔너리인지 확인
-        if not isinstance(sc_item, dict):
-            continue
-        payload_scenes.append({
-            "id": sc_item.get("id"),
-            "section": (sc_item.get("section") or "").lower(),
-            "hint": (sc_item.get("prompt") or ""),
-            "effect": sc_item.get("effect") or [],
-            "screen_transition": bool(sc_item.get("screen_transition")),
-            "characters": [
-                (c.split(':',1)[0] if isinstance(c,str) else (c.get('id') if isinstance(c, dict) else ''))
-                for c in (sc_item.get('characters') or [])
-            ],
-        })
-
-    render_defaults = (story_data.get("defaults") or {}).get("image") or {}
-    render_width = int(render_defaults.get("width") or 832)
-    render_height = int(render_defaults.get("height") or 1472)
-
+        if not isinstance(sc_item, dict): continue
+        payload_scenes.append({"id": sc_item.get("id"), "section": (sc_item.get("section") or "").lower(), "hint": (sc_item.get("prompt") or ""), "effect": sc_item.get("effect") or [], "screen_transition": bool(sc_item.get("screen_transition")), "characters": [(c.split(':',1)[0] if isinstance(c,str) else (c.get('id') if isinstance(c, dict) else '')) for c in (sc_item.get('characters') or [])], })
+    render_defaults = (story_data.get("defaults") or {}).get("image") or {}; render_width = int(render_defaults.get("width") or 832); render_height = int(render_defaults.get("height") or 1472)
     payload = {
-        "title": title,
-        "lyrics_all": lyrics_all,
-        "characters": characters_in_scenes,
-        "scenes": payload_scenes,
-        "need_korean": True,
+        "title": title, "lyrics_all": lyrics_all, "characters": characters_in_scenes,
+        "scenes": payload_scenes, "need_korean": True,
         "render_hint": {"image_width": render_width, "image_height": render_height},
-        "rules": {
-            "character_styles": "모두 한국어. 성별(여성/남성) 명시. 선정성 강조 금지.",
-            "prompts": "항상 한국어. <id> 자리표시 금지. 자연어에는 여성/남성만 사용.",
-            "prompt": "항상 한국어. 자연어에는 여성/남성만 사용. ID 노출 금지.",
-            "per_scene_lyrics": "intro 제외하고 가능한 씬에 가사를 균형 배분. 한 줄씩 간결하게.",
-            "global": "전체 가사를 요약해 global_summary를 만들고, themes/palette/style_guide/negative_bank/section_moods/effect를 작성."
+        "rules": { # [수정됨] rules 내용 변경
+            "character_styles": "모두 한국어. 성별(여성/남성) 명시.",
+            "prompts": "[수정됨] 각 장면에 대해 prompt(한국어 설명), prompt_img_base(간결한 영어 핵심 태그: 배경/인물/행동), motion_hint(간결한 영어 모션 태그: 카메라/인물 움직임) 생성.",
+            "prompt": "한국어. 가사 시각화. 배경, 인물, 행동 묘사.",
+            "prompt_img_base": "영어 태그. 배경, 인물, 행동/상황 관련 핵심 키워드 5-10개. 예: 'night street, young woman walking, looking down, neon lights'.",
+            "motion_hint": "영어 태그. 카메라 움직임 또는 인물 미세 동작 관련 키워드 1-3개. 예: 'slow zoom in', 'subtle eye blink', 'camera pan left'. 없으면 빈 문자열.",
+            "per_scene_lyrics": "intro 제외 가사 배분.",
+            "global": "전체 요약 + 다양한 themes/palette/style_guide/negative_bank/section_moods/effect 작성."
         }
     }
+
     # --------------------------------------------------------------
-    # - 시스템/유저 프롬프트 및 AI 호출 (기존 로직과 동일)
+    # - 시스템/유저 프롬프트 및 AI 호출 (AI 지침 수정됨)
     # --------------------------------------------------------------
+    # [수정됨] AI 지침 및 반환 JSON 구조 변경
     system_prompt = (
-        "너는 영상 기획 보조 도구다. 반드시 한글만 써라.\n"
+        "너는 영상 기획 보조 도구다.\n"
         "하나의 JSON만 반환한다:\n"
         "{\"character_styles\":{id:text,...},\"per_scene_lyrics\":[{\"id\":\"...\",\"lyric\":\"...\"}],"
-        "\"prompts\":[{\"id\":\"...\",\"prompt\":\"...\",\"prompt_img\":\"...\",\"prompt_movie\":\"...\",\"effect\":[\"...\"]}],"
+        # [수정됨] prompts 필드 구조: prompt(한글), prompt_img_base(영문 태그), motion_hint(영문 태그), effect 추가
+        "\"prompts\":[{\"id\":\"...\",\"prompt\":\"...\",\"prompt_img_base\":\"...\",\"motion_hint\":\"...\",\"effect\":[\"...\"]}],"
         "\"global\":{\"global_summary\":\"...\",\"themes\":[\"...\"],\"palette\":\"...\",\"style_guide\":\"...\",\"negative_bank\":\"...\", "
         "\"section_moods\": {\"intro\":\"...\",\"verse\":\"...\",\"chorus\":\"...\",\"bridge\":\"...\",\"outro\":\"...\"},\"effect\":[\"...\"],"
         "\"image_width\":0,\"image_height\":0}}\n"
         "# 엄격한 작성 규칙:\n"
-        "- 자연어에는 캐릭터 ID(female_01, male_01 등) 절대 표기 금지(여성/남성으로 서술).\n"
-        "- 씬에 캐릭터가 2명 이상이면 반드시 위치를 함께 설명한다(예: '화면 왼쪽에 여성, 오른쪽에 남성').\n"
-        "- prompt_img는 얼굴이 잘 보이도록 정면/반정면 구도를 기본 포함한다.\n"
-        "- 각 씬의 effect 배열은 2~4개로 채운다(빈 배열 금지)."
+        "- character_styles: 한국어 설명.\n"
+        "- prompt (장면 설명): 한국어. 가사 시각화 (배경, 인물, 행동).\n"
+        "- prompt_img_base (이미지 핵심 태그): **영어**. 배경/인물/행동 관련 **핵심 태그 5-10개**. 쉼표 구분.\n"
+        "- motion_hint (모션 힌트): **영어**. 카메라/인물 미세 동작 태그 **1-3개**. 없으면 빈 문자열 `\"\"`. 쉼표 구분.\n"
+        "- global (전역 컨셉): 전체 요약 + **다양한 분위기** 포함.\n"
+        "- effect 배열: 각 씬 2~4개 필수 (영어)."
     )
     user_prompt = json.dumps(payload, ensure_ascii=False)
 
     _t(trace, "ai:prepare", f"prefer={prefer or '(auto)'}, allow_fallback={allow_fallback if allow_fallback is not None else '(default)'}")
     raw_response = ask(system_prompt, user_prompt, prefer=prefer, allow_fallback=allow_fallback, trace=trace)
-    if not raw_response or not str(raw_response).strip():
-        raise RuntimeError("AI 응답이 비었습니다.")
+    if not raw_response or not str(raw_response).strip(): raise RuntimeError("AI 응답이 비었습니다.")
 
-    # JSON 파싱 (기존 로직과 동일)
+    # JSON 파싱 (변경 없음)
     ai_data = {}
-    try:
+    try: # ... (파싱 로직은 이전과 동일) ...
         from json import JSONDecodeError
-        text_response = str(raw_response).strip()
-        json_start, json_end = text_response.find("{"), text_response.rfind("}")
+        text_response = str(raw_response).strip(); json_start, json_end = text_response.find("{"), text_response.rfind("}")
         if 0 <= json_start < json_end:
             json_str = text_response[json_start : json_end + 1]
-            try:
-                ai_data = json.loads(json_str)
-                if isinstance(ai_data, str): # 중첩된 JSON 문자열 재파싱
-                    ai_data = json.loads(ai_data)
-            except JSONDecodeError:
-                ai_data = {}
-    except (ImportError, NameError): # JSONDecodeError가 없는 환경 대비
-        try:
-             ai_data = json.loads(raw_response)
-        except ValueError: # json.loads가 ValueError 발생 시
-             ai_data = {}
-
-    if not isinstance(ai_data, dict):
-        ai_data = {}
+            try: ai_data = json.loads(json_str)
+            except JSONDecodeError: ai_data = {}
+            if isinstance(ai_data, str):
+                try: ai_data = json.loads(ai_data)
+                except JSONDecodeError: ai_data = {}
+    except (ImportError, NameError):
+        try: ai_data = json.loads(raw_response)
+        except ValueError: ai_data = {}
+    if not isinstance(ai_data, dict): ai_data = {}
 
     # --------------------------------------------------------------
-    # - AI 응답 데이터 처리 및 최종 프롬프트 조합 (개선된 로직)
+    # - AI 응답 데이터 처리 및 최종 프롬프트 조합 (개선된 로직 v5)
     # --------------------------------------------------------------
-    # 캐릭터 스타일 강제 규칙 적용 (기존 로직과 동일)
     styles_from_ai = (ai_data.get("character_styles") or {})
-    character_styles = _enforce_character_style_rules({str(k): str(v) for k, v in styles_from_ai.items()})
+    # [수정됨] 캐릭터 스타일 처리: 한국어 설명을 영어 태그 리스트로 변환하여 저장
+    character_styles_en_tags: Dict[str, List[str]] = {}
+    for char_id_str, style_ko_str in styles_from_ai.items():
+        if isinstance(char_id_str, str) and isinstance(style_ko_str, str):
+            character_styles_en_tags[char_id_str] = _convert_char_style_ko_to_en(style_ko_str)
+    # 원본 한국어 설명도 유지 (필요 시 사용)
+    character_styles_ko = {str(k): str(v) for k, v in styles_from_ai.items()}
 
-    # 전역 컨텍스트 병합 (기존 로직과 동일)
+
     _merge_global_context(story_data, ai_data.get("global") or {})
+    scene_lyrics_map = {d["id"]: (d.get("lyric") or "").strip() for d in (ai_data.get("per_scene_lyrics") or []) if isinstance(d, dict) and d.get("id")}
+    if not scene_lyrics_map: # 폴백 유지
+        rec_tmp = _segment_lyrics_for_scenes(story_data, audio_info=None, ai=None, lang="ko"); scene_lyrics_map = {sc.get("id"): (sc.get("lyric") or "").strip() for sc in (rec_tmp.get("scenes") or []) if isinstance(sc, dict) and sc.get("id")}; _t(trace, "warn", "AI per_scene_lyrics 부족 -> 내부 세그먼트 폴백 사용")
 
-    # 씬별 가사 처리 (기존 로직과 동일)
-    scene_lyrics_map = {d["id"]: (d.get("lyric") or "").strip()
-                        for d in (ai_data.get("per_scene_lyrics") or []) if isinstance(d, dict) and d.get("id")}
-    if not scene_lyrics_map:
-        rec_tmp = _segment_lyrics_for_scenes(story_data, audio_info=None, ai=None, lang="ko")
-        scene_lyrics_map = {sc.get("id"): (sc.get("lyric") or "").strip()
-                            for sc in (rec_tmp.get("scenes") or []) if isinstance(sc, dict) and sc.get("id")}
-        _t(trace, "warn", "AI per_scene_lyrics 부족 -> 내부 세그먼트 폴백 사용")
-
-    # AI가 생성한 프롬프트 맵
+    # [수정됨] AI prompts 맵 (prompt, prompt_img_base, motion_hint, effect 포함)
     prompts_from_ai = {d["id"]: d for d in (ai_data.get("prompts") or []) if isinstance(d, dict) and d.get("id")}
 
-    # 고정 품질 및 네거티브 태그
-    QUALITY_TAGS = "photorealistic, cinematic lighting, high detail, 8k, masterpiece"
-    DEFAULT_NEGATIVE_TAGS = "lowres, bad anatomy, bad proportions, extra limbs, extra fingers, missing fingers, jpeg artifacts, signature, logo, nsfw, text, letters, typography, watermark"
+    QUALITY_TAGS = "photorealistic, cinematic lighting, high detail, 8k, masterpiece" # 품질 태그 (유지)
+    DEFAULT_NEGATIVE_TAGS = "lowres, bad anatomy, bad proportions, extra limbs, extra fingers, missing fingers, jpeg artifacts, signature, logo, nsfw, text, letters, typography, watermark" # 네거티브 (유지)
 
-    # 각 씬 순회하며 최종 프롬프트 조합
+    # 각 씬 순회하며 최종 프롬프트 조합 (로직 변경됨 v5)
     for scene_obj in scenes:
-        if not isinstance(scene_obj, dict):
-            continue
+        if not isinstance(scene_obj, dict): continue
         scene_id = scene_obj.get("id")
-        if not scene_id: continue # ID 없으면 건너뛰기
+        if not scene_id: continue
 
-        # 1. AI 기본 프롬프트 가져오기
+        # 1. AI 제안 데이터 가져오기
         ai_prompt_data = prompts_from_ai.get(scene_id, {})
-        base_prompt_ko = (ai_prompt_data.get("prompt") or "").strip() # 한국어 설명
-        base_img_prompt = (ai_prompt_data.get("prompt_img") or "").strip()
-        base_movie_prompt = (ai_prompt_data.get("prompt_movie") or "").strip()
+        prompt_ko = (ai_prompt_data.get("prompt") or "").strip() # 한국어 설명
+        prompt_img_base = (ai_prompt_data.get("prompt_img_base") or "").strip() # AI 제안 영어 핵심 태그
+        motion_hint_base = (ai_prompt_data.get("motion_hint") or "").strip() # AI 제안 영어 모션 태그
+        current_scene_effects = ai_prompt_data.get("effect") or story_data.get("global_context", {}).get("effect", [])
+        if not isinstance(current_scene_effects, list) or not all(isinstance(e, str) for e in current_scene_effects): current_scene_effects = []
 
-        # 2. 전역 및 캐릭터 태그 수집
-        global_ctx = story_data.get("global_context", {})
-        # [수정] global_tags 구성요소를 개별적으로 준비
-        themes_list = global_ctx.get("themes", []) # list[str]
-        palette_str = global_ctx.get("palette", "") # str
-        style_guide_str = global_ctx.get("style_guide", "") # str
-
-        scene_effects = ai_prompt_data.get("effect") or global_ctx.get("effect", []) # list[str]
-
-        char_tags: List[str] = [] # list[str]
+        # 2. 캐릭터 태그 (영어) 수집
+        char_tags_final: List[str] = []
         for char_ref in (scene_obj.get("characters") or []):
             char_id = ''
-            # character_ref 타입 확인 및 ID 추출 강화
-            if isinstance(char_ref, str):
-                char_id = char_ref.split(':', 1)[0]
-            elif isinstance(char_ref, dict):
-                char_id = str(char_ref.get('id', ''))
+            if isinstance(char_ref, str): char_id = char_ref.split(':', 1)[0]
+            elif isinstance(char_ref, dict): char_id = str(char_ref.get('id', ''))
+            if char_id and char_id in character_styles_en_tags:
+                char_tags_final.extend(character_styles_en_tags[char_id])
 
-            if char_id and char_id in character_styles:
-                char_tags.append(character_styles[char_id])
-
-        # 3. 최종 prompt_img 조합
-        # [수정] _combine_unique_tags 호출 시 각 소스를 개별 인자로 전달
-        all_positive_sources = [
-            base_img_prompt,    # str
-            themes_list,        # list[str]
-            palette_str,        # str
-            style_guide_str,    # str
-            char_tags,          # list[str]
-            scene_effects,      # list[str]
-            QUALITY_TAGS        # str
-        ]
-        final_prompt_img = _combine_unique_tags(*all_positive_sources) # *로 풀어서 전달
-
-        # 4. 최종 prompt_movie 조합
-        motion_hint = _extract_motion_hint(base_movie_prompt)
-        # 최종 prompt_img 문자열 뒤에 motion_hint 추가 (쉼표로 구분)
-        final_prompt_movie = f"{final_prompt_img}, {motion_hint}" if motion_hint else final_prompt_img
-
-        # 5. 최종 prompt_negative 조합
-        final_prompt_negative = _combine_unique_tags(
-            global_ctx.get("negative_bank", ""), # str
-            DEFAULT_NEGATIVE_TAGS                 # str
+        # 3. [수정됨 v5] 최종 prompt_img: AI 베이스 태그 + 캐릭터 태그 + 효과 + 품질
+        final_prompt_img = _combine_unique_tags(
+            prompt_img_base,      # AI 제안 핵심 태그
+            char_tags_final,      # 캐릭터 태그 (영어)
+            current_scene_effects,# 효과 태그
+            QUALITY_TAGS          # 품질 태그
         )
 
+        # 4. [수정됨 v5] 최종 prompt_movie: 이미지 프롬프트 + AI 제안 모션 힌트
+        final_prompt_movie = _combine_unique_tags(
+            final_prompt_img,     # 완성된 이미지 프롬프트
+            motion_hint_base      # AI 제안 모션 힌트 (없으면 빈 문자열)
+        )
+
+        # 5. 최종 prompt_negative (변경 없음)
+        global_ctx = story_data.get("global_context", {})
+        final_prompt_negative = _combine_unique_tags(global_ctx.get("negative_bank", ""), DEFAULT_NEGATIVE_TAGS)
+
         # 6. scene 객체에 최종 결과 저장
-        scene_obj["prompt"] = base_prompt_ko or scene_obj.get("prompt", "장면 설명 필요") # AI 설명 없으면 기존 prompt 유지
-        scene_obj["prompt_img"] = final_prompt_img
-        scene_obj["prompt_movie"] = final_prompt_movie
-        scene_obj["prompt_negative"] = final_prompt_negative # 네거티브 필드에 저장
-        # effect는 문자열 리스트로 저장 (개별 태그로 분리된 상태)
-        scene_obj["effect"] = _clean_and_split_tags(" ".join(scene_effects))
-        # lyric은 AI 제안 또는 폴백 결과 사용
-        scene_obj["lyric"] = scene_lyrics_map.get(scene_id, scene_obj.get("lyric", "")) # 기존 lyric 유지 폴백 추가
+        scene_obj["prompt"] = prompt_ko or scene_obj.get("prompt", "") # 한국어 설명
+        scene_obj["prompt_img"] = final_prompt_img  # 최종 조합 영어 태그
+        scene_obj["prompt_movie"] = final_prompt_movie # 최종 조합 영어 태그 + 모션
+        scene_obj["prompt_negative"] = final_prompt_negative # 네거티브
+        scene_obj["effect"] = _clean_and_split_tags(" ".join(current_scene_effects)) # 효과
+        scene_obj["lyric"] = scene_lyrics_map.get(scene_id, scene_obj.get("lyric", "")) # 가사
 
     # --------------------------------------------------------------
-    # - 최종 story_data 반환
+    # - 최종 story_data 반환 (character_styles 저장 방식 변경됨)
     # --------------------------------------------------------------
-    story_data["character_styles"] = character_styles
-    story_data["scenes"] = scenes # 수정된 scenes 리스트로 업데이트
-    story_data.setdefault("audit", {})["generated_by"] = "gpt-5-v11-final-prompts"
+    # [수정됨] character_styles는 원본 한국어 설명 저장 (영어 태그는 조합 시 내부적으로만 사용)
+    story_data["character_styles"] = character_styles_ko
+    story_data["scenes"] = scenes
+    story_data.setdefault("audit", {})["generated_by"] = "gpt-5-v11-final-prompts-v5" # 버전명 업데이트
 
-    _t(trace, "gpt", "apply_gpt_to_story_v11 완료 (final prompts built)")
+    _t(trace, "gpt", "apply_gpt_to_story_v11 완료 (v5: AI base tags + combine)")
     return story_data
 
 

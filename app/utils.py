@@ -173,11 +173,21 @@ def _extract_char_tags(char_id: str, style_str: str) -> List[str]:
             uniq.append(t); seen.add(t)
     return uniq
 
+# utils.py 파일의 save_story_overwrite_with_prompts 함수 *내부*에 있는
+# _build_scene_prompts 함수를 찾아 아래 코드로 전체를 교체하세요.
+
 def _build_scene_prompts(scene: Dict[str, Any], story: Dict[str, Any]) -> Tuple[str, str]:
+    """
+    [수정됨] story.json의 정보를 조합하여 최종 영어 태그 기반 프롬프트를 생성합니다.
+    - 네거티브 프롬프트('--neg')를 여기서 덧붙이지 않습니다. (story_enrich 단계에서 prompt_negative 필드에 저장)
+    - 조합 로직은 기존 방식을 유지하되, 네거티브 부분만 제거합니다.
+    """
     global_ctx = story.get("global_context", {}) or {}
     char_styles = story.get("character_styles", {}) or {}
 
-    negative = _compose_negative(global_ctx)
+    # 네거티브 조합 로직은 유지 (하지만 최종 프롬프트 문자열에 --neg로 붙이지 않음)
+    # negative_text = _compose_negative(global_ctx) # 필요 시 내부 로깅 등에 사용 가능
+
     effects = _effects_to_tags(scene.get("effect", []))
     section_tags = _section_mood_tags(scene.get("section", ""), global_ctx)
     theme_palette = _themes_palette_tags(global_ctx)
@@ -186,79 +196,96 @@ def _build_scene_prompts(scene: Dict[str, Any], story: Dict[str, Any]) -> Tuple[
     char_tags: List[str] = []
     char_refs = _parse_char_refs(scene.get("characters", []))
     for ref in char_refs:
-        # ref["id"]가 int일 수도 있으므로 안전하게 문자열로 변환
         rid_str = str(ref.get("id", ""))
         ctags = _extract_char_tags(rid_str, char_styles.get(rid_str, ""))
         if isinstance(ctags, list):
             char_tags.extend(ctags)
         elif ctags:
-            # 혹시 단일 문자열을 반환하는 구현이어도 안전하게 처리
             char_tags.append(str(ctags))
 
-    # 배경 힌트(기존 prompt_img의 '배경:' 뒤만 뽑아 간단 영문 토큰화)
+    # 배경 힌트 (기존 로직 유지)
     bg_hint = ""
-    if scene.get("prompt_img"):
-        m = re.search(r"(배경[:：]\s*)(.+)", scene["prompt_img"])
-        if m:
-            bg_hint = m.group(2).strip()
+    if scene.get("prompt_img"): # scene['prompt_img']가 AI 강화 후 이미 영어 태그일 수 있음
+        # 간단히 첫 5개 단어 정도만 배경 힌트로 간주 (더 정교한 추출 필요 시 개선)
+        bg_tags_candidate = str(scene["prompt_img"]).split(',')[:5]
+        # 한국어 설명 필드('prompt')가 있으면 그것을 우선 사용
+        prompt_ko = str(scene.get("prompt", "")).strip()
+        if prompt_ko:
+             # 간단히 첫 부분만 사용
+             bg_hint = prompt_ko.split('.')[0] # 첫 문장 정도
+        else:
+             bg_hint = " ".join(bg_tags_candidate)
+
     bg_tags = _ko_to_en_tokens(bg_hint) if bg_hint else []
 
-    # 이미지 프롬프트
+    # 이미지 프롬프트 조합 (기존 방식 유지)
     img_prompt_parts = [
         ", ".join(char_tags) if char_tags else None,
         ", ".join(bg_tags) if bg_tags else None,
         ", ".join(theme_palette) if theme_palette else None,
         ", ".join(section_tags) if section_tags else None,
         ", ".join(effects) if effects else None,
-        "photorealistic, cinematic lighting, high detail, 8k, masterpiece",
+        "photorealistic, cinematic lighting, high detail, 8k, masterpiece", # 품질 태그
     ]
     img_prompt = ", ".join([p for p in img_prompt_parts if p])
+    # [수정] 네거티브 프롬프트(--neg) 추가 로직 제거
 
-    # 무비 프롬프트(모션)
+    # 무비 프롬프트 (모션 힌트 추가 로직 유지)
     motion_hint = ""
-    if scene.get("prompt_movie"):
-        mm = re.search(r"(인물 동작[:：]\s*)(.+)", scene["prompt_movie"])
-        if mm:
-            motion_hint = mm.group(2).strip()
-    movie_prompt = img_prompt + (f", motion: {motion_hint}" if motion_hint else "")
+    # scene['prompt_movie']에서 모션 힌트 추출 시도 (AI 강화 단계에서 이미 추가되었을 수 있음)
+    raw_movie_prompt = scene.get("prompt_movie", "")
+    if isinstance(raw_movie_prompt, str):
+        # 'motion:' 또는 'camera:' 키워드 이후 부분 추출
+        motion_match = re.search(r'(motion:|camera:)(.*)', raw_movie_prompt, re.IGNORECASE)
+        if motion_match:
+            motion_hint = motion_match.group(2).strip()
 
-    if negative:
-        img_prompt = f"{img_prompt} --neg {negative}"
-        movie_prompt = f"{movie_prompt} --neg {negative}"
+    # [수정] 네거티브 프롬프트(--neg) 추가 로직 제거
+    movie_prompt = f"{img_prompt}, motion: {motion_hint}" if motion_hint else img_prompt
+
+    # 최종 반환 시 앞뒤 공백 제거 및 중복 쉼표 정리
+    img_prompt = re.sub(r'\s*,\s*', ', ', img_prompt).strip(', ')
+    movie_prompt = re.sub(r'\s*,\s*', ', ', movie_prompt).strip(', ')
 
     return img_prompt, movie_prompt
 
 
+
 def save_story_overwrite_with_prompts(story_path: Path) -> Path:
     """
-    story.json을 읽어 각 scene의 prompt_img/prompt_movie를 재작성하여 같은 파일에 덮어쓴다.
-    실패 시 예외를 그대로 올리되, [PROMPTS] 로그는 남긴다.
+    [수정됨 v2] story.json을 읽어 audit 정보만 추가하고 같은 파일에 덮어쓴다.
+    - 프롬프트(prompt_img/prompt_movie) 재작성 로직을 완전히 제거합니다.
+      (프롬프트 생성 책임은 story_enrich.py의 apply_gpt_to_story_v11로 일원화)
+    - 실패 시 예외를 그대로 올립니다.
     """
-    print(f"[PROMPTS] load → {story_path}", flush=True)
-    story: Dict[str, Any] = json.loads(Path(story_path).read_text(encoding="utf-8"))
+    print(f"[PROMPTS_SAVE] load → {story_path}", flush=True)
+    try:
+        # load_json 함수를 사용하여 안전하게 로드 시도
+        story_raw = load_json(story_path, None)
+        if not isinstance(story_raw, dict):
+             # 로드 실패 또는 형식이 dict가 아니면 오류 발생
+             raise ValueError(f"Failed to load or parse story.json as dict: {story_path}")
+        story = story_raw # 타입 검증 후 할당
+    except Exception as e_load:
+        print(f"[PROMPTS_SAVE] ERROR loading story.json: {e_load}", flush=True)
+        raise # 오류를 상위로 전파
 
     scenes = story.get("scenes", []) or []
-    print(f"[PROMPTS] scenes={len(scenes)} | chars={story.get('characters', [])}", flush=True)
+    print(f"[PROMPTS_SAVE] scenes={len(scenes)} | chars={story.get('characters', [])}", flush=True)
 
-    changed = 0
-    for sc in scenes:
-        sid = sc.get("id", "?")
-        img_p, mov_p = _build_scene_prompts(sc, story)
-        sc["prompt_img"] = img_p
-        sc["prompt_movie"] = mov_p
-        changed += 1
-        if changed <= 2:  # 샘플만
-            print(f"[PROMPTS] {sid} img='{img_p[:100]}...'", flush=True)
-            print(f"[PROMPTS] {sid} mov='{mov_p[:100]}...'", flush=True)
-
+    # audit 정보만 추가 (덮어쓰기 여부, 시간)
     story.setdefault("audit", {})
-    story["audit"]["prompts_overwritten"] = True
-    story["audit"]["prompts_overwritten_at"] = time.strftime("%Y-%m-%d %H:%M:%S")
+    story["audit"]["prompts_finalized_at_enrich"] = True # 플래그 이름 변경 (enrich 단계에서 완료됨을 명시)
+    story["audit"]["finalized_at"] = time.strftime("%Y-%m-%d %H:%M:%S")
 
-    Path(story_path).write_text(json.dumps(story, ensure_ascii=False, indent=2), encoding="utf-8")
-    print(f"[PROMPTS] wrote → {story_path} (changed={changed})", flush=True)
-    return story_path
-# ==== /GPT 프롬프트 재작성 ====
+    try:
+        # save_json 함수를 사용하여 안전하게 저장 시도
+        save_json(story_path, story) # save_json은 Path 객체를 반환하지 않으므로 수정
+        print(f"[PROMPTS_SAVE] wrote (audit updated) → {story_path}", flush=True)
+        return story_path # 저장 성공 시 경로 반환
+    except Exception as e_save:
+        print(f"[PROMPTS_SAVE] ERROR writing story.json: {e_save}", flush=True)
+        raise # 오류를 상위로 전파
 
 # ===== END =====
 
