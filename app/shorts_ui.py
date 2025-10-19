@@ -852,12 +852,14 @@ class MainWindow(QtWidgets.QMainWindow):
         pairs = [
             (_btn(ui, "btn_generate_lyrics") or _btn(self, "btn_gen"), self.on_generate_lyrics_with_log),
             (_btn(ui, "btn_generate_music") or _btn(self, "btn_music"), self.on_click_generate_music),
-            (_btn(ui, "btn_test1_story") or _btn(self, "btn_test1_story"), self.on_click_test1_analyze),
+
+            # ▶ 프로젝트분석 버튼: seg → story → AI (비동기)
+            (_btn(ui, "btn_test1_story") or _btn(self, "btn_test1_story"), self.on_click_build_story_from_seg_async),
+
             (_btn(ui, "btn_test2_1_img") or _btn(self, "btn_test2_1_img"),
              self.on_click_test2_1_generate_missing_images_with_log),
             (_btn(ui, "btn_analyze") or _btn(self, "btn_analyze"), self.on_click_analyze_music),
-            # ⬇️ 변환 토글: 실제 구현 함수 이름(on_toggle_convert)로 정확히 연결
-            (_btn(ui, "btn_convert_toggle") or _btn(self, "btn_convert_toggle"), self.on_toggle_convert),
+            (_btn(ui, "btn_convert_toggle") or _btn(self, "btn_convert_toggle"), self.on_convert_toggle),
         ]
 
         for btn, handler in pairs:
@@ -2082,6 +2084,283 @@ class MainWindow(QtWidgets.QMainWindow):
                 return -1.0
 
         return max(uniq, key=_mtime_safe)
+
+    def on_click_build_story_from_seg_async(self) -> None:
+        """
+        seg.json → story.json 생성 후 AI로 강화하고 프롬프트를 주입한다.
+        - intro: 첫 줄 start < 1.0s 이면 intro 없음, 아니면 0~start intro
+        - outro: 마지막 end 이후 +5.0s
+        - QThread 비동기 실행, 스레드/워커/다이얼로그 참조 self에 보관(GC 방지)
+        """
+        from pathlib import Path
+        from typing import Any, Dict, List
+        from PyQt5 import QtCore
+
+        if getattr(self, "_seg_story_busy", False):
+            return
+        self._seg_story_busy = True
+
+        # 진행창: 현재 파일에 정의된 ProgressLogDialog 직접 사용 (임포트 금지)
+        dlg = ProgressLogDialog(self)  # shorts_ui.py 내부 클래스 사용
+        dlg.set_title("프로젝트분석 (seg→AI)")
+        dlg.enter_determinate(4)
+        dlg.set_status("준비 중…")
+        try:
+            dlg.setWindowModality(QtCore.Qt.NonModal)
+        except Exception:
+            pass
+        dlg.show()
+        QtCore.QCoreApplication.processEvents()
+
+        # 버튼 보호
+        btn = getattr(self, "btn_test1_story", None) or getattr(getattr(self, "ui", None), "btn_test1_story", None)
+        if btn is not None:
+            try:
+                btn.setEnabled(False)
+            except Exception:
+                pass
+
+        # 유틸/AI/강화기
+        try:
+            from utils import load_json, save_json, save_story_overwrite_with_prompts  # type: ignore
+        except (ImportError, ModuleNotFoundError):
+            from app.utils import load_json, save_json, save_story_overwrite_with_prompts  # type: ignore
+        try:
+            from story_enrich import apply_gpt_to_story_v11  # type: ignore
+        except (ImportError, ModuleNotFoundError):
+            from app.story_enrich import apply_gpt_to_story_v11  # type: ignore
+
+        # AI: 우선 app.ai → ai → utils.AI (현재 저장소에 ai.py 있음)
+        try:
+            from app.ai import AI  # type: ignore
+        except (ImportError, ModuleNotFoundError):
+            try:
+                from ai import AI  # type: ignore
+            except (ImportError, ModuleNotFoundError):
+                from utils import AI  # type: ignore
+
+        # 프로젝트/seg.json 확인
+        proj_dir_str = ""
+        try:
+            proj_dir_str = self._current_project_dir()
+        except AttributeError:
+            proj_dir_str = getattr(self, "project_dir", "") or ""
+        if not proj_dir_str:
+            dlg.append_log("[UI][ERROR] 프로젝트 폴더를 선택/생성해 주세요.")
+            if btn is not None:
+                try:
+                    btn.setEnabled(True)
+                except Exception:
+                    pass
+            self._seg_story_busy = False
+            return
+        pdir = Path(proj_dir_str)
+        seg_path = pdir / "seg.json"
+        if not seg_path.exists():
+            dlg.append_log(f"[UI][ERROR] seg.json이 없습니다: {seg_path}")
+            if btn is not None:
+                try:
+                    btn.setEnabled(True)
+                except Exception:
+                    pass
+            self._seg_story_busy = False
+            return
+
+        # ───────── Worker ─────────
+        class _worker(QtCore.QObject):
+            done = QtCore.pyqtSignal()
+            fail = QtCore.pyqtSignal(str)
+            log = QtCore.pyqtSignal(str)
+            step = QtCore.pyqtSignal(str)
+
+            def __init__(self, project_dir: Path):
+                super().__init__()
+                self.project_dir = project_dir
+
+            def _build_story_from_seg(self) -> Path:
+                seg_doc = load_json(self.project_dir / "seg.json", None)
+                if not isinstance(seg_doc, list) or not seg_doc:
+                    raise RuntimeError("seg.json이 비어있거나 형식이 올바르지 않습니다.")
+
+                meta = load_json(self.project_dir / "project.json", {}) or {}
+                if not isinstance(meta, dict):
+                    meta = {}
+                imgs = self.project_dir / "imgs"
+                try:
+                    imgs.mkdir(parents=True, exist_ok=True)
+                except OSError:
+                    pass
+
+                scenes: List[Dict[str, Any]] = []
+                cursor = 0.0
+                first_start = float(seg_doc[0].get("start") or 0.0)
+                if first_start >= 1.0:
+                    scenes.append({
+                        "id": "t_000",
+                        "section": "intro",
+                        "label": "Intro",
+                        "start": 0.0,
+                        "end": round(first_start, 3),
+                        "duration": round(first_start, 3),
+                        "scene": "intro",
+                        "characters": [],
+                        "effect": ["soft light", "film grain", "gentle camera pan"],
+                        "screen_transition": True,
+                        "img_file": str(imgs / "t_000.png"),
+                        "prompt": None,
+                        "needs_character_asset": False,
+                        "lyric": "",
+                    })
+                    cursor = first_start
+
+                for i, row in enumerate(seg_doc, start=1):
+                    s0 = float(row.get("start") or 0.0)
+                    s1 = float(row.get("end") or s0)
+                    if s1 < s0:
+                        s1 = s0
+                    if s0 < cursor:
+                        s0 = cursor
+                    sid = f"t_{i:03d}"
+                    scenes.append({
+                        "id": sid,
+                        "section": "verse",
+                        "label": "Verse",
+                        "start": round(s0, 3),
+                        "end": round(s1, 3),
+                        "duration": round(s1 - s0, 3),
+                        "scene": "verse",
+                        "characters": ["female_01"],
+                        "effect": ["bokeh", "slow push-in"],
+                        "screen_transition": False,
+                        "img_file": str(imgs / f"{sid}.png"),
+                        "prompt": None,
+                        "needs_character_asset": True,
+                        "lyric": str(row.get("text") or "").strip(),
+                    })
+                    cursor = s1
+
+                last_end = float(seg_doc[-1].get("end") or cursor)
+                outro_start = last_end
+                outro_end = last_end + 5.0
+                sid_outro = f"t_{len(scenes) + 1:03d}"
+                scenes.append({
+                    "id": sid_outro,
+                    "section": "outro",
+                    "label": "Outro",
+                    "start": round(outro_start, 3),
+                    "end": round(outro_end, 3),
+                    "duration": round(outro_end - outro_start, 3),
+                    "scene": "outro",
+                    "characters": [],
+                    "effect": ["fade-out", "soft glow"],
+                    "screen_transition": True,
+                    "img_file": str(imgs / f"{sid_outro}.png"),
+                    "prompt": None,
+                    "needs_character_asset": False,
+                    "lyric": "",
+                })
+
+                record: Dict[str, Any] = {
+                    "title": str(meta.get("title") or self.project_dir.name),
+                    "duration": round(outro_end, 3),
+                    "offset": 0.0,
+                    "lyrics": str(meta.get("lyrics") or ""),
+                    "characters": meta.get("characters") or ["female_01"],
+                    "character_styles": meta.get("character_styles") or {},
+                    "global_context": {
+                        "themes": meta.get("themes") or [],
+                        "palette": meta.get("palette") or "",
+                        "style_guide": meta.get("style_guide") or "",
+                        "negative_bank": meta.get("negative_bank") or "",
+                        "section_moods": {
+                            "intro": "도입, 암시, 미니멀",
+                            "verse": "잔잔함, 근접, 친밀감",
+                            "chorus": "개방감, 광각, 확장",
+                            "bridge": "전환감, 대비, 변화",
+                            "outro": "여운, 잔상, 감쇠",
+                        },
+                        "effect": meta.get("effect") or [],
+                    },
+                    "defaults": {"image": {"width": 1080, "height": 1920, "negative": "@global"}},
+                    "scenes": scenes,
+                    "audit": {"built_from": "seg.json", "ai_used": False},
+                }
+
+                story_path = self.project_dir / "story.json"
+                save_json(story_path, record)
+                return story_path
+
+            @QtCore.pyqtSlot()
+            def run(self) -> None:
+                try:
+                    self.log.emit(f"[1/4] 프로젝트: {self.project_dir}")
+                    self.log.emit(f"[1/4] seg.json: {self.project_dir / 'seg.json'}")
+                    self.step.emit("입력 확인 완료")
+
+                    self.step.emit("seg.json에서 story.json 생성 중…")
+                    story_path = self._build_story_from_seg()
+                    self.log.emit(f"[2/4] story.json 생성: {story_path}")
+                    self.step.emit("스토리 생성 완료")
+
+                    self.step.emit("AI로 스토리 강화 중…")
+                    story_doc = load_json(story_path, None) or {}
+                    if not isinstance(story_doc, dict):
+                        raise TypeError("story.json 내용이 올바르지 않습니다(dict 필요).")
+
+                    ai_client = AI()
+
+                    def _ask(system: str, user: str, *, prefer: str | None = None,
+                             allow_fallback: bool | None = None, trace: Any | None = None) -> str:
+                        return ai_client.ask_smart(system=system, user=user, prefer=prefer,
+                                                   allow_fallback=allow_fallback, trace=trace)
+
+                    story_ai = apply_gpt_to_story_v11(
+                        story_doc,
+                        ask=_ask,
+                        prefer=None,
+                        allow_fallback=True,
+                        trace=lambda t, m: self.log.emit(f"[AI][{t}] {m}"),
+                    )
+                    story_ai.setdefault("audit", {})
+                    story_ai["audit"]["ai_used"] = True
+                    save_json(story_path, story_ai)
+                    self.log.emit("[3/4] AI 강화 완료")
+                    self.step.emit("AI 단계 완료")
+
+                    self.step.emit("프롬프트 주입/정규화 중…")
+                    try:
+                        save_story_overwrite_with_prompts(story_path)
+                    except (RuntimeError, ValueError, TypeError) as e:
+                        self.log.emit(f"[WARN] 프롬프트 주입 경고: {e}")
+                    self.log.emit("[4/4] 프롬프트 주입 완료")
+                    self.step.emit("완료")
+                    self.done.emit()
+
+                except (RuntimeError, FileNotFoundError, TypeError, ValueError, ImportError, ModuleNotFoundError) as e:
+                    self.fail.emit(f"{type(e).__name__}: {e}")
+
+        # QThread 구성 + 참조 유지(GC 방지)
+        th = QtCore.QThread(self)
+        wk = _worker(pdir)
+        wk.moveToThread(th)
+        self._seg_thread = th
+        self._seg_worker = wk
+        self._seg_dlg = dlg
+
+        wk.log.connect(dlg.append_log)
+        wk.step.connect(dlg.set_status)
+        wk.done.connect(th.quit)
+        wk.done.connect(lambda: dlg.set_completed("완료"))
+        wk.done.connect(lambda: setattr(self, "_seg_story_busy", False))
+        wk.done.connect(lambda: btn.setEnabled(True) if btn is not None else None)
+        wk.fail.connect(lambda m: dlg.append_log(f"[UI][ERROR] {m}"))
+        wk.fail.connect(lambda m: setattr(self, "_seg_story_busy", False))
+        wk.fail.connect(lambda m: btn.setEnabled(True) if btn is not None else None)
+        wk.fail.connect(th.quit)
+        th.finished.connect(lambda: setattr(self, "_seg_thread", None))
+        th.finished.connect(lambda: setattr(self, "_seg_worker", None))
+        th.started.connect(wk.run)
+        th.start()
 
     def on_click_test1_analyze(self) -> None:
         """
