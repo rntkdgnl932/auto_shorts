@@ -24,6 +24,7 @@ import subprocess
 import json
 from typing import Optional, Dict, Set, Callable
 import requests
+import math
 import shutil
 import sys
 import os
@@ -2096,7 +2097,7 @@ class MainWindow(QtWidgets.QMainWindow):
         """
         from pathlib import Path
         from typing import Any, Dict, List, Optional
-        from PyQt5 import QtCore, QtWidgets
+        from PyQt5 import QtWidgets
         import json  # json 임포트 추가
 
         # --- 표준 비동기 작업 실행기 import ---
@@ -3695,48 +3696,69 @@ class MainWindow(QtWidgets.QMainWindow):
 
     def _estimate_seconds_from_lyrics(self, text: str) -> int:
         """
-        가사 길이 추정:
-          - [chorus] 본문은 2배 가중
-          - 공백/빈 줄/섹션 헤더는 제외
-          - 기본 초/글자(self.seconds_per_char 없으면 0.72)
-          - 최종값에 1.2배 버퍼를 곱해(여유 시간) 정수 초로 반환
-          - 1~3600초로 클램프
+        [수정 v2] 가사 길이 추정 (발음 기반):
+          - seconds_per_unit 값을 대폭 축소 (0.25 수준으로 조정).
+          - kroman 없으면 기존 글자 수 기반 로직으로 폴백.
+          - 1~3600초로 클램프.
         """
-        import re, math
+        kroman_mod = None
+        try:
+            import kroman as kroman_mod
+        except ImportError:
+            print("[WARN] kroman library not found. Falling back to character count estimation.")
+            # kroman 없을 때 폴백 로직 (v1과 동일)
+            section_fb = "default"
+            pieces_fb: list[tuple[str, str]] = []
+            for raw_fb in (text or "").splitlines():
+                s_fb = (raw_fb or "").strip()
+                if not s_fb: continue
+                m_fb = re.fullmatch(r"\[([^\[\]\n]+)]", s_fb, flags=re.I)
+                if m_fb: section_fb = m_fb.group(1).strip().lower(); continue
+                pieces_fb.append((section_fb, s_fb))
+            total_chars_fb = 0.0  # float으로 변경
+            for sec_fb, content_fb in pieces_fb:
+                body_fb = re.sub(r"\s+", "", content_fb)
+                if not body_fb: continue
+                weight_fb = 1.5 if sec_fb == "chorus" else 1.0
+                total_chars_fb += weight_fb * len(body_fb)
+            if total_chars_fb <= 0: return 0
+            spc_fb = getattr(self, "seconds_per_char", 0.72)
+            seconds_raw_fb = total_chars_fb * float(spc_fb)
+            seconds_buf_fb = math.ceil(seconds_raw_fb * 1.20)
+            return int(max(1, min(3600, seconds_buf_fb)))
 
+        # --- kroman 사용 가능 시: 발음 기반 로직 ---
         section = "default"
-        pieces: list[tuple[str, str]] = []
+        pronunciation_based_length = 0.0
+        for raw_line in (text or "").splitlines():  # (v1과 동일 로직)
+            line_strip = (raw_line or "").strip()
+            if not line_strip: continue
+            match_header = re.fullmatch(r"\[([^\[\]\n]+)]", line_strip, flags=re.I)
+            if match_header: section = match_header.group(1).strip().lower(); continue
+            try:
+                romanized_line: Optional[str] = kroman_mod.parse(line_strip)  # type: ignore[attr-defined]
+                if romanized_line is not None:
+                    processed_line = romanized_line.replace("-", "").lower()
+                    line_len = len(re.sub(r"\s+", "", processed_line))
+                else:
+                    line_len = len(re.sub(r"\s+", "", line_strip))
+            except Exception:
+                line_len = len(re.sub(r"\s+", "", line_strip))
+            weight = 1.5 if section == "chorus" else 1.0
+            pronunciation_based_length += weight * line_len
 
-        for raw in (text or "").splitlines():
-            s = (raw or "").strip()
-            if not s:
-                continue
-            m = re.fullmatch(r"\[([^\[\]\n]+)]", s, flags=re.I)
-            if m:
-                section = m.group(1).strip().lower()
-                continue
-            pieces.append((section, s))
+        if pronunciation_based_length <= 0: return 0
 
-        total_chars = 0
-        for sec, content in pieces:
-            body = re.sub(r"\s+", "", content)
-            if not body:
-                continue
-            weight = 2 if sec == "chorus" else 1
-            total_chars += weight * len(body)
+        # ★★ 글자(발음 단위)당 시간 대폭 축소 (0.72 * 0.35 ≈ 0.25) ★★
+        #    이 값을 조정하여 전체 길이를 튜닝하세요.
+        adjustment_factor = 0.35
+        seconds_per_unit = getattr(self, "seconds_per_char", 0.72) * adjustment_factor
 
-        if total_chars <= 0:
-            return 0
+        seconds_raw = pronunciation_based_length * float(seconds_per_unit)
+        seconds_buffered = math.ceil(seconds_raw * 1.20)  # 1.2배 버퍼 유지
 
-        spc = getattr(self, "seconds_per_char", 0.72)  # 초/글자
-        seconds_raw = total_chars * float(spc)
-        seconds_buf = math.ceil(seconds_raw * 1.20)  # ← 1.2배 버퍼 적용(올림)
-
-        if seconds_buf < 1:
-            return 1
-        if seconds_buf > 3600:
-            return 3600
-        return int(seconds_buf)
+        final_seconds = int(max(1, min(3600, seconds_buffered)))
+        return final_seconds
 
     def _wire_convert_toggle_action(self) -> None:
         """
