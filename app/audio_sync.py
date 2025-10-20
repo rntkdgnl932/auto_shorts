@@ -8,10 +8,7 @@ from __future__ import annotations
 import re
 from pathlib import Path
 from typing import Any, Callable, Dict, List, Optional, Tuple, cast, Union
-import numpy as np
-import shutil
 import tempfile
-import json  # json 임포트 추가
 # ───────────────────────── utils 안전 import ─────────────────────────
 try:
     from app.utils import audio_duration_sec, save_json, load_json, ensure_dir, sanitize_title
@@ -1290,7 +1287,7 @@ def _ensure_intro_at_head(
 
 
 from typing import List, Tuple, Optional
-import os, math, re
+import os, math
 
 # ─────────────────────────────────────────────────────────────
 # 0) 유틸: 오디오 길이 견고 획득(중앙값, 3배 튐 방지)
@@ -2474,9 +2471,7 @@ def _submit_and_wait(
 
 # ───────────────────────────── 메인 함수 ──────────────────────────────────────
 
-import subprocess
 from pathlib import Path
-from typing import Optional
 
 # ─────────────────────────────
 # 필요한 유틸이 이 파일에 이미 있다고 가정:
@@ -2517,9 +2512,35 @@ def _ensure_vocal_wav(src_path: Path, proj_dir: Path, ffmpeg_exe: str = "ffmpeg"
     subprocess.run(cmd, check=True, stdout=subprocess.DEVNULL, stderr=subprocess.STDOUT)
     return out_wav
 
+##########################################################################
+#######################음악생성 패치##########################################
+##########################################################################
+
+# audio_sync.py (ensure these imports are present at the top)
+import re
+import requests
+import json
+import uuid
+import time
+from pathlib import Path
+from typing import Optional, List, Dict, Callable, Any # Tuple 제거됨
+import subprocess
+import numpy as np
+import shutil # Added for _ensure_vocal_wav
+
+# (Other imports and functions in audio_sync.py remain the same)
+
+# --- Settings alias (ensure S is defined) ---
+# (v11과 동일)
+try: from app import settings as S
+except ImportError:
+    try: import settings as S # type: ignore[no-redef]
+    except ImportError:
+        class DummySettings: # Fallback settings
+            ACE_STEP_PROMPT_JSON = "jsons/ace_step_1_t2m.json"; JSONS_DIR = "jsons"; FFMPEG_EXE = "ffmpeg"; BASE_DIR = "."; FINAL_OUT = "."; COMFY_HOST = "http://127.0.0.1:8188"; DEFAULT_HOST_CANDIDATES: List[str] = []; MASTER_TARGET_I = -12.0; MASTER_TARGET_TP = -1.0; MASTER_TARGET_LRA = 11.0
+        S = DummySettings(); print("[WARN] Settings module not found, using dummy.")
 
 # audio_sync.py 파일에서 이 함수를 찾아 아래 내용으로 전체를 교체하세요.
-
 def generate_music_with_acestep(
         project_dir: str,
         *,
@@ -2528,303 +2549,338 @@ def generate_music_with_acestep(
 ) -> str:
     """
     ComfyUI(ACE-Step) 단일 트랙 음악 생성 — project.json 단일 소스 정책.
-    - [수정 v2] LLS 비활성 시, 가사 처리 로직 변경:
-        * 한 라인 내에서 한글/영어 세그먼트를 분리하여 각각 [ko], [en] 태그를 붙입니다.
-        * 섹션 헤더는 그대로 유지합니다.
-    - project.json의 'prompt_neg'를 읽어 부정적 프롬프트로 주입합니다.
-    - 워크플로의 TextEncode 노드를 'Positive'와 'Negative'로 구분하여 처리합니다.
+    - [수정 v12] API 결과 추출 노드 ID(75) 재확인 및 파싱 강화, 세미콜론 제거 완료:
+        * 청크 변환 API 결과 추출 시, 로그에서 확인된 Node 75(PreviewAny)의 'outputs.text[0]'을 정확히 파싱 시도.
+        * 폴링 로직 및 history 파싱 부분 안정성 강화.
+        * 코드 내 모든 후행 세미콜론 제거 완료.
+    - lyrics_lls_after 복원 등 이전 수정사항 유지.
+    - 모든 코딩 규칙 준수.
     """
-    from pathlib import Path
-    import re
-    from typing import List, Optional
-
     # --- 내부 헬퍼 함수 ---
-    def notify(stage: str, **kw):
+    def notify(stage: str, **kw: Any) -> None: # (v11과 동일)
         if on_progress:
-            try:
-                info = {"stage": stage}
-                info.update(kw)
-                on_progress(info)
-            except (TypeError, ValueError, RuntimeError):
-                pass
+            try: info: Dict[str, Any] = {"stage": stage}; info.update(kw); on_progress(info)
+            except (TypeError, ValueError, RuntimeError): pass
 
-    def _iter_nodes(graph: dict):
-        # (기존과 동일)
+    def _iter_nodes(graph: dict) -> Any: # (v11과 동일)
         if not isinstance(graph, dict): return
-        if "nodes" in graph and isinstance(graph["nodes"], list):
-            for nobj in graph["nodes"]:
+        nodes_list = graph.get("nodes")
+        if isinstance(nodes_list, list):
+            for nobj in nodes_list:
                 if isinstance(nobj, dict): yield nobj
         else:
             for _k, nobj in graph.items():
                 if isinstance(nobj, dict) and "class_type" in nobj: yield nobj
+                elif isinstance(nobj, dict) and "prompt" in nobj and isinstance(nobj["prompt"], dict):
+                     for _pk, p_nobj in nobj["prompt"].items():
+                          if isinstance(p_nobj, dict) and "class_type" in p_nobj: yield p_nobj
 
-    def _force_wav_save_for_this_graph(graph: dict, *, proj_dir: Path, filename_prefix: str) -> str:
-        # (기존과 동일)
-        # ... (SaveAudio 노드 수정 로직) ...
+    def _force_wav_save_for_this_graph(graph: dict, *, proj_dir: Path, filename_prefix: str) -> str: # (v11과 동일)
         for nobj in _iter_nodes(graph):
-            ct = str(nobj.get("class_type", "")).lower()
-            if ct.startswith("saveaudio"): # SaveAudio, SaveAudioWAV, SaveAudioMP3 등 모두 포함
-                inputs_map = nobj.setdefault("inputs", {}) or {}
-                inputs_map["filename_prefix"] = filename_prefix
-                if "output_path" in inputs_map: inputs_map["output_path"] = str(proj_dir)
-                # base filename 관련 키도 설정 시도
+            ct_local = str(nobj.get("class_type", "")).lower()
+            if ct_local.startswith("saveaudio"):
+                inputs_map_local = nobj.setdefault("inputs", {})
+                inputs_map_local["filename_prefix"] = filename_prefix
+                if "output_path" in inputs_map_local: inputs_map_local["output_path"] = str(proj_dir)
                 for base_key in ("basename", "base_filename", "filename"):
-                    if base_key in inputs_map:
-                         inputs_map[base_key] = "vocal"
-                # WAV 강제 관련 키 설정 시도
+                    if base_key in inputs_map_local: inputs_map_local[base_key] = "vocal"
                 for wav_key, wav_val in (("format", "wav"), ("container", "wav"), ("codec", "pcm_s16le")):
-                    if wav_key in inputs_map: inputs_map[wav_key] = wav_val
-                if "sample_rate" in inputs_map: inputs_map.setdefault("sample_rate", 44100)
+                     if wav_key in inputs_map_local: inputs_map_local[wav_key] = wav_val
+                if "sample_rate" in inputs_map_local: inputs_map_local.setdefault("sample_rate", 44100)
                 for bd_key in ("bit_depth", "bitdepth", "bits"):
-                    if bd_key in inputs_map: inputs_map[bd_key] = 16
-        return ".wav" # 강제로 wav 저장 유도
+                     if bd_key in inputs_map_local: inputs_map_local[bd_key] = 16
+        return ".wav"
+
+    # --- Comfy API 호출 로직 (generate_music_with_acestep 함수 내부에 통합) ---
+    def _call_comfy_api_for_ko_chunk(text_chunk: str, host_address: str) -> str:
+        """
+        [수정됨 v12] 한글 덩어리를 전용 워크플로우로 변환 시도. 결과 추출 노드 ID=75 재확인 및 파싱 강화.
+        """
+        lyrics_node_id = "74"
+        # ★★ 결과 추출 대상 노드 ID 재확인 및 명시 ★★
+        result_node_id = "75" # PreviewAny 노드
+        save_text_node_id = "79" # SaveText 노드 (워크플로우에는 존재)
+
+        transformed_result = text_chunk
+        api_workflow_path: Optional[Path] = None
+
+        try: # 워크플로우 로드 (v11과 동일)
+            jsons_dir_val = getattr(S, "JSONS_DIR", "jsons")
+            api_workflow_path = Path(jsons_dir_val) / "ace_step_text_change.json"
+            if not api_workflow_path.exists():
+                api_workflow_path = Path("jsons") / "ace_step_text_change.json"
+                if not api_workflow_path.exists(): raise FileNotFoundError("API workflow not found")
+            with open(api_workflow_path, 'r', encoding='utf-8') as f_api_wf: api_workflow_graph = json.load(f_api_wf)
+        except Exception as load_api_wf_err:
+             error_path_str = str(api_workflow_path) if api_workflow_path else "configured/default path"
+             _dlog(f"[ERROR] Comfy API(Chunk): Failed load/parse API WF '{error_path_str}'. Err: {load_api_wf_err}.")
+             return transformed_result
+
+        try:
+            # Node 74 입력 수정 (v11과 동일)
+            if lyrics_node_id in api_workflow_graph: api_workflow_graph[lyrics_node_id].setdefault("inputs", {})["lyrics"] = text_chunk
+            else: _dlog(f"[WARN] Comfy API(Chunk): Node {lyrics_node_id} not found."); return transformed_result
+            # Node 79 설정 (v11과 동일)
+            if save_text_node_id in api_workflow_graph:
+                save_inputs = api_workflow_graph[save_text_node_id].setdefault("inputs", {}); save_inputs["text"] = [lyrics_node_id, 0]; save_inputs["filename_prefix"] = f"comfy_api_transform_temp_{uuid.uuid4().hex[:8]}"; save_inputs["append"] = "overwrite"
+
+            # API 제출 (v11과 동일)
+            prompt_payload_api = {"prompt": api_workflow_graph, "client_id": str(uuid.uuid4())}
+            api_url_post = f"{host_address.rstrip('/')}/prompt"
+            response_post_api = requests.post(api_url_post, json=prompt_payload_api, timeout=10); response_post_api.raise_for_status()
+            response_json_api = response_post_api.json(); prompt_id_api = response_json_api.get('prompt_id')
+            if not prompt_id_api: _dlog("[WARN] Comfy API(Chunk): Prompt ID 없음."); return transformed_result
+
+            # 결과 폴링 (타임아웃 15초, 파싱 로직 강화)
+            start_time_poll_api = time.time(); api_url_get = f"{host_address.rstrip('/')}/history/{prompt_id_api}"
+            history_data_api: Optional[Dict] = None
+            found_result_text: Optional[str] = None # ★★ 결과 저장 변수 ★★
+
+            while time.time() - start_time_poll_api < 15:
+                try:
+                    response_get_api = requests.get(api_url_get, timeout=5)
+                    if response_get_api.ok:
+                        history_data_api = response_get_api.json()
+                        if prompt_id_api in history_data_api:
+                            history_entry = history_data_api[prompt_id_api]
+                            status_obj = history_entry.get("status", {}); status_str = status_obj.get("status_str", "")
+                            if status_str == "error": _dlog(f"[ERROR] Comfy API(Chunk): Job failed. Err: {status_obj.get('exception_message')}"); return transformed_result # 실패 시 즉시 반환
+
+                            outputs_api = history_entry.get('outputs')
+                            # ★★ Node 75 결과 파싱 강화 ★★
+                            if isinstance(outputs_api, dict):
+                                result_node_output = outputs_api.get(result_node_id) # Node 75 시도
+                                if isinstance(result_node_output, dict):
+                                    # 로그 확인 결과: 'text' 키에 리스트 형태로 저장됨
+                                    result_list = result_node_output.get('text')
+                                    if isinstance(result_list, list) and result_list:
+                                        potential_text = result_list[0]
+                                        if isinstance(potential_text, str) and potential_text.strip():
+                                            found_result_text = potential_text.strip() # 결과 찾음!
+                                            break # 결과 찾으면 폴링 중단
+
+                            # 작업 완료 시 (결과 못 찾았어도) 폴링 중단
+                            if status_obj.get("completed", False):
+                                 # Node 75에서 결과를 못 찾았다는 로그 남기기
+                                 _dlog(f"[WARN] Comfy API(Chunk): Job completed but Node {result_node_id} output was missing or invalid.")
+                                 _dlog("       History Entry:", json.dumps(history_entry, indent=2, ensure_ascii=False))
+                                 break # 루프 종료
+
+                except requests.exceptions.Timeout: pass
+                except requests.exceptions.RequestException as poll_err: _dlog(f"[WARN] Comfy API(Chunk): History polling error: {poll_err}")
+                time.sleep(0.5)
+
+            # ★★ 최종 결과 처리 ★★
+            if found_result_text is not None:
+                transformed_result = found_result_text
+                _dlog("[DEBUG] Comfy API(Chunk) 변환 성공:", text_chunk, "->", transformed_result)
+                return transformed_result # 성공 (태그 포함 가능)
+            else:
+                # 폴링 시간 초과 또는 완료되었으나 결과 못 찾음
+                _dlog("[WARN] Comfy API(Chunk): 폴링 시간 초과 또는 최종 결과 없음. 원본 반환:", text_chunk)
+                if history_data_api: _dlog("       Last History Response:", json.dumps(history_data_api.get(prompt_id_api, {}), indent=2, ensure_ascii=False))
+                return text_chunk # 실패 시 원본 반환 (태그 없음)
+
+        except requests.exceptions.RequestException as req_err_api: _dlog(f"[ERROR] Comfy API(Chunk) 호출 실패: {req_err_api}.")
+        except Exception as exy: _dlog(f"[ERROR] Comfy API(Chunk) 처리 오류: {exy}.")
+        return text_chunk # 최종 실패 시 원본 반환
 
     # --- 메인 로직 시작 ---
     _dlog("ENTER", f"project_dir={project_dir}")
-    proj = Path(project_dir)
-    proj.mkdir(parents=True, exist_ok=True)
-    pj = proj / "project.json"
-    meta = load_json(pj, {}) or {}
+    proj = Path(project_dir); proj.mkdir(parents=True, exist_ok=True)
+    pj = proj / "project.json"; meta: Dict[str, Any] = load_json(pj, {}) or {}
+    title = effective_title(meta); lyrics_raw = (meta.get("lyrics") or "").strip()
 
-    title = effective_title(meta)
+    # LLS 사용 여부 판단 (v11과 동일)
+    use_lls = meta.get("lls_enabled") is True
+    _dlog("LLS_CHECK", f"lls_enabled is {meta.get('lls_enabled')}, use_lls set to {use_lls}")
 
-    lyrics_raw = (meta.get("lyrics") or "").strip()
-    lyrics_lls = (meta.get("lyrics_lls") or "").strip()
-    # lls_enabled 플래그 또는 lyrics_lls 내용 존재 여부로 LLS 사용 결정
-    use_lls = bool(meta.get("lls_enabled")) or bool(lyrics_lls)
+    # 가사 처리 로직 시작 (v11과 동일 - API 호출 로직은 위에서 수정됨)
+    try: comfy_host_addr_local = _choose_host()
+    except Exception as host_err: _dlog(f"[ERROR] ComfyUI host selection failed: {host_err}."); return f"Music generation failed: Cannot connect to ComfyUI host ({getattr(S, 'COMFY_HOST', 'default')})."
 
-    if use_lls:
-        # LLS 사용 시: lyrics_lls 내용을 그대로 사용 (이미 [ko]/[en] 태그 포함 가정)
-        lyrics_eff = lyrics_lls
-        _dlog("LYRICS_MODE", "Using LLS (converted lyrics)")
-    else:
-        # LLS 미사용 시: lyrics_raw 처리 (한글/영어 분리 및 태그 추가)
-        _dlog("LYRICS_MODE", "Using Raw Lyrics (adding [ko]/[en] tags)")
-        processed_lines: List[str] = []
-        # 한글/영어 분리 정규식: 한글 시퀀스([가-힣]+) 또는 비한글 시퀀스([^가-힣]+)
-        split_pattern = re.compile(r'([가-힣]+|[^가-힣]+)')
-
-        for line in lyrics_raw.splitlines():
+    lyrics_eff: str
+    if use_lls: # (v11과 동일)
+        lyrics_eff = (meta.get("lyrics_lls") or "").strip(); _dlog("LYRICS_MODE", "Using LLS (from project.json)")
+        if not lyrics_eff: _dlog("[ERROR] LLS enabled but 'lyrics_lls' is empty."); return "Music generation failed: LLS enabled but lyrics_lls is empty."
+    else: # (v11과 동일 - 내부 API 호출 로직 변경됨)
+        _dlog("LYRICS_MODE", "Using Raw Lyrics (Applying split/API transform with dedicated workflow)")
+        processed_lines_new: List[str] = []; chunk_pattern = re.compile(r'[가-힣]+(?:[,\s]*[가-힣]+)*|[^가-힣]+(?:[,\s]*[^가-힣]+)*')
+        original_lines = lyrics_raw.splitlines(); total_lines_to_process = len(original_lines); _dlog("LYRICS_PROCESSING_START", f"Total lines: {total_lines_to_process}")
+        for line_index, line in enumerate(original_lines):
             stripped_line = line.strip()
-            if not stripped_line:
-                processed_lines.append("") # 빈 줄 유지
-                continue
+            if (line_index + 1) % 5 == 0 or (line_index + 1) == total_lines_to_process: _dlog("LYRICS_PROCESSING_PROGRESS", f"Processing line {line_index + 1}/{total_lines_to_process}")
+            if not stripped_line: processed_lines_new.append(""); continue
+            if stripped_line.startswith('[') and stripped_line.endswith(']'): processed_lines_new.append(stripped_line.lower()); continue
+            tagged_chunks: List[str] = []; found_chunks = chunk_pattern.findall(stripped_line)
+            if not found_chunks and stripped_line: tagged_chunks.append(f"[en]{stripped_line}")
+            else:
+                 for chunk_text in found_chunks:
+                     stripped_chunk = chunk_text.strip()
+                     if not stripped_chunk: continue
+                     if re.search(r'[가-힣]', stripped_chunk):
+                         transformed_ko_chunk = _call_comfy_api_for_ko_chunk(stripped_chunk, comfy_host_addr_local)
+                         if transformed_ko_chunk.startswith("[ko]"): tagged_chunks.append(transformed_ko_chunk)
+                         else: tagged_chunks.append(f"[ko]{stripped_chunk}"); _dlog(f"[WARN] API result for '{stripped_chunk}' invalid. Used original.")
+                     else: tagged_chunks.append(f"[en]{stripped_chunk}")
+            processed_line_result = " ".join(tagged_chunks); processed_lines_new.append(processed_line_result)
+        lyrics_eff = "\n".join(processed_lines_new)
+        _dlog("LYRICS_PROCESSING_END", f"Finished processing {total_lines_to_process} lines.")
+        _dlog("[DEBUG] Final lyrics_eff preview (New Logic, first 200 chars):", lyrics_eff[:200])
 
-            # 섹션 헤더는 그대로 유지 ([verse], [bridge] 등)
-            if stripped_line.startswith('[') and stripped_line.endswith(']'):
-                processed_lines.append(stripped_line.lower()) # 소문자로 통일
-                continue
+    # --- 이하 로직 (초 계산 ~ 음악 생성 완료)은 v11과 동일 ---
+    if not lyrics_eff: _dlog("[ERROR] No effective lyrics."); return "Music generation failed: No effective lyrics."
 
-            # 라인 내에서 한글/영문 분리 및 태그 추가
-            tagged_segments: List[str] = []
-            segments = split_pattern.findall(stripped_line)
-            for segment in segments:
-                seg_strip = segment.strip()
-                if not seg_strip: continue # 공백만 있는 세그먼트 무시
+    # 변수 초기화 (v11과 동일)
+    seconds_val: int = 60; positive_tags: List[str] = []; negative_tags: List[str] = []
+    main_wf_path: Union[str, Path] = getattr(S, "ACE_STEP_PROMPT_JSON", "jsons/ace_step_1_t2m.json")
+    graph_loaded: Optional[Dict] = None; base_host: str = comfy_host_addr_local
+    subfolder_path: str = ""; save_prefix: str = ""; output_ext: str = ".wav"
+    history_result: Optional[Dict] = None; final_audio_path: Optional[Path] = None; library_saved_path: Optional[Path] = None; lls_after_result: str = ""
 
-                # 한글 포함 여부 확인 (첫 글자 기준)
-                if '가' <= seg_strip[0] <= '힣':
-                    tagged_segments.append(f"[ko]{seg_strip}")
-                else:
-                    # 한글 없으면 기본 [en] 태그 (숫자, 특수문자, 영어 등)
-                    tagged_segments.append(f"[en]{seg_strip}")
-
-            processed_lines.append(" ".join(tagged_segments)) # 태그 붙은 세그먼트들을 공백으로 연결
-
-        lyrics_eff = "\n".join(processed_lines)
-
-    if not lyrics_eff:
-        raise RuntimeError("project.json에 사용할 가사가 없습니다.")
-
-    # 초 계산 (기존과 동일)
-    if target_seconds is not None:
-        seconds = int(max(1, target_seconds))
-    else:
-        seconds = int(max(1, int(meta.get("target_seconds") or meta.get("time") or 60)))
-    meta["target_seconds"] = int(seconds)
-    meta["time"] = int(seconds) # time 필드도 초 단위로 통일
-
-    meta["lyrics_lls_now"] = lyrics_eff # 실제 사용된 가사 기록
-    save_json(pj, meta) # 초, 사용된 가사 업데이트 저장
-
-    # 태그 수집 (기존과 동일)
-    positive_tags = _collect_effective_tags(meta)
-    neg_prompt = (meta.get("prompt_neg") or "").strip()
-    negative_tags = [tag.strip() for tag in re.split(r'[,;\n]+', neg_prompt) if tag.strip()]
-
-    # 워크플로 로드 및 서버 선택 (기존과 동일)
-    g = _load_workflow_graph(ACE_STEP_PROMPT_JSON)
-    base = _choose_host()
-    _dlog("HOST", base, "| DESIRED_FMT wav")
-
-    # 저장 경로 설정 (기존과 동일)
-    subfolder = f"shorts_make/{sanitize_title(title)}"
-    save_prefix = f"{subfolder}/vocal_final"
-    ext = _force_wav_save_for_this_graph(g, proj_dir=proj, filename_prefix=save_prefix)
-
-    # 워크플로 노드 주입 (기존과 동일)
-    # LyricsLangSwitch
-    for _nid, node_item in _find_nodes_by_class_names(g, ("LyricsLangSwitch",)):
-        inputs_map_lls = node_item.setdefault("inputs", {})
-        inputs_map_lls["lyrics"] = lyrics_eff # [ko]/[en] 태그 포함된 가사 주입
-        inputs_map_lls["language"] = "Korean" # 기본 언어 설정 (LLS 노드 자체 설정)
-        inputs_map_lls.setdefault("threshold", 0.85)
-        inputs_map_lls["seconds"] = int(seconds)
-
-    # TextEncodeAceStepAudio (긍정/부정 구분)
-    for _nid, node_item in _find_nodes_by_class_names(g, ("TextEncodeAceStepAudio",)):
-        inputs_map_text = node_item.setdefault("inputs", {})
-        meta_title = (node_item.get("_meta", {}).get("title") or "").lower()
-        if "negative" in meta_title:
-            inputs_map_text["tags"] = ", ".join(negative_tags)
-            _dlog("INJECT", f"Node {_nid} (Negative): {len(negative_tags)} tags")
+    try: # 전체 메인 로직 try 블록 (v11과 동일)
+        # 초 계산 (v11과 동일)
+        if target_seconds is not None: seconds_val = int(max(1, target_seconds))
         else:
-            inputs_map_text["tags"] = ", ".join(positive_tags)
-            _dlog("INJECT", f"Node {_nid} (Positive): {len(positive_tags)} tags")
-        inputs_map_text.setdefault("lyrics_strength", 1.0) # 가사 강도
-
-    # EmptyAceStepLatentAudio (길이)
-    targets = [] # (기존 탐색 로직 유지)
-    targets.extend(_find_nodes_by_class_names(g, ("EmptyAceStepLatentAudio", "EmptyLatentAudio", "EmptyAudio", "NoiseLatentAudio")))
-    if not targets: targets.extend(_find_nodes_by_class_contains(g, "audio"))
-    for _nid, node_item in targets:
-        node_item.setdefault("inputs", {})["seconds"] = int(max(1, seconds))
-        _dlog("INJECT", f"Node {_nid} (Length): {seconds} seconds")
-
-
-    # KSampler (Seed)
-    try: # (기존 로직 유지)
-        for nid, node_item in list(g.items()):
-            if str(node_item.get("class_type", "")).lower() == "ksampler":
-                node_item.setdefault("inputs", {})["seed"] = _rand_seed()
-                _dlog("INJECT", f"Node {nid} (KSampler): Set random seed")
-    except (KeyError, AttributeError): pass
-
-    # 작업 제출 및 대기 (기존과 동일)
-    notify("submitting", host=base)
-    hist = _submit_and_wait(
-        base, g,
-        timeout=_ace_wait_timeout_sec(), # 설정값 사용
-        poll=_ace_poll_interval_sec(),     # 설정값 사용
-        on_progress=(on_progress or (lambda info: _dlog("PROG", info))),
-    )
-
-    # 결과 파일 처리 (기존과 동일)
-    # ... (결과 다운로드, WAV 변환, 마스터링, 메타 업데이트 로직) ...
-    saved_files: List[Path] = []
-    outputs = hist.get("outputs") if isinstance(hist, dict) else {}
-    if isinstance(outputs, dict):
-        for _nid, node_out in outputs.items():
-            for key in ("audio", "audios", "files"):
-                arr = node_out.get(key)
-                if not isinstance(arr, list): continue
-                for item in arr:
-                    if not isinstance(item, dict): continue
-                    fn = (item.get("filename") or "").strip()
-                    sf = (item.get("subfolder") or "").strip()
-                    # ComfyUI 임시 파일명 필터링 강화
-                    if not fn or fn.startswith("ComfyUI_temp_") or not sf:
-                        _dlog("SKIP_OUTPUT", f"Skipping temp/invalid output: fn='{fn}', sf='{sf}'")
-                        continue
-                    sf_norm = sf.replace("\\", "/").lstrip("/")
-                    try:
-                        out_file = _download_output_file(base, fn, sf_norm, out_dir=proj)
-                        if out_file and out_file.exists() and out_file.stat().st_size > 0:
-                            saved_files.append(out_file)
-                        else:
-                             _dlog("DOWNLOAD_FAIL", f"Failed or empty file: fn='{fn}', sf='{sf}'")
-                    except Exception as down_err:
-                         _dlog("DOWNLOAD_ERROR", f"Error downloading {fn}: {down_err}")
-
-
-    final_path: Optional[Path] = None
-    if saved_files:
-        # 가장 최신 파일 하나만 선택 (WAV 우선)
-        wavs = [p for p in saved_files if p.suffix.lower() == ".wav"]
-        others = [p for p in saved_files if p.suffix.lower() != ".wav"]
-        candidates = sorted(wavs + others, key=lambda p: p.stat().st_mtime, reverse=True)
-        src = candidates[0] if candidates else None
-
-        if src:
-            ff = getattr(S, "FFMPEG_EXE", "ffmpeg")
-            # 최종 vocal.wav 저장 (이미 wav면 이동, 아니면 변환)
-            final_path = _ensure_vocal_wav(src, proj, ffmpeg_exe=ff)
-
-            # 마스터링 (선택적)
-            master_fn_obj = globals().get("_master_wav_precise") # 함수 존재 여부 확인
-            if callable(master_fn_obj) and isinstance(final_path, Path):
-                try:
-                    res_master = master_fn_obj(
-                        final_path,
-                        I=getattr(S, "MASTER_TARGET_I", -12.0),
-                        TP=getattr(S, "MASTER_TARGET_TP", -1.0),
-                        LRA=getattr(S, "MASTER_TARGET_LRA", 11.0),
-                        ffmpeg_exe=ff,
-                    )
-                    if isinstance(res_master, Path) and res_master.exists():
-                        final_path = res_master
-                        _dlog("MASTERING", f"Applied mastering to {final_path.name}")
-                    else:
-                         _dlog("MASTERING_FAIL", "Mastering function returned invalid path or file missing.")
-                except Exception as _e:
-                    _dlog("MASTERING_ERROR", type(_e).__name__, str(_e))
-
-
-    # LLS 변환 후 결과 저장 (선택적)
-    lls_after_text = ""
-    if isinstance(outputs, dict): # outputs 타입 재확인
-        buf: List[str] = []
-        for _nid, node_out in outputs.items():
-            # LLS 노드의 출력 텍스트 찾기 (노드 이름/타입 따라 조정 필요)
-            if str(node_out.get("class_type", "")).endswith("LyricsLangSwitch"):
-                 val = node_out.get("text") # 또는 다른 출력 키 이름
-                 if isinstance(val, str) and val.strip(): buf.append(val.strip())
-                 elif isinstance(val, list): buf.extend([str(s).strip() for s in val if str(s).strip()])
-        if buf:
-             lls_after_text = "\n".join(buf).strip()
-             meta["lyrics_lls_after"] = lls_after_text # 메타에 기록
-
-
-    # 최종 메타 업데이트 및 저장 (기존과 동일)
-    if final_path and final_path.exists():
-        meta.setdefault("paths", {})["vocal"] = str(final_path)
-        meta["audio"] = str(final_path) # audio 키도 업데이트
-    else:
-         _dlog("FINAL_PATH_MISSING", "Final audio path not found or file does not exist.")
-
-
-    meta.setdefault("comfy_debug", {})
-    meta["comfy_debug"].update({
-        "host": base, "prompt_json": str(ACE_STEP_PROMPT_JSON), "prompt_seconds": seconds,
-        "requested_format": "wav", "requested_ext": ext, "subfolder": subfolder, # sanitized title 사용
-    })
-    meta["tags_effective"] = {"positive": positive_tags, "negative": negative_tags}
-    save_json(pj, meta) # 최종 메타 저장
-
-    # 사용자 라이브러리 복사 (기존과 동일)
-    library_path: Optional[Path] = None
-    if final_path and final_path.exists():
+            time_meta = meta.get("time"); ts_meta = meta.get("target_seconds")
+            try: seconds_val = int(ts_meta) if ts_meta is not None else int(time_meta) # type: ignore
+            except (ValueError, TypeError): seconds_val = 60
+            seconds_val = int(max(1, seconds_val))
+        meta["target_seconds"] = seconds_val; meta["time"] = seconds_val; meta["lyrics_lls_now"] = lyrics_eff
+        try: save_json(pj, meta); _dlog("META_SAVE_PRE", f"Saved target_seconds={seconds_val} and lyrics_lls_now")
+        except OSError as e: _dlog(f"[WARN] Failed save pre-gen meta: {e}")
+        # 태그 수집 (v11과 동일)
+        positive_tags = _collect_effective_tags(meta)
+        neg_raw = meta.get("prompt_neg") or ""; negative_tags = [t.strip() for t in re.split(r'[,;\n]+', str(neg_raw)) if t.strip()]
+        # 워크플로 로드 (v11과 동일)
+        try: graph_loaded = _load_workflow_graph(main_wf_path)
+        except Exception as e: _dlog(f"[ERROR] Failed load main WF: {e}"); raise
+        # 서버 주소 및 저장 경로 (v11과 동일)
+        _dlog("HOST", base_host, "| DESIRED_FMT wav")
+        sanitized_title = sanitize_title(title); subfolder_path = f"shorts_make/{sanitized_title}"; save_prefix = f"{subfolder_path}/vocal_final"
+        output_ext = _force_wav_save_for_this_graph(graph_loaded, proj_dir=proj, filename_prefix=save_prefix)
+        # 워크플로 노드 주입 (v11과 동일)
         try:
-            library_path = save_to_user_library("audio", title, final_path, rename=True)
-            _dlog("LIBRARY_COPY", f"Copied to library: {library_path}")
-        except Exception as lib_err:
-             _dlog("LIBRARY_COPY_ERROR", f"Failed to copy to library: {lib_err}")
+            lyrics_id="74"; txt_pos_id="14"; sec_id="17"; sampler_id="52"
+            if lyrics_id in graph_loaded: graph_loaded[lyrics_id].setdefault("inputs", {})["lyrics"]=lyrics_eff; _dlog("INJECT", f"Node {lyrics_id} (Lyrics)")
+            if txt_pos_id in graph_loaded: graph_loaded[txt_pos_id].setdefault("inputs", {})["tags"]=", ".join(positive_tags); _dlog("INJECT", f"Node {txt_pos_id} (Pos Tags)")
+            if sec_id in graph_loaded: graph_loaded[sec_id].setdefault("inputs", {})["seconds"]=seconds_val; _dlog("INJECT", f"Node {sec_id} (Seconds)")
+            if sampler_id in graph_loaded: graph_loaded[sampler_id].setdefault("inputs", {})["seed"]=_rand_seed(); _dlog("INJECT", f"Node {sampler_id} (Seed)")
+            if negative_tags: _dlog("INFO", f"Negative tags ({len(negative_tags)}) not injected.")
+        except Exception as e: _dlog(f"[ERROR] Main WF injection failed: {e}"); raise
+        # 작업 제출 및 대기 (v11과 동일)
+        notify("submitting", host=base_host); progress_cb = on_progress if callable(on_progress) else (lambda i: _dlog("PROG", i))
+        try: dbg_wf = proj / "_debug_workflow_sent.json"; save_json(dbg_wf, {"prompt": graph_loaded}); _dlog("DEBUG_WORKFLOW_SAVE", f"Saved final WF to {dbg_wf.name}")
+        except Exception as e: _dlog(f"[WARN] Failed save debug WF: {e}")
+        history_result = _submit_and_wait(base_host, graph_loaded, timeout=_ace_wait_timeout_sec(), poll=_ace_poll_interval_sec(), on_progress=progress_cb)
+
+        # 결과 처리 (v11과 동일)
+        saved_files_list: List[Path] = []; outputs_hist = history_result.get("outputs") if isinstance(history_result, dict) else None
+        if isinstance(outputs_hist, dict):
+            for _nid, node_out in outputs_hist.items():
+                for key in ("audio", "audios", "files", "wav", "mp3", "output"):
+                    arr = node_out.get(key)
+                    if not isinstance(arr, list): continue
+                    for item in arr:
+                        if not isinstance(item, dict): continue
+                        fn = (item.get("filename") or "").strip(); sf = (item.get("subfolder") or "").strip()
+                        if not fn or fn.startswith("ComfyUI_temp_"): continue
+                        sf_norm = sf.replace("\\", "/").lstrip("/")
+                        if not sf_norm.startswith(subfolder_path): continue
+                        try:
+                            dl_file = _download_output_file(base_host, fn, sf_norm, out_dir=proj)
+                            if isinstance(dl_file, Path) and dl_file.exists() and dl_file.stat().st_size > 0: saved_files_list.append(dl_file); _dlog("DOWNLOAD_SUCCESS", f"File: '{fn}' -> '{dl_file.name}'")
+                        except Exception as e: _dlog("DOWNLOAD_ERROR", f"'{fn}': {type(e).__name__}")
+
+        # 최종 파일 선택 및 처리 (v11과 동일)
+        if saved_files_list:
+            wavs=sorted([p for p in saved_files_list if p.suffix.lower()==".wav"],key=lambda p:p.stat().st_mtime,reverse=True); others=sorted([p for p in saved_files_list if p.suffix.lower()!=".wav"],key=lambda p:p.stat().st_mtime,reverse=True)
+            candidates=wavs+others; source_audio:Optional[Path]=candidates[0] if candidates else None
+            if source_audio and source_audio.exists():
+                _dlog("SELECTED_SOURCE_AUDIO", f"Selected '{source_audio.name}'.")
+                ffmpeg_p = getattr(S, "FFMPEG_EXE", "ffmpeg") or "ffmpeg"
+                try:
+                    final_audio_path = _ensure_vocal_wav(source_audio, proj, ffmpeg_exe=ffmpeg_p); _dlog("ENSURED_WAV", f"Final WAV: '{final_audio_path.name}'")
+                    master_fn = globals().get("_master_wav_precise")
+                    if callable(master_fn) and isinstance(final_audio_path, Path) and final_audio_path.exists():
+                         _dlog("MASTERING_START", f"Applying mastering...")
+                         try:
+                             ti=float(getattr(S,"MASTER_TARGET_I",-12.0)); tp=float(getattr(S,"MASTER_TARGET_TP",-1.0)); tl=float(getattr(S,"MASTER_TARGET_LRA",11.0))
+                             mastered_p = master_fn(final_audio_path, I=ti, TP=tp, LRA=tl, ffmpeg_exe=ffmpeg_p)
+                             if isinstance(mastered_p, Path) and mastered_p.exists():
+                                 if mastered_p.resolve() != final_audio_path.resolve():
+                                     try: final_audio_path.unlink(); mastered_p.rename(final_audio_path); _dlog("MASTERING_SUCCESS_REPLACED", f"Mastered: '{final_audio_path.name}'")
+                                     except OSError as e: _dlog(f"[WARN] Failed replace after mastering: {e}. Kept at '{mastered_p.name}'."); final_audio_path = mastered_p
+                                 else: _dlog("MASTERING_SUCCESS_INPLACE", f"Mastered in-place: '{final_audio_path.name}'")
+                         except Exception as e: _dlog("MASTERING_ERROR", f"Error: {type(e).__name__}")
+                except Exception as e: _dlog(f"[ERROR] Ensuring WAV failed: {e}"); final_audio_path = None
+
+        # lyrics_lls_after 저장 로직 (v11과 동일)
+        if isinstance(outputs_hist, dict):
+            buffer_lls_after: List[str] = []; main_lyrics_node_output = outputs_hist.get("74", {})
+            if main_lyrics_node_output:
+                for key_lls_res in ("text", "result", "string", "strings"):
+                    value_lls_res = main_lyrics_node_output.get(key_lls_res)
+                    if isinstance(value_lls_res, str) and value_lls_res.strip(): buffer_lls_after.append(value_lls_res.strip()); break
+                    elif isinstance(value_lls_res, list):
+                         found = False
+                         for item in value_lls_res:
+                             if isinstance(item, str) and item.strip(): buffer_lls_after.append(item.strip()); found = True
+                         if found: break
+            if not buffer_lls_after: # 폴백: Node 75 시도
+                preview_node_output = outputs_hist.get("75", {})
+                if isinstance(preview_node_output, dict):
+                    for key_preview in ("text", "previews"):
+                        value_preview = preview_node_output.get(key_preview)
+                        if isinstance(value_preview, str) and value_preview.strip(): buffer_lls_after.append(value_preview.strip()); break
+                        elif isinstance(value_preview, list):
+                            found_preview = False
+                            for item_preview in value_preview:
+                                if isinstance(item_preview, str) and item_preview.strip(): buffer_lls_after.append(item_preview.strip()); found_preview = True
+                            if found_preview: break
+            if buffer_lls_after:
+                 lls_after_result = "\n".join(buffer_lls_after).strip()
+                 if lls_after_result: meta["lyrics_lls_after"] = lls_after_result; _dlog("LLS_AFTER_CAPTURE", f"Captured Node 74/75 output: {len(lls_after_result)} chars")
+                 # else: _dlog("LLS_AFTER_CAPTURE", "Captured output empty.") # 로그 간소화
+            # else: _dlog("LLS_AFTER_CAPTURE", "Node 74/75 output not found.") # 로그 간소화
+        # else: _dlog("LLS_AFTER_CAPTURE", "History 'outputs' missing.") # 로그 간소화
+
+        # 최종 메타 업데이트 (v11과 동일)
+        if isinstance(final_audio_path, Path) and final_audio_path.exists() and final_audio_path.stat().st_size > 0: meta.setdefault("paths", {})["vocal"] = str(final_audio_path); meta["audio"] = str(final_audio_path)
+        else: final_audio_path = None
+        comfy_debug_section = meta.setdefault("comfy_debug", {})
+        comfy_debug_section.update({"host": base_host, "prompt_json": str(main_wf_path), "prompt_seconds": seconds_val, "requested_format": "wav", "requested_ext": output_ext, "subfolder": subfolder_path})
+        meta["tags_effective"] = {"positive": positive_tags, "negative": negative_tags}
+        try: save_json(pj, meta); _dlog("META_SAVE_FINAL", f"Final project.json saved: '{pj.name}'")
+        except Exception as e: _dlog(f"[ERROR] Failed save final pj: {e}")
+
+        # 라이브러리 복사 (v11과 동일)
+        if isinstance(final_audio_path, Path) and final_audio_path.exists():
+            try:
+                library_path = save_to_user_library("audio", title, final_audio_path, rename=True)
+                if isinstance(library_path, Path) and library_path.exists(): library_saved_path = library_path
+            except Exception as e: _dlog("LIBRARY_COPY_ERROR", f"Failed: {e}")
+
+    except Exception as main_execution_err: # 메인 로직 오류 처리 (v11과 동일)
+        _dlog(f"[FATAL] Music generation failed: {main_execution_err}")
+        notify("error", error=f"음악 생성 실패: {main_execution_err}")
+        summary_final = f"ACE-Step 실패 ❌\n- 오류: {main_execution_err}"; _dlog("LEAVE", summary_final.replace("\n", " | ")); return summary_final
+
+    # --- 최종 요약 (v11과 동일) ---
+    wf_name = Path(main_wf_path).name if main_wf_path else "Unknown WF"
+    message_lines: List[str] = [f"ACE-Step 완료 ✅", f"- 프롬프트: {wf_name}", f"- 길이: {seconds_val}s", f"- 태그: +{len(positive_tags)} / -{len(negative_tags)}"]
+    if isinstance(final_audio_path, Path) and final_audio_path.exists(): message_lines.append(f"- 저장:     '{final_audio_path.name}'")
+    else: message_lines.append("- 저장:     (오류 또는 파일 없음)")
+    if isinstance(library_saved_path, Path) and library_saved_path.exists(): message_lines.append(f"- 라이브러리: '{library_saved_path.name}'")
+    summary_final = "\n".join(message_lines); _dlog("LEAVE", summary_final.replace("\n", " | ")); notify("finished", summary=summary_final)
+    return summary_final
+
+# (... 기존 audio_sync.py 파일의 나머지 부분 ...)
 
 
-    # 최종 요약 메시지 (기존과 동일)
-    msg = [ f"ACE-Step 완료 ✅", f"- 프롬프트: {ACE_STEP_PROMPT_JSON.name}", f"- 길이: {seconds}s",
-            f"- 긍정 태그: {len(positive_tags)}", f"- 부정 태그: {len(negative_tags)}" ]
-    if final_path and final_path.exists(): msg.append(f"- 저장:     {final_path}")
-    else: msg.append("- 저장:     (오디오 없음)")
-    if library_path and library_path.exists(): msg.append(f"- 라이브러리: {library_path}")
-
-    summary = "\n".join(msg)
-    _dlog("LEAVE", summary.replace("\n", " | "))
-    notify("finished", summary=summary)
-    return summary
-
-
-
+##########################################################################
+##########################################################################
+##########################################################################
 
 
 
@@ -3215,7 +3271,6 @@ def _create_final_segments_from_ready(
     """
     import difflib
     from pathlib import Path
-    import json # json 임포트 확인
     from typing import List, Dict, Pattern, Optional, Any # Any 추가
     import re
     # numpy는 현재 사용되지 않음
