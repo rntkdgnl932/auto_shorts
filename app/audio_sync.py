@@ -3774,7 +3774,7 @@ def _create_final_segments_from_ready(
                 "ref_origin": ""
             }
 
-            # 직전 확정 단어 기반 문맥 보너스 준비
+            # 직전 확정 단어 기반 문맥 보너스
             prev_out_lower = segment_corrected_words[-1].lower() if segment_corrected_words else ""
 
             for i_ref, loop_ref_word in enumerate(ref_all_words):
@@ -3856,6 +3856,11 @@ def _create_final_segments_from_ready(
             if word_to_append:
                 segment_corrected_words.append(word_to_append)
 
+            # === 추가 보완: 부분 일치로 남은 꼬리를 즉시 다음 토큰으로 재처리 ===
+            if leftover_whisper_part:
+                whisper_words_list.insert(whisper_cursor + 1, leftover_whisper_part)
+                leftover_whisper_part = ""
+
             whisper_cursor += 1
 
         corrected_text = " ".join(segment_corrected_words).strip()
@@ -3933,6 +3938,7 @@ def _create_final_segments_from_ready(
     print(f"\n[SYNC-PRO] Returning {len(final_segments)} final segments.")
     print("------------------------------------\n")
     return final_segments
+
 
 
 
