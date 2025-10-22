@@ -3581,14 +3581,15 @@ def _create_final_segments_from_ready(
         project_dir: str
 ) -> list:
     """
-    [헤더 제거 최종 수정 v5.1 + 안전한 시간표현 통일 주입 + 한↔영 오인식 보정(내부헬퍼)]
+    [헤더 제거 최종 수정 v5.1 + 안전한 시간표현 통일 주입 + 이웃기반 영단어 복원(내부 로컬)]
     - Boundary detection uses lyric lines *without* headers.
-    - Word correction reference (`ref_all_words`) is now also built from lyric lines *without* headers.
-    - 필요 시 시간표현(3시/세 시/15:05:00 등)을 표준형으로 통일하되, 헬퍼가 없으면 그대로 진행.
-    - 마지막 줄 탐색은 **역방향**(원본 그대로) 유지.
-    - 기존 상수/로직/임계값은 그대로.
-    - 영어 가사 한글 오인식(예: '스크린라이트' → 'screen light')은 단어 교정 루프 직전,
-      내부 헬퍼로 '앵커+음차+사전' 방식의 전처리를 1회 적용 (기능 추가이지만 기존 흐름/출력형식은 동일).
+    - Word correction reference(`ref_all_words`)는 헤더 제거본 사용.
+    - 필요 시 시간표현(3시/세 시/15:05:00 등) 통일(헬퍼 있으면만).
+    - 마지막 줄 탐색은 역방향(원본 유지).
+    - 기존 상수/로직/임계값 그대로.
+    - 추가: 참조 가사에서 [앵커(한글 등)] 뒤에 [영단어 1~2개]가 오는 패턴을 학습해,
+            세그먼트 텍스트에서 앵커 다음의 한글 오인식 토큰을 해당 영단어로 보수적으로 치환.
+            (예: '푸른 스크린라이트' → 참조 '푸른 screen light'를 근거로 'screen light' 복원)
     """
     import difflib
     from pathlib import Path
@@ -3604,7 +3605,7 @@ def _create_final_segments_from_ready(
         try:
             time_map = build_time_variant_map(clean_lyrics_lines)
         except Exception:
-            time_map = None  # 헬퍼가 있어도 실패하면 비활성
+            time_map = None
 
     def _maybe_norm_time(s: str) -> str:
         if time_map and normalize_times_in_text:
@@ -3614,11 +3615,11 @@ def _create_final_segments_from_ready(
                 return s
         return s
 
-    # --- Constants and local utils (기존 그대로 유지) ---
-    _MATCH_TYPE_KEPT = "KEPT"
-    _MATCH_TYPE_AUTHENTICATED = "AUTHENTICATED"
-    _MATCH_TYPE_CORRECTED = "CORRECTED"
-    _FILTER_SHORT_WORDS = {'a', 'ah', 'oh', 'uh', 'hm', 'hmm', 'um', 'o', 'eh', '음', 'nan', 'neo'}
+    # --- Constants and local utils ---
+    _match_type_kept = "KEPT"
+    _match_type_authenticated = "AUTHENTICATED"
+    _match_type_corrected = "CORRECTED"
+    _filter_short_words = {'a', 'ah', 'oh', 'uh', 'hm', 'hmm', 'um', 'o', 'eh', '음', 'nan', 'neo'}
 
     def _safe_float(val: Any) -> float:
         try:
@@ -3645,16 +3646,16 @@ def _create_final_segments_from_ready(
         kroman = None
         print("[WARN] kroman library not found. Romanization comparison will be limited.")
 
-    _KOREAN_PATTERN: Pattern[str] = re.compile(r'[\uac00-\ud7a3]')
+    _korean_pattern: Pattern[str] = re.compile(r'[\uac00-\ud7a3]')
 
     def _is_korean(word: str) -> bool:
-        return bool(_KOREAN_PATTERN.search(str(word or "")))
+        return bool(_korean_pattern.search(str(word or "")))
 
     def _romanize(text: str) -> str:
         text_norm = _norm_for_compare(text)
         if not text_norm:
             return ""
-        korean_parts = _KOREAN_PATTERN.findall(text)
+        korean_parts = _korean_pattern.findall(text)
         if korean_parts and kroman:
             try:
                 korean_text_only = "".join(korean_parts)
@@ -3665,113 +3666,6 @@ def _create_final_segments_from_ready(
                 return text_norm
         return text_norm
 
-    # ===== [내부 헬퍼 1] ref 토큰 스트림 (헤더 제거본에서 생성) =====
-    def _build_ref_token_stream_for_bilingual(ref_lines_no_headers: list[str]) -> list[str]:
-        tokens: list[str] = []
-        for ln in ref_lines_no_headers:
-            s = (ln or "").replace(",", " ").replace("'", " ")
-            s = re.sub(r"\s+", " ", s.strip())
-            if not s:
-                continue
-            tokens.extend(s.split(" "))
-        return [t for t in tokens if t]
-
-    # ===== [내부 헬퍼 2] 한글→영문 보정 (앵커+음차+소규모 사전) =====
-    def _kor_eng_fix_line(text: str, ref_tokens: list[str], kroman_obj: Optional[Any]) -> str:
-        if not text or not ref_tokens:
-            return text
-
-        def is_ascii_word(w: str) -> bool:
-            return bool(re.fullmatch(r"[A-Za-z][A-Za-z'\-]*", w or ""))
-
-        def is_hangul_word(w: str) -> bool:
-            return bool(re.search(r"[\uac00-\ud7a3]", w or ""))
-
-        def romanize_kor(w: str) -> str:
-            if not is_hangul_word(w):
-                return (w or "").lower()
-            if kroman_obj:
-                try:
-                    r = kroman_obj.parse(w)  # type: ignore[attr-defined]
-                    return (r or w).replace("-", "").lower()
-                except Exception:
-                    pass
-            # 아주 단순한 폴백(정확도보다 일관성 우선)
-            return re.sub(r"[^a-z]", "", (w or "").lower())
-
-        small_lex = {
-            "스크린": "screen",
-            "라이트": "light",
-            "화이트": "white",
-            "하우스": "house",
-            "블랙": "black",
-            "번아웃": "burnout",
-        }
-
-        src = re.sub(r"\s+", " ", (text or "").strip())
-        src_tokens = src.split(" ")
-
-        # ref 토큰 인덱스 (단순 딕셔너리)
-        ref_index: Dict[str, int] = {}
-        for i_ref, rt in enumerate(ref_tokens):
-            if rt not in ref_index:
-                ref_index[rt] = i_ref
-
-        # 앵커 후보: src 내에서 한글 토큰이 ref에도 존재
-        anchors: list[int] = []
-        for i_tok, tok in enumerate(src_tokens):
-            if tok and not is_ascii_word(tok) and tok in ref_index:
-                anchors.append(i_tok)
-
-        # 앵커가 없으면 사전 중심의 약한 보정만
-        if not anchors:
-            out_simple: list[str] = []
-            for w in src_tokens:
-                if is_hangul_word(w) and w in small_lex:
-                    out_simple.append(small_lex[w])
-                else:
-                    out_simple.append(w)
-            return " ".join(out_simple)
-
-        last_anchor = anchors[-1]
-        ref_pos = ref_index.get(src_tokens[last_anchor], -1)
-        out_tokens = src_tokens[:]
-
-        # 앵커 뒤 1~2 토큰을 ref의 다음 1~2 토큰과 강 매칭
-        from difflib import SequenceMatcher
-        for offset in (1, 2):
-            si = last_anchor + offset
-            ri = ref_pos + offset
-            if si >= len(out_tokens) or ri >= len(ref_tokens):
-                continue
-
-            cand = out_tokens[si]
-            refw = ref_tokens[ri]
-
-            if not refw:
-                continue
-
-            if is_ascii_word(refw):
-                if re.search(r"[\uac00-\ud7a3]", cand or ""):
-                    if cand in small_lex and small_lex[cand].lower() == refw.lower():
-                        out_tokens[si] = refw
-                        continue
-                    rc = romanize_kor(cand)
-                    sim = SequenceMatcher(None, rc, refw.lower()).ratio()
-                    if sim >= 0.70:
-                        out_tokens[si] = refw
-                else:
-                    sim2 = SequenceMatcher(None, (cand or "").lower(), refw.lower()).ratio()
-                    if sim2 >= 0.80:
-                        out_tokens[si] = refw
-
-        # 마지막으로 전역적인 작은 사전 보정
-        for i_tok, w in enumerate(out_tokens):
-            if re.search(r"[\uac00-\ud7a3]", w or "") and w in small_lex:
-                out_tokens[i_tok] = small_lex[w]
-
-        return " ".join(out_tokens)
-
     # ---- 1. Prepare Reference Lines & Boundary Detection ----
     print("\n--- [BOUNDARY DETECTION] ---")
     correction_ref_lines_with_headers = lyrics_compare_lines if lyrics_compare_lines else clean_lyrics_lines
@@ -3779,7 +3673,7 @@ def _create_final_segments_from_ready(
         print("[ERROR] Reference lyrics (with headers) or ready segments are empty.")
         return []
 
-    # 헤더 제외한 가사 목록 생성
+    # 헤더 제외한 가사 목록
     boundary_ref_lines_no_headers: List[str] = []
     header_pattern = re.compile(r"^\s*\[[^]]+]\s*$")
     for line_with_header in correction_ref_lines_with_headers:
@@ -3826,7 +3720,7 @@ def _create_final_segments_from_ready(
         first_idx = 0
         print("[WARN] Target first line empty, setting first_idx = 0.")
 
-    # 마지막 줄 탐색 (역방향: 기존 유지)
+    # 마지막 줄 탐색(역방향)
     print("\n[DEBUG] Searching for Last Line Match (reverse)...")
     if last_line_norm:
         payload_len = len(seg_ready_payload)
@@ -3878,15 +3772,73 @@ def _create_final_segments_from_ready(
     except Exception as e_save_compare:
         print(f"[WARN] Failed to save seg_compare.json: {type(e_save_compare).__name__}")
 
-    # ---- 2 & 3. Word Correction (Using header-less reference words) ----
-    # 시간표현 통일본으로 ref 소스 구성
-    ref_source_lines = [_maybe_norm_time(x) for x in boundary_ref_lines_no_headers]
+    # ---- 2 & 3. Word Correction 준비 (헤더 제거본 + 시간통일 적용) ----
+    ref_source_lines = boundary_ref_lines_no_headers
+    ref_source_lines = [_maybe_norm_time(x) for x in ref_source_lines]
 
-    # === [추가] 이 시점에서 '영어-한글' 교정용 ref 토큰 스트림 1회 생성 ===
-    ref_tokens_for_bilingual = _build_ref_token_stream_for_bilingual(ref_source_lines)
+    # === 여기에 '이웃 기반 영단어 복원'용 앵커 맵을 한 번만 구축 ===
+    #  - 패턴: [앵커(한글/숫자/혼합)] 다음에 [영단어 1~2개]가 이어진 라인에서
+    #          anchor_map[앵커] = "영단어들" 로 저장
+    #  - 예: '푸른 screen light' → anchor_map['푸른'] = 'screen light'
+    #  - 영어 토큰은 a~z로 한정(대소문자 무시). 숫자는 앵커 측엔 허용.
+    anchor_map: Dict[str, str] = {}
+    rx_token = re.compile(r"[A-Za-z]+|[가-힣]+|\d+")
+    for line_ref in ref_source_lines:
+        toks = rx_token.findall(line_ref or "")
+        for i_tok in range(len(toks)):
+            anchor_tok = toks[i_tok]
+            if not anchor_tok:
+                continue
+            # 뒤에 오는 영단어 1~2개 수집
+            eng_seq: List[str] = []
+            j = i_tok + 1
+            while j < len(toks) and len(eng_seq) < 2:
+                t = toks[j]
+                if re.fullmatch(r"[A-Za-z]+", t):
+                    eng_seq.append(t.lower())
+                    j += 1
+                    continue
+                break
+            if eng_seq:
+                key_anchor = anchor_tok.strip()
+                # 앵커는 한글/숫자/혼합 허용. 영어 앵커는 의미가 적으므로 제외.
+                if _is_korean(key_anchor) or re.search(r"\d", key_anchor):
+                    phrase = " ".join(eng_seq).strip()
+                    if phrase:
+                        prev = anchor_map.get(key_anchor)
+                        # 더 긴 구문을 우선(예: 'screen light' > 'screen')
+                        if not prev or len(phrase) > len(prev):
+                            anchor_map[key_anchor] = phrase
+
+    def _apply_bilingual_hint(text: str, anchors: Dict[str, str]) -> str:
+        """
+        세그먼트 한 줄에서, '앵커 다음에 붙은 한글 오인식 토큰 1개'를
+        참조의 영단어 구절로 보수적으로 치환한다.
+        예) '푸른 스크린라이트' -> '푸른 screen light'
+        조건:
+          - 앵커 존재
+          - 앵커 뒤 첫 토큰이 한글(2~15자)
+          - 앵커 뒤 토큰이 이미 영문이면 건드리지 않음
+        """
+        if not text or not anchors:
+            return text
+        out = str(text)
+        for anchor_key, eng_phrase in anchors.items():
+            # 앵커 단어 경계 후에 '한글 토큰 1개'가 오는 경우만 치환
+            # \b는 한글 경계에 약하므로 공백/문장경계 기준으로 처리
+            pat = re.compile(r"(?:(?<=^)|(?<=\s))" +
+                             re.escape(anchor_key) +
+                             r"\s+([가-힣]{2,15})(?=\s|$)")
+            def _repl(m: re.Match) -> str:
+                # 이미 뒤 토큰이 영문이 아닌 경우에만 복원
+                return f"{anchor_key} {eng_phrase}"
+            out_new = pat.sub(_repl, out)
+            out = out_new
+        return out
 
     ref_all_words_raw = " ".join(ref_source_lines).replace(",", "").replace("'", "")
-    ref_all_words = [w for w in ref_all_words_raw.split() if w]
+    ref_all_words = ref_all_words_raw.split()
+    ref_all_words = [w for w in ref_all_words if w]
     if not ref_all_words:
         print("[ERROR] Reference words list (no headers) is empty.")
         return []
@@ -3899,18 +3851,16 @@ def _create_final_segments_from_ready(
     for seg_idx, seg_corr in enumerate(seg_compare_payload):
         if not isinstance(seg_corr, dict) or "text" not in seg_corr:
             continue
+        whisper_text_corr = str(seg_corr.get("text", "")).strip()
+        whisper_text_corr = _maybe_norm_time(whisper_text_corr)
 
-        # 1) 시간표현 통일
-        whisper_text_corr = _maybe_norm_time(str(seg_corr.get("text", "")).strip())
-
-        # 2) [추가] 영어 가사 한글 오인식 전처리 (앵커+음차+사전)
-        #    => '푸른 스크린라이트' → '푸른 screen light' 등으로 보수적 보정
-        whisper_text_corr = _kor_eng_fix_line(whisper_text_corr, ref_tokens_for_bilingual, kroman)
+        # === 추가: 앵커 기반 영단어 복원(보수적 적용, 한 줄 1차 전처리) ===
+        # 기존 교정 파이프라인을 바꾸지 않고, 단 1회 전처리만 수행
+        whisper_text_corr = _apply_bilingual_hint(whisper_text_corr, anchor_map)
 
         if not whisper_text_corr:
             continue
 
-        # === 이하 기존 단어 교정 로직 그대로 ===
         segment_corrected_words: List[str] = []
         whisper_words_list = whisper_text_corr.split()
         whisper_cursor = 0
@@ -3925,10 +3875,10 @@ def _create_final_segments_from_ready(
                 leftover_whisper_part = ""
                 continue
 
-            best_match: Dict = {
+            best_match: Dict[str, Any] = {
                 "score": -1.0,
                 "word": candidate_whisper,
-                "type": _MATCH_TYPE_KEPT,
+                "type": _match_type_kept,
                 "ref_origin": ""
             }
 
@@ -3957,7 +3907,7 @@ def _create_final_segments_from_ready(
                     best_match.update({
                         "score": auth_score,
                         "word": candidate_whisper,
-                        "type": _MATCH_TYPE_AUTHENTICATED,
+                        "type": _match_type_authenticated,
                         "ref_origin": loop_ref_word
                     })
                 elif correction_score >= auth_score and correction_score > current_best_score:
@@ -3967,7 +3917,7 @@ def _create_final_segments_from_ready(
                         best_match.update({
                             "score": correction_score,
                             "word": loop_ref_word,
-                            "type": _MATCH_TYPE_CORRECTED,
+                            "type": _match_type_corrected,
                             "ref_origin": loop_ref_word
                         })
 
@@ -3979,8 +3929,8 @@ def _create_final_segments_from_ready(
             word_to_append: Optional[str] = None
             leftover_whisper_part = ""
 
-            if match_type == _MATCH_TYPE_KEPT:
-                if candidate_whisper.lower() not in _FILTER_SHORT_WORDS:
+            if match_type == _match_type_kept:
+                if candidate_whisper.lower() not in _filter_short_words:
                     word_to_append = candidate_whisper
             else:
                 if best_score >= score_threshold:
@@ -3995,7 +3945,7 @@ def _create_final_segments_from_ready(
                         except re.error:
                             leftover_whisper_part = ""
                 else:
-                    if candidate_whisper.lower() not in _FILTER_SHORT_WORDS:
+                    if candidate_whisper.lower() not in _filter_short_words:
                         word_to_append = candidate_whisper
 
             if word_to_append:
@@ -4078,6 +4028,7 @@ def _create_final_segments_from_ready(
     print(f"\n[SYNC-PRO] Returning {len(final_segments)} final segments.")
     print("------------------------------------\n")
     return final_segments
+
 
 
 
