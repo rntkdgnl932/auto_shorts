@@ -3245,7 +3245,7 @@ def sync_lyrics_with_whisper_pro(
         "summary_text": summary_text
     }
 
-# 시간 관련 유사도
+# 시간 관련 유사도(아래 2개는 링크 안되어도 실제로 쓰임)
 def build_time_variant_map(ref_lines: list[str]) -> dict:
     """
     ref_lines(= lyrics_raw, 헤더 포함 가능)를 훑어,
@@ -3448,122 +3448,6 @@ def normalize_times_in_text(text: str, ref_time_map: dict) -> str:
 
     return out
 
-# 한글형 영어관련
-# 1) ref 토큰 스트림 구성 (헤더 제거된 가사 사용)
-def build_ref_token_stream_for_bilingual(ref_lines: list[str]) -> list[str]:
-    import re
-    tokens: list[str] = []
-    header_rx = re.compile(r"^\s*\[[^]]+]\s*$")
-    for ln in ref_lines:
-        if header_rx.match(ln or ""):
-            continue
-        # 콤마 등 단순 제거, 다중 공백 정리
-        s = (ln or "").replace(",", " ").replace("'", " ")
-        s = re.sub(r"\s+", " ", s.strip())
-        if not s:
-            continue
-        tokens.extend(s.split(" "))
-    return [t for t in tokens if t]
-
-# 2) 한글→영문 교정 (앵커+음차+사전)
-def kor_eng_fix_line(text: str, ref_tokens: list[str], kroman_obj=None) -> str:
-    import re
-    from difflib import SequenceMatcher
-
-    if not text or not ref_tokens:
-        return text
-
-    # 간단 판별
-    def is_ascii_word(w: str) -> bool:
-        return bool(re.fullmatch(r"[A-Za-z][A-Za-z'\-]*", w or ""))
-
-    def is_hangul_word(w: str) -> bool:
-        return bool(re.search(r"[\uac00-\ud7a3]", w or ""))
-
-    # kroman or fallback
-    def romanize_kor(w: str) -> str:
-        if not is_hangul_word(w):
-            return w.lower()
-        if kroman_obj:
-            try:
-                r = kroman_obj.parse(w)  # type: ignore[attr-defined]
-                return (r or w).replace("-", "").lower()
-            except Exception:
-                pass
-        # 매우 단순한 fallback (정교함보단 일관성)
-        return re.sub(r"[^a-z]", "", w.encode("utf-8", "ignore").decode("utf-8").lower())
-
-    # 소규모 사전 (옵션)
-    small_lex = {
-        "스크린": "screen",
-        "라이트": "light",
-        "화이트": "white",
-        "하우스": "house",
-        "블랙": "black",
-        "번아웃": "burnout",
-    }
-
-    # 토큰화
-    src = re.sub(r"\s+", " ", (text or "").strip())
-    src_tokens = src.split(" ")
-
-    # 앵커 찾기: src에서 한글 토큰이 ref에도 있으면 그 위치를 후보 앵커로 사용
-    # (가장 오른쪽 앵커가 뒤의 영어쌍을 잘 끌어오기 좋음)
-    anchors: list[int] = []
-    ref_index = {tok: i for i, tok in enumerate(ref_tokens)}
-    for i, tok in enumerate(src_tokens):
-        if tok and not is_ascii_word(tok) and tok in ref_index:
-            anchors.append(i)
-
-    if not anchors:
-        # 앵커가 없으면 사전/음차만 가볍게 적용
-        out = []
-        for w in src_tokens:
-            if is_hangul_word(w) and w in small_lex:
-                out.append(small_lex[w])
-            else:
-                out.append(w)
-        return " ".join(out)
-
-    last_anchor = anchors[-1]
-    # ref에서의 위치
-    ref_pos = ref_index.get(src_tokens[last_anchor], -1)
-
-    out_tokens = src_tokens[:]
-    # 앵커 뒤 1~2개를 강하게 본다
-    for offset in (1, 2):
-        si = last_anchor + offset
-        ri = ref_pos + offset
-        if si >= len(out_tokens) or ri >= len(ref_tokens):
-            continue
-
-        cand = out_tokens[si]
-        refw = ref_tokens[ri]
-
-        if is_ascii_word(refw):
-            # cand가 한글이면 음차 비교 + 사전
-            if is_hangul_word(cand):
-                # 사전 우선
-                if cand in small_lex and small_lex[cand].lower() == refw.lower():
-                    out_tokens[si] = refw
-                    continue
-                # 로마자-영문 유사도
-                rc = romanize_kor(cand)
-                sim = SequenceMatcher(None, rc, refw.lower()).ratio()
-                if sim >= 0.70:
-                    out_tokens[si] = refw
-            # cand가 영어인데 철자만 틀린 경우(소문자화 후 비교)
-            else:
-                sim = SequenceMatcher(None, cand.lower(), refw.lower()).ratio()
-                if sim >= 0.80:
-                    out_tokens[si] = refw
-
-    # 마지막으로, 앵커 주변이 아닌 나머지 한글→영문 흔한 조각만 사전으로 약하게 보정
-    for i, w in enumerate(out_tokens):
-        if is_hangul_word(w) and w in small_lex:
-            out_tokens[i] = small_lex[w]
-
-    return " ".join(out_tokens)
 
 
 # 한글 자모 분해를 위한 전역 상수
@@ -3572,8 +3456,6 @@ JUNGSUNG = ['ㅏ', 'ㅐ', 'ㅑ', 'ㅒ', 'ㅓ', 'ㅔ', 'ㅕ', 'ㅖ', 'ㅗ', 'ㅘ'
 JONGSUNG = ['', 'ㄱ', 'ㄲ', 'ㄳ', 'ㄴ', 'ㄵ', 'ㄶ', 'ㄷ', 'ㄹ', 'ㄺ', 'ㄻ', 'ㄼ', 'ㄽ', 'ㄾ', 'ㄿ', 'ㅀ', 'ㅁ', 'ㅂ', 'ㅄ', 'ㅅ', 'ㅆ', 'ㅇ', 'ㅈ', 'ㅊ', 'ㅋ', 'ㅌ', 'ㅍ', 'ㅎ']
 
 
-# audio_sync.py 파일에서 이 함수를 찾아 아래 내용으로 전체를 교체하세요.
-
 def _create_final_segments_from_ready(
         seg_ready_payload: list,
         clean_lyrics_lines: list,  # 헤더 포함된 원본 가사 (입력)
@@ -3581,15 +3463,17 @@ def _create_final_segments_from_ready(
         project_dir: str
 ) -> list:
     """
-    [헤더 제거 최종 수정 v5.1 + 안전한 시간표현 통일 주입 + 이웃기반 영단어 복원(내부 로컬)]
+    [헤더 제거 최종 수정 v5.1 + 안전한 시간표현 통일 주입 + 이웃기반 영단어 복원(내부 로컬) + 참조 bigram 문맥 가중치]
     - Boundary detection uses lyric lines *without* headers.
     - Word correction reference(`ref_all_words`)는 헤더 제거본 사용.
     - 필요 시 시간표현(3시/세 시/15:05:00 등) 통일(헬퍼 있으면만).
     - 마지막 줄 탐색은 역방향(원본 유지).
     - 기존 상수/로직/임계값 그대로.
-    - 추가: 참조 가사에서 [앵커(한글 등)] 뒤에 [영단어 1~2개]가 오는 패턴을 학습해,
-            세그먼트 텍스트에서 앵커 다음의 한글 오인식 토큰을 해당 영단어로 보수적으로 치환.
-            (예: '푸른 스크린라이트' → 참조 '푸른 screen light'를 근거로 'screen light' 복원)
+    - 추가1: 참조 가사에서 [앵커(한글 등)] 뒤에 [영단어 1~2개]가 오는 패턴을 학습해,
+             세그먼트 텍스트에서 앵커 다음의 한글 오인식 토큰을 해당 영단어로 보수적으로 치환.
+             (예: '푸른 스크린라이트' → 참조 '푸른 screen light'를 근거로 'screen light' 복원)
+    - 추가2: 참조 가사에서 인접 단어 bigram을 수집하여, 교정 시 '직전 확정 단어의 다음으로 자주 오는 단어'에
+             미세 가중치를 부여(동점/근소차 해소). (예: 'a perfect' 다음 'heal' 우선)
     """
     import difflib
     from pathlib import Path
@@ -3615,7 +3499,7 @@ def _create_final_segments_from_ready(
                 return s
         return s
 
-    # --- Constants and local utils ---
+    # --- constants and local utils ---
     _match_type_kept = "KEPT"
     _match_type_authenticated = "AUTHENTICATED"
     _match_type_corrected = "CORRECTED"
@@ -3776,11 +3660,7 @@ def _create_final_segments_from_ready(
     ref_source_lines = boundary_ref_lines_no_headers
     ref_source_lines = [_maybe_norm_time(x) for x in ref_source_lines]
 
-    # === 여기에 '이웃 기반 영단어 복원'용 앵커 맵을 한 번만 구축 ===
-    #  - 패턴: [앵커(한글/숫자/혼합)] 다음에 [영단어 1~2개]가 이어진 라인에서
-    #          anchor_map[앵커] = "영단어들" 로 저장
-    #  - 예: '푸른 screen light' → anchor_map['푸른'] = 'screen light'
-    #  - 영어 토큰은 a~z로 한정(대소문자 무시). 숫자는 앵커 측엔 허용.
+    # === 앵커 기반 영단어 복원용 맵 ===
     anchor_map: Dict[str, str] = {}
     rx_token = re.compile(r"[A-Za-z]+|[가-힣]+|\d+")
     for line_ref in ref_source_lines:
@@ -3789,7 +3669,6 @@ def _create_final_segments_from_ready(
             anchor_tok = toks[i_tok]
             if not anchor_tok:
                 continue
-            # 뒤에 오는 영단어 1~2개 수집
             eng_seq: List[str] = []
             j = i_tok + 1
             while j < len(toks) and len(eng_seq) < 2:
@@ -3801,12 +3680,10 @@ def _create_final_segments_from_ready(
                 break
             if eng_seq:
                 key_anchor = anchor_tok.strip()
-                # 앵커는 한글/숫자/혼합 허용. 영어 앵커는 의미가 적으므로 제외.
                 if _is_korean(key_anchor) or re.search(r"\d", key_anchor):
                     phrase = " ".join(eng_seq).strip()
                     if phrase:
                         prev = anchor_map.get(key_anchor)
-                        # 더 긴 구문을 우선(예: 'screen light' > 'screen')
                         if not prev or len(phrase) > len(prev):
                             anchor_map[key_anchor] = phrase
 
@@ -3815,26 +3692,42 @@ def _create_final_segments_from_ready(
         세그먼트 한 줄에서, '앵커 다음에 붙은 한글 오인식 토큰 1개'를
         참조의 영단어 구절로 보수적으로 치환한다.
         예) '푸른 스크린라이트' -> '푸른 screen light'
-        조건:
-          - 앵커 존재
-          - 앵커 뒤 첫 토큰이 한글(2~15자)
-          - 앵커 뒤 토큰이 이미 영문이면 건드리지 않음
         """
         if not text or not anchors:
             return text
         out = str(text)
         for anchor_key, eng_phrase in anchors.items():
-            # 앵커 단어 경계 후에 '한글 토큰 1개'가 오는 경우만 치환
-            # \b는 한글 경계에 약하므로 공백/문장경계 기준으로 처리
-            pat = re.compile(r"(?:(?<=^)|(?<=\s))" +
-                             re.escape(anchor_key) +
-                             r"\s+([가-힣]{2,15})(?=\s|$)")
+            pat = re.compile(r"(?:(?<=^)|(?<=\s))" + re.escape(anchor_key) + r"\s+([가-힣]{2,15})(?=\s|$)")
             def _repl(m: re.Match) -> str:
-                # 이미 뒤 토큰이 영문이 아닌 경우에만 복원
                 return f"{anchor_key} {eng_phrase}"
             out_new = pat.sub(_repl, out)
             out = out_new
         return out
+
+    # === bigram 문맥 맵 (ref 라인 순서 기준) ===
+    bigram_counts: Dict[str, Dict[str, int]] = {}
+    for line_ref in ref_source_lines:
+        toks = rx_token.findall(line_ref or "")
+        toks_l = [t.lower() for t in toks if t]
+        for i_b in range(len(toks_l) - 1):
+            a = toks_l[i_b]
+            b = toks_l[i_b + 1]
+            if a not in bigram_counts:
+                bigram_counts[a] = {}
+            if b not in bigram_counts[a]:
+                bigram_counts[a][b] = 0
+            bigram_counts[a][b] += 1
+
+    top_next_map: Dict[str, str] = {}
+    for k_prev, nxts in bigram_counts.items():
+        best_next = ""
+        best_cnt = -1
+        for cand_nxt, cnt in nxts.items():
+            if cnt > best_cnt:
+                best_cnt = cnt
+                best_next = cand_nxt
+        if best_next:
+            top_next_map[k_prev] = best_next
 
     ref_all_words_raw = " ".join(ref_source_lines).replace(",", "").replace("'", "")
     ref_all_words = ref_all_words_raw.split()
@@ -3854,8 +3747,7 @@ def _create_final_segments_from_ready(
         whisper_text_corr = str(seg_corr.get("text", "")).strip()
         whisper_text_corr = _maybe_norm_time(whisper_text_corr)
 
-        # === 추가: 앵커 기반 영단어 복원(보수적 적용, 한 줄 1차 전처리) ===
-        # 기존 교정 파이프라인을 바꾸지 않고, 단 1회 전처리만 수행
+        # 앵커 기반 영단어 복원(보수적, 전처리 1회)
         whisper_text_corr = _apply_bilingual_hint(whisper_text_corr, anchor_map)
 
         if not whisper_text_corr:
@@ -3882,6 +3774,9 @@ def _create_final_segments_from_ready(
                 "ref_origin": ""
             }
 
+            # 직전 확정 단어 기반 문맥 보너스 준비
+            prev_out_lower = segment_corrected_words[-1].lower() if segment_corrected_words else ""
+
             for i_ref, loop_ref_word in enumerate(ref_all_words):
                 ref_norm_loop = ref_words_norm[i_ref]
                 ref_roman_loop = ref_words_roman[i_ref]
@@ -3900,7 +3795,17 @@ def _create_final_segments_from_ready(
                 elif not _is_korean(candidate_whisper) and ref_roman_loop:
                     roman_score = _match_score(candidate_norm, ref_roman_loop) * 0.9
 
-                correction_score = max(spell_score, roman_score)
+                # 문맥 보너스 (ref bigram 기반)
+                context_bonus = 0.0
+                loop_ref_lower = loop_ref_word.lower()
+                if prev_out_lower and prev_out_lower in bigram_counts:
+                    if loop_ref_lower in bigram_counts[prev_out_lower]:
+                        context_bonus += 0.18
+                        if top_next_map.get(prev_out_lower) == loop_ref_lower:
+                            context_bonus += 0.05
+
+                correction_base = spell_score if spell_score >= roman_score else roman_score
+                correction_score = correction_base + context_bonus
                 current_best_score = best_match["score"]
 
                 if auth_score > correction_score and auth_score > current_best_score:
@@ -3910,7 +3815,7 @@ def _create_final_segments_from_ready(
                         "type": _match_type_authenticated,
                         "ref_origin": loop_ref_word
                     })
-                elif correction_score >= auth_score and correction_score > current_best_score:
+                elif correction_score > current_best_score:
                     is_candidate_korean = _is_korean(candidate_whisper)
                     is_ref_single_eng = len(loop_ref_word) == 1 and 'a' <= loop_ref_word.lower() <= 'z'
                     if not (is_candidate_korean and is_ref_single_eng):
@@ -4028,6 +3933,7 @@ def _create_final_segments_from_ready(
     print(f"\n[SYNC-PRO] Returning {len(final_segments)} final segments.")
     print("------------------------------------\n")
     return final_segments
+
 
 
 
