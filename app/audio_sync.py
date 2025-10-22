@@ -3245,6 +3245,7 @@ def sync_lyrics_with_whisper_pro(
         "summary_text": summary_text
     }
 
+# 시간 관련 유사도
 def build_time_variant_map(ref_lines: list[str]) -> dict:
     """
     ref_lines(= lyrics_raw, 헤더 포함 가능)를 훑어,
@@ -3447,6 +3448,123 @@ def normalize_times_in_text(text: str, ref_time_map: dict) -> str:
 
     return out
 
+# 한글형 영어관련
+# 1) ref 토큰 스트림 구성 (헤더 제거된 가사 사용)
+def build_ref_token_stream_for_bilingual(ref_lines: list[str]) -> list[str]:
+    import re
+    tokens: list[str] = []
+    header_rx = re.compile(r"^\s*\[[^]]+]\s*$")
+    for ln in ref_lines:
+        if header_rx.match(ln or ""):
+            continue
+        # 콤마 등 단순 제거, 다중 공백 정리
+        s = (ln or "").replace(",", " ").replace("'", " ")
+        s = re.sub(r"\s+", " ", s.strip())
+        if not s:
+            continue
+        tokens.extend(s.split(" "))
+    return [t for t in tokens if t]
+
+# 2) 한글→영문 교정 (앵커+음차+사전)
+def kor_eng_fix_line(text: str, ref_tokens: list[str], kroman_obj=None) -> str:
+    import re
+    from difflib import SequenceMatcher
+
+    if not text or not ref_tokens:
+        return text
+
+    # 간단 판별
+    def is_ascii_word(w: str) -> bool:
+        return bool(re.fullmatch(r"[A-Za-z][A-Za-z'\-]*", w or ""))
+
+    def is_hangul_word(w: str) -> bool:
+        return bool(re.search(r"[\uac00-\ud7a3]", w or ""))
+
+    # kroman or fallback
+    def romanize_kor(w: str) -> str:
+        if not is_hangul_word(w):
+            return w.lower()
+        if kroman_obj:
+            try:
+                r = kroman_obj.parse(w)  # type: ignore[attr-defined]
+                return (r or w).replace("-", "").lower()
+            except Exception:
+                pass
+        # 매우 단순한 fallback (정교함보단 일관성)
+        return re.sub(r"[^a-z]", "", w.encode("utf-8", "ignore").decode("utf-8").lower())
+
+    # 소규모 사전 (옵션)
+    small_lex = {
+        "스크린": "screen",
+        "라이트": "light",
+        "화이트": "white",
+        "하우스": "house",
+        "블랙": "black",
+        "번아웃": "burnout",
+    }
+
+    # 토큰화
+    src = re.sub(r"\s+", " ", (text or "").strip())
+    src_tokens = src.split(" ")
+
+    # 앵커 찾기: src에서 한글 토큰이 ref에도 있으면 그 위치를 후보 앵커로 사용
+    # (가장 오른쪽 앵커가 뒤의 영어쌍을 잘 끌어오기 좋음)
+    anchors: list[int] = []
+    ref_index = {tok: i for i, tok in enumerate(ref_tokens)}
+    for i, tok in enumerate(src_tokens):
+        if tok and not is_ascii_word(tok) and tok in ref_index:
+            anchors.append(i)
+
+    if not anchors:
+        # 앵커가 없으면 사전/음차만 가볍게 적용
+        out = []
+        for w in src_tokens:
+            if is_hangul_word(w) and w in small_lex:
+                out.append(small_lex[w])
+            else:
+                out.append(w)
+        return " ".join(out)
+
+    last_anchor = anchors[-1]
+    # ref에서의 위치
+    ref_pos = ref_index.get(src_tokens[last_anchor], -1)
+
+    out_tokens = src_tokens[:]
+    # 앵커 뒤 1~2개를 강하게 본다
+    for offset in (1, 2):
+        si = last_anchor + offset
+        ri = ref_pos + offset
+        if si >= len(out_tokens) or ri >= len(ref_tokens):
+            continue
+
+        cand = out_tokens[si]
+        refw = ref_tokens[ri]
+
+        if is_ascii_word(refw):
+            # cand가 한글이면 음차 비교 + 사전
+            if is_hangul_word(cand):
+                # 사전 우선
+                if cand in small_lex and small_lex[cand].lower() == refw.lower():
+                    out_tokens[si] = refw
+                    continue
+                # 로마자-영문 유사도
+                rc = romanize_kor(cand)
+                sim = SequenceMatcher(None, rc, refw.lower()).ratio()
+                if sim >= 0.70:
+                    out_tokens[si] = refw
+            # cand가 영어인데 철자만 틀린 경우(소문자화 후 비교)
+            else:
+                sim = SequenceMatcher(None, cand.lower(), refw.lower()).ratio()
+                if sim >= 0.80:
+                    out_tokens[si] = refw
+
+    # 마지막으로, 앵커 주변이 아닌 나머지 한글→영문 흔한 조각만 사전으로 약하게 보정
+    for i, w in enumerate(out_tokens):
+        if is_hangul_word(w) and w in small_lex:
+            out_tokens[i] = small_lex[w]
+
+    return " ".join(out_tokens)
+
 
 # 한글 자모 분해를 위한 전역 상수
 CHOSUNG = ['ㄱ', 'ㄲ', 'ㄴ', 'ㄷ', 'ㄸ', 'ㄹ', 'ㅁ', 'ㅂ', 'ㅃ', 'ㅅ', 'ㅆ', 'ㅇ', 'ㅈ', 'ㅉ', 'ㅊ', 'ㅋ', 'ㅌ', 'ㅍ', 'ㅎ']
@@ -3458,23 +3576,24 @@ JONGSUNG = ['', 'ㄱ', 'ㄲ', 'ㄳ', 'ㄴ', 'ㄵ', 'ㄶ', 'ㄷ', 'ㄹ', 'ㄺ', '
 
 def _create_final_segments_from_ready(
         seg_ready_payload: list,
-        clean_lyrics_lines: list, # 헤더 포함된 원본 가사 (입력)
-        lyrics_compare_lines: list, # 헤더 포함된 비교용 가사 (입력)
+        clean_lyrics_lines: list,  # 헤더 포함된 원본 가사 (입력)
+        lyrics_compare_lines: list,  # 헤더 포함된 비교용 가사 (입력)
         project_dir: str
 ) -> list:
     """
-    [헤더 제거 최종 수정 v5.1 + 안전한 시간표현 통일 주입]
+    [헤더 제거 최종 수정 v5.1 + 안전한 시간표현 통일 주입 + 한↔영 오인식 보정(내부헬퍼)]
     - Boundary detection uses lyric lines *without* headers.
     - Word correction reference (`ref_all_words`) is now also built from lyric lines *without* headers.
     - 필요 시 시간표현(3시/세 시/15:05:00 등)을 표준형으로 통일하되, 헬퍼가 없으면 그대로 진행.
     - 마지막 줄 탐색은 **역방향**(원본 그대로) 유지.
     - 기존 상수/로직/임계값은 그대로.
+    - 영어 가사 한글 오인식(예: '스크린라이트' → 'screen light')은 단어 교정 루프 직전,
+      내부 헬퍼로 '앵커+음차+사전' 방식의 전처리를 1회 적용 (기능 추가이지만 기존 흐름/출력형식은 동일).
     """
     import difflib
     from pathlib import Path
-    from typing import List, Dict, Pattern, Optional, Any # Any 추가
+    from typing import List, Dict, Pattern, Optional, Any
     import re
-    # numpy는 현재 사용되지 않음
 
     # ---- 시간표현 통일 헬퍼 바인딩(있으면만 사용, 임포트 시도 안 함) ----
     build_time_variant_map = globals().get("build_time_variant_map")
@@ -3495,52 +3614,163 @@ def _create_final_segments_from_ready(
                 return s
         return s
 
-    # --- Constants and local utils ---
+    # --- Constants and local utils (기존 그대로 유지) ---
     _MATCH_TYPE_KEPT = "KEPT"
     _MATCH_TYPE_AUTHENTICATED = "AUTHENTICATED"
     _MATCH_TYPE_CORRECTED = "CORRECTED"
     _FILTER_SHORT_WORDS = {'a', 'ah', 'oh', 'uh', 'hm', 'hmm', 'um', 'o', 'eh', '음', 'nan', 'neo'}
 
-    def _safe_float(val: Any) -> float: # 타입 힌트 Any 추가
-        try: return float(val)
-        except (TypeError, ValueError): return 0.0
+    def _safe_float(val: Any) -> float:
+        try:
+            return float(val)
+        except (TypeError, ValueError):
+            return 0.0
 
     def _norm_for_compare(text: str) -> str:
-        s = str(text or "").lower().strip(); s = re.sub(r"[^a-z0-9가-힣\s']+", " ", s); s = re.sub(r"\s+", " ", s).strip(); return s
+        s = str(text or "").lower().strip()
+        s = re.sub(r"[^a-z0-9가-힣\s']+", " ", s)
+        s = re.sub(r"\s+", " ", s).strip()
+        return s
 
     def _match_score(a: str, b: str) -> float:
-        if not a or not b: return 0.0
-        # SequenceMatcher 사용 유지 (타입 문제 없음)
+        if not a or not b:
+            return 0.0
         return difflib.SequenceMatcher(None, a, b).ratio()
 
     # kroman 처리 (ImportError 시 None 할당 및 except 블록에서도 정의)
-    kroman: Optional[Any] # 타입 힌트 추가
+    kroman: Optional[Any]
     try:
-        import kroman
+        import kroman  # type: ignore
     except ImportError:
         kroman = None
         print("[WARN] kroman library not found. Romanization comparison will be limited.")
-    # except 블록에서도 kroman = None 으로 정의됨
 
     _KOREAN_PATTERN: Pattern[str] = re.compile(r'[\uac00-\ud7a3]')
 
-    def _is_korean(word: str) -> bool: return bool(_KOREAN_PATTERN.search(str(word or "")))
+    def _is_korean(word: str) -> bool:
+        return bool(_KOREAN_PATTERN.search(str(word or "")))
 
     def _romanize(text: str) -> str:
-        text_norm = _norm_for_compare(text) # 세미콜론 제거됨
-        if not text_norm: return ""
-        korean_parts = _KOREAN_PATTERN.findall(text) # 세미콜론 제거됨
+        text_norm = _norm_for_compare(text)
+        if not text_norm:
+            return ""
+        korean_parts = _KOREAN_PATTERN.findall(text)
         if korean_parts and kroman:
             try:
                 korean_text_only = "".join(korean_parts)
-                # kroman.parse가 None을 반환할 수 있으므로 처리
-                parsed: Optional[str] = kroman.parse(korean_text_only)
-                # None이 아닐 때만 replace/lower 호출
+                parsed: Optional[str] = kroman.parse(korean_text_only)  # type: ignore[attr-defined]
                 return parsed.replace("-", "").lower() if parsed else text_norm
-            except Exception as e_kroman_parse: # 구체적인 예외 처리
+            except Exception as e_kroman_parse:
                 print(f"[WARN] kroman parsing failed for '{text}': {type(e_kroman_parse).__name__}")
-                return text_norm # 실패 시 정규화된 원본 반환
+                return text_norm
         return text_norm
+
+    # ===== [내부 헬퍼 1] ref 토큰 스트림 (헤더 제거본에서 생성) =====
+    def _build_ref_token_stream_for_bilingual(ref_lines_no_headers: list[str]) -> list[str]:
+        tokens: list[str] = []
+        for ln in ref_lines_no_headers:
+            s = (ln or "").replace(",", " ").replace("'", " ")
+            s = re.sub(r"\s+", " ", s.strip())
+            if not s:
+                continue
+            tokens.extend(s.split(" "))
+        return [t for t in tokens if t]
+
+    # ===== [내부 헬퍼 2] 한글→영문 보정 (앵커+음차+소규모 사전) =====
+    def _kor_eng_fix_line(text: str, ref_tokens: list[str], kroman_obj: Optional[Any]) -> str:
+        if not text or not ref_tokens:
+            return text
+
+        def is_ascii_word(w: str) -> bool:
+            return bool(re.fullmatch(r"[A-Za-z][A-Za-z'\-]*", w or ""))
+
+        def is_hangul_word(w: str) -> bool:
+            return bool(re.search(r"[\uac00-\ud7a3]", w or ""))
+
+        def romanize_kor(w: str) -> str:
+            if not is_hangul_word(w):
+                return (w or "").lower()
+            if kroman_obj:
+                try:
+                    r = kroman_obj.parse(w)  # type: ignore[attr-defined]
+                    return (r or w).replace("-", "").lower()
+                except Exception:
+                    pass
+            # 아주 단순한 폴백(정확도보다 일관성 우선)
+            return re.sub(r"[^a-z]", "", (w or "").lower())
+
+        small_lex = {
+            "스크린": "screen",
+            "라이트": "light",
+            "화이트": "white",
+            "하우스": "house",
+            "블랙": "black",
+            "번아웃": "burnout",
+        }
+
+        src = re.sub(r"\s+", " ", (text or "").strip())
+        src_tokens = src.split(" ")
+
+        # ref 토큰 인덱스 (단순 딕셔너리)
+        ref_index: Dict[str, int] = {}
+        for i_ref, rt in enumerate(ref_tokens):
+            if rt not in ref_index:
+                ref_index[rt] = i_ref
+
+        # 앵커 후보: src 내에서 한글 토큰이 ref에도 존재
+        anchors: list[int] = []
+        for i_tok, tok in enumerate(src_tokens):
+            if tok and not is_ascii_word(tok) and tok in ref_index:
+                anchors.append(i_tok)
+
+        # 앵커가 없으면 사전 중심의 약한 보정만
+        if not anchors:
+            out_simple: list[str] = []
+            for w in src_tokens:
+                if is_hangul_word(w) and w in small_lex:
+                    out_simple.append(small_lex[w])
+                else:
+                    out_simple.append(w)
+            return " ".join(out_simple)
+
+        last_anchor = anchors[-1]
+        ref_pos = ref_index.get(src_tokens[last_anchor], -1)
+        out_tokens = src_tokens[:]
+
+        # 앵커 뒤 1~2 토큰을 ref의 다음 1~2 토큰과 강 매칭
+        from difflib import SequenceMatcher
+        for offset in (1, 2):
+            si = last_anchor + offset
+            ri = ref_pos + offset
+            if si >= len(out_tokens) or ri >= len(ref_tokens):
+                continue
+
+            cand = out_tokens[si]
+            refw = ref_tokens[ri]
+
+            if not refw:
+                continue
+
+            if is_ascii_word(refw):
+                if re.search(r"[\uac00-\ud7a3]", cand or ""):
+                    if cand in small_lex and small_lex[cand].lower() == refw.lower():
+                        out_tokens[si] = refw
+                        continue
+                    rc = romanize_kor(cand)
+                    sim = SequenceMatcher(None, rc, refw.lower()).ratio()
+                    if sim >= 0.70:
+                        out_tokens[si] = refw
+                else:
+                    sim2 = SequenceMatcher(None, (cand or "").lower(), refw.lower()).ratio()
+                    if sim2 >= 0.80:
+                        out_tokens[si] = refw
+
+        # 마지막으로 전역적인 작은 사전 보정
+        for i_tok, w in enumerate(out_tokens):
+            if re.search(r"[\uac00-\ud7a3]", w or "") and w in small_lex:
+                out_tokens[i_tok] = small_lex[w]
+
+        return " ".join(out_tokens)
 
     # ---- 1. Prepare Reference Lines & Boundary Detection ----
     print("\n--- [BOUNDARY DETECTION] ---")
@@ -3552,26 +3782,26 @@ def _create_final_segments_from_ready(
     # 헤더 제외한 가사 목록 생성
     boundary_ref_lines_no_headers: List[str] = []
     header_pattern = re.compile(r"^\s*\[[^]]+]\s*$")
-    for line_with_header in correction_ref_lines_with_headers: # 변수명 변경 (가리기 방지)
+    for line_with_header in correction_ref_lines_with_headers:
         if not header_pattern.match(line_with_header):
             boundary_ref_lines_no_headers.append(line_with_header)
 
     if not boundary_ref_lines_no_headers:
         print("[ERROR] No actual lyric lines found after removing headers.")
-        # 헤더만 있는 경우: v5의 폴백 로직 유지 (헤더 포함 목록 사용)
         boundary_ref_lines_no_headers = correction_ref_lines_with_headers
-        if not boundary_ref_lines_no_headers: return []
+        if not boundary_ref_lines_no_headers:
+            return []
         print("[WARN] Fallback: Using lines *with* headers for boundary detection.")
 
-    # === 새로 추가: 시간표현 통일(있으면만) ===
+    # 시간표현 통일(있으면만)
     boundary_ref_lines_no_headers = [_maybe_norm_time(x) for x in boundary_ref_lines_no_headers]
 
-    # 경계 탐색용 첫/마지막 줄 (헤더 제외 목록 사용)
+    # 경계 탐색용 첫/마지막 줄
     first_line_raw = boundary_ref_lines_no_headers[0] if boundary_ref_lines_no_headers else ""
     last_line_raw = boundary_ref_lines_no_headers[-1] if boundary_ref_lines_no_headers else ""
     first_line_norm = _norm_for_compare(first_line_raw)
     last_line_norm = _norm_for_compare(last_line_raw)
-    print(f"[DEBUG] Target First Line (Raw, No Header): '{first_line_raw}'") # ... (로그 유지)
+    print(f"[DEBUG] Target First Line (Raw, No Header): '{first_line_raw}'")
     print(f"[DEBUG] Target First Line (Norm, No Header): '{first_line_norm}'")
     print(f"[DEBUG] Target Last Line (Raw, No Header): '{last_line_raw}'")
     print(f"[DEBUG] Target Last Line (Norm, No Header): '{last_line_norm}'")
@@ -3580,165 +3810,275 @@ def _create_final_segments_from_ready(
     score_threshold_boundary = 0.25
 
     # 첫 줄 탐색
-    print("\n[DEBUG] Searching for First Line Match...") # ... (탐색 및 로그 로직 유지)
+    print("\n[DEBUG] Searching for First Line Match...")
     if first_line_norm:
-        for i, seg_item in enumerate(seg_ready_payload): # 변수명 변경 (가리기 방지)
+        for i, seg_item in enumerate(seg_ready_payload):
             if isinstance(seg_item, dict) and "text" in seg_item:
-                 # === 새로 추가: 세그먼트 텍스트의 시간표현 통일 적용 ===
-                 seg_text_raw = _maybe_norm_time(str(seg_item.get("text", "")))
-                 seg_text_norm = _norm_for_compare(seg_text_raw)
-                 score_val = _match_score(seg_text_norm, first_line_norm) # 변수명 변경 (가리기 방지)
-                 print(f"  [DEBUG] Comparing seg[{i}] ('{seg_text_norm}') vs First ('{first_line_norm}') -> Score: {score_val:.4f}")
-                 if score_val > score_threshold_boundary: first_idx = i; print(f"    => Match found! Setting first_idx = {i}"); break
-    else: first_idx = 0; print("[WARN] Target first line empty, setting first_idx = 0.")
+                seg_text_raw = _maybe_norm_time(str(seg_item.get("text", "")))
+                seg_text_norm = _norm_for_compare(seg_text_raw)
+                score_val = _match_score(seg_text_norm, first_line_norm)
+                print(f"  [DEBUG] Comparing seg[{i}] ('{seg_text_norm}') vs First ('{first_line_norm}') -> Score: {score_val:.4f}")
+                if score_val > score_threshold_boundary:
+                    first_idx = i
+                    print(f"    => Match found! Setting first_idx = {i}")
+                    break
+    else:
+        first_idx = 0
+        print("[WARN] Target first line empty, setting first_idx = 0.")
 
-    # 마지막 줄 탐색  (원본 그대로 **역방향**)
-    print("\n[DEBUG] Searching for Last Line Match (reverse)...") # ... (탐색 및 로그 로직 유지)
+    # 마지막 줄 탐색 (역방향: 기존 유지)
+    print("\n[DEBUG] Searching for Last Line Match (reverse)...")
     if last_line_norm:
         payload_len = len(seg_ready_payload)
-        for i_rev in range(payload_len - 1, -1, -1): # 변수명 변경 (가리기 방지)
-            current_seg_item = seg_ready_payload[i_rev] # 변수명 변경 (가리기 방지)
+        for i_rev in range(payload_len - 1, -1, -1):
+            current_seg_item = seg_ready_payload[i_rev]
             if isinstance(current_seg_item, dict) and "text" in current_seg_item:
-                 seg_text_norm_rev = _norm_for_compare(_maybe_norm_time(current_seg_item.get("text", ""))) # 시간 통일 적용
-                 score_val_rev = _match_score(seg_text_norm_rev, last_line_norm) # 변수명 변경
-                 print(f"  [DEBUG] Comparing seg[{i_rev}] ('{seg_text_norm_rev}') vs Last ('{last_line_norm}') -> Score: {score_val_rev:.4f}")
-                 if score_val_rev > score_threshold_boundary: last_idx = i_rev; print(f"    => Match found! Setting last_idx = {i_rev}"); break
-    else: last_idx = len(seg_ready_payload) - 1 if seg_ready_payload else -1; print("[WARN] Target last line empty, setting last_idx = end.")
+                seg_text_norm_rev = _norm_for_compare(_maybe_norm_time(current_seg_item.get("text", "")))
+                score_val_rev = _match_score(seg_text_norm_rev, last_line_norm)
+                print(f"  [DEBUG] Comparing seg[{i_rev}] ('{seg_text_norm_rev}') vs Last ('{last_line_norm}') -> Score: {score_val_rev:.4f}")
+                if score_val_rev > score_threshold_boundary:
+                    last_idx = i_rev
+                    print(f"    => Match found! Setting last_idx = {i_rev}")
+                    break
+    else:
+        last_idx = len(seg_ready_payload) - 1 if seg_ready_payload else -1
+        print("[WARN] Target last line empty, setting last_idx = end.")
 
     print(f"\n[DEBUG] Final Boundary Indices: first_idx = {first_idx}, last_idx = {last_idx}")
 
     # seg_compare_payload 생성
-    seg_compare_payload: list = [] # 타입 명시
-    if first_idx != -1 and last_idx != -1 and last_idx >= first_idx: seg_compare_payload = seg_ready_payload[first_idx : last_idx + 1]; print(f"[INFO] Slicing seg_ready from {first_idx} to {last_idx + 1}.")
-    elif first_idx != -1: seg_compare_payload = seg_ready_payload[first_idx:]; print(f"[WARN] Last line fail. Slicing from {first_idx} to end.")
-    elif last_idx != -1: seg_compare_payload = seg_ready_payload[: last_idx + 1]; print(f"[WARN] First line fail. Slicing from start to {last_idx + 1}.")
-    else: seg_compare_payload = seg_ready_payload; print("[WARN] Both boundary fails. Using all segments.")
+    seg_compare_payload: list = []
+    if first_idx != -1 and last_idx != -1 and last_idx >= first_idx:
+        seg_compare_payload = seg_ready_payload[first_idx: last_idx + 1]
+        print(f"[INFO] Slicing seg_ready from {first_idx} to {last_idx + 1}.")
+    elif first_idx != -1:
+        seg_compare_payload = seg_ready_payload[first_idx:]
+        print(f"[WARN] Last line fail. Slicing from {first_idx} to end.")
+    elif last_idx != -1:
+        seg_compare_payload = seg_ready_payload[: last_idx + 1]
+        print(f"[WARN] First line fail. Slicing from start to {last_idx + 1}.")
+    else:
+        seg_compare_payload = seg_ready_payload
+        print("[WARN] Both boundary fails. Using all segments.")
     print(f"       => Resulting seg_compare_payload length: {len(seg_compare_payload)}")
 
-    if not seg_compare_payload: print("[ERROR] No segments selected. Cannot proceed."); return []
+    if not seg_compare_payload:
+        print("[ERROR] No segments selected. Cannot proceed.")
+        return []
 
     # seg_compare.json 저장
-    try: # ... (저장 로직 유지)
+    try:
         compare_path = Path(project_dir) / "seg_compare.json"
-        # save_json 임포트 확인 (파일 상단 또는 try 블록 내부)
-        try: from app.utils import save_json
-        except ImportError: from utils import save_json # type: ignore[no-redef]
-        save_json(compare_path, seg_compare_payload); print(f"[SYNC-PRO] seg_compare.json saved: {compare_path} ({len(seg_compare_payload)} segments)")
-    except Exception as e_save_compare: # 구체적인 예외 처리
+        try:
+            from app.utils import save_json  # type: ignore
+        except ImportError:
+            from utils import save_json  # type: ignore
+        save_json(compare_path, seg_compare_payload)
+        print(f"[SYNC-PRO] seg_compare.json saved: {compare_path} ({len(seg_compare_payload)} segments)")
+    except Exception as e_save_compare:
         print(f"[WARN] Failed to save seg_compare.json: {type(e_save_compare).__name__}")
 
     # ---- 2 & 3. Word Correction (Using header-less reference words) ----
-    # [핵심 수정] ref_all_words 생성 시 헤더 제외 목록 사용 (+ 시간표현 통일 적용)
-    ref_source_lines = boundary_ref_lines_no_headers
-    ref_source_lines = [_maybe_norm_time(x) for x in ref_source_lines]  # 추가
+    # 시간표현 통일본으로 ref 소스 구성
+    ref_source_lines = [_maybe_norm_time(x) for x in boundary_ref_lines_no_headers]
+
+    # === [추가] 이 시점에서 '영어-한글' 교정용 ref 토큰 스트림 1회 생성 ===
+    ref_tokens_for_bilingual = _build_ref_token_stream_for_bilingual(ref_source_lines)
 
     ref_all_words_raw = " ".join(ref_source_lines).replace(",", "").replace("'", "")
-    ref_all_words = ref_all_words_raw.split()
-    ref_all_words = [w for w in ref_all_words if w]
-    if not ref_all_words: print("[ERROR] Reference words list (no headers) is empty."); return []
+    ref_all_words = [w for w in ref_all_words_raw.split() if w]
+    if not ref_all_words:
+        print("[ERROR] Reference words list (no headers) is empty.")
+        return []
     print(f"[DEBUG] Using {len(ref_all_words)} reference words for correction (headers excluded).")
     ref_words_norm = [_norm_for_compare(w) for w in ref_all_words]
     ref_words_roman = [_romanize(w) for w in ref_all_words]
 
     intermediate_segments: List[Dict] = []
     print("\n--- [SEGMENT CORRECTION PROCESS] ---")
-    for seg_idx, seg_corr in enumerate(seg_compare_payload): # 변수명 변경 (가리기 방지)
-        if not isinstance(seg_corr, dict) or "text" not in seg_corr: continue
-        whisper_text_corr = str(seg_corr.get("text", "")).strip() # 변수명 변경
-        # === 세그먼트 텍스트도 시간표현 통일 후 교정 ===
-        whisper_text_corr = _maybe_norm_time(whisper_text_corr)
-        if not whisper_text_corr: continue
+    for seg_idx, seg_corr in enumerate(seg_compare_payload):
+        if not isinstance(seg_corr, dict) or "text" not in seg_corr:
+            continue
+
+        # 1) 시간표현 통일
+        whisper_text_corr = _maybe_norm_time(str(seg_corr.get("text", "")).strip())
+
+        # 2) [추가] 영어 가사 한글 오인식 전처리 (앵커+음차+사전)
+        #    => '푸른 스크린라이트' → '푸른 screen light' 등으로 보수적 보정
+        whisper_text_corr = _kor_eng_fix_line(whisper_text_corr, ref_tokens_for_bilingual, kroman)
+
+        if not whisper_text_corr:
+            continue
+
+        # === 이하 기존 단어 교정 로직 그대로 ===
         segment_corrected_words: List[str] = []
-        whisper_words_list = whisper_text_corr.split(); whisper_cursor = 0; leftover_whisper_part = "" # 변수명 변경
+        whisper_words_list = whisper_text_corr.split()
+        whisper_cursor = 0
+        leftover_whisper_part = ""
+
         while whisper_cursor < len(whisper_words_list):
-            candidate_whisper_raw = leftover_whisper_part + whisper_words_list[whisper_cursor]; candidate_whisper = candidate_whisper_raw.strip()
+            candidate_whisper_raw = leftover_whisper_part + whisper_words_list[whisper_cursor]
+            candidate_whisper = candidate_whisper_raw.strip()
             candidate_norm = _norm_for_compare(candidate_whisper)
-            if not candidate_norm: whisper_cursor += 1; leftover_whisper_part = ""; continue
-            best_match: Dict = {"score": -1.0, "word": candidate_whisper, "type": _MATCH_TYPE_KEPT, "ref_origin": ""}
-            for i_ref, loop_ref_word in enumerate(ref_all_words): # 변수명 변경 (가리기 방지)
-                ref_norm_loop = ref_words_norm[i_ref] # 변수명 변경
-                ref_roman_loop = ref_words_roman[i_ref] # 변수명 변경
-                if not ref_norm_loop: continue
+            if not candidate_norm:
+                whisper_cursor += 1
+                leftover_whisper_part = ""
+                continue
+
+            best_match: Dict = {
+                "score": -1.0,
+                "word": candidate_whisper,
+                "type": _MATCH_TYPE_KEPT,
+                "ref_origin": ""
+            }
+
+            for i_ref, loop_ref_word in enumerate(ref_all_words):
+                ref_norm_loop = ref_words_norm[i_ref]
+                ref_roman_loop = ref_words_roman[i_ref]
+                if not ref_norm_loop:
+                    continue
+
                 auth_score = -1.0
-                if candidate_norm and ref_norm_loop and candidate_norm in ref_norm_loop: auth_score = 0.85 + (len(candidate_norm) / len(ref_norm_loop)) * 0.15
-                spell_score = _match_score(candidate_norm, ref_norm_loop); roman_score = 0.0; candidate_roman = _romanize(candidate_whisper)
-                if candidate_roman and ref_roman_loop: roman_score = _match_score(candidate_roman, ref_roman_loop)
-                elif not _is_korean(candidate_whisper) and ref_roman_loop: roman_score = _match_score(candidate_norm, ref_roman_loop) * 0.9
-                correction_score = max(spell_score, roman_score); current_best_score = best_match["score"]; updated = False
-                if auth_score > correction_score and auth_score > current_best_score: best_match.update({"score": auth_score, "word": candidate_whisper, "type": _MATCH_TYPE_AUTHENTICATED, "ref_origin": loop_ref_word}); updated = True
+                if candidate_norm and ref_norm_loop and candidate_norm in ref_norm_loop:
+                    auth_score = 0.85 + (len(candidate_norm) / len(ref_norm_loop)) * 0.15
+
+                spell_score = _match_score(candidate_norm, ref_norm_loop)
+                roman_score = 0.0
+                candidate_roman = _romanize(candidate_whisper)
+                if candidate_roman and ref_roman_loop:
+                    roman_score = _match_score(candidate_roman, ref_roman_loop)
+                elif not _is_korean(candidate_whisper) and ref_roman_loop:
+                    roman_score = _match_score(candidate_norm, ref_roman_loop) * 0.9
+
+                correction_score = max(spell_score, roman_score)
+                current_best_score = best_match["score"]
+
+                if auth_score > correction_score and auth_score > current_best_score:
+                    best_match.update({
+                        "score": auth_score,
+                        "word": candidate_whisper,
+                        "type": _MATCH_TYPE_AUTHENTICATED,
+                        "ref_origin": loop_ref_word
+                    })
                 elif correction_score >= auth_score and correction_score > current_best_score:
-                    is_candidate_korean = _is_korean(candidate_whisper); is_ref_single_eng = len(loop_ref_word) == 1 and 'a' <= loop_ref_word.lower() <= 'z'
-                    if not (is_candidate_korean and is_ref_single_eng): best_match.update({"score": correction_score, "word": loop_ref_word, "type": _MATCH_TYPE_CORRECTED, "ref_origin": loop_ref_word}); updated = True
-            match_type = best_match["type"]; word_to_process = best_match["word"]; best_score = best_match["score"]; ref_origin = best_match["ref_origin"]; score_threshold = 0.50
-            word_to_append: Optional[str] = None; leftover_whisper_part = ""
+                    is_candidate_korean = _is_korean(candidate_whisper)
+                    is_ref_single_eng = len(loop_ref_word) == 1 and 'a' <= loop_ref_word.lower() <= 'z'
+                    if not (is_candidate_korean and is_ref_single_eng):
+                        best_match.update({
+                            "score": correction_score,
+                            "word": loop_ref_word,
+                            "type": _MATCH_TYPE_CORRECTED,
+                            "ref_origin": loop_ref_word
+                        })
+
+            match_type = best_match["type"]
+            word_to_process = best_match["word"]
+            best_score = best_match["score"]
+            ref_origin = best_match["ref_origin"]
+            score_threshold = 0.50
+            word_to_append: Optional[str] = None
+            leftover_whisper_part = ""
+
             if match_type == _MATCH_TYPE_KEPT:
-                if candidate_whisper.lower() not in _FILTER_SHORT_WORDS: word_to_append = candidate_whisper
+                if candidate_whisper.lower() not in _FILTER_SHORT_WORDS:
+                    word_to_append = candidate_whisper
             else:
                 if best_score >= score_threshold:
                     word_to_append = word_to_process
-                    ref_matched_norm = _norm_for_compare(ref_origin); candidate_actual_norm = _norm_for_compare(candidate_whisper)
+                    ref_matched_norm = _norm_for_compare(ref_origin)
+                    candidate_actual_norm = _norm_for_compare(candidate_whisper)
                     if len(candidate_actual_norm) > len(ref_matched_norm) and candidate_actual_norm.startswith(ref_matched_norm):
                         try:
-                            match_obj = re.match(re.escape(ref_matched_norm), candidate_whisper, flags=re.IGNORECASE | re.UNICODE) # 변수명 변경
-                            if match_obj: leftover_whisper_part = candidate_whisper[match_obj.end():].strip()
-                        except re.error: leftover_whisper_part = ""
+                            match_obj = re.match(re.escape(ref_matched_norm), candidate_whisper, flags=re.IGNORECASE | re.UNICODE)
+                            if match_obj:
+                                leftover_whisper_part = candidate_whisper[match_obj.end():].strip()
+                        except re.error:
+                            leftover_whisper_part = ""
                 else:
-                    if candidate_whisper.lower() not in _FILTER_SHORT_WORDS: word_to_append = candidate_whisper
-            if word_to_append: segment_corrected_words.append(word_to_append)
+                    if candidate_whisper.lower() not in _FILTER_SHORT_WORDS:
+                        word_to_append = candidate_whisper
+
+            if word_to_append:
+                segment_corrected_words.append(word_to_append)
+
             whisper_cursor += 1
+
         corrected_text = " ".join(segment_corrected_words).strip()
         if corrected_text:
-            intermediate_segments.append({"start": _safe_float(seg_corr.get("start")), "end": _safe_float(seg_corr.get("end")), "text": corrected_text, "line_ko": corrected_text})
+            intermediate_segments.append({
+                "start": _safe_float(seg_corr.get("start")),
+                "end": _safe_float(seg_corr.get("end")),
+                "text": corrected_text,
+                "line_ko": corrected_text
+            })
 
     print("--- [SEGMENT CORRECTION PROCESS COMPLETED] ---")
     print(f"Total intermediate segments generated: {len(intermediate_segments)}")
 
     # ---- 4. Final Boundary Check & Return ----
-    if not intermediate_segments: print("[ERROR] No segments survived correction."); return []
+    if not intermediate_segments:
+        print("[ERROR] No segments survived correction.")
+        return []
 
     final_start_idx, final_end_idx = -1, -1
     final_boundary_threshold = 0.45
 
-    print("\n--- [FINAL BOUNDARY CHECK] ---") # ... (최종 경계 확인 로직 및 로그 유지)
+    print("\n--- [FINAL BOUNDARY CHECK] ---")
     if first_line_norm:
         print(f"[DEBUG] Final check - Searching for First Line (Norm): '{first_line_norm}'")
-        for i_final, seg_final in enumerate(intermediate_segments): # 변수명 변경 (가리기 방지)
-            score_final = _match_score(_norm_for_compare(seg_final.get("text", "")), first_line_norm) # 변수명 변경
-            if score_final > final_boundary_threshold: final_start_idx = i_final; print(f"    => Match found! final_start_idx = {i_final}"); break
-    else: final_start_idx = 0; print("[WARN] Final check - Target first line empty, using index 0.")
+        for i_final, seg_final in enumerate(intermediate_segments):
+            score_final = _match_score(_norm_for_compare(seg_final.get("text", "")), first_line_norm)
+            if score_final > final_boundary_threshold:
+                final_start_idx = i_final
+                print(f"    => Match found! final_start_idx = {i_final}")
+                break
+    else:
+        final_start_idx = 0
+        print("[WARN] Final check - Target first line empty, using index 0.")
 
     if last_line_norm:
         print(f"[DEBUG] Final check - Searching for Last Line (Norm, reverse): '{last_line_norm}'")
-        # range 길이 안전 계산
         inter_len = len(intermediate_segments)
-        for i_final_rev in range(inter_len - 1, -1, -1): # 변수명 변경
-            seg_final_rev = intermediate_segments[i_final_rev] # 변수명 변경
-            score_final_rev = _match_score(_norm_for_compare(seg_final_rev.get("text", "")), last_line_norm) # 변수명 변경
-            if score_final_rev > final_boundary_threshold: final_end_idx = i_final_rev; print(f"    => Match found! final_end_idx = {i_final_rev}"); break
-    else: final_end_idx = len(intermediate_segments) - 1 if intermediate_segments else -1; print("[WARN] Final check - Target last line empty, using last index.")
+        for i_final_rev in range(inter_len - 1, -1, -1):
+            seg_final_rev = intermediate_segments[i_final_rev]
+            score_final_rev = _match_score(_norm_for_compare(seg_final_rev.get("text", "")), last_line_norm)
+            if score_final_rev > final_boundary_threshold:
+                final_end_idx = i_final_rev
+                print(f"    => Match found! final_end_idx = {i_final_rev}")
+                break
+    else:
+        final_end_idx = len(intermediate_segments) - 1 if intermediate_segments else -1
+        print("[WARN] Final check - Target last line empty, using last index.")
 
     print(f"[DEBUG] Final Boundary Indices after check: start={final_start_idx}, end={final_end_idx}")
 
-    final_segments: List[Dict] = [] # ... (슬라이싱 및 로그 로직 유지)
-    if final_start_idx != -1 and final_end_idx != -1 and final_end_idx >= final_start_idx: final_segments = intermediate_segments[final_start_idx : final_end_idx + 1]; print(f"[SYNC-PRO] Final check: Kept segments {final_start_idx} to {final_end_idx} (Total: {len(final_segments)}).")
-    elif intermediate_segments: final_segments = intermediate_segments; print("[WARN] Final check failed, using all intermediate.")
-    else: print("[ERROR] Final check failed, no intermediate segments."); return []
+    final_segments: List[Dict] = []
+    if final_start_idx != -1 and final_end_idx != -1 and final_end_idx >= final_start_idx:
+        final_segments = intermediate_segments[final_start_idx: final_end_idx + 1]
+        print(f"[SYNC-PRO] Final check: Kept segments {final_start_idx} to {final_end_idx} (Total: {len(final_segments)}).")
+    elif intermediate_segments:
+        final_segments = intermediate_segments
+        print("[WARN] Final check failed, using all intermediate.")
+    else:
+        print("[ERROR] Final check failed, no intermediate segments.")
+        return []
 
     # Time Adjustment
     final_segments.sort(key=lambda x: _safe_float(x.get("start", 0.0)))
-    print("\n--- [TIME ADJUSTMENT] ---") # ... (시간 조정 로직 및 로그 유지)
-    for i_adjust in range(1, len(final_segments)): # 변수명 변경
-        prev_end_adjust = _safe_float(final_segments[i_adjust - 1].get("end", 0.0)) # 변수명 변경
-        curr_start_adjust = _safe_float(final_segments[i_adjust].get("start", 0.0)) # 변수명 변경
+    print("\n--- [TIME ADJUSTMENT] ---")
+    for i_adjust in range(1, len(final_segments)):
+        prev_end_adjust = _safe_float(final_segments[i_adjust - 1].get("end", 0.0))
+        curr_start_adjust = _safe_float(final_segments[i_adjust].get("start", 0.0))
         if curr_start_adjust < prev_end_adjust - 0.01:
             final_segments[i_adjust]["start"] = prev_end_adjust
-            curr_end_adjust = _safe_float(final_segments[i_adjust].get("end", 0.0)) # 변수명 변경
-            if curr_end_adjust < prev_end_adjust + 0.1: final_segments[i_adjust]["end"] = prev_end_adjust + 0.1
+            curr_end_adjust = _safe_float(final_segments[i_adjust].get("end", 0.0))
+            if curr_end_adjust < prev_end_adjust + 0.1:
+                final_segments[i_adjust]["end"] = prev_end_adjust + 0.1
 
-    # Final Return
     print(f"\n[SYNC-PRO] Returning {len(final_segments)} final segments.")
     print("------------------------------------\n")
     return final_segments
+
 
 
 
