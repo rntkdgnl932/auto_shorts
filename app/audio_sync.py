@@ -3245,6 +3245,207 @@ def sync_lyrics_with_whisper_pro(
         "summary_text": summary_text
     }
 
+def build_time_variant_map(ref_lines: list[str]) -> dict:
+    """
+    ref_lines(= lyrics_raw, 헤더 포함 가능)를 훑어,
+    문장 내 '시간 표현'을 캐논 (h, m, s) 키로 매핑한 '정답 표기' 사전을 만든다.
+
+    반환 예:
+      { (3, None, None): '세 시',
+        (15, 5, 0): '15시 5분 0초',
+        (17, 32, 8): '열일곱 시 32분 8초' ... }
+    """
+    import re
+    from typing import Optional
+
+    def to_int_from_k_num(token: str) -> Optional[int]:
+        # 간단 한글수사 파서 (99까지 대충 처리). '한/두/세/네'도 처리.
+        token = token.strip()
+        special = {'한': 1, '두': 2, '세': 3, '네': 4}
+        if token in special:
+            return special[token]
+        digit = {'영': 0, '공': 0, '일': 1, '이': 2, '삼': 3, '사': 4, '오': 5,
+                 '육': 6, '칠': 7, '팔': 8, '구': 9}
+        if token.isdigit():
+            return int(token)
+        # 십 기반 단순 조합: '십오'(15), '이십삼'(23) ...
+        if '십' in token:
+            parts = token.split('십')
+            tens = digit.get(parts[0], 1) if parts[0] else 1
+            ones = digit.get(parts[1], 0) if len(parts) > 1 and parts[1] else 0
+            return tens * 10 + ones
+        # 한 글자 숫자
+        if len(token) == 1 and token in digit:
+            return digit[token]
+        # 못 파싱하면 None
+        return None
+
+    def parse_colon_time(s: str) -> list[tuple[int, Optional[int], Optional[int], str]]:
+        # HH:MM(:SS?) 또는 M:SS (앞뒤 텍스트에 붙어있어도 findall)
+        colon_rx = re.compile(r'(?<!\d)(\d{1,2}):(\d{2})(?::(\d{2}))?(?!\d)')
+        results: list[tuple[int, Optional[int], Optional[int], str]] = []
+        for m in colon_rx.finditer(s):
+            h_or_m = int(m.group(1))
+            mm = int(m.group(2))
+            ss = int(m.group(3)) if m.group(3) is not None else None
+            # 3-part면 (H,M,S), 2-part면 (M, S)로 해석될 수도 있으나
+            # 여기서는 보수적으로 (H,M,SS)로 보고, 말이 안 되면 (M,S)로 다운캐스트
+            if m.group(3) is not None:
+                h = h_or_m
+                results.append((h, mm, ss, m.group(0)))
+            else:
+                # 두 파트만 있을 때: 시:분 또는 분:초 모호성
+                # ref 측에서는 표기 그대로 쓰므로 우선 (h, m)로 본다.
+                h = h_or_m
+                results.append((h, mm, None, m.group(0)))
+        return results
+
+    def parse_unit_time(s: str) -> list[tuple[Optional[int], Optional[int], Optional[int], str]]:
+        # (숫자|한글수사) + (시|분|초) 패턴을 모두 모은 후 가장 최근 세 개를 묶어본다.
+        # 예) "세 시 26분 10초" -> ('세','시'),('26','분'),('10','초')
+        num_unit_rx = re.compile(
+    r'(?P<num>\d{1,2}|[영공일이삼사오육칠팔구]+|한|두|세|네)\s*(?P<unit>[시분초])'
+)
+        pairs = [(m.group('num'), m.group('unit'), m.group(0)) for m in num_unit_rx.finditer(s)]
+        if not pairs:
+            return []
+        # 연속된 시/분/초를 하나의 묶음으로 조립
+        out: list[tuple[Optional[int], Optional[int], Optional[int], str]] = []
+        i = 0
+        while i < len(pairs):
+            h = m = sec = None
+            buf = []
+            j = i
+            while j < len(pairs) and len(buf) < 3:
+                num_raw, unit, raw = pairs[j]
+                buf.append(raw)
+                val: Optional[int]
+                if num_raw.isdigit():
+                    val = int(num_raw)
+                else:
+                    val = to_int_from_k_num(num_raw)
+                if unit == '시':
+                    h = val
+                elif unit == '분':
+                    m = val
+                elif unit == '초':
+                    sec = val
+                j += 1
+            raw_join = ' '.join(buf).strip()
+            out.append((h, m, sec, raw_join))
+            i = j
+        return out
+
+    def extract_all_times(line: str) -> list[tuple[Optional[int], Optional[int], Optional[int], str]]:
+        found: list[tuple[Optional[int], Optional[int], Optional[int], str]] = []
+        found.extend(parse_colon_time(line))
+        found.extend(parse_unit_time(line))
+        return found
+
+    time_map: dict = {}
+    for line in ref_lines:
+        # 헤더 제거: [A], [HOOK] 등
+        if line.strip().startswith('[') and line.strip().endswith(']'):
+            continue
+        for h, m, s_val, raw in extract_all_times(line):
+            key = (h, m, s_val)  # None 허용
+            # 동일 키에 여러 표기가 있으면 "가장 긴 표기"를 우선(예: '세 시 5분' > '세 시')
+            prev = time_map.get(key)
+            if not prev or len(raw) > len(prev):
+                time_map[key] = raw
+    return time_map
+
+def normalize_times_in_text(text: str, ref_time_map: dict) -> str:
+    """
+    ASR 결과 한 줄에서 시간 표현만 찾아,
+    ref_time_map(캐논 (h,m,s) -> 정답 표기)으로 보수적으로 치환한다.
+    """
+    import re
+    from typing import Optional
+
+    def to_int_from_k_num(token: str) -> Optional[int]:
+        token = token.strip()
+        special = {'한': 1, '두': 2, '세': 3, '네': 4}
+        if token in special:
+            return special[token]
+        digit = {'영': 0, '공': 0, '일': 1, '이': 2, '삼': 3, '사': 4, '오': 5,
+                 '육': 6, '칠': 7, '팔': 8, '구': 9}
+        if token.isdigit():
+            return int(token)
+        if '십' in token:
+            parts = token.split('십')
+            tens = digit.get(parts[0], 1) if parts[0] else 1
+            ones = digit.get(parts[1], 0) if len(parts) > 1 and parts[1] else 0
+            return tens * 10 + ones
+        if len(token) == 1 and token in digit:
+            return digit[token]
+        return None
+
+    # --- 1) HH:MM(:SS?) / M:SS 탐지 후 치환 ---
+    colon_rx = re.compile(r'(?<!\d)(\d{1,2}):(\d{2})(?::(\d{2}))?(?!\d)')
+    def repl_colon(m: re.Match) -> str:
+        h_or_m = int(m.group(1))
+        mm = int(m.group(2))
+        ss = int(m.group(3)) if m.group(3) is not None else None
+        key_3 = (h_or_m, mm, ss)
+        key_2 = (h_or_m, mm, None)
+        # 우선 3-튜플, 없으면 2-튜플
+        if key_3 in ref_time_map:
+            return ref_time_map[key_3]
+        if key_2 in ref_time_map:
+            return ref_time_map[key_2]
+        return m.group(0)
+
+    text_after_colon = colon_rx.sub(repl_colon, text)
+
+    # --- 2) (숫자|한글수사) + (시|분|초) 연쇄 탐지 후 묶음 단위로 치환 ---
+    # 예: '3시 5분 10초', '세 시 5분', '15시'
+    num_unit_rx = re.compile(
+    r'(?P<num>\d{1,2}|[영공일이삼사오육칠팔구]+|한|두|세|네)\s*(?P<unit>[시분초])'
+)
+    pairs = [(m.group('num'), m.group('unit'), m.span()) for m in num_unit_rx.finditer(text_after_colon)]
+    if not pairs:
+        return text_after_colon
+
+    # 연속 구간으로 묶기(시/분/초가 연달아 나오면 하나의 덩어리로)
+    spans: list[tuple[int, int]] = []
+    i = 0
+    while i < len(pairs):
+        start_i = pairs[i][2][0]
+        end_i = pairs[i][2][1]
+        j = i + 1
+        while j < len(pairs) and pairs[j][2][0] == end_i:
+            end_i = pairs[j][2][1]
+            j += 1
+        spans.append((start_i, end_i))
+        i = j
+
+    # 뒤에서부터 치환해야 인덱스 안 어긋남
+    out = text_after_colon
+    for span_start, span_end in reversed(spans):
+        chunk = out[span_start:span_end]
+        # 이 chunk 내부에서 다시 시/분/초 값 추출하여 (h,m,s)로 캐논키 생성
+        sub_pairs = list(num_unit_rx.finditer(chunk))
+        h = m_val = s_val = None
+        for sm in sub_pairs:
+            num_raw = sm.group('num')
+            unit = sm.group('unit')
+            if num_raw.isdigit():
+                val = int(num_raw)
+            else:
+                val = to_int_from_k_num(num_raw)
+            if unit == '시':
+                h = val
+            elif unit == '분':
+                m_val = val
+            elif unit == '초':
+                s_val = val
+        key = (h, m_val, s_val)
+        if key in ref_time_map and h is not None:
+            out = out[:span_start] + ref_time_map[key] + out[span_end:]
+        # ref에 없으면 그대로 둔다(보수적)
+
+    return out
 
 
 # 한글 자모 분해를 위한 전역 상수
@@ -3262,18 +3463,37 @@ def _create_final_segments_from_ready(
         project_dir: str
 ) -> list:
     """
-    [헤더 제거 최종 수정 v5.1]
+    [헤더 제거 최종 수정 v5.1 + 안전한 시간표현 통일 주입]
     - Boundary detection uses lyric lines *without* headers.
     - Word correction reference (`ref_all_words`) is now also built from lyric lines *without* headers.
-    - Unnecessary trailing semicolons removed.
-    - Adheres to all specified coding rules.
-    - Debug logging remains.
+    - 필요 시 시간표현(3시/세 시/15:05:00 등)을 표준형으로 통일하되, 헬퍼가 없으면 그대로 진행.
+    - 마지막 줄 탐색은 **역방향**(원본 그대로) 유지.
+    - 기존 상수/로직/임계값은 그대로.
     """
     import difflib
     from pathlib import Path
     from typing import List, Dict, Pattern, Optional, Any # Any 추가
     import re
     # numpy는 현재 사용되지 않음
+
+    # ---- 시간표현 통일 헬퍼 바인딩(있으면만 사용, 임포트 시도 안 함) ----
+    build_time_variant_map = globals().get("build_time_variant_map")
+    normalize_times_in_text = globals().get("normalize_times_in_text")
+
+    time_map = None
+    if build_time_variant_map:
+        try:
+            time_map = build_time_variant_map(clean_lyrics_lines)
+        except Exception:
+            time_map = None  # 헬퍼가 있어도 실패하면 비활성
+
+    def _maybe_norm_time(s: str) -> str:
+        if time_map and normalize_times_in_text:
+            try:
+                return normalize_times_in_text(s, time_map)
+            except Exception:
+                return s
+        return s
 
     # --- Constants and local utils ---
     _MATCH_TYPE_KEPT = "KEPT"
@@ -3343,6 +3563,9 @@ def _create_final_segments_from_ready(
         if not boundary_ref_lines_no_headers: return []
         print("[WARN] Fallback: Using lines *with* headers for boundary detection.")
 
+    # === 새로 추가: 시간표현 통일(있으면만) ===
+    boundary_ref_lines_no_headers = [_maybe_norm_time(x) for x in boundary_ref_lines_no_headers]
+
     # 경계 탐색용 첫/마지막 줄 (헤더 제외 목록 사용)
     first_line_raw = boundary_ref_lines_no_headers[0] if boundary_ref_lines_no_headers else ""
     last_line_raw = boundary_ref_lines_no_headers[-1] if boundary_ref_lines_no_headers else ""
@@ -3361,21 +3584,22 @@ def _create_final_segments_from_ready(
     if first_line_norm:
         for i, seg_item in enumerate(seg_ready_payload): # 변수명 변경 (가리기 방지)
             if isinstance(seg_item, dict) and "text" in seg_item:
-                 seg_text_norm = _norm_for_compare(seg_item.get("text", ""))
+                 # === 새로 추가: 세그먼트 텍스트의 시간표현 통일 적용 ===
+                 seg_text_raw = _maybe_norm_time(str(seg_item.get("text", "")))
+                 seg_text_norm = _norm_for_compare(seg_text_raw)
                  score_val = _match_score(seg_text_norm, first_line_norm) # 변수명 변경 (가리기 방지)
                  print(f"  [DEBUG] Comparing seg[{i}] ('{seg_text_norm}') vs First ('{first_line_norm}') -> Score: {score_val:.4f}")
                  if score_val > score_threshold_boundary: first_idx = i; print(f"    => Match found! Setting first_idx = {i}"); break
     else: first_idx = 0; print("[WARN] Target first line empty, setting first_idx = 0.")
 
-    # 마지막 줄 탐색
+    # 마지막 줄 탐색  (원본 그대로 **역방향**)
     print("\n[DEBUG] Searching for Last Line Match (reverse)...") # ... (탐색 및 로그 로직 유지)
     if last_line_norm:
-        # range 길이를 안전하게 계산
         payload_len = len(seg_ready_payload)
         for i_rev in range(payload_len - 1, -1, -1): # 변수명 변경 (가리기 방지)
             current_seg_item = seg_ready_payload[i_rev] # 변수명 변경 (가리기 방지)
             if isinstance(current_seg_item, dict) and "text" in current_seg_item:
-                 seg_text_norm_rev = _norm_for_compare(current_seg_item.get("text", "")) # 변수명 변경
+                 seg_text_norm_rev = _norm_for_compare(_maybe_norm_time(current_seg_item.get("text", ""))) # 시간 통일 적용
                  score_val_rev = _match_score(seg_text_norm_rev, last_line_norm) # 변수명 변경
                  print(f"  [DEBUG] Comparing seg[{i_rev}] ('{seg_text_norm_rev}') vs Last ('{last_line_norm}') -> Score: {score_val_rev:.4f}")
                  if score_val_rev > score_threshold_boundary: last_idx = i_rev; print(f"    => Match found! Setting last_idx = {i_rev}"); break
@@ -3403,10 +3627,12 @@ def _create_final_segments_from_ready(
     except Exception as e_save_compare: # 구체적인 예외 처리
         print(f"[WARN] Failed to save seg_compare.json: {type(e_save_compare).__name__}")
 
-
     # ---- 2 & 3. Word Correction (Using header-less reference words) ----
-    # [핵심 수정] ref_all_words 생성 시 헤더 제외 목록 사용
-    ref_all_words_raw = " ".join(boundary_ref_lines_no_headers).replace(",", "").replace("'", "")
+    # [핵심 수정] ref_all_words 생성 시 헤더 제외 목록 사용 (+ 시간표현 통일 적용)
+    ref_source_lines = boundary_ref_lines_no_headers
+    ref_source_lines = [_maybe_norm_time(x) for x in ref_source_lines]  # 추가
+
+    ref_all_words_raw = " ".join(ref_source_lines).replace(",", "").replace("'", "")
     ref_all_words = ref_all_words_raw.split()
     ref_all_words = [w for w in ref_all_words if w]
     if not ref_all_words: print("[ERROR] Reference words list (no headers) is empty."); return []
@@ -3419,6 +3645,8 @@ def _create_final_segments_from_ready(
     for seg_idx, seg_corr in enumerate(seg_compare_payload): # 변수명 변경 (가리기 방지)
         if not isinstance(seg_corr, dict) or "text" not in seg_corr: continue
         whisper_text_corr = str(seg_corr.get("text", "")).strip() # 변수명 변경
+        # === 세그먼트 텍스트도 시간표현 통일 후 교정 ===
+        whisper_text_corr = _maybe_norm_time(whisper_text_corr)
         if not whisper_text_corr: continue
         segment_corrected_words: List[str] = []
         whisper_words_list = whisper_text_corr.split(); whisper_cursor = 0; leftover_whisper_part = "" # 변수명 변경
@@ -3428,7 +3656,6 @@ def _create_final_segments_from_ready(
             if not candidate_norm: whisper_cursor += 1; leftover_whisper_part = ""; continue
             best_match: Dict = {"score": -1.0, "word": candidate_whisper, "type": _MATCH_TYPE_KEPT, "ref_origin": ""}
             for i_ref, loop_ref_word in enumerate(ref_all_words): # 변수명 변경 (가리기 방지)
-                # [수정] 후행 세미콜론 제거됨
                 ref_norm_loop = ref_words_norm[i_ref] # 변수명 변경
                 ref_roman_loop = ref_words_roman[i_ref] # 변수명 변경
                 if not ref_norm_loop: continue
@@ -3497,7 +3724,6 @@ def _create_final_segments_from_ready(
     elif intermediate_segments: final_segments = intermediate_segments; print("[WARN] Final check failed, using all intermediate.")
     else: print("[ERROR] Final check failed, no intermediate segments."); return []
 
-
     # Time Adjustment
     final_segments.sort(key=lambda x: _safe_float(x.get("start", 0.0)))
     print("\n--- [TIME ADJUSTMENT] ---") # ... (시간 조정 로직 및 로그 유지)
@@ -3513,6 +3739,7 @@ def _create_final_segments_from_ready(
     print(f"\n[SYNC-PRO] Returning {len(final_segments)} final segments.")
     print("------------------------------------\n")
     return final_segments
+
 
 
 def transcribe_words(
