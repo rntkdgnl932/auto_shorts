@@ -2265,6 +2265,224 @@ def apply_intro_outro_to_story_file(
     return str(dest_path)
 
 
+def build_video_json_with_gap_policy(
+    project_dir: str,
+    *,
+    small_gap_sec: float = 2.0,
+    filler_section: str = "bridge",
+    filler_label: str = "Gap",
+    filler_scene: str = "bridge",
+) -> str:
+    """
+    story.json을 읽어 공백 구간을 보정해 video.json을 생성한다.
+
+    규칙:
+    - gap < small_gap_sec: 이전 씬을 다음 씬 시작까지 '연장'(새 씬 추가 없음)
+    - gap ≥ small_gap_sec: 공백을 갭 씬으로 '삽입'
+    - 시작/끝 공백에도 동일 규칙 적용
+
+    요구사항:
+    - 갭 씬은 일반 씬과 동일 스키마를 갖되, 프롬프트는 비워서 AI가 전부 구성하도록 맡긴다.
+    - 갭 씬 ID는 3자리로 통일: gap_###, 그리고 바로 앞 t_### 번호를 따른다(예: t_007 뒤 gap_007).
+    """
+    from pathlib import Path
+    import re
+    from typing import SupportsFloat, SupportsIndex
+
+    try:
+        from app.utils import load_json, save_json  # type: ignore
+    except ImportError:
+        from utils import load_json, save_json  # type: ignore
+
+    proj_path = Path(project_dir)
+    story_path = proj_path / "story.json"
+    if not story_path.exists():
+        raise FileNotFoundError(f"story.json 파일을 찾을 수 없습니다: {story_path}")
+
+    story_doc = load_json(story_path, {}) or {}
+    if not isinstance(story_doc, dict):
+        raise TypeError("story.json 형식 오류(dict 아님)")
+
+    scenes_in = list(story_doc.get("scenes") or [])
+    if not scenes_in:
+        raise ValueError("story.json에 scenes가 없습니다.")
+
+    defaults = story_doc.get("defaults") or {}
+    default_img = defaults.get("image") or {}
+    default_negative = str(default_img.get("negative") or "")
+
+    imgs_dir = proj_path / "imgs"
+    try:
+        imgs_dir.mkdir(parents=True, exist_ok=True)
+    except OSError:
+        pass
+
+    # ✅ 타입체커가 허용하는 입력 타입으로 정확히 명시
+    def _as_float(v: str | bytes | bytearray | SupportsFloat | SupportsIndex | None) -> float:
+        if v is None:
+            return 0.0
+        try:
+            return float(v)
+        except (TypeError, ValueError):
+            return 0.0
+
+    # 시간 정렬 및 정규화
+    tmp_scenes: list[dict] = []
+    for it in scenes_in:
+        if not isinstance(it, dict):
+            continue
+        s = _as_float(it.get("start"))
+        e = _as_float(it.get("end"))
+        if e < s:
+            e = s
+        item = dict(it)
+        item["start"] = s
+        item["end"] = e
+        item["duration"] = round(max(0.0, e - s), 3)
+        tmp_scenes.append(item)
+    tmp_scenes.sort(key=lambda x: float(x.get("start", 0.0)))
+
+    total_duration = _as_float(story_doc.get("duration"))
+    if total_duration <= 0.0 and tmp_scenes:
+        total_duration = float(tmp_scenes[-1].get("end", 0.0))
+    offset_val = _as_float(story_doc.get("offset"))
+
+    out_scenes: list[dict] = []
+
+    # 직전 t_### 번호를 기억 → gap은 같은 번호 사용
+    last_t_num = 0
+    rx_tnum = re.compile(r"^t_(\d{3})$")
+
+    def _copy_scene_for_video(src: dict) -> dict:
+        nonlocal last_t_num
+        sc_id = str(src.get("id") or "")
+        m = rx_tnum.match(sc_id)
+        if m:
+            try:
+                last_t_num = int(m.group(1))
+            except ValueError:
+                last_t_num = last_t_num
+        return {
+            "id": src.get("id"),
+            "section": src.get("section"),
+            "label": src.get("label"),
+            "start": float(src.get("start", 0.0) or 0.0),
+            "end": float(src.get("end", 0.0) or 0.0),
+            "duration": round(max(0.0, float(src.get("end", 0.0) or 0.0) - float(src.get("start", 0.0) or 0.0)), 3),
+            "scene": src.get("scene"),
+            "characters": list(src.get("characters") or []),
+            "effect": list(src.get("effect") or []),
+            "screen_transition": bool(src.get("screen_transition", False)),
+            "img_file": str(src.get("img_file") or ""),
+            "prompt": str(src.get("prompt") or ""),
+            "prompt_img": str(src.get("prompt_img") or ""),
+            "prompt_movie": str(src.get("prompt_movie") or ""),
+            "prompt_negative": str(src.get("prompt_negative") or default_negative),
+            "lyric": str(src.get("lyric") or ""),
+        }
+
+    def _mk_gap(start: float, end: float) -> dict:
+        sc_id = f"gap_{last_t_num:03d}"  # 직전 t_### 번호를 따른다. 시작부면 000
+        return {
+            "id": sc_id,
+            "section": filler_section,
+            "label": filler_label,
+            "start": round(start, 3),
+            "end": round(end, 3),
+            "duration": round(max(0.0, end - start), 3),
+            "scene": filler_scene,
+            "characters": [],
+            "effect": ["dissolve"],
+            "screen_transition": True,
+            "img_file": str((imgs_dir / f"{sc_id}.png").resolve()),
+            "prompt": "",
+            "prompt_img": "",
+            "prompt_movie": "",
+            "prompt_negative": "",
+            "lyric": "",
+            "origin": "gap-fill",
+        }
+
+    # 시작부 공백
+    if tmp_scenes:
+        first_id = str(tmp_scenes[0].get("id") or "")
+        m0 = rx_tnum.match(first_id)
+        if m0:
+            try:
+                last_t_num = int(m0.group(1)) - 1  # 첫 씬 앞 갭은 gap_(첫t-1) → gap_000부터 가능
+            except ValueError:
+                last_t_num = 0
+        else:
+            last_t_num = 0
+
+        first_start = float(tmp_scenes[0].get("start", 0.0))
+        head_gap = round(max(0.0, first_start - offset_val), 3)
+        if head_gap > 0.0:
+            if head_gap < small_gap_sec:
+                sc0 = _copy_scene_for_video(tmp_scenes[0])
+                sc0["start"] = offset_val
+                sc0["duration"] = round(max(0.0, sc0["end"] - sc0["start"]), 3)
+                out_scenes.append(sc0)
+            else:
+                out_scenes.append(_mk_gap(offset_val, first_start))
+                out_scenes.append(_copy_scene_for_video(tmp_scenes[0]))
+        else:
+            out_scenes.append(_copy_scene_for_video(tmp_scenes[0]))
+
+    # 본문 공백
+    for i in range(len(tmp_scenes) - 1):
+        cur = tmp_scenes[i]
+        nxt = tmp_scenes[i + 1]
+        cur_end = float(cur.get("end", 0.0))
+        nxt_start = float(nxt.get("start", 0.0))
+        gap = round(max(0.0, nxt_start - cur_end), 3)
+
+        if gap <= 0.0:
+            out_scenes.append(_copy_scene_for_video(nxt))
+            continue
+
+        if gap < small_gap_sec:
+            last = out_scenes[-1]
+            last["end"] = nxt_start
+            last["duration"] = round(max(0.0, last["end"] - last["start"]), 3)
+            out_scenes.append(_copy_scene_for_video(nxt))
+        else:
+            out_scenes.append(_mk_gap(cur_end, nxt_start))
+            out_scenes.append(_copy_scene_for_video(nxt))
+
+    # 끝부분 공백
+    if tmp_scenes:
+        last_end = float(tmp_scenes[-1].get("end", 0.0))
+        if total_duration > 0.0:
+            tail_gap = round(max(0.0, total_duration - last_end), 3)
+            if tail_gap > 0.0:
+                if tail_gap < small_gap_sec:
+                    if out_scenes:
+                        out_scenes[-1]["end"] = total_duration
+                        out_scenes[-1]["duration"] = round(max(0.0, out_scenes[-1]["end"] - out_scenes[-1]["start"]), 3)
+                else:
+                    out_scenes.append(_mk_gap(last_end, total_duration))
+
+    video_obj = dict(story_doc)
+    video_obj["scenes"] = out_scenes
+    video_obj.setdefault("audit", {})
+    video_obj["audit"]["gap_policy"] = {
+        "applied": True,
+        "small_gap_sec": float(small_gap_sec),
+        "source": str(story_path),
+        "id_width": 3,
+        "note": "gaps inserted empty so AI can fully author them; gap id follows previous t id",
+    }
+
+    video_path = story_path.parent / "video.json"
+    save_json(video_path, video_obj)
+    return str(video_path)
+
+
+
+
+
+
 
 
 

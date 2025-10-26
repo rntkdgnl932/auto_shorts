@@ -1008,51 +1008,52 @@ class AI:
             **kwargs,
     ) -> str:
         """
-        공급자 우선순위에 따라 호출하고, 실제 호출한 쪽의 trace 라벨을 남긴다.
-        prefer="gemini" 이고 allow_fallback=False 이면 Gemini만 사용.
+        공급자 우선순위에 따라 호출하고, trace 라벨을 '실제 시도한 공급자'로 표준화해 남긴다.
+        최종적으로 선택/성공한 공급자는 'provider:selected ...' 한 줄로 요약한다.
         """
 
-        def _t(ev: str, msg: str) -> None:
+        def _t(provider_tag: str, kind: str, msg: str) -> None:
             if trace:
                 try:
-                    trace(ev, msg)
+                    trace(f"{provider_tag}:{kind}", msg)
                 except Exception:
                     pass
 
-        order = ["openai", "gemini"] if prefer == "openai" else ["gemini", "openai"]
+        # 시도 순서 결정
+        order = ["openai", "gemini"] if (prefer or "openai").lower() == "openai" else ["gemini", "openai"]
         last_err: BaseException | None = None
 
         for provider in order:
-            if prefer == "gemini" and not allow_fallback and provider != "gemini":
+            # prefer="gemini" & allow_fallback=False 면 gemini만 시도
+            if prefer.lower() == "gemini" and not allow_fallback and provider != "gemini":
                 continue
 
             if provider == "openai":
-                _t(
-                    "openai:request",
-                    f"model={getattr(self.cfg, 'openai_model', None) or os.getenv('OPENAI_MODEL', 'gpt-5-mini')}"
-                )
+                model_name = getattr(self.cfg, "openai_model", None) or os.getenv("OPENAI_MODEL", "gpt-5-mini")
+                _t("openai", "request", f"model={model_name}")
                 try:
-                    # 시그니처에 맞게 포지셔널 전달: (system, prompt)
                     out = self._ask_openai(system, user, **kwargs)
-                    _t("openai:success", f"len={len(out)}")
+                    _t("openai", "success", f"len={len(out)}")
+                    _t("provider", "selected", f"openai model={model_name}")
                     return out
                 except Exception as e:
-                    _t("openai:error", f"{type(e).__name__}: {e}")
+                    _t("openai", "error", f"{type(e).__name__}: {e}")
                     last_err = e
-                    if prefer == "openai" and allow_fallback:
+                    if prefer.lower() == "openai" and allow_fallback:
                         continue
                     raise
             else:
-                _t("gemini:request", f"model={self.gemini_model}")
+                model_name = self.gemini_model or "gemini-2.5-pro"
+                _t("gemini", "request", f"model={model_name}")
                 try:
-                    # 시그니처에 맞게 포지셔널 전달: (system, prompt)
                     out = self._ask_gemini(system, user, **kwargs)
-                    _t("gemini:success", f"len={len(out)}")
+                    _t("gemini", "success", f"len={len(out)}")
+                    _t("provider", "selected", f"gemini model={model_name}")
                     return out
                 except Exception as e:
-                    _t("gemini:error", f"{type(e).__name__}: {e}")
+                    _t("gemini", "error", f"{type(e).__name__}: {e}")
                     last_err = e
-                    if prefer == "gemini" and allow_fallback:
+                    if prefer.lower() == "gemini" and allow_fallback:
                         continue
                     raise
 
