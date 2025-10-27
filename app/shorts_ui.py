@@ -2610,55 +2610,56 @@ class MainWindow(QtWidgets.QMainWindow):
             prefer_detected_provider = _detect_prefer_from_ui()  # AI 선호도 감지 #
 
             # _ask_wrapper_internal 내부 함수 (AI 호출 담당)
-            def _ask_wrapper_internal(system: str, user: str, *, prefer: Optional[str] = None,
-                                      allow_fallback: Optional[bool] = None) -> str:  #
-
-                # 실제 AI 호출 로직
-                if ai_client_instance is None:  # AI 클라이언트 없으면 예외 발생
+            def _ask_wrapper_internal(
+                    system: str,
+                    user: str,
+                    *,
+                    prefer: Optional[str] = None,
+                    allow_fallback: Optional[bool] = None,
+                    trace: Optional[Callable[[str, str], None]] = None,
+            ) -> str:
+                """
+                내부 AI 호출 래퍼.
+                - UI에서 trace= 를 넘겨줘도 안전하게 수용.
+                - ai_client_instance.ask_smart 의 시그니처를 점검한 뒤, 지원하는 키워드만 전달.
+                - 기존 동작(선호 provider, 폴백 허용) 100% 유지.
+                """
+                # 필수 전제: 바깥 스코프에 ai_client_instance, prefer_detected_provider, inspect, Any, Dict, Optional, Callable 존재
+                if ai_client_instance is None:
                     raise RuntimeError("AI 클라이언트가 초기화되지 않아 호출할 수 없습니다.")
 
-                # ask_smart 메서드 시그니처 확인 및 호출
-                actual_prefer_provider = prefer or prefer_detected_provider or getattr(ai_client_instance,
-                                                                                       "default_prefer", "openai")  #
-                actual_allow_fallback = allow_fallback if allow_fallback is not None else True
+                # prefer/allow_fallback 해석
+                prefer_final = prefer or prefer_detected_provider or getattr(ai_client_instance, "default_prefer",
+                                                                             "openai")
+                allow_fallback_final = True if allow_fallback is None else bool(allow_fallback)
 
-                # ask_smart 메서드 동적 호출 (시그니처 호환성 고려)
-                try:
-                    ask_smart_method = getattr(ai_client_instance, "ask_smart", None)  #
-                    if not callable(ask_smart_method): raise AttributeError("ask_smart method not found")
+                # ask_smart 존재/시그니처 확인
+                ask_smart = getattr(ai_client_instance, "ask_smart", None)
+                if not callable(ask_smart):
+                    raise AttributeError("ask_smart method not found")
 
-                    sig_ask_smart = inspect.signature(ask_smart_method)
-                    call_kwargs: Dict[str, Any] = {}
-                    if "prefer" in sig_ask_smart.parameters: call_kwargs["prefer"] = actual_prefer_provider  #
-                    if "allow_fallback" in sig_ask_smart.parameters: call_kwargs[
-                        "allow_fallback"] = actual_allow_fallback  #
-                    # trace 파라미터 전달 안 함
+                sig = inspect.signature(ask_smart)
+                call_kwargs: Dict[str, Any] = {}
+                if "prefer" in sig.parameters:
+                    call_kwargs["prefer"] = prefer_final
+                if "allow_fallback" in sig.parameters:
+                    call_kwargs["allow_fallback"] = allow_fallback_final
+                # ask_smart 가 trace 파라미터를 지원하면 그대로 전달 (선택적)
+                if "trace" in sig.parameters and trace is not None:
+                    call_kwargs["trace"] = trace
 
-                    # ask_smart 호출 (필수 인자 포함)
-                    result = ask_smart_method(system=system, user=user, **call_kwargs)  #
+                # trace 인자가 여기서 사용되지 않는다는 경고 방지 및 간단한 진단 로그 전달(선택적)
+                if trace:
+                    try:
+                        # 길이 정보만 간단히 넘김 (민감한 프롬프트 내용 노출 방지)
+                        trace("ai.ask", f"prefer={prefer_final} allow_fallback={allow_fallback_final} "
+                                        f"len={len(str(system))}/{len(str(user))}")
+                    except Exception:
+                        pass
 
-                    # AI 호출 성공/실패 로그 추가 (trace 대신 여기서 직접 로깅)
-                    provider_name = actual_prefer_provider  # 실제 사용된 provider
-                    # len() 호출 전 str()로 감싸기
-                    result_str = str(result)
-                    log_message = f"[ai_trace:{provider_name}:success] len={len(result_str)}" if result_str else f"[ai_trace:{provider_name}:empty_result] Result was empty"  #
-                    on_progress_callback({"stage": "ai_trace", "msg": log_message})
-                    # 최종 선택된 provider 로그
-                    on_progress_callback({"stage": "ai_trace", "msg": f"[provider:selected] {provider_name}"})
-
-                    return result_str  # str 타입 보장
-
-                except AttributeError as e_attr:  # 메서드 못 찾음
-                    on_progress_callback({"stage": "ai_trace", "msg": f"[ai_trace:error] AttributeError: {e_attr}"})
-                    raise RuntimeError(f"AI 호출 실패: 필요한 메서드 없음 ({e_attr})") from e_attr
-                except TypeError as e_type:  # 인자 불일치
-                    on_progress_callback({"stage": "ai_trace", "msg": f"[ai_trace:error] TypeError: {e_type}"})
-                    raise RuntimeError(f"AI 호출 실패: 메서드 인자 불일치 ({e_type})") from e_type
-                except Exception as e_ask:  # 기타 AI 호출 오류
-                    provider_name = actual_prefer_provider
-                    on_progress_callback({"stage": "ai_trace",
-                                          "msg": f"[ai_trace:{provider_name}:error] {type(e_ask).__name__}: {e_ask}"})
-                    raise RuntimeError(f"AI 호출 중 오류 발생: {e_ask}") from e_ask
+                # 실제 호출
+                result_text = ask_smart(str(system), str(user), **call_kwargs)
+                return str(result_text or "")
 
             # video.json AI 강화 실행 (video_path_str 유효성 검증 후)
             if video_path_str and Path(video_path_str).is_file():
@@ -6524,7 +6525,6 @@ class MainWindow(QtWidgets.QMainWindow):
 
         return [dst]
 
-
     # ────────────── 영상 빌드(선택) ──────────────
     def on_video(self):
         proj = self._latest_project()
@@ -6532,18 +6532,36 @@ class MainWindow(QtWidgets.QMainWindow):
             QtWidgets.QMessageBox.warning(self, "안내", "프로젝트가 없습니다.")
             return
         total = self.sb_total.value()
-        ov_fixed = recalc_overlap(self.sb_infps.value(), self.sb_outfps.value(), self.sb_overlap.value())
+        # overlap 계산은 build_shots_with_i2v 내부 또는 movie.json 생성 시 처리될 수 있으므로,
+        # 여기서는 직접 사용하지 않아도 될 수 있습니다. 필요시 유지합니다.
+        # ov_fixed = recalc_overlap(self.sb_infps.value(), self.sb_outfps.value(), self.sb_overlap.value())
         try:
-            self.status.showMessage("i2v 세그먼트 생성…")
-            clips = build_shots_with_i2v(str(proj), total)
-            self.status.showMessage("합치기…")
-            final = xfade_concat(
-                clips, ov_fixed, self.sb_outfps.value(),
-                audio_path=(Path(proj) / "vocal.mp3"),
-                out_path=(Path(proj) / "final.mp4"),
-            )
-            QtWidgets.QMessageBox.information(self, "완료", f"영상 완성: {final}")
-            self.status.showMessage(f"완료: {final}")
+            self.status.showMessage("i2v 세그먼트 생성 시작…")
+            # ▼▼▼ build_shots_with_i2v 호출은 유지 ▼▼▼
+            clips = build_shots_with_i2v(str(proj), total)  # total_frames 인자는 호환성 위해 남겨둘 수 있음
+            self.status.showMessage(f"i2v 세그먼트 생성 완료: {len(clips)}개 클립 생성됨")  # 메시지 수정
+
+            # ▼▼▼ xfade_concat 호출 부분을 삭제하거나 주석 처리 ▼▼▼
+            # self.status.showMessage("합치기…")
+            # final = xfade_concat(
+            #     clips, ov_fixed, self.sb_outfps.value(),
+            #     audio_path=(Path(proj) / "vocal.mp3"),
+            #     out_path=(Path(proj) / "final.mp4"),
+            # )
+            # QtWidgets.QMessageBox.information(self, "완료", f"영상 완성: {final}")
+            # self.status.showMessage(f"완료: {final}")
+            # ▲▲▲ 여기까지 삭제 또는 주석 처리 ▲▲▲
+
+            # 완료 안내 메시지 수정
+            QtWidgets.QMessageBox.information(self, "완료",
+                                              f"영상 클립 생성 완료\n\n생성된 클립 수: {len(clips)}\n클립 폴더: {proj / 'clips'}")
+
+        except FileNotFoundError as e:  # story.json/movie.json/video.json 못 찾는 경우 등
+            QtWidgets.QMessageBox.critical(self, "오류", f"필요한 JSON 파일을 찾을 수 없습니다: {e}")
+            self.status.showMessage(f"오류: {e}")
+        except RuntimeError as e:  # movie.json/video.json에 items/scenes가 없는 경우 등
+            QtWidgets.QMessageBox.critical(self, "오류", f"JSON 파일 내용 오류: {e}")
+            self.status.showMessage(f"오류: {e}")
         except Exception as e:
             QtWidgets.QMessageBox.critical(self, "오류", str(e))
             self.status.showMessage(f"오류: {e}")

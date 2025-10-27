@@ -79,7 +79,7 @@ JSONS_DIR: Path = BASE_DIR.parent / "app" / "jsons"  # 기존 구조 유지
 JSONS_DIR.mkdir(parents=True, exist_ok=True)
 
 ACE_STEP_PROMPT_JSON: Path = JSONS_DIR / "ace_step_1_t2m.json"  # 음악 생성 프롬프트 JSON
-I2V_WORKFLOW:         Path = JSONS_DIR / "i2v_t2v.json"         # i2v 워크플로 JSON
+I2V_WORKFLOW:         Path = JSONS_DIR / "guff_movie.json"         # i2v 워크플로 JSON
 
 # 오디오/비디오 저장 관련
 # - AUDIO_SAVE_FORMAT 은 "wav"|"mp3"|"opus" 중 하나

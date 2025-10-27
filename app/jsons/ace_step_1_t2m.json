@@ -163,9 +163,10 @@
       "audio": [
         "18",
         0
-      ]
+      ],
+      "quality": "320k"
     },
-    "class_type": "SaveAudio",
+    "class_type": "SaveAudioMP3",
     "_meta": {
       "title": "오디오 저장"
     }

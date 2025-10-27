@@ -26,7 +26,7 @@
   },
   "11": {
     "inputs": {
-      "shift": 8.000000000000002,
+      "shift": 8,
       "model": [
         "18",
         0
@@ -39,7 +39,7 @@
   },
   "12": {
     "inputs": {
-      "shift": 8.000000000000002,
+      "shift": 8,
       "model": [
         "16",
         0
@@ -128,7 +128,7 @@
   "16": {
     "inputs": {
       "lora_name": "lightx2v_I2V_14B_480p_cfg_step_distill_rank32_bf16 (1).safetensors",
-      "strength_model": 1.5000000000000002,
+      "strength_model": 1.5,
       "model": [
         "15",
         0
@@ -153,7 +153,7 @@
   "18": {
     "inputs": {
       "lora_name": "lightx2v_I2V_14B_480p_cfg_step_distill_rank128_bf16.safetensors",
-      "strength_model": 3.0000000000000004,
+      "strength_model": 3,
       "model": [
         "19",
         0
@@ -242,7 +242,11 @@
       "pad_color": "0, 0, 0",
       "crop_position": "center",
       "divisible_by": 8,
-      "device": "gpu"
+      "device": "gpu",
+      "image": [
+        "26",
+        0
+      ]
     },
     "class_type": "ImageResizeKJv2",
     "_meta": {
@@ -281,6 +285,15 @@
     "class_type": "WanImageToVideo",
     "_meta": {
       "title": "WAN 비디오 생성 (이미지 → 비디오)"
+    }
+  },
+  "26": {
+    "inputs": {
+      "image": "02.jpeg"
+    },
+    "class_type": "LoadImage",
+    "_meta": {
+      "title": "이미지 로드"
     }
   }
 }

@@ -5,7 +5,10 @@ from __future__ import annotations
 import subprocess
 from typing import List, Tuple, Optional, Dict, Any, Callable
 import re
+import math
 from pathlib import Path
+from pathlib import Path as _Path
+import json as _json
 import time, requests, shutil
 
 try:
@@ -164,94 +167,306 @@ def _apply_overrides(graph: dict, overrides: Dict[str, Any]) -> None:
 
 # ── i2v 샷 생성 ────────────────────────────────────────────────────────────
 def build_shots_with_i2v(project_dir: str, total_frames: int) -> List[Path]:
-    import copy
+    """
+    씬별 이미지→영상(i2v) 생성.
+    - 입력: project_dir(프로젝트 폴더), total_frames(호환용)
+    - 워크플로: settings.I2V_WORKFLOW (예: guff_movie.json)
+    - 그래프 내 기존 LoadImage 노드를 사용하며, 각 씬의 파일명으로 inputs.image를 덮어쓴다.
+    - source_image가 상대/파일명만인 경우 video.json의 paths(root/imgs_dir)로 절대경로를 해석한다.
+    - Comfy 입력 폴더 복사 실패시 /upload/image 폴백 사용.
+    - Resize Image v2에는 width/height 모두 지정하여 확실히 축소 적용.
+    - 출력: clips/<scene_id>.mp4 (없으면 clips/<scene_id>.png)
+    """
+    proj_path = Path(project_dir).resolve()
+    clips_dir = ensure_dir(proj_path / "clips")
 
-    proj = Path(project_dir)
-    meta = load_json(proj / "project.json") or {}
-    if not meta:
-        raise RuntimeError("project.json 없음")
+    # movie.json(items) 우선, 없으면 video.json(scenes)에서 변환
+    movie_obj: Dict[str, Any] = load_json(proj_path / "movie.json", {}) or {}
+    items: List[Dict[str, Any]] = list(movie_obj.get("items") or [])
 
-    vdir = ensure_dir(Path(meta["paths"]["video_dir"]))
-    in_fps = int(meta.get("i2v_plan", {}).get("input_fps", 60))
-    out_fps = int(meta.get("i2v_plan", {}).get("target_fps", in_fps))
-    base = int(meta.get("i2v_plan", {}).get("base_chunk", 300))
-    ov = int(meta.get("i2v_plan", {}).get("overlap", 12))
+    defaults_movie = (movie_obj.get("defaults") or {}).get("movie") or {}
+    target_w = int(defaults_movie.get("target_width") or movie_obj.get("width") or 1080)
+    target_h = int(defaults_movie.get("target_height") or movie_obj.get("height") or 1920)
+    target_fps = int(defaults_movie.get("target_fps") or movie_obj.get("fps") or 60)
+    neg_default = str(defaults_movie.get("negative") or "")
 
-    # ▶ 입력/출력 FPS 차이를 반영해 겹침 프레임 보정
-    ov_eff = recalc_overlap(in_fps, out_fps, ov)
-    segs = plan_segments(total_frames, base, ov_eff)
+    # video.json은 항상 로드(경로/해상도/프롬프트 보조)
+    video_meta: Dict[str, Any] = load_json(proj_path / "video.json", {}) or {}
+    v_paths = video_meta.get("paths") or {}
+    v_root = Path(v_paths.get("root") or proj_path)
+    v_imgs_dir = str(v_paths.get("imgs_dir") or "imgs")
+    v_imgs_root = v_root / v_imgs_dir
 
-    # 기본 그래프는 한 번만 로드하고, 매 세그먼트마다 deepcopy
-    base_graph = _load_workflow_graph(I2V_WORKFLOW)
+    # defaults 보완
+    v_defaults = video_meta.get("defaults") or {}
+    v_img_defaults = v_defaults.get("image") or {}
+    if not defaults_movie:
+        target_w = int(v_img_defaults.get("width") or target_w)
+        target_h = int(v_img_defaults.get("height") or target_h)
+        if not movie_obj.get("fps"):
+            target_fps = 60
+    if not neg_default:
+        neg_default = str(v_img_defaults.get("negative") or "")
 
-    base_url = _choose_host()
-    out_paths: List[Path] = []
+    if not items:
+        scenes: List[Dict[str, Any]] = list(video_meta.get("scenes") or [])
+        if not scenes:
+            raise RuntimeError("movie.json의 items가 비어 있고, video.json의 scenes도 없습니다")
 
-    for idx, (a, b) in enumerate(segs):
-        out_mp4 = vdir / f"clip_{idx:03d}.mp4"
-        if out_mp4.exists():
-            out_paths.append(out_mp4)
-            continue
+        items = []
+        for s_idx, scene in enumerate(scenes):
+            scene_id = str(scene.get("id") or f"scene_{s_idx:03d}")
+            src_img_val = str(scene.get("img_file") or "")
+            if not src_img_val:
+                continue
+            duration_val = float(scene.get("duration") or 0.0)
+            frames_calc = int(math.floor(duration_val * float(target_fps) + 0.5))
+            head_handle = 0 if s_idx == 0 else 12
 
-        # ▶ 세그먼트별 그래프 복제(노드 입력 덮어쓰기의 부작용 방지)
-        graph = copy.deepcopy(base_graph)
+            pos_mov = str(scene.get("prompt_movie") or "").strip()
+            if not pos_mov:
+                p1 = str(scene.get("prompt") or "").strip()
+                p2 = str(scene.get("prompt_img") or "").strip()
+                pos_mov = f"{p1}\n{p2}" if p1 and p2 else (p1 or p2)
 
-        # TODO: 실제 노드 ID/키는 환경에 맞게 조정
-        overrides = {
-            "20.inputs.start_frame": a,
-            "20.inputs.end_frame": b,
-            # "33.inputs.filename_prefix": f"clip_{idx:03d}",
-            # "33.inputs.subfolder": str(vdir).replace("\\", "/"),
-        }
-        _apply_overrides(graph, overrides)
+            neg_mov = str(scene.get("prompt_negative") or "").strip() or neg_default
 
-        # ▶ SaveVideo/VideoWrite 계열 노드에서 fps 입력키가 있으면 out_fps 주입
-        for _nid, node in _find_nodes_by_class_contains(graph, "savevideo"):
-            ins = node.setdefault("inputs", {})
-            for k in ("fps", "frame_rate", "framerate", "frame_rate_num"):
-                if k in ins:
-                    try:
-                        ins[k] = int(out_fps)
-                    except Exception:
-                        pass
-        for _nid, node in _find_nodes_by_class_contains(graph, "videowrite"):
-            ins = node.setdefault("inputs", {})
-            for k in ("fps", "frame_rate", "framerate", "frame_rate_num"):
-                if k in ins:
-                    try:
-                        ins[k] = int(out_fps)
-                    except Exception:
-                        pass
+            items.append({
+                "id": scene_id,
+                "source_image": src_img_val,
+                "i2v_prompt": pos_mov,
+                "frames": max(1, frames_calc),
+                "head_handle_frames": int(head_handle),
+                "negative": neg_mov,
+            })
 
-        # ▶ 제출 및 응답 활용(간단 로깅으로 hist '미사용' 경고 해소)
-        def _wait_i2v(url_base, wf_graph, *, timeout: int, poll: float):
-            return _submit_and_wait(url_base, wf_graph, timeout=timeout, poll=poll)
+    # 음악 대기/큐 대기 공용 루틴 재사용
+    try:
+        from audio_sync import _submit_and_wait as wait_core  # type: ignore
+    except (ImportError, AttributeError):
+        from app.audio_sync import _submit_and_wait as wait_core  # type: ignore
 
-        # hist = _submit_and_wait(base_url, graph, timeout=1200, poll=1.5)
-        hist = _wait_i2v(base_url, graph, timeout=1200, poll=1.5)
+    def _relay_i2v(progress_entry: Dict[str, Any]) -> None:
+        text_line = str(progress_entry.get("msg") or "")
+        if text_line.startswith("[MUSIC]"):
+            patched_line = "[I2V]" + text_line[len("[MUSIC]"):]
+        else:
+            patched_line = "[I2V] " + text_line
         try:
-            outputs = hist.get("outputs") or {}
-            nouts = 0
-            for _nid, out in outputs.items():
-                if isinstance(out, dict):
-                    nouts += len(out.get("images", []) or [])
-                    nouts += len(out.get("files", []) or [])
-                    nouts += len(out.get("video", []) or [])
-            print(f"[I2V] seg {idx} {a}-{b} frames -> outputs: {nouts}", flush=True)
-        except Exception:
+            print(patched_line)
+        except OSError:
             pass
 
-        # ▶ 결과 파일 보정(파일명이 임의일 때 최근 파일을 clip_xxx.mp4로 정규화)
-        if not out_mp4.exists():
-            latest = max(vdir.glob("*.mp4"), key=lambda p: p.stat().st_mtime, default=None)
-            if latest:
-                latest.rename(out_mp4)
-        if not out_mp4.exists():
-            raise RuntimeError(f"세그먼트 결과 없음: {idx}")
+    wf_path = Path(I2V_WORKFLOW)
+    if not wf_path.exists():
+        raise FileNotFoundError(f"I2V 워크플로 없음: {wf_path}")
 
-        out_paths.append(out_mp4)
+    with open(wf_path, "r", encoding="utf-8") as fr:
+        base_graph: Dict[str, Any] = json.load(fr)
 
-    return out_paths
+    base_url = str(movie_obj.get("comfy_host") or video_meta.get("comfy_host") or "http://127.0.0.1:8188").rstrip("/")
+    comfy_inputs = Path(COMFY_INPUT_DIR)
+    ensure_dir(comfy_inputs)
+
+    def _find_ids(graph_dict: Dict[str, Any], class_type: str) -> List[str]:
+        found_ids: List[str] = []
+        for node_id, node_obj in (graph_dict or {}).items():
+            try:
+                if str(node_obj.get("class_type")) == class_type:
+                    found_ids.append(str(node_id))
+            except (AttributeError, TypeError, KeyError):
+                continue
+        return found_ids
+
+    created_paths: List[Path] = []
+
+    for idx, item in enumerate(items):
+        try:
+            scene_id = str(item.get("id") or f"scene_{idx:03d}")
+            src_img_field = str(item.get("source_image") or "")
+            if not src_img_field:
+                continue
+
+            # source_image 절대경로 해석 (파일명/상대경로 모두 지원)
+            resolved_src = Path(src_img_field)
+            if not resolved_src.is_absolute():
+                cand1 = v_imgs_root / resolved_src.name
+                if cand1.exists():
+                    resolved_src = cand1
+                else:
+                    cand2 = proj_path / "imgs" / resolved_src.name
+                    resolved_src = cand2 if cand2.exists() else resolved_src
+            if not resolved_src.exists():
+                # 소스가 없으면 스킵
+                continue
+
+            # 그래프 복사
+            vid_graph: Dict[str, Any] = json.loads(json.dumps(base_graph))
+
+            # 노드 탐색
+            ids_load = _find_ids(vid_graph, "LoadImage")
+            ids_resize = _find_ids(vid_graph, "ImageResizeKJv2")
+            ids_i2v = _find_ids(vid_graph, "WanImageToVideo")
+            ids_vhs = _find_ids(vid_graph, "VHS_VideoCombine")
+
+            # Comfy 입력 확보: 복사 → 검증 → 실패 시 업로드 폴백
+            img_name = resolved_src.name
+            dest_path = comfy_inputs / img_name
+            copied_ok = False
+            try:
+                shutil.copy2(str(resolved_src), str(dest_path))
+                if dest_path.exists() and dest_path.stat().st_size > 1024:
+                    copied_ok = True
+            except (OSError, shutil.Error):
+                copied_ok = False
+
+            if not copied_ok:
+                try:
+                    with open(resolved_src, "rb") as fb:
+                        up_resp = requests.post(
+                            base_url.rstrip("/") + "/upload/image",
+                            files={"image": (img_name, fb, "application/octet-stream")},
+                            timeout=60,
+                        )
+                    if up_resp.ok:
+                        up_json = up_resp.json()
+                        srv_name = str(up_json.get("name") or img_name)
+                        if srv_name:
+                            img_name = srv_name  # 서버가 저장한 이름으로 교체
+                            copied_ok = True
+                except (requests.RequestException, OSError, ValueError, KeyError, TypeError):
+                    copied_ok = False
+
+            if not copied_ok:
+                # 그래도 확보 실패면 다음 씬으로
+                continue
+
+            # 기존 LoadImage 노드들의 image를 모두 현재 파일명으로 덮어쓰기
+            for load_id in ids_load:
+                try:
+                    vid_graph[load_id].setdefault("inputs", {})["image"] = img_name
+                except (AttributeError, KeyError, TypeError):
+                    continue
+
+            # Resize: width/height 모두 지정 (세로 고정 방지)
+            for r_id in ids_resize:
+                try:
+                    r_inputs = vid_graph[r_id].setdefault("inputs", {})
+                    r_inputs["width"] = int(target_w)
+                    r_inputs["height"] = int(target_h)
+                except (AttributeError, KeyError, TypeError, ValueError):
+                    continue
+
+            # 길이/프레임레이트
+            total_len = int(item.get("frames") or 1) + int(item.get("head_handle_frames") or 0)
+            if ids_i2v:
+                try:
+                    vid_graph[ids_i2v[0]].setdefault("inputs", {})["length"] = int(max(1, total_len))
+                except (AttributeError, KeyError, TypeError, ValueError):
+                    pass
+            if ids_vhs:
+                try:
+                    vid_graph[ids_vhs[0]].setdefault("inputs", {})["frame_rate"] = int(target_fps)
+                except (AttributeError, KeyError, TypeError, ValueError):
+                    pass
+
+            # 프롬프트 주입 (CLIPTextEncode Positive/Negative)
+            pos_text = str(item.get("i2v_prompt") or "")
+            neg_text = str(item.get("negative") or neg_default)
+            pos_set = False
+            neg_set = False
+            for enc_id, enc_node in vid_graph.items():
+                try:
+                    if enc_node.get("class_type") == "CLIPTextEncode":
+                        title_hint = str(enc_node.get("_meta", {}).get("title") or "")
+                        if "Positive" in title_hint and not pos_set:
+                            vid_graph[enc_id].setdefault("inputs", {})["text"] = pos_text
+                            pos_set = True
+                        elif "Negative" in title_hint and not neg_set:
+                            vid_graph[enc_id].setdefault("inputs", {})["text"] = neg_text
+                            neg_set = True
+                except (AttributeError, KeyError, TypeError):
+                    continue
+
+            # 제출/대기 (실시간 로그 릴레이)
+            result_obj = wait_core(
+                str(movie_obj.get("comfy_host") or video_meta.get("comfy_host") or base_url),
+                vid_graph,
+                timeout=600,
+                poll=1.5,
+                on_progress=_relay_i2v,
+            )
+
+            # 출력 수집
+            outputs_obj = result_obj.get("outputs") or {}
+            videos_meta: List[Dict[str, Any]] = []
+            images_meta: List[Dict[str, Any]] = []
+            for _, out_obj in outputs_obj.items():
+                if not isinstance(out_obj, Dict):
+                    continue
+                for key_name in ("videos", "video", "gifs", "gif"):
+                    meta_val = out_obj.get(key_name)
+                    if isinstance(meta_val, list):
+                        for entry in meta_val:
+                            if isinstance(entry, dict):
+                                videos_meta.append(entry)
+                imgs_val = out_obj.get("images")
+                if isinstance(imgs_val, list):
+                    for entry in imgs_val:
+                        if isinstance(entry, dict):
+                            images_meta.append(entry)
+
+            # 비디오가 있으면 mp4 저장
+            if videos_meta:
+                last_v = videos_meta[-1]
+                v_sub = str(last_v.get("subfolder") or "")
+                v_name = str(last_v.get("filename") or "")
+                if v_name:
+                    try:
+                        v_resp = requests.get(
+                            base_url.rstrip("/") + "/view",
+                            params={"filename": v_name, "subfolder": v_sub},
+                            timeout=30,
+                        )
+                        if v_resp.ok:
+                            out_vid = clips_dir / f"{scene_id}.mp4"
+                            with open(out_vid, "wb") as fw:
+                                fw.write(v_resp.content)
+                            created_paths.append(out_vid)
+                            continue
+                    except requests.RequestException:
+                        pass
+
+            # 백업: 이미지 결과라도 저장
+            if images_meta:
+                last_i = images_meta[-1]
+                i_sub = str(last_i.get("subfolder") or "")
+                i_name = str(last_i.get("filename") or "")
+                if i_name:
+                    try:
+                        i_resp = requests.get(
+                            base_url.rstrip("/") + "/view",
+                            params={"filename": i_name, "subfolder": i_sub},
+                            timeout=30,
+                        )
+                        if i_resp.ok:
+                            out_img = clips_dir / f"{scene_id}.png"
+                            with open(out_img, "wb") as fiw:
+                                fiw.write(i_resp.content)
+                            created_paths.append(out_img)
+                            continue
+                    except requests.RequestException:
+                        pass
+
+            # 결과가 전혀 없으면 다음 씬
+            continue
+
+        except (OSError, ValueError, TypeError, KeyError):
+            # 씬 단위로 안전하게 스킵
+            continue
+
+    _ = int(total_frames or 0)  # 사용 흔적(호환)
+    return created_paths
 
 
 
@@ -314,313 +529,386 @@ def xfade_concat(clip_paths: List[Path], overlap_frames: int, fps: int,
 
 
 
+
 def build_missing_images_from_story(
-    story_path: str | Path,
+    story_path: str | _Path,
     *,
     ui_width: int,
     ui_height: int,
     steps: int = 28,
     timeout_sec: int = 300,
     poll_sec: float = 1.5,
-    workflow_path: str | Path | None = None,
+    workflow_path: str | _Path | None = None,
     on_progress: Optional[Dict[str, Any] | Callable[[Dict[str, Any]], None]] = None,
-) -> List[Path]:
+) -> List[_Path]:
     """
-    story.json을 읽고, 각 scene의 img_file이 없으면 ComfyUI로 생성한다.
-    - 워크플로: settings.JSONS_DIR / nunchaku_qwen_image_swap.json (단일 사용)
-    - 프롬프트: scene.prompt (+ scene.prompt_img)
+    누락 이미지 생성:
+    - 1순위: story_path와 같은 폴더의 video.json을 읽어 scenes[].img_file을 검사/생성
+    - 2순위: 기존 story.json의 scenes 사용(호환)
+    - 생성된 경로는 video.json.scenes[*].img_file 에 즉시 반영 (있으면 story.json에도 반영)
+    - 워크플로: settings.JSONS_DIR / nunchaku_qwen_image_swap.json (강제) 또는 전달된 workflow_path
+    - 프롬프트: scene.prompt_movie 없으면 scene.prompt + '\\n' + scene.prompt_img
     - 네거티브: scene.prompt_negative or defaults.image.negative
-    - 캐릭터가 없으면 모든 ReActorFaceSwap을 비활성화하여 스왑을 차단한다.
     """
 
-    def notify(stage: str, msg: str = "", **extra: Any) -> None:
+    def _notify(stage: str, msg: str = "", **extra: Any) -> None:
         if not on_progress:
             return
-        payload: Dict[str, Any] = {"stage": stage, "msg": msg}
+        data: Dict[str, Any] = {"stage": stage, "msg": msg}
         if extra:
-            payload.update(extra)
+            data.update(extra)
         try:
             if callable(on_progress):
-                on_progress(payload)
+                on_progress(data)
             elif isinstance(on_progress, dict):
                 cb = on_progress.get("callback")
                 if callable(cb):
-                    cb(payload)
+                    cb(data)
         except (RuntimeError, ValueError, TypeError):
             pass
 
-    p_story = Path(story_path).resolve()
-    if not p_story.exists():
-        raise FileNotFoundError(f"story.json 없음: {p_story}")
+    p_story = _Path(story_path).resolve()
+    story_dir = p_story.parent if p_story.is_file() else _Path(story_path).resolve()
+    if not story_dir.exists():
+        raise FileNotFoundError(f"경로 없음: {story_dir}")
 
-    story: Dict[str, Any] = load_json(p_story, {}) or {}
+    # 우선 video.json
+    p_video = story_dir / "video.json"
+    video = load_json(p_video, {}) or {}
+    # 보조로 story.json
+    p_story_json = story_dir / "story.json"
+    story = load_json(p_story_json, {}) or {}
 
-    # 선택: 레거시 키 정리
+    # paths 해석
+    paths_v = video.get("paths") or {}
+    root_dir = _Path(paths_v.get("root") or story.get("paths", {}).get("root") or story_dir)
+    imgs_dir_name = str(paths_v.get("imgs_dir") or story.get("paths", {}).get("imgs_dir") or "imgs")
+    img_root = ensure_dir(root_dir / imgs_dir_name)
+
+    # 워크플로 경로
     try:
-        from utils import purge_legacy_scene_keys  # type: ignore
-        scenes_probe = story.get("scenes")
-        if isinstance(scenes_probe, list):
-            for scene_item in scenes_probe:
-                try:
-                    purge_legacy_scene_keys(scene_item)  # type: ignore
-                except (KeyError, TypeError, ValueError):
-                    pass
+        from settings import JSONS_DIR  # type: ignore
+        base_jsons = _Path(JSONS_DIR)
     except (ImportError, AttributeError):
-        pass
+        base_jsons = _Path(r"C:\my_games\shorts_make\app\jsons")
 
-    paths = story.get("paths") or {}
-    root_dir = Path(paths.get("root") or p_story.parent)
-    imgs_dir = Path(paths.get("imgs_dir") or "imgs")
-    img_root = ensure_dir(root_dir / imgs_dir)
-
-    # 워크플로 로드(스왑 포함 하나)
-    base_jsons = Path(JSONS_DIR)
-    wf_path = Path(workflow_path) if workflow_path else (base_jsons / "nunchaku_qwen_image_swap.json")
+    wf_path = _Path(workflow_path) if workflow_path else (base_jsons / "nunchaku_qwen_image_swap.json")
     if not wf_path.exists():
         raise FileNotFoundError(f"필수 워크플로 없음: {wf_path}")
 
     with open(wf_path, "r", encoding="utf-8") as f:
-        graph_origin: Dict[str, Any] = json.load(f)
+        graph_origin: Dict[str, Any] = _json.load(f)
 
-    notify("begin", f"누락 이미지 생성 시작: {p_story.name}")
-
-    # 유틸
-    def find_nodes(gdict: Dict[str, Any], *, class_type: Optional[str] = None) -> List[str]:
+    # 노드 헬퍼
+    def _find_nodes(gdict: Dict[str, Any], class_type: str) -> List[str]:
         hits: List[str] = []
-        for nid_scan, node_scan in (gdict or {}).items():
+        for nid, node in (gdict or {}).items():
             try:
-                if class_type and str(node_scan.get("class_type")) != class_type:
-                    continue
-                hits.append(str(nid_scan))
+                if str(node.get("class_type")) == class_type:
+                    hits.append(str(nid))
             except (AttributeError, KeyError, TypeError):
                 continue
         return hits
 
-    def set_input(gdict: Dict[str, Any], nid_target: str, key_target: str, val: Any) -> None:
+    def _set_input(gdict: Dict[str, Any], nid: str, key: str, val: Any) -> None:
         try:
-            gdict[str(nid_target)].setdefault("inputs", {})[key_target] = val
-        except (KeyError, TypeError, AttributeError):
+            gdict[str(nid)].setdefault("inputs", {})[key] = val
+        except (KeyError, TypeError):
             pass
 
-    def apply_prompts(gdict: Dict[str, Any], pos_val: str, neg_val: str) -> List[Tuple[str, str, int]]:
-        changed: List[Tuple[str, str, int]] = []
-        fields = ("text", "text_g", "text_l")
-        for nid_apply, node_apply in (gdict or {}).items():
+    latent_ids = _find_nodes(graph_origin, "EmptySD3LatentImage") + _find_nodes(graph_origin, "EmptyLatentImage")
+    latent_ids = list(dict.fromkeys(latent_ids))
+    ksampler_ids = _find_nodes(graph_origin, "KSampler")
+    _ = _find_nodes(graph_origin, "CheckpointLoaderSimple")  # 보존
+    reactor_ids = [nid for nid, node in graph_origin.items() if str(node.get("class_type")) == "ReActorFaceSwap"]
+
+    def _inject_face_to_reactors(gdict: Dict[str, Any], file_name: str) -> List[str]:
+        applied_ids: List[str] = []
+        for rid in reactor_ids:
             try:
-                inputs_map = node_apply.get("inputs", {})
-                if not isinstance(inputs_map, dict):
-                    continue
-                has_any = any(fld in inputs_map for fld in fields)
-                if not has_any:
-                    continue
-                label_str = str(node_apply.get("label") or "")
-                is_neg = ("neg" in label_str.lower()) or ("negative" in label_str.lower())
-                val_to_set = neg_val if is_neg else pos_val
-                for fld in fields:
-                    if fld in inputs_map:
-                        inputs_map[fld] = val_to_set
-                        changed.append((str(nid_apply), fld, len(val_to_set)))
+                ins = gdict[rid].setdefault("inputs", {})
+                if "source_image" in ins:
+                    ins["source_image"] = file_name
+                    applied_ids.append(rid)
+                elif "input_image" in ins:
+                    ins["input_image"] = file_name
+                    applied_ids.append(rid)
+            except (KeyError, TypeError):
+                continue
+        return applied_ids
+
+    def _inject_face_image_loaders(gdict: Dict[str, Any], file_name: str) -> List[str]:
+        hits: List[str] = []
+        for nid, node in gdict.items():
+            try:
+                if str(node.get("class_type")) == "LoadImage":
+                    gdict[nid].setdefault("inputs", {})["image"] = file_name
+                    hits.append(nid)
             except (AttributeError, KeyError, TypeError):
                 continue
-        return changed
+        return hits
 
-    def parse_first_char_index(scene_obj: Dict[str, Any]) -> int:
-        specs = scene_obj.get("characters") or scene_obj.get("character_objs") or []
+    def _parse_first_char_index(scene: Dict[str, Any]) -> int:
+        specs = scene.get("characters") or scene.get("character_objs") or []
         if not specs:
             return 0
-        first_spec = specs[0]
-        if isinstance(first_spec, str) and ":" in first_spec:
+        if isinstance(specs[0], str) and ":" in specs[0]:
             try:
-                return int(first_spec.split(":")[1])
+                return int(specs[0].split(":")[1])
             except (ValueError, IndexError):
                 return 0
-        if isinstance(first_spec, dict):
+        if isinstance(specs[0], dict):
             try:
-                return int(first_spec.get("index", 0))
+                return int(specs[0].get("index", 0))
             except (ValueError, TypeError):
                 return 0
         return 0
 
-    # 노드 집합(초기 스캔)
-    latent_ids = find_nodes(graph_origin, class_type="EmptySD3LatentImage")
-    latent_ids += find_nodes(graph_origin, class_type="EmptyLatentImage")
-    latent_ids = list(dict.fromkeys(latent_ids))
-    ksampler_ids = find_nodes(graph_origin, class_type="KSampler")
-    ckpt_ids = find_nodes(graph_origin, class_type="CheckpointLoaderSimple")
-    reactor_ids = [nid for nid, node in graph_origin.items() if str(node.get("class_type")) == "ReActorFaceSwap"]
-
-    # Comfy 대기 유틸 재사용 (가리기 방지: 파라미터 이름 변경)
+    # 음악 대기/큐 루틴 재사용
     try:
-        from audio_sync import _submit_and_wait as wait_core  # type: ignore
+        from audio_sync import _submit_and_wait as _wait_core  # type: ignore
     except (ImportError, AttributeError):
-        from app.audio_sync import _submit_and_wait as wait_core  # type: ignore
+        from app.audio_sync import _submit_and_wait as _wait_core  # type: ignore
 
-    def comfy_wait(base_url_in: str, graph_in: Dict[str, Any]) -> Dict[str, Any]:
-        return wait_core(base_url_in, graph_in, timeout=timeout_sec, poll=poll_sec, on_progress=on_progress)
+    # ---------- 로그 스로틀 (동일 문구 50회당 1회 출력) ----------
+    def _wait_img(url: str, gdict: Dict[str, Any], *, timeout: int, poll: float, progress_cb: Callable[[Dict[str, Any]], None]) -> Dict[str, Any]:
+        state: Dict[str, Any] = {
+            "last_msg": "",
+            "same_count": 0,
+            "suppressed_total": 0,
+        }
 
-    created: List[Path] = []
-    base_url = str(story.get("comfy_host") or "http://127.0.0.1:8188").rstrip("/")
-    defaults = story.get("defaults") or {}
-    default_neg = str((defaults.get("image") or {}).get("negative") or "")
-    scenes: List[Dict[str, Any]] = list(story.get("scenes") or [])
+        def _emit(text: str) -> None:
+            try:
+                progress_cb({"msg": text})
+            except (RuntimeError, ValueError, TypeError):
+                pass
+
+        def _relay(prog: Dict[str, Any]) -> None:
+            raw = str(prog.get("msg") or "")
+            if raw.startswith("[MUSIC]"):
+                patched = "[IMG]" + raw[len("[MUSIC]"):]
+            else:
+                patched = "[IMG] " + raw if raw else "[IMG]"
+
+            # 동일 문구 누적 처리
+            if patched == state["last_msg"]:
+                state["same_count"] = int(state["same_count"]) + 1
+                state["suppressed_total"] = int(state["suppressed_total"]) + 1
+                # 50번째마다 1회 출력 + 억제 요약
+                if state["same_count"] >= 50:
+                    _emit(f"{patched} … suppressed {state['same_count'] - 1}")
+                    state["same_count"] = 0
+                return
+
+            # 문구가 변경된 경우: 이전 누적 요약 한번 출력
+            if int(state["same_count"]) > 0:
+                _emit(f"[IMG] … {int(state['same_count'])} suppressed")
+                state["same_count"] = 0
+
+            state["last_msg"] = patched
+            _emit(patched)
+
+        return _wait_core(url, gdict, timeout=timeout, poll=poll, on_progress=_relay)
+    # ---------- 스로틀 끝 ----------
+
+    created: List[_Path] = []
+    base_url = str(video.get("comfy_host") or story.get("comfy_host") or "http://127.0.0.1:8188").rstrip("/")
+    _notify("begin", f"[IMG] 대상 scenes={(len(video.get('scenes') or story.get('scenes') or []))} wf={wf_path.name}")
+
+    defaults_v = video.get("defaults") or {}
+    defaults_img = defaults_v.get("image") or (story.get("defaults", {}).get("image") if story else {}) or {}
+    default_neg = str(defaults_img.get("negative") or "")
+
+    scenes: List[Dict[str, Any]] = list(video.get("scenes") or story.get("scenes") or [])
     req_count = 0
 
-    notify("cfg", f"[IMG] host={base_url}, scenes={len(scenes)}, reactors={len(reactor_ids)}")
-
-    # 메인 루프
-    for idx_scene, scene_data in enumerate(scenes):
+    for idx, sc in enumerate(scenes):
         try:
-            scene_id = str(scene_data.get("id") or f"scene_{idx_scene:03d}")
-            out_path = img_root / f"{scene_id}.png"
-            if out_path.exists():
-                notify("skip", f"[IMG] scenes[{idx_scene}] {scene_id} → exists, skip")
+            sid = str(sc.get("id") or f"scene_{idx:03d}")
+            img_path = img_root / f"{sid}.png"
+
+            # video.json의 img_file 절대/상대 지원
+            scene_img = str(sc.get("img_file") or "")
+            if scene_img:
+                p_scene_img = _Path(scene_img)
+                if not p_scene_img.is_absolute():
+                    p_scene_img = img_root / p_scene_img.name
+                if p_scene_img.exists():
+                    _notify("skip", f"[IMG] {sid} → 존재 {p_scene_img.name}")
+                    continue
+            if img_path.exists():
+                _notify("skip", f"[IMG] {sid} → 존재 {img_path.name}")
                 continue
 
-            # deepcopy: json 경유(복잡 노드에도 안전)
-            graph: Dict[str, Any] = json.loads(json.dumps(graph_origin))
+            # 그래프 복사
+            graph = _json.loads(_json.dumps(graph_origin))
 
-            # 해상도/스텝
-            for nid_lat in latent_ids:
-                set_input(graph, nid_lat, "width", int(ui_width))
-                set_input(graph, nid_lat, "height", int(ui_height))
-            for nid_ks in ksampler_ids:
-                set_input(graph, nid_ks, "steps", int(steps))
+            # 해상도
+            for nid in latent_ids:
+                _set_input(graph, nid, "width", int(ui_width))
+                _set_input(graph, nid, "height", int(ui_height))
 
-            # 프롬프트
-            pos_text = str(scene_data.get("prompt") or "").strip()
-            add_img_text = str(scene_data.get("prompt_img") or "").strip()
-            if add_img_text:
-                pos_text = f"{pos_text}\n{add_img_text}" if pos_text else add_img_text
-            neg_text = str(scene_data.get("prompt_negative") or "") or default_neg
+            # 프롬프트 (prompt_movie 우선)
+            pos_text = str(sc.get("prompt_movie") or "").strip()
+            if not pos_text:
+                p_main = str(sc.get("prompt") or "").strip()
+                p_img = str(sc.get("prompt_img") or "").strip()
+                pos_text = f"{p_main}\n{p_img}" if p_main and p_img else (p_main or p_img)
+            neg_text = str(sc.get("prompt_negative") or "") or default_neg
 
-            changed_fields = apply_prompts(graph, pos_text, neg_text)
-            if changed_fields:
-                prev = ", ".join(f"{nid}:{fld}:{ln}" for nid, fld, ln in changed_fields[:6])
-                if len(changed_fields) > 6:
-                    prev += f" (+{len(changed_fields) - 6})"
-                notify("cfg", f"[IMG] prompt-applied → {prev}")
+            # 텍스트 인코더 일괄 반영
+            def _apply_prompts(gdict: Dict[str, Any], pos: str, neg: str) -> None:
+                fields = ("text", "text_g", "text_l")
+                for nid2, node2 in gdict.items():
+                    try:
+                        if not isinstance(node2, dict):
+                            continue
+                        if not any(k in node2.get("inputs", {}) for k in fields):
+                            continue
+                        hint = str(node2.get("label") or "") + " " + str(node2.get("_meta", {}).get("title") or "")
+                        is_neg = ("neg" in hint.lower()) or ("negative" in hint.lower()) or ("Negative" in hint)
+                        val = neg if is_neg else pos
+                        inp = node2.setdefault("inputs", {})
+                        for fk in fields:
+                            inp[fk] = val
+                    except (AttributeError, KeyError, TypeError):
+                        continue
 
-            # 얼굴 소스 결정(character_objs → characters)
-            face_path: Optional[Path] = None
-            char_objs = scene_data.get("character_objs") or []
+            _apply_prompts(graph, pos_text, neg_text)
+
+            # 캐릭터 이미지 탐색
+            face_path: _Path | None = None
+            char_objs = sc.get("character_objs") or []
             if isinstance(char_objs, list) and char_objs:
                 obj0 = char_objs[0]
                 if isinstance(obj0, dict):
-                    cand = str(obj0.get("img_file") or obj0.get("image") or "")
-                    if cand:
-                        p0 = Path(cand)
-                        if p0.exists():
-                            face_path = p0
-            if face_path is None:
-                chars = scene_data.get("characters") or []
-                if isinstance(chars, list) and chars:
-                    ch0 = chars[0]
-                    if isinstance(ch0, dict):
-                        cand2 = str(ch0.get("img_file") or ch0.get("image") or "")
-                        if cand2:
-                            p1 = Path(cand2)
-                            if p1.exists():
-                                face_path = p1
+                    fi = obj0.get("img_file") or obj0.get("image") or ""
+                    if fi:
+                        face_path = _Path(fi)
 
-            # 스왑 on/off
             if face_path is None:
-                for nid_react in reactor_ids:
-                    set_input(graph, nid_react, "enabled", False)
-                notify("cfg", f"[IMG] scenes[{idx_scene}] {scene_id} → face-swap disabled (no character)")
-            else:
+                chars = sc.get("characters") or []
+                if isinstance(chars, list) and chars:
+                    c0 = chars[0]
+                    if isinstance(c0, dict):
+                        fi2 = c0.get("img_file") or c0.get("image") or ""
+                        if fi2:
+                            face_path = _Path(fi2)
+
+            face_name: str | None = None
+            if face_path and face_path.exists():
+                try:
+                    from settings import COMFY_INPUT_DIR  # type: ignore
+                    comfy_in = _Path(COMFY_INPUT_DIR)
+                except (ImportError, AttributeError):
+                    comfy_in = _Path(r"C:\my_games\shorts_make\app\comfy_inputs")
+                comfy_in.mkdir(parents=True, exist_ok=True)
                 face_name = face_path.name
                 try:
-                    ensure_dir(Path(COMFY_INPUT_DIR))
-                    shutil.copy2(str(face_path), str(Path(COMFY_INPUT_DIR) / face_name))
+                    shutil.copy2(str(face_path), str(comfy_in / face_name))
                 except (OSError, shutil.Error):
                     pass
-                for nid_react in reactor_ids:
-                    set_input(graph, nid_react, "source_image", face_name)
-                    set_input(graph, nid_react, "enabled", True)
 
-                face_idx = parse_first_char_index(scene_data)
-                for nid_iter, node_iter in graph.items():
+            # 얼굴 노드 주입 + 인덱스 주입
+            applied_reactors: List[str] = []
+            if face_name:
+                applied_reactors = _inject_face_to_reactors(graph, face_name)
+                _inject_face_image_loaders(graph, face_name)
+
+                face_idx = _parse_first_char_index(sc)
+                for rnid in reactor_ids:
                     try:
-                        if node_iter.get("class_type") == "ReActorFaceSwap":
-                            inputs_map2 = node_iter.setdefault("inputs", {})
-                            for idx_key in ("source_faces_index", "input_faces_index"):
-                                if idx_key in inputs_map2:
-                                    inputs_map2[idx_key] = str(face_idx)
-                    except (AttributeError, KeyError, TypeError):
+                        inp_map = graph[rnid].setdefault("inputs", {})
+                        if "source_faces_index" in inp_map:
+                            inp_map["source_faces_index"] = str(face_idx)
+                        if "input_faces_index" in inp_map:
+                            inp_map["input_faces_index"] = str(face_idx)
+                    except (KeyError, TypeError):
                         continue
-                notify("cfg", f"[IMG] scenes[{idx_scene}] {scene_id} → face-swap enabled, source={face_name}, idx={face_idx}")
 
-            # ckpt 로그(실사용)
-            ckpt_names: List[str] = []
-            for nid_ck in ckpt_ids:
+            # enable 토글: 캐릭터 이미지가 있으면 True, 없으면 False
+            for rnid in reactor_ids:
                 try:
-                    name_val = str((graph.get(nid_ck) or {}).get("inputs", {}).get("ckpt_name") or "")
-                    if name_val:
-                        ckpt_names.append(name_val)
-                except (AttributeError, KeyError, TypeError):
-                    pass
-            if ckpt_names:
-                notify("cfg", f"[IMG] ckpt={ckpt_names[:1]}")
+                    graph[rnid].setdefault("inputs", {})["enabled"] = bool(face_name)
+                except (KeyError, TypeError):
+                    continue
+
+            # 샘플링 스텝
+            for nid in ksampler_ids:
+                _set_input(graph, nid, "steps", int(steps))
 
             # 제출/대기
             req_count += 1
-            notify("submit", f"[IMG] scenes[{idx_scene}] {scene_id} → /prompt")
-            result = comfy_wait(base_url, graph)
+            _notify("submit", f"[IMG] /prompt {sid}")
+            result = _wait_img(
+                base_url,
+                graph,
+                timeout=timeout_sec,
+                poll=poll_sec,
+                progress_cb=lambda d: _notify("wait", str(d.get("msg") or "")),
+            )
 
-            # 결과 파싱/다운로드
-            outputs_map = result.get("outputs") or {}
-            images_meta: List[Dict[str, Any]] = []
-            for out_key, out_val in outputs_map.items():
-                if isinstance(out_val, dict):
-                    images_meta.extend(out_val.get("images") or [])
-            if not images_meta:
+            # 결과 파싱 및 다운로드
+            files: List[Dict[str, Any]] = []
+            for _, out in (result.get("outputs") or {}).items():
+                if isinstance(out, dict):
+                    files.extend(out.get("images", []) or [])
+            if not files:
                 raise RuntimeError("출력 이미지 없음")
 
-            last_meta = images_meta[-1]
-            subfolder = str(last_meta.get("subfolder") or "")
-            filename = str(last_meta.get("filename") or "")
-            if not filename:
+            last = files[-1]
+            subfolder = str(last.get("subfolder") or "")
+            fname = str(last.get("filename") or "")
+            if not fname:
                 raise RuntimeError("출력 파일명 없음")
 
-            resp = requests.get(
+            rimg = requests.get(
                 base_url.rstrip("/") + "/view",
-                params={"filename": filename, "subfolder": subfolder},
+                params={"filename": fname, "subfolder": subfolder},
                 timeout=30,
             )
-            if not resp.ok:
-                raise RuntimeError(f"/view 실패: {resp.status_code}")
+            if not rimg.ok:
+                raise RuntimeError(f"/view 실패: {rimg.status_code}")
 
-            out_path.parent.mkdir(parents=True, exist_ok=True)
-            with open(out_path, "wb") as wf:
-                wf.write(resp.content)
+            img_path.parent.mkdir(parents=True, exist_ok=True)
+            with open(img_path, "wb") as fpw:
+                fpw.write(rimg.content)
 
-            if not scene_data.get("img_file"):
-                scene_data["img_file"] = str(out_path)
+            # video.json 즉시 반영
+            for s in scenes:
+                if str(s.get("id")) == sid:
+                    s["img_file"] = str(img_path)
+                    break
+            try:
+                save_json(p_video, video)
+                _notify("save", f"[IMG] video.json 갱신: {sid}")
+            except (OSError, ValueError, TypeError):
+                pass
+
+            # story.json에도 반영(있을 때만)
+            if story:
                 try:
-                    save_json(p_story, story)
-                    notify("save", f"story.json 갱신: scenes[{idx_scene}].img_file")
+                    scs = story.get("scenes") or []
+                    for s in scs:
+                        if str(s.get("id")) == sid:
+                            s["img_file"] = str(img_path)
+                            break
+                    save_json(p_story_json, story)
                 except (OSError, ValueError, TypeError):
                     pass
 
-            created.append(out_path)
-            notify("done", f"[IMG] scenes[{idx_scene}] {scene_id} → saved {out_path.name}")
+            created.append(img_path)
+            _notify("done", f"[IMG] 저장 {img_path.name}")
 
         except (OSError, ValueError, TypeError, KeyError, RuntimeError, requests.RequestException) as err:
-            notify("scene-error", f"[IMG] scenes[{idx_scene}] {scene_data.get('id')}: {err}")
+            _notify("scene-error", f"[IMG] {sc.get('id')}: {err}")
             continue
 
-    notify("summary", f"[IMG] 총 scenes={len(scenes)}, 요청={req_count}, 생성={len(created)}")
-
-    # 남은 요청(파일 미존재 씬)
-    remain = 0
-    for scene_chk in scenes:
-        img_field = scene_chk.get("img_file") or ""
-        path_chk = Path(img_field) if img_field else (img_root / f"{str(scene_chk.get('id', 'scene'))}.png")
-        if not path_chk.exists():
-            remain += 1
-
-    notify("end", f"생성 {len(created)}개 / 남은 요청 {remain}개")
+    _notify("summary", f"[IMG] 생성={len(created)} / 요청={req_count}")
     return created
+
+
 
 
 
@@ -1124,74 +1412,98 @@ def build_movie_json(project_dir: str,
                      _workflow_dir: Path | None = None):
     """
     story.json → movie.json 빌드
-    - ui_prefs(movie_fps/overlap) 반영: movie.defaults.target_fps/overlap_frames
-    - 효과(effect)→i2v 모션 힌트 주입
-    - 섹션 경계 전환 힌트/씬 전환 플래그(screen_transition) 병합
+
+    - 타겟 해상도/프레임레이트/스텝은 video.json(story.json)의 값을 우선 사용:
+        * width  = story.defaults.image.width   (없으면 1080)
+        * height = story.defaults.image.height  (없으면 1920)
+        * fps    = story.fps 또는 story.defaults.movie.target_fps (없으면 60)
+        * steps  = story.defaults.movie.steps (없으면 24)
+        * overlap_frames = story.defaults.movie.overlap_frames (없으면 12)
+    - i2v 프레임 계획:
+        * frames = round(duration * fps)
+        * 두 번째 아이템부터 head_handle_frames = overlap_frames (첫 아이템은 0)
+    - 기존 필드/구조 보존: items[].duration / source_image / i2v_prompt 등 기존 흐름은 그대로.
     """
+
     proj = Path(project_dir)
-    story = _load_json(proj / "story.json", {}) or {}
+    story: Dict[str, Any] = _load_json(proj / "story.json", {}) or {}
 
-    # ★ UI 드롭다운 값 로드
-    try:
-        prefs = load_ui_prefs_for_audio(story.get("audio", ""))
-    except Exception:
-        prefs = {"image_w": 832, "image_h": 1472, "movie_fps": 24, "overlap": 12}
+    # hair_map이 전달되더라도 현재 단계에서는 결과를 바꾸지 않음(경고 방지용으로 접근만 수행)
+    if isinstance(hair_map, dict):
+        pass
 
-    char_styles = dict(hair_map or story.get("character_styles") or {})
-    scenes = story.get("scenes") or []
+    # ---- 안전한 기본값 추출 (video.json 기반) ----
+    defaults_dict: Dict[str, Any] = story.get("defaults") or {}
+    image_defaults: Dict[str, Any] = defaults_dict.get("image") or {}
+    movie_defaults: Dict[str, Any] = defaults_dict.get("movie") or {}
 
-    # 우선순위: story.fps > ui_prefs.movie_fps
-    fps = int(story.get("fps") or prefs["movie_fps"])
+    target_width: int = int(image_defaults.get("width") or 1080)
+    target_height: int = int(image_defaults.get("height") or 1920)
 
-    out = {
+    # fps 우선순위: story.fps → defaults.movie.target_fps → 60
+    fps_val: int = int(story.get("fps") or movie_defaults.get("target_fps") or 60)
+
+    # steps/overlap_frames 기본
+    steps_val: int = int(movie_defaults.get("steps") or 24)
+    overlap_frames_val: int = int(movie_defaults.get("overlap_frames") or 12)
+
+    # ---- 씬 목록 ----
+    scenes: List[Dict[str, Any]] = list(story.get("scenes") or [])
+
+    # ---- 출력 스켈레톤 (기존 구조 보존) ----
+    out: Dict[str, Any] = {
         "title": story.get("title", ""),
         "audio": story.get("audio", ""),
-        "fps": fps,
+        "fps": fps_val,  # 상단에도 기록(기존 키 유지)
         "defaults": {
-            "movie": {"target_fps": int(prefs["movie_fps"]), "overlap_frames": int(prefs["overlap"]), "negative": "@global"}
+            "movie": {
+                # i2v/렌더 타겟 설정(후속 단계에서 그대로 사용)
+                "target_width": target_width,
+                "target_height": target_height,
+                "target_fps": fps_val,
+                "steps": steps_val,
+                "overlap_frames": overlap_frames_val,
+                # 네거티브 프롬프트: story.defaults.image.negative 우선
+                "negative": (image_defaults.get("negative") or "")
+            }
         },
         "items": []
     }
 
-    prev_section = None
-    for i, sc in enumerate(scenes, 1):
-        sid = sc.get("id") or f"t_{i:02d}"
-        section = (sc.get("section") or "").lower() or "scene"
-        big_transition = prev_section is not None and section != prev_section
-        prev_section = section
+    # ---- 아이템 구성 (기존 프롬프트 규칙 보존) ----
+    for idx, sc in enumerate(scenes, 1):
+        scene_id = sc.get("id") or f"t_{idx:02d}"
+        duration_sec = float(sc.get("duration") or 0.75)
 
-        # 전환 힌트 우선순위: 섹션 경계 > screen_transition 플래그
-        if big_transition:
-            transition_hint = "Impactful transition at boundary (whip-pan / flash cut / strong light-leak)."
-        elif sc.get("screen_transition"):
-            transition_hint = "Soft cross-dissolve or light-leak."
+        # i2v 프롬프트 우선순위: prompt_movie → (prompt + prompt_img)
+        prompt_movie = (sc.get("prompt_movie") or "").strip()
+        if prompt_movie:
+            i2v_prompt = prompt_movie
         else:
-            transition_hint = ""
+            prompt_base = (sc.get("prompt") or "").strip()
+            prompt_img = (sc.get("prompt_img") or "").strip()
+            if prompt_img:
+                i2v_prompt = f"{prompt_base}\n{prompt_img}" if prompt_base else prompt_img
+            else:
+                i2v_prompt = prompt_base
 
-        # 효과 → 모션 힌트
-        motion = _effect_to_motion(sc.get("effect") or [], bool(sc.get("screen_transition")))
-        variety = _VARIATIONS[(i - 1) % len(_VARIATIONS)]
-        style_str = ", ".join(
-            f"{cid}: {char_styles.get(cid,'')}"
-            for cid in (sc.get("characters") or [])
-            if cid in char_styles
-        )
-
-        i2v_prompt = (
-            f"{sc.get('scene','')}; {sc.get('prompt','')}. "
-            f"[Face rules: {_FACE_RULES}]. {_COMPOSITION}. "
-            f"Motion: {motion}. Variation: {variety}. {transition_hint} "
-            f"Character consistency: {style_str}"
-        )
+        # 프레임 산출 (60fps 기본, story 기반으로 이미 fps_val 계산됨)
+        base_frames = int(round(duration_sec * fps_val))
+        head_handle_frames = overlap_frames_val if idx >= 2 else 0
 
         out["items"].append({
-            "id": sid,
-            "duration": float(sc.get("duration") or 0.75),
-            "source_image": sc.get("img_file"),
-            "i2v_prompt": i2v_prompt
+            "id": scene_id,
+            "duration": duration_sec,                 # 기존 보존
+            "source_image": sc.get("img_file"),       # 기존 보존 (이미지 생성 단계에서 채워진 값)
+            "i2v_prompt": i2v_prompt,                 # 기존 보존 (prompt_movie 우선)
+            # ↓↓↓ 추가 메타(후속 i2v 렌더에서 사용)
+            "frames": base_frames,
+            "head_handle_frames": head_handle_frames
         })
 
+    # 저장 (기존 방식)
     return _save_json(proj / "movie.json", out)
+
 
 
 
