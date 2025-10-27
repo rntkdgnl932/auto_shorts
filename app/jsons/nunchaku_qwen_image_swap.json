@@ -61,7 +61,7 @@
   },
   "8": {
     "inputs": {
-      "shift": 3.1000000000000005,
+      "shift": 3.1,
       "model": [
         "46",
         0
@@ -130,7 +130,6 @@
   },
   "15": {
     "inputs": {
-      "text_0": "A man and a woman walk on a beach. All staring head-on.\nMale muscular, short hair.\nWomen's skinny bodies. Huge breasts. little ass. slim legs. korean",
       "text": [
         "16",
         0
@@ -143,7 +142,7 @@
   },
   "16": {
     "inputs": {
-      "from_translate": "korean",
+      "from_translate": "auto",
       "to_translate": "english",
       "add_proxies": false,
       "proxies": "",
@@ -322,20 +321,6 @@
     "class_type": "PreviewImage",
     "_meta": {
       "title": "이미지 미리보기"
-    }
-  },
-  "31": {
-    "inputs": {
-      "purge_cache": true,
-      "purge_models": true,
-      "anything": [
-        "33",
-        0
-      ]
-    },
-    "class_type": "LayerUtility: PurgeVRAM",
-    "_meta": {
-      "title": "LayerUtility: Purge VRAM"
     }
   },
   "32": {
