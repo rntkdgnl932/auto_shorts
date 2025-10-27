@@ -4,7 +4,6 @@ from __future__ import annotations
 
 import subprocess
 from typing import List, Tuple, Optional, Dict, Any, Callable
-from pathlib import Path as _Path
 import re
 from pathlib import Path
 import time, requests, shutil
@@ -313,15 +312,6 @@ def xfade_concat(clip_paths: List[Path], overlap_frames: int, fps: int,
 
 # === ADD: video_build.py ===
 
-
-from pathlib import Path
-from typing import Any, Callable, Dict, List, Optional, Tuple
-import json
-import shutil
-import requests
-
-from utils import load_json, save_json, ensure_dir
-from settings import JSONS_DIR, COMFY_INPUT_DIR
 
 
 def build_missing_images_from_story(
