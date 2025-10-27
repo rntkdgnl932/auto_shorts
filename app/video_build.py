@@ -543,11 +543,10 @@ def build_missing_images_from_story(
 ) -> List[_Path]:
     """
     누락 이미지 생성:
-    - 1순위: story_path와 같은 폴더의 video.json을 읽어 scenes[].img_file을 검사/생성
-    - 2순위: 기존 story.json의 scenes 사용(호환)
-    - 생성된 경로는 video.json.scenes[*].img_file 에 즉시 반영 (있으면 story.json에도 반영)
-    - 워크플로: settings.JSONS_DIR / nunchaku_qwen_image_swap.json (강제) 또는 전달된 workflow_path
-    - 프롬프트: scene.prompt_movie 없으면 scene.prompt + '\\n' + scene.prompt_img
+    - story_path와 같은 폴더의 video.json 우선, 없으면 story.json 사용
+    - scenes[*].img_file 없으면 ComfyUI로 생성하고 파일 경로를 video.json(그리고 story.json)에 반영
+    - 워크플로: settings.JSONS_DIR / nunchaku_qwen_image_swap.json (또는 인자 workflow_path)
+    - 프롬프트: scene.prompt_movie > (scene.prompt + '\\n' + scene.prompt_img)
     - 네거티브: scene.prompt_negative or defaults.image.negative
     """
 
@@ -572,20 +571,16 @@ def build_missing_images_from_story(
     if not story_dir.exists():
         raise FileNotFoundError(f"경로 없음: {story_dir}")
 
-    # 우선 video.json
     p_video = story_dir / "video.json"
     video = load_json(p_video, {}) or {}
-    # 보조로 story.json
     p_story_json = story_dir / "story.json"
     story = load_json(p_story_json, {}) or {}
 
-    # paths 해석
     paths_v = video.get("paths") or {}
     root_dir = _Path(paths_v.get("root") or story.get("paths", {}).get("root") or story_dir)
     imgs_dir_name = str(paths_v.get("imgs_dir") or story.get("paths", {}).get("imgs_dir") or "imgs")
     img_root = ensure_dir(root_dir / imgs_dir_name)
 
-    # 워크플로 경로
     try:
         from settings import JSONS_DIR  # type: ignore
         base_jsons = _Path(JSONS_DIR)
@@ -599,7 +594,6 @@ def build_missing_images_from_story(
     with open(wf_path, "r", encoding="utf-8") as f:
         graph_origin: Dict[str, Any] = _json.load(f)
 
-    # 노드 헬퍼
     def _find_nodes(gdict: Dict[str, Any], class_type: str) -> List[str]:
         hits: List[str] = []
         for nid, node in (gdict or {}).items():
@@ -619,9 +613,41 @@ def build_missing_images_from_story(
     latent_ids = _find_nodes(graph_origin, "EmptySD3LatentImage") + _find_nodes(graph_origin, "EmptyLatentImage")
     latent_ids = list(dict.fromkeys(latent_ids))
     ksampler_ids = _find_nodes(graph_origin, "KSampler")
-    _ = _find_nodes(graph_origin, "CheckpointLoaderSimple")  # 보존
     reactor_ids = [nid for nid, node in graph_origin.items() if str(node.get("class_type")) == "ReActorFaceSwap"]
 
+    # ---- 새로 추가: 캐릭터명→파일 경로 해석(폴더: character) ----
+    def _resolve_face_image_by_name(name: str) -> _Path | None:
+        try:
+            from settings import CHARACTER_DIR  # type: ignore
+            base_dir = _Path(CHARACTER_DIR)
+        except (ImportError, AttributeError):
+            base_dir = _Path(r"C:\my_games\shorts_make\character")
+        exts = (".png", ".jpg", ".jpeg", ".webp")
+        for ext in exts:
+            p = base_dir / f"{name}{ext}"
+            if p.exists():
+                return p
+        return None
+
+    def _pick_scene_character_name(scene: Dict[str, Any]) -> str | None:
+        chars = scene.get("characters") or []
+        if isinstance(chars, list) and chars:
+            c0 = chars[0]
+            if isinstance(c0, str):
+                name = c0.strip()
+                return name or None
+            if isinstance(c0, dict):
+                cand = (str(c0.get("id") or "") or str(c0.get("name") or "")).strip()
+                return cand or None
+        cobjs = scene.get("character_objs") or []
+        if isinstance(cobjs, list) and cobjs:
+            o0 = cobjs[0]
+            if isinstance(o0, dict):
+                cand = (str(o0.get("id") or "") or str(o0.get("name") or "")).strip()
+                return cand or None
+        return None
+
+    # 참고: 기존 보조 주입 함수(전역 덮어쓰기 용)는 유지(호출 안 함)
     def _inject_face_to_reactors(gdict: Dict[str, Any], file_name: str) -> List[str]:
         applied_ids: List[str] = []
         for rid in reactor_ids:
@@ -637,16 +663,9 @@ def build_missing_images_from_story(
                 continue
         return applied_ids
 
-    def _inject_face_image_loaders(gdict: Dict[str, Any], file_name: str) -> List[str]:
-        hits: List[str] = []
-        for nid, node in gdict.items():
-            try:
-                if str(node.get("class_type")) == "LoadImage":
-                    gdict[nid].setdefault("inputs", {})["image"] = file_name
-                    hits.append(nid)
-            except (AttributeError, KeyError, TypeError):
-                continue
-        return hits
+    # 참고: 기존 보조 함수(모든 LoadImage 전역 변경)는 안전을 위해 사용하지 않음
+    def _inject_face_image_loaders(_gdict: Dict[str, Any], _file_name: str) -> List[str]:
+        return []
 
     def _parse_first_char_index(scene: Dict[str, Any]) -> int:
         specs = scene.get("characters") or scene.get("character_objs") or []
@@ -664,53 +683,24 @@ def build_missing_images_from_story(
                 return 0
         return 0
 
-    # 음악 대기/큐 루틴 재사용
     try:
         from audio_sync import _submit_and_wait as _wait_core  # type: ignore
     except (ImportError, AttributeError):
         from app.audio_sync import _submit_and_wait as _wait_core  # type: ignore
 
-    # ---------- 로그 스로틀 (동일 문구 50회당 1회 출력) ----------
     def _wait_img(url: str, gdict: Dict[str, Any], *, timeout: int, poll: float, progress_cb: Callable[[Dict[str, Any]], None]) -> Dict[str, Any]:
-        state: Dict[str, Any] = {
-            "last_msg": "",
-            "same_count": 0,
-            "suppressed_total": 0,
-        }
-
-        def _emit(text: str) -> None:
-            try:
-                progress_cb({"msg": text})
-            except (RuntimeError, ValueError, TypeError):
-                pass
-
         def _relay(prog: Dict[str, Any]) -> None:
             raw = str(prog.get("msg") or "")
             if raw.startswith("[MUSIC]"):
-                patched = "[IMG]" + raw[len("[MUSIC]"):]
+                patched = "[IMG]" + raw[len("[MUSIC]") :]
             else:
                 patched = "[IMG] " + raw if raw else "[IMG]"
-
-            # 동일 문구 누적 처리
-            if patched == state["last_msg"]:
-                state["same_count"] = int(state["same_count"]) + 1
-                state["suppressed_total"] = int(state["suppressed_total"]) + 1
-                # 50번째마다 1회 출력 + 억제 요약
-                if state["same_count"] >= 50:
-                    _emit(f"{patched} … suppressed {state['same_count'] - 1}")
-                    state["same_count"] = 0
-                return
-
-            # 문구가 변경된 경우: 이전 누적 요약 한번 출력
-            if int(state["same_count"]) > 0:
-                _emit(f"[IMG] … {int(state['same_count'])} suppressed")
-                state["same_count"] = 0
-
-            state["last_msg"] = patched
-            _emit(patched)
+            try:
+                progress_cb({"msg": patched})
+            except (RuntimeError, ValueError, TypeError):
+                pass
 
         return _wait_core(url, gdict, timeout=timeout, poll=poll, on_progress=_relay)
-    # ---------- 스로틀 끝 ----------
 
     created: List[_Path] = []
     base_url = str(video.get("comfy_host") or story.get("comfy_host") or "http://127.0.0.1:8188").rstrip("/")
@@ -728,7 +718,6 @@ def build_missing_images_from_story(
             sid = str(sc.get("id") or f"scene_{idx:03d}")
             img_path = img_root / f"{sid}.png"
 
-            # video.json의 img_file 절대/상대 지원
             scene_img = str(sc.get("img_file") or "")
             if scene_img:
                 p_scene_img = _Path(scene_img)
@@ -741,15 +730,12 @@ def build_missing_images_from_story(
                 _notify("skip", f"[IMG] {sid} → 존재 {img_path.name}")
                 continue
 
-            # 그래프 복사
             graph = _json.loads(_json.dumps(graph_origin))
 
-            # 해상도
             for nid in latent_ids:
                 _set_input(graph, nid, "width", int(ui_width))
                 _set_input(graph, nid, "height", int(ui_height))
 
-            # 프롬프트 (prompt_movie 우선)
             pos_text = str(sc.get("prompt_movie") or "").strip()
             if not pos_text:
                 p_main = str(sc.get("prompt") or "").strip()
@@ -757,7 +743,6 @@ def build_missing_images_from_story(
                 pos_text = f"{p_main}\n{p_img}" if p_main and p_img else (p_main or p_img)
             neg_text = str(sc.get("prompt_negative") or "") or default_neg
 
-            # 텍스트 인코더 일괄 반영
             def _apply_prompts(gdict: Dict[str, Any], pos: str, neg: str) -> None:
                 fields = ("text", "text_g", "text_l")
                 for nid2, node2 in gdict.items():
@@ -777,24 +762,31 @@ def build_missing_images_from_story(
 
             _apply_prompts(graph, pos_text, neg_text)
 
-            # 캐릭터 이미지 탐색
+            # ---- 얼굴 경로 선택: 캐릭터명 우선, 기존 경로 폴백 ----
             face_path: _Path | None = None
-            char_objs = sc.get("character_objs") or []
-            if isinstance(char_objs, list) and char_objs:
-                obj0 = char_objs[0]
-                if isinstance(obj0, dict):
-                    fi = obj0.get("img_file") or obj0.get("image") or ""
-                    if fi:
-                        face_path = _Path(fi)
+            char_name = _pick_scene_character_name(sc)
+            if isinstance(char_name, str):
+                face_path = _resolve_face_image_by_name(char_name)
 
             if face_path is None:
-                chars = sc.get("characters") or []
-                if isinstance(chars, list) and chars:
-                    c0 = chars[0]
+                char_objs = sc.get("character_objs") or []
+                if isinstance(char_objs, list) and char_objs:
+                    obj0 = char_objs[0]
+                    if isinstance(obj0, dict):
+                        fi = obj0.get("img_file") or obj0.get("image") or ""
+                        if fi:
+                            fp = _Path(fi)
+                            face_path = fp if fp.exists() else None
+
+            if face_path is None:
+                chars2 = sc.get("characters") or []
+                if isinstance(chars2, list) and chars2:
+                    c0 = chars2[0]
                     if isinstance(c0, dict):
                         fi2 = c0.get("img_file") or c0.get("image") or ""
                         if fi2:
-                            face_path = _Path(fi2)
+                            fp2 = _Path(fi2)
+                            face_path = fp2 if fp2.exists() else None
 
             face_name: str | None = None
             if face_path and face_path.exists():
@@ -810,35 +802,97 @@ def build_missing_images_from_story(
                 except (OSError, shutil.Error):
                     pass
 
-            # 얼굴 노드 주입 + 인덱스 주입
+            # ---- ReActor: 정확히 1개만 활성화, 해당 LoadImage만 교체 ----
             applied_reactors: List[str] = []
             if face_name:
-                applied_reactors = _inject_face_to_reactors(graph, face_name)
-                _inject_face_image_loaders(graph, face_name)
+                # 대상 ReActor 선택(첫 번째를 기본으로)
+                target_rid = reactor_ids[0] if reactor_ids else None
 
+                # 전체 on/off 설정
+                for rnid in reactor_ids:
+                    try:
+                        graph[rnid].setdefault("inputs", {})["enabled"] = (rnid == target_rid)
+                    except (KeyError, TypeError):
+                        continue
+
+                # 대상 리액터의 source_image 입력이 LoadImage 링크면 그 LoadImage만 filename 교체
+                if target_rid:
+                    try:
+                        rinp = graph[target_rid].setdefault("inputs", {})
+                        link = rinp.get("source_image")
+                        if isinstance(link, list) and len(link) == 2:
+                            link_id = str(link[0])
+                            if link_id in graph and str(graph[link_id].get("class_type")) == "LoadImage":
+                                graph[link_id].setdefault("inputs", {})["image"] = face_name
+                                applied_reactors.append(target_rid)
+                        else:
+                            # 링크가 아니면 직접 파일명 주입
+                            if "source_image" in rinp:
+                                rinp["source_image"] = face_name
+                                applied_reactors.append(target_rid)
+                            elif "input_image" in rinp:
+                                rinp["input_image"] = face_name
+                                applied_reactors.append(target_rid)
+                    except (KeyError, TypeError):
+                        pass
+
+                # 인덱스 반영
                 face_idx = _parse_first_char_index(sc)
                 for rnid in reactor_ids:
                     try:
                         inp_map = graph[rnid].setdefault("inputs", {})
                         if "source_faces_index" in inp_map:
-                            inp_map["source_faces_index"] = str(face_idx)
+                            inp_map["source_faces_index"] = int(face_idx)
                         if "input_faces_index" in inp_map:
-                            inp_map["input_faces_index"] = str(face_idx)
+                            inp_map["input_faces_index"] = int(face_idx)
+                    except (KeyError, TypeError, ValueError):
+                        continue
+            else:
+                # 얼굴 없으면 전부 끔
+                for rnid in reactor_ids:
+                    try:
+                        graph[rnid].setdefault("inputs", {})["enabled"] = False
                     except (KeyError, TypeError):
                         continue
 
-            # enable 토글: 캐릭터 이미지가 있으면 True, 없으면 False
-            for rnid in reactor_ids:
-                try:
-                    graph[rnid].setdefault("inputs", {})["enabled"] = bool(face_name)
-                except (KeyError, TypeError):
-                    continue
+            # ======== 디버그 로그 ========
+            try:
+                load_ids = _find_nodes(graph, "LoadImage")
+                for lid in load_ids:
+                    try:
+                        li = graph[lid].get("inputs", {})  # type: ignore
+                        _notify("debug-loadimage", f"[IMG][DBG] LoadImage nid={lid} image={str(li.get('image') or '')}")
+                    except (AttributeError, KeyError, TypeError):
+                        continue
 
-            # 샘플링 스텝
+                for rid in reactor_ids:
+                    try:
+                        rin = graph[rid].get("inputs", {})  # type: ignore
+                        _notify(
+                            "debug-reactor",
+                            "[IMG][DBG] ReActor nid="
+                            + str(rid)
+                            + " enabled="
+                            + str(rin.get("enabled"))
+                            + " src_img="
+                            + str(rin.get("source_image") or rin.get("input_image") or "")
+                            + " src_idx="
+                            + str(rin.get("source_faces_index"))
+                            + " in_idx="
+                            + str(rin.get("input_faces_index"))
+                        )
+                    except (AttributeError, KeyError, TypeError):
+                        continue
+
+                if face_name and not applied_reactors:
+                    _notify("debug-warn", "[IMG][DBG] face image 있음에도 ReActor에 연결된 입력이 감지되지 않음")
+            except (RuntimeError, ValueError, TypeError):
+                pass
+            # ======== 디버그 로그 끝 ========
+
             for nid in ksampler_ids:
                 _set_input(graph, nid, "steps", int(steps))
 
-            # 제출/대기
             req_count += 1
             _notify("submit", f"[IMG] /prompt {sid}")
             result = _wait_img(
@@ -849,7 +903,6 @@ def build_missing_images_from_story(
                 progress_cb=lambda d: _notify("wait", str(d.get("msg") or "")),
             )
 
-            # 결과 파싱 및 다운로드
             files: List[Dict[str, Any]] = []
             for _, out in (result.get("outputs") or {}).items():
                 if isinstance(out, dict):
@@ -875,7 +928,6 @@ def build_missing_images_from_story(
             with open(img_path, "wb") as fpw:
                 fpw.write(rimg.content)
 
-            # video.json 즉시 반영
             for s in scenes:
                 if str(s.get("id")) == sid:
                     s["img_file"] = str(img_path)
@@ -886,7 +938,6 @@ def build_missing_images_from_story(
             except (OSError, ValueError, TypeError):
                 pass
 
-            # story.json에도 반영(있을 때만)
             if story:
                 try:
                     scs = story.get("scenes") or []
@@ -907,6 +958,7 @@ def build_missing_images_from_story(
 
     _notify("summary", f"[IMG] 생성={len(created)} / 요청={req_count}")
     return created
+
 
 
 
