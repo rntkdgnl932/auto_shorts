@@ -314,6 +314,16 @@ def xfade_concat(clip_paths: List[Path], overlap_frames: int, fps: int,
 # === ADD: video_build.py ===
 
 
+from pathlib import Path
+from typing import Any, Callable, Dict, List, Optional, Tuple
+import json
+import shutil
+import requests
+
+from utils import load_json, save_json, ensure_dir
+from settings import JSONS_DIR, COMFY_INPUT_DIR
+
+
 def build_missing_images_from_story(
     story_path: str | Path,
     *,
@@ -621,6 +631,7 @@ def build_missing_images_from_story(
 
     notify("end", f"생성 {len(created)}개 / 남은 요청 {remain}개")
     return created
+
 
 
 
