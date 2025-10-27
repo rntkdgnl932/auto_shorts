@@ -327,333 +327,304 @@ def build_missing_images_from_story(
 ) -> List[Path]:
     """
     story.json을 읽고, 각 scene의 img_file이 없으면 ComfyUI로 생성한다.
-    - 워크플로: settings.JSONS_DIR / nunchaku_qwen_image_swap.json (강제)
-    - 프롬프트: scene.prompt + scene.prompt_img (합침)
+    - 워크플로: settings.JSONS_DIR / nunchaku_qwen_image_swap.json (단일 사용)
+    - 프롬프트: scene.prompt (+ scene.prompt_img)
     - 네거티브: scene.prompt_negative or defaults.image.negative
+    - 캐릭터가 없으면 모든 ReActorFaceSwap을 비활성화하여 스왑을 차단한다.
     """
 
     def notify(stage: str, msg: str = "", **extra: Any) -> None:
-        if on_progress:
-            progress_info: Dict[str, Any] = {"stage": stage, "msg": msg}
-            progress_info.update(extra)
-            try:
-                on_progress(progress_info)  # type: ignore[misc]
-            except Exception:
-                pass
+        if not on_progress:
+            return
+        payload: Dict[str, Any] = {"stage": stage, "msg": msg}
+        if extra:
+            payload.update(extra)
+        try:
+            if callable(on_progress):
+                on_progress(payload)
+            elif isinstance(on_progress, dict):
+                cb = on_progress.get("callback")
+                if callable(cb):
+                    cb(payload)
+        except (RuntimeError, ValueError, TypeError):
+            pass
 
-    p_story = _Path(story_path).resolve()
+    p_story = Path(story_path).resolve()
     if not p_story.exists():
         raise FileNotFoundError(f"story.json 없음: {p_story}")
 
-    story = load_json(p_story, {}) or {}
+    story: Dict[str, Any] = load_json(p_story, {}) or {}
 
-    # 레거시 키 정리(예: needs_character_asset)
+    # 선택: 레거시 키 정리
     try:
-        from utils import purge_legacy_scene_keys
-        story = purge_legacy_scene_keys(story)
-    except Exception:
+        from utils import purge_legacy_scene_keys  # type: ignore
+        scenes_probe = story.get("scenes")
+        if isinstance(scenes_probe, list):
+            for scene_item in scenes_probe:
+                try:
+                    purge_legacy_scene_keys(scene_item)  # type: ignore
+                except (KeyError, TypeError, ValueError):
+                    pass
+    except (ImportError, AttributeError):
         pass
 
-    scenes = story.get("scenes") or []
-    if not isinstance(scenes, list) or not scenes:
-        raise RuntimeError("story.scenes 비어 있음")
-
     paths = story.get("paths") or {}
-    root_dir = _Path(paths.get("root") or p_story.parent)
-    imgs_dir = _Path(paths.get("imgs_dir") or "imgs")
+    root_dir = Path(paths.get("root") or p_story.parent)
+    imgs_dir = Path(paths.get("imgs_dir") or "imgs")
     img_root = ensure_dir(root_dir / imgs_dir)
 
-    # 워크플로 로드 (강제)
-    try:
-        from settings import JSONS_DIR  # type: ignore
-        base_jsons = _Path(JSONS_DIR)
-    except Exception:
-        base_jsons = _Path(r"C:\my_games\shorts_make\app\jsons")
-
-    wf_path = _Path(workflow_path) if workflow_path else (base_jsons / "nunchaku_qwen_image_swap.json")
+    # 워크플로 로드(스왑 포함 하나)
+    base_jsons = Path(JSONS_DIR)
+    wf_path = Path(workflow_path) if workflow_path else (base_jsons / "nunchaku_qwen_image_swap.json")
     if not wf_path.exists():
         raise FileNotFoundError(f"필수 워크플로 없음: {wf_path}")
 
-    try:
-        graph = _load_workflow_graph(wf_path)
-    except Exception as e:
-        raise RuntimeError(f"워크플로 로드 실패: {e}")
+    with open(wf_path, "r", encoding="utf-8") as f:
+        graph_origin: Dict[str, Any] = json.load(f)
 
-    # Comfy 호스트
-    try:
-        base_url = _choose_host()
-    except Exception:
-        try:
-            from settings import COMFY_HOST  # type: ignore
-            base_url = str(COMFY_HOST)
-        except Exception as e:
-            raise RuntimeError(f"Comfy 호스트 결정 실패: {e}")
+    notify("begin", f"누락 이미지 생성 시작: {p_story.name}")
 
-    # ── 그래프 탐색 유틸(노드 ID 달라도 동작) ─────────────
-    def _find_nodes(g: dict, *, class_type: str = "", label_contains: str = "") -> list[str]:
-        hits: list[str] = []
-        for nid, node in g.items():
+    # 유틸
+    def find_nodes(gdict: Dict[str, Any], *, class_type: Optional[str] = None) -> List[str]:
+        hits: List[str] = []
+        for nid_scan, node_scan in (gdict or {}).items():
             try:
-                ct = str(node.get("class_type") or "")
-                lbl = str(node.get("label") or "")
-                if class_type and ct != class_type:
+                if class_type and str(node_scan.get("class_type")) != class_type:
                     continue
-                if label_contains and (label_contains not in lbl):
-                    continue
-                hits.append(str(nid))
-            except Exception:
+                hits.append(str(nid_scan))
+            except (AttributeError, KeyError, TypeError):
                 continue
         return hits
 
-    def _set_input(g: dict, nid: str, key: str, val: Any) -> None:
+    def set_input(gdict: Dict[str, Any], nid_target: str, key_target: str, val: Any) -> None:
         try:
-            g[str(nid)].setdefault("inputs", {})[key] = val
-        except Exception:
+            gdict[str(nid_target)].setdefault("inputs", {})[key_target] = val
+        except (KeyError, TypeError, AttributeError):
             pass
 
-    # 후보 노드 (한 번만 스캔)
-    latent_ids = _find_nodes(graph, class_type="EmptySD3LatentImage")
-    latent_ids += _find_nodes(graph, class_type="EmptyLatentImage")
-    latent_ids = list(dict.fromkeys(latent_ids))
-
-    ksampler_ids = _find_nodes(graph, class_type="KSampler")
-    ckpt_ids = _find_nodes(graph, class_type="CheckpointLoaderSimple")
-    reactor_ids = [nid for nid, node in graph.items() if "ReActor" in str(node.get("label") or "")]
-
-    # 스왑 소스 존재 여부(있으면 enable)
-    def _swap_sources_available() -> bool:
-        try:
-            cand = list((root_dir / "swap_src").glob("*.*"))
-        except OSError:
-            return False
-        return any(x.suffix.lower() in {".png", ".jpg", ".jpeg", ".webp"} for x in cand)
-
-    swap_ok = _swap_sources_available()
-
-    # 전역 텍스트 필드 덮어쓰기 헬퍼
-    def _override_text_inputs(g: dict, *, pos: str, neg: str) -> list[tuple[str, str, int]]:
-        changed: list[tuple[str, str, int]] = []
-        for nid, node in g.items():
+    def apply_prompts(gdict: Dict[str, Any], pos_val: str, neg_val: str) -> List[Tuple[str, str, int]]:
+        changed: List[Tuple[str, str, int]] = []
+        fields = ("text", "text_g", "text_l")
+        for nid_apply, node_apply in (gdict or {}).items():
             try:
-                lbl = str(node.get("label") or "")
-                inp_map = node.setdefault("inputs", {})  # ← 이름 가리기 방지
-                fields = []
-                if "text" in inp_map:   fields.append("text")
-                if "text_g" in inp_map: fields.append("text_g")
-                if "text_l" in inp_map: fields.append("text_l")
-                if not fields:
+                inputs_map = node_apply.get("inputs", {})
+                if not isinstance(inputs_map, dict):
                     continue
-                is_neg = ("neg" in lbl.lower()) or ("negative" in lbl.lower())
-                val = neg if is_neg else pos
-                for fkey in fields:
-                    inp_map[fkey] = val
-                    changed.append((str(nid), fkey, len(val)))
-            except Exception:
+                has_any = any(fld in inputs_map for fld in fields)
+                if not has_any:
+                    continue
+                label_str = str(node_apply.get("label") or "")
+                is_neg = ("neg" in label_str.lower()) or ("negative" in label_str.lower())
+                val_to_set = neg_val if is_neg else pos_val
+                for fld in fields:
+                    if fld in inputs_map:
+                        inputs_map[fld] = val_to_set
+                        changed.append((str(nid_apply), fld, len(val_to_set)))
+            except (AttributeError, KeyError, TypeError):
                 continue
         return changed
 
-    # 음악 대기/큐 모니터를 재사용하되, 로그 프리픽스를 [IMG]로 전환
-    try:
-        from audio_sync import _submit_and_wait as _wait_core  # 재사용
-    except Exception:
-        from app.audio_sync import _submit_and_wait as _wait_core  # type: ignore
+    def parse_first_char_index(scene_obj: Dict[str, Any]) -> int:
+        specs = scene_obj.get("characters") or scene_obj.get("character_objs") or []
+        if not specs:
+            return 0
+        first_spec = specs[0]
+        if isinstance(first_spec, str) and ":" in first_spec:
+            try:
+                return int(first_spec.split(":")[1])
+            except (ValueError, IndexError):
+                return 0
+        if isinstance(first_spec, dict):
+            try:
+                return int(first_spec.get("index", 0))
+            except (ValueError, TypeError):
+                return 0
+        return 0
 
-    def _wait_img(url: str, g: dict, *, timeout: int, poll: float, progress_cb: Callable[[Dict[str, Any]], None]) -> dict:
-        def relay(progress_info: Dict[str, Any]) -> None:
-            if not callable(progress_cb):
-                return
-            msg = str(progress_info.get("msg") or "")
-            if msg.startswith("[MUSIC]"):
-                patched = dict(progress_info)
-                patched["msg"] = "[IMG]" + msg[len("[MUSIC]"):]
-                progress_cb(patched)
-            else:
-                progress_cb(progress_info)
-        return _wait_core(url, g, timeout=timeout, poll=poll, on_progress=relay)
+    # 노드 집합(초기 스캔)
+    latent_ids = find_nodes(graph_origin, class_type="EmptySD3LatentImage")
+    latent_ids += find_nodes(graph_origin, class_type="EmptyLatentImage")
+    latent_ids = list(dict.fromkeys(latent_ids))
+    ksampler_ids = find_nodes(graph_origin, class_type="KSampler")
+    ckpt_ids = find_nodes(graph_origin, class_type="CheckpointLoaderSimple")
+    reactor_ids = [nid for nid, node in graph_origin.items() if str(node.get("class_type")) == "ReActorFaceSwap"]
+
+    # Comfy 대기 유틸 재사용 (가리기 방지: 파라미터 이름 변경)
+    try:
+        from audio_sync import _submit_and_wait as wait_core  # type: ignore
+    except (ImportError, AttributeError):
+        from app.audio_sync import _submit_and_wait as wait_core  # type: ignore
+
+    def comfy_wait(base_url_in: str, graph_in: Dict[str, Any]) -> Dict[str, Any]:
+        return wait_core(base_url_in, graph_in, timeout=timeout_sec, poll=poll_sec, on_progress=on_progress)
 
     created: List[Path] = []
-    notify("begin", f"총 {len(scenes)}개 씬 검사")
+    base_url = str(story.get("comfy_host") or "http://127.0.0.1:8188").rstrip("/")
+    defaults = story.get("defaults") or {}
+    default_neg = str((defaults.get("image") or {}).get("negative") or "")
+    scenes: List[Dict[str, Any]] = list(story.get("scenes") or [])
+    req_count = 0
 
-    for idx, sc in enumerate(scenes):
+    notify("cfg", f"[IMG] host={base_url}, scenes={len(scenes)}, reactors={len(reactor_ids)}")
+
+    # 메인 루프
+    for idx_scene, scene_data in enumerate(scenes):
         try:
-            img_win = sc.get("img_file") or ""
-            img_path = _Path(img_win) if img_win else (img_root / f"{sc.get('id','scene')}.png")
-            if img_path.exists():
-                continue  # 이미 있음
+            scene_id = str(scene_data.get("id") or f"scene_{idx_scene:03d}")
+            out_path = img_root / f"{scene_id}.png"
+            if out_path.exists():
+                notify("skip", f"[IMG] scenes[{idx_scene}] {scene_id} → exists, skip")
+                continue
 
-            # 프롬프트 결합(이미지 전용)
-            base_prompt = str(sc.get("prompt") or "").strip()
-            img_prompt = str(sc.get("prompt_img") or "").strip()
-            parts = [p for p in (base_prompt, img_prompt) if p]
-            pos_text = " ".join(parts) if parts else "photo portrait, realistic, high quality"
-            neg_text = str(
-                sc.get("prompt_negative")
-                or (story.get("defaults", {}).get("image", {}) or {}).get("negative")
-                or "low quality, artifacts, text watermark"
-            ).strip()
+            # deepcopy: json 경유(복잡 노드에도 안전)
+            graph: Dict[str, Any] = json.loads(json.dumps(graph_origin))
 
-            # 1) 해상도/스텝 일괄 주입(모든 latent/ksampler)
-            for nid in latent_ids:
-                _set_input(graph, nid, "width", int(ui_width))
-                _set_input(graph, nid, "height", int(ui_height))
-            for nid in ksampler_ids:
-                _set_input(graph, nid, "steps", int(steps))
+            # 해상도/스텝
+            for nid_lat in latent_ids:
+                set_input(graph, nid_lat, "width", int(ui_width))
+                set_input(graph, nid_lat, "height", int(ui_height))
+            for nid_ks in ksampler_ids:
+                set_input(graph, nid_ks, "steps", int(steps))
 
-            # 2) 스왑 enable 토글
-            for nid in reactor_ids:
-                _set_input(graph, nid, "enabled", bool(swap_ok))
+            # 프롬프트
+            pos_text = str(scene_data.get("prompt") or "").strip()
+            add_img_text = str(scene_data.get("prompt_img") or "").strip()
+            if add_img_text:
+                pos_text = f"{pos_text}\n{add_img_text}" if pos_text else add_img_text
+            neg_text = str(scene_data.get("prompt_negative") or "") or default_neg
 
-            # 3) 프롬프트 전역 덮어쓰기
-            applied = _override_text_inputs(graph, pos=pos_text, neg=neg_text)
+            changed_fields = apply_prompts(graph, pos_text, neg_text)
+            if changed_fields:
+                prev = ", ".join(f"{nid}:{fld}:{ln}" for nid, fld, ln in changed_fields[:6])
+                if len(changed_fields) > 6:
+                    prev += f" (+{len(changed_fields) - 6})"
+                notify("cfg", f"[IMG] prompt-applied → {prev}")
 
-            # ---- 캐릭터 얼굴 주입 ----
-            face_path = _resolve_character_image_path(sc, story)
+            # 얼굴 소스 결정(character_objs → characters)
+            face_path: Optional[Path] = None
+            char_objs = scene_data.get("character_objs") or []
+            if isinstance(char_objs, list) and char_objs:
+                obj0 = char_objs[0]
+                if isinstance(obj0, dict):
+                    cand = str(obj0.get("img_file") or obj0.get("image") or "")
+                    if cand:
+                        p0 = Path(cand)
+                        if p0.exists():
+                            face_path = p0
+            if face_path is None:
+                chars = scene_data.get("characters") or []
+                if isinstance(chars, list) and chars:
+                    ch0 = chars[0]
+                    if isinstance(ch0, dict):
+                        cand2 = str(ch0.get("img_file") or ch0.get("image") or "")
+                        if cand2:
+                            p1 = Path(cand2)
+                            if p1.exists():
+                                face_path = p1
 
-            # 3-1) ReActor 계열에 직접 주입 (첫 경로)
-            applied_face_nodes_first: List[str] = []
-            face_fname: Optional[str] = None
-            if face_path:
-                face_fname = _copy_to_comfy_input(face_path)  # C:\comfy310\ComfyUI\input\ 에 복사 → 파일명만
-                # female_01 / male_01에 따라 힌트 줄 수도 있음 (선택)
-                hint = None
-                chars = sc.get("characters") or []
-                if chars and isinstance(chars[0], str):
-                    low = chars[0].lower()
-                    if "female" in low:
-                        hint = "female"
-                    elif "male" in low:
-                        hint = "male"
-                applied_face_nodes_first = _set_face_on_reactors(graph, face_fname, target_label_hint=hint)
-                notify("cfg", f"[IMG] face source set → {face_fname} | LoadImage nodes={applied_face_nodes_first}")
+            # 스왑 on/off
+            if face_path is None:
+                for nid_react in reactor_ids:
+                    set_input(graph, nid_react, "enabled", False)
+                notify("cfg", f"[IMG] scenes[{idx_scene}] {scene_id} → face-swap disabled (no character)")
             else:
-                notify("cfg", "[IMG] face-swap skipped (no character image)")
-
-            def _parse_first_char_index(scene) -> int:
-                specs = scene.get("characters") or scene.get("character_objs") or []
-                if not specs:
-                    return 0
-                if isinstance(specs[0], str) and ":" in specs[0]:
-                    try:
-                        return int(specs[0].split(":")[1])
-                    except Exception:
-                        return 0
-                if isinstance(specs[0], dict):
-                    try:
-                        return int(specs[0].get("index", 0))
-                    except Exception:
-                        return 0
-                return 0
-
-            # … 얼굴 주입 직후:
-            face_idx = _parse_first_char_index(sc)
-            for rnid, node in graph.items():
-                if node.get("class_type") == "ReActorFaceSwap":
-                    inp_map2 = node.setdefault("inputs", {})  # ← 이름 가리기 방지
-                    for k in ("source_faces_index", "input_faces_index"):
-                        if k in inp_map2:
-                            inp_map2[k] = str(face_idx)
-
-            # 3-2) 별도 주입 경로가 있는 경우 합산
-            applied_face_nodes_second: List[str] = []
-            if face_path and face_fname:
-                applied_face_nodes_second = _inject_face_image_to_graph(graph, face_fname)
-                notify("cfg", f"[IMG] face-swap source={face_fname} -> LoadImage nodes={applied_face_nodes_second or ['?']}")
-
-            # 두 경로 합산하여 실제 적용 여부 판단
-            applied_face_nodes = list(dict.fromkeys((applied_face_nodes_first or []) + (applied_face_nodes_second or [])))
-            applied_face = bool(applied_face_nodes)
-
-            # 스왑 노드 enable
-            for nid, node in graph.items():
-                if "ReActor" in str(node.get("label") or ""):
-                    graph[nid].setdefault("inputs", {})["enabled"] = bool(face_fname and applied_face)
-
-            # 4) 체크포인트 이름 로깅
-            ckpts: list[str] = []
-            for nid in ckpt_ids:
+                face_name = face_path.name
                 try:
-                    name = str(graph[nid].get("inputs", {}).get("ckpt_name") or "")
-                    if name:
-                        ckpts.append(name)
-                except Exception:
+                    ensure_dir(Path(COMFY_INPUT_DIR))
+                    shutil.copy2(str(face_path), str(Path(COMFY_INPUT_DIR) / face_name))
+                except (OSError, shutil.Error):
                     pass
+                for nid_react in reactor_ids:
+                    set_input(graph, nid_react, "source_image", face_name)
+                    set_input(graph, nid_react, "enabled", True)
 
-            # 주입 결과 로그
-            notify(
-                "cfg",
-                f"[IMG] size={ui_width}x{ui_height}, steps={steps}, pos_len={len(pos_text)}, "
-                f"ckpt={ckpts[:1] or ['?']}, latents={len(latent_ids)}, ksamplers={len(ksampler_ids)}, reactors={len(reactor_ids)}"
-            )
-            if applied:
-                head = ", ".join(f"{nid}:{field}:{ln}" for nid, field, ln in applied[:6])
-                more = f" (+{len(applied)-6} more)" if len(applied) > 6 else ""
-                notify("cfg", f"[IMG] prompt-applied → {head}{more}")
+                face_idx = parse_first_char_index(scene_data)
+                for nid_iter, node_iter in graph.items():
+                    try:
+                        if node_iter.get("class_type") == "ReActorFaceSwap":
+                            inputs_map2 = node_iter.setdefault("inputs", {})
+                            for idx_key in ("source_faces_index", "input_faces_index"):
+                                if idx_key in inputs_map2:
+                                    inputs_map2[idx_key] = str(face_idx)
+                    except (AttributeError, KeyError, TypeError):
+                        continue
+                notify("cfg", f"[IMG] scenes[{idx_scene}] {scene_id} → face-swap enabled, source={face_name}, idx={face_idx}")
 
-            notify("submit", f"scene[{idx}] 제출: {pos_text[:60]}…")
+            # ckpt 로그(실사용)
+            ckpt_names: List[str] = []
+            for nid_ck in ckpt_ids:
+                try:
+                    name_val = str((graph.get(nid_ck) or {}).get("inputs", {}).get("ckpt_name") or "")
+                    if name_val:
+                        ckpt_names.append(name_val)
+                except (AttributeError, KeyError, TypeError):
+                    pass
+            if ckpt_names:
+                notify("cfg", f"[IMG] ckpt={ckpt_names[:1]}")
 
-            # 제출 & 대기
-            hist = _wait_img(
-                base_url, graph,
-                timeout=timeout_sec,
-                poll=poll_sec,
-                progress_cb=(on_progress or (lambda _pinfo: None)),
-            )
+            # 제출/대기
+            req_count += 1
+            notify("submit", f"[IMG] scenes[{idx_scene}] {scene_id} → /prompt")
+            result = comfy_wait(base_url, graph)
 
-            # 출력 파싱(outputs/output 모두 대응)
-            files: List[Dict[str, Any]] = []
-            outputs = hist.get("outputs") or hist.get("output") or {}
-            for out in outputs.values():
-                if isinstance(out, dict):
-                    files.extend(out.get("images", []) or [])
-
-            if not files:
+            # 결과 파싱/다운로드
+            outputs_map = result.get("outputs") or {}
+            images_meta: List[Dict[str, Any]] = []
+            for out_key, out_val in outputs_map.items():
+                if isinstance(out_val, dict):
+                    images_meta.extend(out_val.get("images") or [])
+            if not images_meta:
                 raise RuntimeError("출력 이미지 없음")
 
-            last = files[-1]
-            subfolder = str(last.get("subfolder") or "")
-            fname = str(last.get("filename") or "")
-            if not fname:
+            last_meta = images_meta[-1]
+            subfolder = str(last_meta.get("subfolder") or "")
+            filename = str(last_meta.get("filename") or "")
+            if not filename:
                 raise RuntimeError("출력 파일명 없음")
 
-            r = requests.get(
+            resp = requests.get(
                 base_url.rstrip("/") + "/view",
-                params={"filename": fname, "subfolder": subfolder},
+                params={"filename": filename, "subfolder": subfolder},
                 timeout=30,
             )
-            if not r.ok:
-                raise RuntimeError(f"/view 실패: {r.status_code}")
+            if not resp.ok:
+                raise RuntimeError(f"/view 실패: {resp.status_code}")
 
-            img_path.parent.mkdir(parents=True, exist_ok=True)
-            with open(img_path, "wb") as fp:
-                fp.write(r.content)
+            out_path.parent.mkdir(parents=True, exist_ok=True)
+            with open(out_path, "wb") as wf:
+                wf.write(resp.content)
 
-            # story.json 즉시 반영
-            if not sc.get("img_file"):
-                sc["img_file"] = str(img_path)
+            if not scene_data.get("img_file"):
+                scene_data["img_file"] = str(out_path)
                 try:
                     save_json(p_story, story)
-                    notify("save", f"story.json 갱신: scenes[{idx}].img_file")
-                except Exception as ex:
-                    notify("warn", f"story 저장 실패: {type(ex).__name__}: {ex}")
+                    notify("save", f"story.json 갱신: scenes[{idx_scene}].img_file")
+                except (OSError, ValueError, TypeError):
+                    pass
 
-            created.append(img_path)
-            notify("scene-done", f"scene[{idx}] → {img_path.name}")
+            created.append(out_path)
+            notify("done", f"[IMG] scenes[{idx_scene}] {scene_id} → saved {out_path.name}")
 
-        except requests.RequestException as ex_net:
-            notify("scene-error", f"scene[{idx}] 네트워크 오류: {ex_net.__class__.__name__}: {ex_net}")
-        except (OSError, ValueError, RuntimeError, KeyError, json.JSONDecodeError) as ex_gen:
-            notify("scene-error", f"scene[{idx}] 실패: {ex_gen.__class__.__name__}: {ex_gen}")
+        except (OSError, ValueError, TypeError, KeyError, RuntimeError, requests.RequestException) as err:
+            notify("scene-error", f"[IMG] scenes[{idx_scene}] {scene_data.get('id')}: {err}")
+            continue
 
-    # 요청 개수 리포트
-    req_total = 0
-    for s in scenes:
-        img_win = s.get("img_file") or ""
-        p = _Path(img_win) if img_win else (img_root / f"{str(s.get('id', 'scene'))}.png")
-        if not p.exists():
-            req_total += 1
+    notify("summary", f"[IMG] 총 scenes={len(scenes)}, 요청={req_count}, 생성={len(created)}")
 
-    notify("end", f"생성 {len(created)}개 / 요청 {req_total}개")
+    # 남은 요청(파일 미존재 씬)
+    remain = 0
+    for scene_chk in scenes:
+        img_field = scene_chk.get("img_file") or ""
+        path_chk = Path(img_field) if img_field else (img_root / f"{str(scene_chk.get('id', 'scene'))}.png")
+        if not path_chk.exists():
+            remain += 1
+
+    notify("end", f"생성 {len(created)}개 / 남은 요청 {remain}개")
     return created
+
+
+
+
 
 
 
