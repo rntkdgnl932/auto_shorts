@@ -615,7 +615,6 @@ def build_missing_images_from_story(
     ksampler_ids = _find_nodes(graph_origin, "KSampler")
     reactor_ids = [nid for nid, node in graph_origin.items() if str(node.get("class_type")) == "ReActorFaceSwap"]
 
-    # ---- 새로 추가: 캐릭터명→파일 경로 해석(폴더: character) ----
     def _resolve_face_image_by_name(name: str) -> _Path | None:
         try:
             from settings import CHARACTER_DIR  # type: ignore
@@ -647,7 +646,6 @@ def build_missing_images_from_story(
                 return cand or None
         return None
 
-    # 참고: 기존 보조 주입 함수(전역 덮어쓰기 용)는 유지(호출 안 함)
     def _inject_face_to_reactors(gdict: Dict[str, Any], file_name: str) -> List[str]:
         applied_ids: List[str] = []
         for rid in reactor_ids:
@@ -663,7 +661,6 @@ def build_missing_images_from_story(
                 continue
         return applied_ids
 
-    # 참고: 기존 보조 함수(모든 LoadImage 전역 변경)는 안전을 위해 사용하지 않음
     def _inject_face_image_loaders(_gdict: Dict[str, Any], _file_name: str) -> List[str]:
         return []
 
@@ -688,19 +685,30 @@ def build_missing_images_from_story(
     except (ImportError, AttributeError):
         from app.audio_sync import _submit_and_wait as _wait_core  # type: ignore
 
+    # ====== 여기만 변경(대기 로그 50번에 1번씩만 전달) ======
     def _wait_img(url: str, gdict: Dict[str, Any], *, timeout: int, poll: float, progress_cb: Callable[[Dict[str, Any]], None]) -> Dict[str, Any]:
+        wait_i = 0  # throttling counter inside one request
+
         def _relay(prog: Dict[str, Any]) -> None:
+            nonlocal wait_i
             raw = str(prog.get("msg") or "")
             if raw.startswith("[MUSIC]"):
-                patched = "[IMG]" + raw[len("[MUSIC]") :]
+                patched = "[IMG]" + raw[len("[MUSIC]"):]
             else:
                 patched = "[IMG] " + raw if raw else "[IMG]"
+
+            # throttle: forward only every 50th wait message
+            wait_i += 1
+            if wait_i % 50 != 0:
+                return
+
             try:
-                progress_cb({"msg": patched})
+                progress_cb({"stage": "wait", "msg": patched})
             except (RuntimeError, ValueError, TypeError):
                 pass
 
         return _wait_core(url, gdict, timeout=timeout, poll=poll, on_progress=_relay)
+    # ================================================
 
     created: List[_Path] = []
     base_url = str(video.get("comfy_host") or story.get("comfy_host") or "http://127.0.0.1:8188").rstrip("/")
@@ -762,7 +770,6 @@ def build_missing_images_from_story(
 
             _apply_prompts(graph, pos_text, neg_text)
 
-            # ---- 얼굴 경로 선택: 캐릭터명 우선, 기존 경로 폴백 ----
             face_path: _Path | None = None
             char_name = _pick_scene_character_name(sc)
             if isinstance(char_name, str):
@@ -802,20 +809,14 @@ def build_missing_images_from_story(
                 except (OSError, shutil.Error):
                     pass
 
-            # ---- ReActor: 정확히 1개만 활성화, 해당 LoadImage만 교체 ----
             applied_reactors: List[str] = []
             if face_name:
-                # 대상 ReActor 선택(첫 번째를 기본으로)
                 target_rid = reactor_ids[0] if reactor_ids else None
-
-                # 전체 on/off 설정
                 for rnid in reactor_ids:
                     try:
                         graph[rnid].setdefault("inputs", {})["enabled"] = (rnid == target_rid)
                     except (KeyError, TypeError):
                         continue
-
-                # 대상 리액터의 source_image 입력이 LoadImage 링크면 그 LoadImage만 filename 교체
                 if target_rid:
                     try:
                         rinp = graph[target_rid].setdefault("inputs", {})
@@ -826,7 +827,6 @@ def build_missing_images_from_story(
                                 graph[link_id].setdefault("inputs", {})["image"] = face_name
                                 applied_reactors.append(target_rid)
                         else:
-                            # 링크가 아니면 직접 파일명 주입
                             if "source_image" in rinp:
                                 rinp["source_image"] = face_name
                                 applied_reactors.append(target_rid)
@@ -836,7 +836,6 @@ def build_missing_images_from_story(
                     except (KeyError, TypeError):
                         pass
 
-                # 인덱스 반영
                 face_idx = _parse_first_char_index(sc)
                 for rnid in reactor_ids:
                     try:
@@ -848,14 +847,12 @@ def build_missing_images_from_story(
                     except (KeyError, TypeError, ValueError):
                         continue
             else:
-                # 얼굴 없으면 전부 끔
                 for rnid in reactor_ids:
                     try:
                         graph[rnid].setdefault("inputs", {})["enabled"] = False
                     except (KeyError, TypeError):
                         continue
 
-            # ======== 디버그 로그 ========
             try:
                 load_ids = _find_nodes(graph, "LoadImage")
                 for lid in load_ids:
@@ -888,7 +885,6 @@ def build_missing_images_from_story(
                     _notify("debug-warn", "[IMG][DBG] face image 있음에도 ReActor에 연결된 입력이 감지되지 않음")
             except (RuntimeError, ValueError, TypeError):
                 pass
-            # ======== 디버그 로그 끝 ========
 
             for nid in ksampler_ids:
                 _set_input(graph, nid, "steps", int(steps))
@@ -958,6 +954,7 @@ def build_missing_images_from_story(
 
     _notify("summary", f"[IMG] 생성={len(created)} / 요청={req_count}")
     return created
+
 
 
 
