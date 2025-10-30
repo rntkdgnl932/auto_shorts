@@ -105,18 +105,18 @@ USE_HWACCEL: bool = True
 
 # 1) 이미지 기본 크기 (가로, 세로)
 #    예: (832, 1472)는 9:16 세로형에 가깝습니다. (w, h)
-DEFAULT_IMG_SIZE: tuple[int, int] = (1080, 1920)
+DEFAULT_IMG_SIZE: tuple[int, int] = (720, 1080)
 
 # 드롭다운 후보(원하는 값 추가/삭제 가능)
 IMAGE_SIZE_CHOICES: list[int] = [480, 520, 720, 960, 1080, 1280, 1440, 1920]
 
 # 2) 렌더 FPS 기본/후보 (24 또는 60 선택)
-DEFAULT_MOVIE_FPS: int = 60
+DEFAULT_MOVIE_FPS: int = 30
 MOVIE_FPS_CHOICES: list[int] = [24, 30, 60]
 
 # 3) 청크 오버랩(프레임) — i2v를 여러 덩어리로 만들 때 경계 끊김을 줄이기 위해
 #    앞/뒤 청크가 겹치는 프레임 수. 60fps에서 12프레임은 약 0.2초.
-DEFAULT_MOVIE_OVERLAP: int = 12
+DEFAULT_MOVIE_OVERLAP: int = 5
 
 # 4) 최소 장면 길이(초) — 분석/보정 시 너무 짧은 컷을 '삭제'가 아니라
 #    '최소 길이로 승격'하는 기준값. (삭제로 바꾸고 싶으면 알려주세요.)

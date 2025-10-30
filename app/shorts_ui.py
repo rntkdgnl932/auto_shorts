@@ -111,7 +111,7 @@ except ImportError:
 # - female_* 캐릭터에는 'huge breasts' 자동 포함
 # ============================================================
 import re
-from typing import List, Any
+from typing import List, Any, Callable
 # 공용헬퍼
 from pathlib import Path
 
@@ -1625,8 +1625,8 @@ class MainWindow(QtWidgets.QMainWindow):
             except (TypeError, ValueError, AttributeError):
                 return int(default_val)
 
-        ui_w = _get_combo_int("cmb_img_w", 1080)
-        ui_h = _get_combo_int("cmb_img_h", 1920)
+        ui_w = _get_combo_int("cmb_img_w", 720)
+        ui_h = _get_combo_int("cmb_img_h", 1080)
 
         spn = getattr(self, "spn_t2i_steps", None)
         try:
@@ -2539,7 +2539,7 @@ class MainWindow(QtWidgets.QMainWindow):
                     },
                     # defaults: project.json > 기본값 (image 키 포함)
                     "defaults": meta_info.get("defaults") or {  #
-                        "image": {"width": 1080, "height": 1920, "negative": "@global"}  #
+                        "image": {"width": 720, "height": 1080, "negative": "@global"}  #
                     },
                     "scenes": scenes_list,  # 생성된 씬 리스트
                     # audit 정보 추가
@@ -3607,7 +3607,7 @@ class MainWindow(QtWidgets.QMainWindow):
             from app import settings as _settings  # type: ignore
         return _settings.FFMPEG_EXE or "ffmpeg"
 
-    def _build_clip_from_image(self, img: Path, out_mp4: Path, duration: float, fps: int = 24,
+    def _build_clip_from_image(self, img: Path, out_mp4: Path, duration: float, fps: int = 16,
                                width: int = 1080, height: int = 1920) -> bool:
         """
         단일 이미지로 duration 길이의 mp4를 만든다(세로 1080x1920 기본).
@@ -6526,46 +6526,223 @@ class MainWindow(QtWidgets.QMainWindow):
         return [dst]
 
     # ────────────── 영상 빌드(선택) ──────────────
-    def on_video(self):
-        proj = self._latest_project()
-        if not proj:
-            QtWidgets.QMessageBox.warning(self, "안내", "프로젝트가 없습니다.")
-            return
-        total = self.sb_total.value()
-        # overlap 계산은 build_shots_with_i2v 내부 또는 movie.json 생성 시 처리될 수 있으므로,
-        # 여기서는 직접 사용하지 않아도 될 수 있습니다. 필요시 유지합니다.
-        # ov_fixed = recalc_overlap(self.sb_infps.value(), self.sb_outfps.value(), self.sb_overlap.value())
+    def on_video(self) -> None:
+        """
+        영상 생성:
+          - UI에서 W/H/FPS/스텝 값을 읽어 build_shots_with_i2v로 전달.
+          - run_job_with_progress_async를 사용하여 비동기 실행 및 실시간 로그 창 표시.
+          - video_build.build_shots_with_i2v 기존 동작 100% 보존.
+        """
+        # 필요한 모듈 임포트
+        from pathlib import Path
+        from typing import Any, Dict, Optional, Callable
+        from PyQt5 import QtWidgets
+        import inspect # inspect 모듈은 시그니처 확인에 필요
+        import traceback
+
+
+
+        # --- 버튼 상태 관리 ---
+        btn_video_widget: Optional[QtWidgets.QAbstractButton] = None
+        for btn_name in ("btn_video", "btn_build_video"):
+             widget_candidate = getattr(self, btn_name, None) or \
+                                getattr(getattr(self, "ui", None), btn_name, None)
+             if isinstance(widget_candidate, QtWidgets.QAbstractButton):
+                  btn_video_widget = widget_candidate
+                  break
+
+        if btn_video_widget:
+            btn_video_widget.setEnabled(False)
+
         try:
-            self.status.showMessage("i2v 세그먼트 생성 시작…")
-            # ▼▼▼ build_shots_with_i2v 호출은 유지 ▼▼▼
-            clips = build_shots_with_i2v(str(proj), total)  # total_frames 인자는 호환성 위해 남겨둘 수 있음
-            self.status.showMessage(f"i2v 세그먼트 생성 완료: {len(clips)}개 클립 생성됨")  # 메시지 수정
+            # --- UI 값 읽기 ---
+            ui_w: Optional[int] = None
+            ui_h: Optional[int] = None
+            ui_fps: Optional[int] = None
+            ui_steps: Optional[int] = None
 
-            # ▼▼▼ xfade_concat 호출 부분을 삭제하거나 주석 처리 ▼▼▼
-            # self.status.showMessage("합치기…")
-            # final = xfade_concat(
-            #     clips, ov_fixed, self.sb_outfps.value(),
-            #     audio_path=(Path(proj) / "vocal.mp3"),
-            #     out_path=(Path(proj) / "final.mp4"),
-            # )
-            # QtWidgets.QMessageBox.information(self, "완료", f"영상 완성: {final}")
-            # self.status.showMessage(f"완료: {final}")
-            # ▲▲▲ 여기까지 삭제 또는 주석 처리 ▲▲▲
+            def _get_ui_int_value(widget_name: str, data_attr: str = "currentData", default_val: Optional[int] = None) -> Optional[int]:
+                """UI 위젯에서 정수 값을 안전하게 읽어옴."""
+                widget = getattr(self, widget_name, None)
+                if widget is not None:
+                    try:
+                        value_method = getattr(widget, data_attr, None)
+                        if callable(value_method):
+                            raw_value = value_method()
+                            if callable(raw_value):
+                                 print(f"[경고] UI 값 읽기 오류 ({widget_name}): 함수 반환.")
+                                 return default_val
+                            if raw_value is not None:
+                                try:
+                                    return int(raw_value) # type: ignore
+                                except (ValueError, TypeError) as e_int_conv:
+                                    print(f"[경고] UI 값 정수 변환 실패 ({widget_name}, 값: '{raw_value}'): {e_int_conv}")
+                                    return default_val
+                            else:
+                                return default_val
+                    except (AttributeError) as e_attr:
+                         print(f"[경고] UI 위젯 속성 접근 실패 ({widget_name}.{data_attr}): {e_attr}")
+                    except Exception as e_get_val_unexpected:
+                         print(f"[경고] UI 값 읽기 중 예상치 못한 오류 ({widget_name}): {e_get_val_unexpected}")
+                return default_val
 
-            # 완료 안내 메시지 수정
-            QtWidgets.QMessageBox.information(self, "완료",
-                                              f"영상 클립 생성 완료\n\n생성된 클립 수: {len(clips)}\n클립 폴더: {proj / 'clips'}")
+            ui_w = _get_ui_int_value("cmb_img_w", "currentData")
+            ui_h = _get_ui_int_value("cmb_img_h", "currentData")
+            ui_fps = _get_ui_int_value("cmb_movie_fps", "currentData")
+            ui_steps = _get_ui_int_value("spn_t2i_steps", "value")
 
-        except FileNotFoundError as e:  # story.json/movie.json/video.json 못 찾는 경우 등
-            QtWidgets.QMessageBox.critical(self, "오류", f"필요한 JSON 파일을 찾을 수 없습니다: {e}")
-            self.status.showMessage(f"오류: {e}")
-        except RuntimeError as e:  # movie.json/video.json에 items/scenes가 없는 경우 등
-            QtWidgets.QMessageBox.critical(self, "오류", f"JSON 파일 내용 오류: {e}")
-            self.status.showMessage(f"오류: {e}")
-        except Exception as e:
-            QtWidgets.QMessageBox.critical(self, "오류", str(e))
-            self.status.showMessage(f"오류: {e}")
+            # --- 프로젝트 경로 확인 ---
+            proj_dir_val: Optional[str] = None
+            proj_dir_getter = getattr(self, "_current_project_dir", None)
+            if callable(proj_dir_getter):
+                try:
+                    proj_dir_obj = proj_dir_getter()
+                    if isinstance(proj_dir_obj, (str, Path)):
+                        proj_dir_val = str(proj_dir_obj)
+                except Exception as e_get_proj_inner:
+                    print(f"[경고] 프로젝트 경로 얻기 실패 (_current_project_dir): {e_get_proj_inner}")
+            if not proj_dir_val:
+                 proj_dir_attr = getattr(self, "project_dir", None)
+                 if isinstance(proj_dir_attr, (str, Path)):
+                     proj_dir_val = str(proj_dir_attr)
 
+            if not proj_dir_val:
+                QtWidgets.QMessageBox.warning(self, "오류", "프로젝트 폴더가 선택되지 않았습니다.")
+                return # finally 블록에서 버튼 활성화
+            pdir = Path(proj_dir_val)
+
+            # --- 백그라운드 작업 함수 정의 (콜백 인자 추가) ---
+            def _job(progress_callback: Callable[[Dict[str, Any]], None]) -> None: # <-- 콜백 인자 명시
+                """영상 생성을 수행하는 백그라운드 작업 함수."""
+                build_func_local: Optional[Callable] = None # <-- 변수명 변경
+                try:
+                    from app.video_build import build_shots_with_i2v as build_func_imp # type: ignore
+                    build_func_local = build_func_imp
+                except (ImportError, ModuleNotFoundError, AttributeError):
+                    try:
+                         from video_build import build_shots_with_i2v as build_func_imp2 # type: ignore
+                         build_func_local = build_func_imp2
+                    except (ImportError, ModuleNotFoundError, AttributeError) as e_import_vb_inner:
+                         raise ImportError(f"video_build.build_shots_with_i2v 로드 실패: {e_import_vb_inner}") from e_import_vb_inner
+
+                tframes = 0
+                sb_total_widget = getattr(self, "sb_total", None)
+                if sb_total_widget is not None and hasattr(sb_total_widget, "value"):
+                    try:
+                        tframes = int(sb_total_widget.value())
+                    except (TypeError, ValueError):
+                        tframes = 0
+                if tframes <= 0:
+                     progress_callback({"msg": "[경고] total_frames가 0 이하입니다."})
+
+                try:
+                    sig_build_inner = inspect.signature(build_func_local) # <-- 변수명 변경
+                    build_kwargs_inner: Dict[str, Any] = {
+                        "project_dir": str(pdir),
+                        "total_frames": tframes,
+                        "on_progress": progress_callback # <-- 전달받은 콜백 명시적으로 사용
+                    }
+                    # UI 값 인자 추가 (시그니처 확인 후, None이 아닐 때만)
+                    if "ui_width" in sig_build_inner.parameters and ui_w is not None: build_kwargs_inner["ui_width"] = ui_w
+                    if "ui_height" in sig_build_inner.parameters and ui_h is not None: build_kwargs_inner["ui_height"] = ui_h
+                    if "ui_fps" in sig_build_inner.parameters and ui_fps is not None: build_kwargs_inner["ui_fps"] = ui_fps
+                    if "ui_steps" in sig_build_inner.parameters and ui_steps is not None: build_kwargs_inner["ui_steps"] = ui_steps
+
+                    build_func_local(**build_kwargs_inner) # <-- 변수명 변경
+
+                except TypeError as e_type_build_inner:
+                    progress_callback({"msg": f"[경고] build_shots_with_i2v 호출 시그니처 불일치 ({e_type_build_inner}), UI 값 없이 호출 시도."})
+                    try:
+                        build_func_local(str(pdir), tframes, on_progress=progress_callback) # <-- 변수명 변경
+                    except TypeError:
+                         progress_callback({"msg": "[경고] on_progress 인자도 실패, 인자 없이 호출 시도."})
+                         build_func_local(str(pdir), tframes) # type: ignore[call-arg] # <-- 변수명 변경
+                    except Exception as e_fallback_call_inner:
+                         raise RuntimeError(f"build_shots_with_i2v 최종 호출 실패: {e_fallback_call_inner}") from e_fallback_call_inner
+                except Exception as e_build_other_inner:
+                    raise RuntimeError(f"build_shots_with_i2v 실행 오류: {e_build_other_inner}") from e_build_other_inner
+
+            # --- 작업 완료 콜백 ---
+            def _done(ok: bool, _payload: Any, err: Optional[Exception]) -> None: # <-- _payload 사용 안 함 명시
+                 """작업 완료 후 UI 업데이트 및 메시지 표시."""
+                 if not ok and err:
+                      err_type_name = type(err).__name__
+                      err_message = str(err)
+                      print(f"[오류] 영상 생성 작업 실패: {err_type_name}: {err_message}")
+                      print(traceback.format_exc())
+                      QtWidgets.QMessageBox.critical(self, "영상 생성 오류", f"오류 발생:\n{err_type_name}: {err_message}\n\n상세 내용은 콘솔 로그를 확인하세요.")
+                 elif ok:
+                      print("[정보] 영상 생성 작업 완료.")
+                      QtWidgets.QMessageBox.information(self, "완료", "영상 생성 작업이 완료되었습니다.")
+
+            # --- 진행창 유틸 로드 ---
+            run_async_local: Optional[Callable] = None # <-- 변수명 변경
+            try:
+                from app.utils import run_job_with_progress_async as run_async_imp # type: ignore
+                run_async_local = run_async_imp
+            except (ImportError, ModuleNotFoundError, AttributeError):
+                try:
+                    from utils import run_job_with_progress_async as run_async_imp2 # type: ignore
+                    run_async_local = run_async_imp2
+                except (ImportError, ModuleNotFoundError, AttributeError):
+                    run_async_local = None
+
+            if run_async_local is None:
+                # 유틸 로드 실패 시 동기 실행
+                print("[경고] run_job_with_progress_async 로드 실패, 동기 실행합니다.")
+                def _notify_sync(data: Dict[str, Any]) -> None:
+                     print(f"[I2V][Sync] {data.get('msg', '')}")
+                try:
+                    _job(_notify_sync)
+                    _done(True, None, None)
+                except Exception as e_sync_job_inner:
+                    _done(False, None, e_sync_job_inner)
+                return # 동기 실행 후 종료
+
+            # --- run_async 호출 준비 ---
+            # run_job_with_progress_async 함수 시그니처 확인 (utils.py 기준)
+            # def run_job_with_progress_async(owner, title, job, *, tail_file=None, on_done=None)
+            kw_run_async: Dict[str, Any] = {}
+            try:
+                 sig_run_async_check = inspect.signature(run_async_local)
+                 if "tail_file" in sig_run_async_check.parameters:
+                      kw_run_async["tail_file"] = None # 영상 생성은 tail 불필요
+                 if "on_done" in sig_run_async_check.parameters:
+                      kw_run_async["on_done"] = _done
+            except (TypeError, ValueError) as e_sig_check:
+                 print(f"[경고] run_async 시그니처 분석 실패 (호출은 시도): {e_sig_check}")
+                 # 기본 키워드 인자 설정 (on_done은 중요하므로 포함 시도)
+                 kw_run_async = {"tail_file": None, "on_done": _done}
+
+            # --- run_async 실행 (정확한 인자 전달) ---
+            try:
+                 # utils.py 시그니처에 맞춰 owner, title, job을 위치 인자로 전달
+                 run_async_local(self, "영상 생성", _job, **kw_run_async) # <-- 호출 방식 수정
+            except Exception as e_run_call_final:
+                 # 호출 실패 시 오류 로깅 및 동기 실행
+                 print(f"[오류] run_job_with_progress_async 호출 실패: {e_run_call_final}")
+                 print("[경고] 동기 실행으로 전환합니다.")
+                 def _notify_sync_fallback(data: Dict[str, Any]) -> None:
+                      print(f"[I2V][SyncFallback] {data.get('msg', '')}")
+                 try:
+                      _job(_notify_sync_fallback)
+                      _done(True, None, None)
+                 except Exception as e_sync_job_fallback_inner:
+                      _done(False, None, e_sync_job_fallback_inner)
+
+        except Exception as e_outer_inner:
+             # on_video 함수 자체의 최상위 예외 처리
+             print(f"[오류] on_video 실행 중 오류 발생: {type(e_outer_inner).__name__}: {e_outer_inner}")
+             print(traceback.format_exc())
+             QtWidgets.QMessageBox.critical(self, "오류", f"영상 생성 시작 중 오류 발생:\n{e_outer_inner}")
+
+        finally:
+            # 버튼 활성화 (항상 실행)
+            if btn_video_widget:
+                 try:
+                      btn_video_widget.setEnabled(True)
+                 except RuntimeError: # 위젯 소멸 등 예외
+                      pass
     # ────────────── 기타 ──────────────
     def _set_total_frames_from_audio(self, audio_path: Path) -> None:
         dur = audio_duration_sec(audio_path)
@@ -6884,6 +7061,48 @@ def _inject_render_prefs_methods():
 
     # ==== 메서드 정의: 드롭다운 UI 추가 ====
     def _add_render_prefs_controls(self, parent_layout: QtWidgets.QBoxLayout) -> None:
+        """렌더 설정(W, H, FPS, 프리셋, 스텝) UI를 생성하고 부모 레이아웃에 추가합니다."""
+        # settings 모듈을 안전하게 참조 (s_mod_prefs 별칭 사용)
+        try:
+            from app import settings as s_mod_prefs # type: ignore
+        except ImportError:
+            try:
+                import settings as s_mod_prefs # type: ignore
+            except ImportError:
+                print("[경고] _add_render_prefs_controls: settings 모듈 로드 실패, 기본값 사용")
+                class SettingsFallbackPrefs:
+                    IMAGE_SIZE_CHOICES = [480, 512, 720, 832, 960, 1024, 1080, 1280, 1440, 1920, 2560]
+                    DEFAULT_IMG_SIZE = (1080, 1920)
+                    MOVIE_FPS_CHOICES = [24, 30, 60]
+                    DEFAULT_MOVIE_FPS = 30
+                s_mod_prefs = SettingsFallbackPrefs()
+
+        #--- 내부 유틸 함수 (load_json) ---
+        _load_json_local_prefs: Callable # 타입 명시
+        try:
+            from app.utils import load_json as _load_json_local_prefs # type: ignore
+        except ImportError:
+            try:
+                from utils import load_json as _load_json_local_prefs # type: ignore
+            except ImportError:
+                print("[오류] _add_render_prefs_controls: load_json 함수 로드 실패")
+                def _load_json_fb_prefs(p, default=None):
+                    try: return json.loads(Path(p).read_text(encoding="utf-8"))
+                    except Exception: return default
+                _load_json_local_prefs = _load_json_fb_prefs
+
+        #--- 내부 유틸 함수 (_guess_project_dir) ---
+        _guess_project_dir_local: Callable[[], Path] # 타입 명시
+        try:
+            _guess_project_dir_local = getattr(self, "_guess_project_dir")
+            if not callable(_guess_project_dir_local):
+                 raise AttributeError("_guess_project_dir 메서드를 찾을 수 없습니다.")
+        except AttributeError as e_guess_dir_local: # 변수명 변경
+             print(f"[오류] _add_render_prefs_controls: {e_guess_dir_local}")
+             def _guess_project_dir_fb() -> Path: return Path(".")
+             _guess_project_dir_local = _guess_project_dir_fb
+
+
         grp = QtWidgets.QGroupBox("렌더 설정")
         row = QtWidgets.QHBoxLayout(grp)
 
@@ -6896,96 +7115,154 @@ def _inject_render_prefs_methods():
         self.cmb_img_h.setToolTip("이미지 세로 (height)")
         self.cmb_movie_fps.setToolTip("타깃 FPS (i2v/렌더)")
 
-        size_choices = getattr(settings_mod, "IMAGE_SIZE_CHOICES", [480, 520, 720, 960, 1080, 1280, 1440])
-        for w_val in size_choices:
-            self.cmb_img_w.addItem(str(int(w_val)), int(w_val))
+        # --- ▼▼▼ 프리셋 값들(832, 1024 등)이 포함되도록 수정 ▼▼▼ ---
+        default_w_val, default_h_val = getattr(s_mod_prefs, "DEFAULT_IMG_SIZE", (1080, 1920))
+        # 프리셋에 사용된 모든 W 값을 size_choices_val에 포함시킴
+        preset_widths = {720, 832, 1080, 1280, 1920, 512, 1024}
+        preset_heights = {1280, 1472, 1920, 720, 1080, 512, 1024}
 
-        default_w, default_h = getattr(settings_mod, "DEFAULT_IMG_SIZE", (1080, 1920))
-        h_candidates = {int(round(w_val * 16 / 9)) for w_val in size_choices}
-        h_candidates.update({default_h})
-        for h_val in sorted(h_candidates):
-            self.cmb_img_h.addItem(str(int(h_val)), int(h_val))
+        size_choices_conf = getattr(s_mod_prefs, "IMAGE_SIZE_CHOICES", [480, 520, 720, 960, 1080, 1280, 1440])
+        size_choices_set = set(int(w) for w in size_choices_conf if str(w).isdigit())
+        size_choices_set.update(preset_widths) # 프리셋 W 값 추가
+        size_choices_set.add(int(default_w_val)) # 기본 W 값 추가
+        size_choices_val = sorted(list(size_choices_set)) # 정렬된 리스트
 
-        for fps_val in getattr(settings_mod, "MOVIE_FPS_CHOICES", [24, 60]):
-            self.cmb_movie_fps.addItem(str(int(fps_val)), int(fps_val))
+        # H 값 목록 생성
+        h_candidates_set = {int(round(w * 16 / 9)) for w in size_choices_val} # 16:9 비율
+        h_candidates_set.update({int(round(w * 9 / 16)) for w in size_choices_val}) # 9:16 비율
+        h_candidates_set.update(preset_heights) # 프리셋 H 값 추가
+        h_candidates_set.add(int(default_h_val)) # 기본 H 값 추가
+        h_candidates_val = sorted(list(h_candidates_set)) # 정렬된 리스트
+        # --- ▲▲▲ 목록 수정 끝 ▲▲▲ ---
+
+        fps_choices_val = getattr(s_mod_prefs, "MOVIE_FPS_CHOICES", [24, 30, 60])
+        default_fps_val = int(getattr(s_mod_prefs, "DEFAULT_MOVIE_FPS", 30))
+
+        # W/H 콤보박스 채우기
+        try:
+            for w_val_item in size_choices_val:
+                self.cmb_img_w.addItem(str(w_val_item), int(w_val_item))
+            for h_val_item in h_candidates_val:
+                self.cmb_img_h.addItem(str(h_val_item), int(h_val_item))
+        except (ValueError, TypeError) as e_size_fill_local: # 변수명 변경
+             print(f"[경고] W/H 콤보박스 채우기 오류: {e_size_fill_local}")
+             if self.cmb_img_w.count() == 0: self.cmb_img_w.addItem(str(default_w_val), int(default_w_val))
+             if self.cmb_img_h.count() == 0: self.cmb_img_h.addItem(str(default_h_val), int(default_h_val))
+
+        # FPS 콤보박스 채우기
+        try:
+            valid_fps_choices = [int(f) for f in fps_choices_val if str(f).isdigit()]
+            if default_fps_val not in valid_fps_choices: # 기본값이 목록에 없으면 추가
+                 valid_fps_choices.append(default_fps_val)
+                 valid_fps_choices.sort()
+            for fps_val_item in valid_fps_choices:
+                self.cmb_movie_fps.addItem(str(fps_val_item), int(fps_val_item))
+        except (ValueError, TypeError) as e_fps_fill_local: # 변수명 변경
+             print(f"[경고] FPS 콤보박스 채우기 오류: {e_fps_fill_local}")
+             if self.cmb_movie_fps.count() == 0: self.cmb_movie_fps.addItem(str(default_fps_val), int(default_fps_val))
+
 
         # 해상도 프리셋 + 스텝
         self.cmb_res_preset = QtWidgets.QComboBox()
         self.cmb_res_preset.setToolTip("해상도 프리셋(선택 시 W/H 자동 설정)")
 
-        presets = [
+        presets_data = [
             ("Shorts 9:16 · 720×1280", 720, 1280, "shorts_720x1280"),
             ("Shorts 9:16 · 832×1472", 832, 1472, "shorts_832x1472"),
             ("Shorts 9:16 · 1080×1920", 1080, 1920, "shorts_1080x1920"),
             ("Landscape 16:9 · 1280×720", 1280, 720, "land_1280x720"),
             ("Landscape 16:9 · 1920×1080", 1920, 1080, "land_1920x1080"),
-            ("Landscape 16:9 · 2560×1440", 2560, 1440, "land_2560x1440"),
             ("Square 1:1 · 512×512", 512, 512, "square_512"),
             ("Square 1:1 · 1024×1024", 1024, 1024, "square_1024"),
-            ("맞춤(커스텀)", -1, -1, "custom"),
+            ("맞춤(커스텀)", -1, -1, "custom"), # '맞춤'이 항상 마지막
         ]
-        for label, w_val, h_val, preset_key_val in presets:
-            self.cmb_res_preset.addItem(label, (w_val, h_val, preset_key_val))
+        for label_text, w_preset, h_preset, key_preset in presets_data:
+            self.cmb_res_preset.addItem(label_text, (w_preset, h_preset, key_preset))
 
         self.spn_t2i_steps = QtWidgets.QSpinBox()
         self.spn_t2i_steps.setRange(1, 200)
-        self.spn_t2i_steps.setValue(24)
+        self.spn_t2i_steps.setValue(12) # 기본값 12
         self.spn_t2i_steps.setToolTip("샘플링 스텝 수(확산 단계 수)")
 
         # project.json 초기값 반영
-        proj_dir = _guess_project_dir(self)
-        pj = proj_dir / "project.json"
-        meta = load_json(pj, {}) if pj.exists() else {}
-        ui = meta.get("ui_prefs") or {}
+        proj_dir_current = _guess_project_dir_local()
+        pj_current = proj_dir_current / "project.json"
+        meta_current = _load_json_local_prefs(pj_current, {}) if pj_current.exists() else {}
+        ui_prefs_current = meta_current.get("ui_prefs") or {}
 
-        def _set_combo(combo: QtWidgets.QComboBox, val: int, fallback: int):
-            idx_found = combo.findData(int(val))
-            if idx_found < 0:
-                idx_found = combo.findData(int(fallback))
-            combo.setCurrentIndex(idx_found if idx_found >= 0 else 0)
+        def _set_combo_safe(combo: QtWidgets.QComboBox, val_to_set: int, fallback_val: int):
+            """콤보박스 값을 안전하게 설정 (데이터 값 기준)."""
+            try:
+                val_int = int(val_to_set)
+                idx_found = combo.findData(val_int)
+                if idx_found < 0:
+                    idx_found = combo.findData(int(fallback_val))
+                combo.setCurrentIndex(idx_found if idx_found >= 0 else 0)
+            except (ValueError, TypeError):
+                combo.setCurrentIndex(0)
 
-        _set_combo(self.cmb_img_w, int((ui.get("image_size") or [default_w, default_h])[0]), int(default_w))
-        _set_combo(self.cmb_img_h, int((ui.get("image_size") or [default_w, default_h])[1]), int(default_h))
-        def_fps = int(getattr(settings_mod, "DEFAULT_MOVIE_FPS", 24))
-        _set_combo(self.cmb_movie_fps, int(ui.get("movie_fps") or def_fps), def_fps)
+        ui_w_val = (ui_prefs_current.get("image_size") or [default_w_val, default_h_val])[0]
+        ui_h_val = (ui_prefs_current.get("image_size") or [default_w_val, default_h_val])[1]
+        ui_fps_val = ui_prefs_current.get("movie_fps") or default_fps_val
 
-        preset_key0 = str((ui.get("resolution_preset") or "custom"))
-        steps0 = int(ui.get("t2i_steps") or 24)
-        self.spn_t2i_steps.setValue(steps0)
+        _set_combo_safe(self.cmb_img_w, ui_w_val, default_w_val)
+        _set_combo_safe(self.cmb_img_h, ui_h_val, default_h_val)
+        _set_combo_safe(self.cmb_movie_fps, ui_fps_val, default_fps_val)
 
-        def _lock_wh(lock: bool) -> None:
+        preset_key_from_json = str((ui_prefs_current.get("resolution_preset") or "custom"))
+        steps_from_json = int(ui_prefs_current.get("t2i_steps") or 12)
+        self.spn_t2i_steps.setValue(steps_from_json)
+
+        def _lock_wh_inputs(lock: bool) -> None:
+            """W/H 콤보박스 활성화/비활성화 및 툴팁 설정."""
             self.cmb_img_w.setEnabled(not lock)
             self.cmb_img_h.setEnabled(not lock)
-            tip = (
+            tip_text = (
                 "프리셋을 '맞춤(커스텀)'으로 바꾸면 해상도를 수정할 수 있습니다."
                 if lock else "W/H를 직접 선택하세요."
             )
-            self.cmb_img_w.setToolTip(tip)
-            self.cmb_img_h.setToolTip(tip)
+            self.cmb_img_w.setToolTip(tip_text)
+            self.cmb_img_h.setToolTip(tip_text)
 
-        def _apply_preset_to_wh() -> None:
-            w_sel, h_sel, preset_key_sel = self.cmb_res_preset.currentData()
+        def _apply_preset_to_wh_inputs() -> None:
+            """프리셋 콤보박스 변경 시 W/H 콤보박스 값 업데이트 및 잠금 처리."""
+            current_data = self.cmb_res_preset.currentData()
+            if not (isinstance(current_data, tuple) and len(current_data) == 3):
+                 return
+
+            w_sel_preset, h_sel_preset, preset_key_sel = current_data
             if preset_key_sel == "custom":
-                _lock_wh(False)
+                _lock_wh_inputs(False)
                 return
-            i_w = self.cmb_img_w.findData(int(w_sel))
-            if i_w >= 0:
-                self.cmb_img_w.setCurrentIndex(i_w)
-            i_h = self.cmb_img_h.findData(int(h_sel))
-            if i_h >= 0:
-                self.cmb_img_h.setCurrentIndex(i_h)
-            _lock_wh(True)
 
-        # 프리셋 초기값
-        kidx_preset = 0
-        for idx_preset in range(self.cmb_res_preset.count()):
-            _, _, key_val = self.cmb_res_preset.itemData(idx_preset)
-            if key_val == preset_key0:
-                kidx_preset = idx_preset
-                break
-        self.cmb_res_preset.setCurrentIndex(kidx_preset)
-        self.cmb_res_preset.currentIndexChanged.connect(_apply_preset_to_wh)
-        _apply_preset_to_wh()
+            idx_w_preset = self.cmb_img_w.findData(int(w_sel_preset))
+            if idx_w_preset >= 0:
+                self.cmb_img_w.setCurrentIndex(idx_w_preset)
+            else:
+                # 목록에 없으면 경고 (하지만 목록 생성 로직이 수정되어 이 경우는 드물 것)
+                print(f"[경고] 프리셋 W 값({w_sel_preset})이 콤보박스 목록에 없습니다.")
+
+            idx_h_preset = self.cmb_img_h.findData(int(h_sel_preset))
+            if idx_h_preset >= 0:
+                self.cmb_img_h.setCurrentIndex(idx_h_preset)
+            else:
+                print(f"[경고] 프리셋 H 값({h_sel_preset})이 콤보박스 목록에 없습니다.")
+            _lock_wh_inputs(True)
+
+        # 프리셋 초기값 설정
+        kidx_preset_init = 0
+        for idx_preset_loop in range(self.cmb_res_preset.count()):
+            item_data = self.cmb_res_preset.itemData(idx_preset_loop)
+            if isinstance(item_data, tuple) and len(item_data) == 3:
+                _, _, key_val_loop = item_data
+                if key_val_loop == preset_key_from_json:
+                    kidx_preset_init = idx_preset_loop
+                    break
+        self.cmb_res_preset.setCurrentIndex(kidx_preset_init)
+        # 시그널 연결 (프리셋 변경 -> W/H 업데이트)
+        self.cmb_res_preset.currentIndexChanged.connect(_apply_preset_to_wh_inputs)
+        # 초기 잠금 상태 적용
+        _apply_preset_to_wh_inputs()
 
         # 레이아웃
         row.addWidget(QtWidgets.QLabel("W")); row.addWidget(self.cmb_img_w)
@@ -6998,11 +7275,11 @@ def _inject_render_prefs_methods():
         row.addStretch(1)
         parent_layout.addWidget(grp)
 
-        # 변경 시 저장
+        # 변경 시 저장 시그널 연결
         self.cmb_img_w.currentIndexChanged.connect(self._save_ui_prefs_to_project)
         self.cmb_img_h.currentIndexChanged.connect(self._save_ui_prefs_to_project)
         self.cmb_movie_fps.currentIndexChanged.connect(self._save_ui_prefs_to_project)
-        self.cmb_res_preset.currentIndexChanged.connect(self._save_ui_prefs_to_project)
+        # self.cmb_res_preset.currentIndexChanged.connect(self._save_ui_prefs_to_project) # <-- 이 라인 제거됨 (유지)
         self.spn_t2i_steps.valueChanged.connect(self._save_ui_prefs_to_project)
 
     # ==== 메서드 정의: project.json 저장 ====
