@@ -70,7 +70,7 @@ DEFAULT_HOST_CANDIDATES = [
 
 # UI 기본값 (영상 분할/프레임)
 DEFAULT_CHUNK: int = 300
-DEFAULT_OVERLAP: int = 12
+DEFAULT_OVERLAP: int = 5
 DEFAULT_INPUT_FPS: int = 60
 DEFAULT_TARGET_FPS: int = 60
 
@@ -108,7 +108,7 @@ USE_HWACCEL: bool = True
 DEFAULT_IMG_SIZE: tuple[int, int] = (720, 1080)
 
 # 드롭다운 후보(원하는 값 추가/삭제 가능)
-IMAGE_SIZE_CHOICES: list[int] = [480, 520, 720, 960, 1080, 1280, 1440, 1920]
+IMAGE_SIZE_CHOICES: list[int] = [240, 480, 520, 720, 960, 1080, 1280, 1440, 1920]
 
 # 2) 렌더 FPS 기본/후보 (24 또는 60 선택)
 DEFAULT_MOVIE_FPS: int = 30

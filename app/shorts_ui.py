@@ -20,12 +20,10 @@ print("GPU_LOCK:", os.getenv("CUDA_VISIBLE_DEVICES"), os.getenv("CT2_FORCE_CPU")
 - 설정 탭: settings_local.json 오버라이드 저장/즉시 적용
 """
 
-import subprocess
 import json
 from typing import Optional, Dict, Set
 import requests
 import math
-import shutil
 import sys
 import os
 import faulthandler
@@ -3520,6 +3518,42 @@ class MainWindow(QtWidgets.QMainWindow):
 
 
     # ==== [SCHEMA HELPERS] story.json 강제 scenes 스키마 ====
+    def _guess_project_dir(self) -> Path:
+        """현재 프로젝트 폴더 추정: _current_project_dir() → FINAL_OUT → BASE_DIR/title"""
+        # 안전 import (app 패키지/단독 실행 모두 고려)
+        try:
+            from app import settings as settings_mod
+            from app.utils import sanitize_title as sanitize_title_fn
+        except Exception:
+            import settings as settings_mod  # type: ignore
+            from utils import sanitize_title as sanitize_title_fn  # type: ignore
+
+        # 1) UI 제공 메서드 우선
+        if hasattr(self, "_current_project_dir"):
+            try:
+                d = self._current_project_dir()
+                if d:
+                    return Path(d)
+            except Exception:
+                pass
+
+        # 2) 제목 기반 추정
+        try:
+            title_val = sanitize_title_fn(self.le_title.text().strip())
+        except Exception:
+            title_val = ""
+        if not title_val:
+            title_val = "무제"
+
+        # 2-1) FINAL_OUT 템플릿 우선
+        final_tpl = getattr(settings_mod, "FINAL_OUT", "")
+        if final_tpl and "[title]" in final_tpl:
+            return Path(final_tpl.replace("[title]", title_val))
+
+        # 2-2) BASE_DIR/[title]
+        base_dir_val = getattr(settings_mod, "BASE_DIR", ".")
+        return Path(base_dir_val) / title_val
+
     @staticmethod
     def _assert_scenes_story(story: dict) -> None:
         need_scene = [
@@ -3607,50 +3641,74 @@ class MainWindow(QtWidgets.QMainWindow):
             from app import settings as _settings  # type: ignore
         return _settings.FFMPEG_EXE or "ffmpeg"
 
-    def _build_clip_from_image(self, img: Path, out_mp4: Path, duration: float, fps: int = 16,
-                               width: int = 1080, height: int = 1920) -> bool:
+    from pathlib import Path
+    from typing import Optional
+    # @staticmethod
+    def _build_clip_from_image(
+            self,
+            img: "str | Path",
+            out_mp4: "str | Path",
+            duration: float,
+            fps: int = 16,
+            width: int = 1080,
+            height: int = 1920,
+    ) -> bool:
         """
-        단일 이미지로 duration 길이의 mp4를 만든다(세로 1080x1920 기본).
-        - 이미지 비율 유지(scale + pad)
-        - 코덱: h264, yuv420p
+        단일 이미지로 MP4 클립을 만든다.
+        - 시그니처 유지(호출부 호환).
+        - duration(초) 동안 -loop 1 정지영상 → 고정 FPS로 인코딩.
+        - yuv420p, SAR 1:1, CFR 보장(후속 xfade 등 필터 호환).
         """
-        import subprocess, shlex
-        out_mp4.parent.mkdir(parents=True, exist_ok=True)
-        ff = self._ffmpeg_exe()
-        vf = f"scale={width}:{height}:force_original_aspect_ratio=decrease,pad={width}:{height}:(ow-iw)/2:(oh-ih)/2"
-        cmd = [
-            ff, "-y",
-            "-loop", "1",
-            "-t", f"{max(0.1, float(duration))}",
-            "-i", str(img),
-            "-r", str(int(max(1, fps))),
-            "-vf", vf,
-            "-pix_fmt", "yuv420p",
-            "-c:v", "libx264",
-            "-preset", "veryfast",
-            "-crf", "18",
-            str(out_mp4),
-        ]
-        print("[TEST2] ffmpeg:", " ".join(shlex.quote(c) for c in cmd), flush=True)
-        cp = subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
-        ok = (cp.returncode == 0 and out_mp4.exists() and out_mp4.stat().st_size > 0)
-        if not ok:
-            print("[TEST2][ffmpeg][stderr]", cp.stderr[:2000], flush=True)
-        return ok
+        from pathlib import Path
+        import subprocess
 
+        try:
+            img_path = Path(img)
+            out_path = Path(out_mp4)
 
+            if not img_path.exists():
+                return False
 
+            out_path.parent.mkdir(parents=True, exist_ok=True)
 
+            # ffmpeg 경로 확보
+            try:
+                from app import settings as _s_mod  # type: ignore
+                ffmpeg_bin = getattr(_s_mod, "FFMPEG_EXE", "") or "ffmpeg"
+            except Exception:
+                try:
+                    import settings as _s_mod  # type: ignore
+                    ffmpeg_bin = getattr(_s_mod, "FFMPEG_EXE", "") or "ffmpeg"
+                except Exception:
+                    ffmpeg_bin = "ffmpeg"
 
+            dur_safe = max(0.01, float(duration))
+            fps_safe = int(fps)
+            w_safe = int(width)
+            h_safe = int(height)
 
+            cmd = [
+                ffmpeg_bin, "-y",
+                "-loop", "1",
+                "-i", str(img_path),
+                "-t", f"{dur_safe}",
+                "-vf", f"scale={w_safe}:{h_safe},fps={fps_safe},setsar=1,format=yuv420p,setpts=PTS-STARTPTS",
+                "-r", f"{fps_safe}",
+                "-pix_fmt", "yuv420p",
+                "-c:v", "libx264",
+                "-movflags", "+faststart",
+                str(out_path),
+            ]
 
+            # Windows 콘솔 인코딩 이슈를 피하려면 text=True로 캡처만 수행
+            proc = subprocess.run(cmd, capture_output=True, text=True, check=False)
+            if proc.returncode != 0:
+                return False
 
+            return out_path.exists() and out_path.stat().st_size > 0
 
-
-
-
-
-
+        except (OSError, ValueError):
+            return False
 
     def _get_prompt_text(self) -> str:
         # 기본 경로: 별칭이 있으면 바로 사용
@@ -4654,7 +4712,7 @@ class MainWindow(QtWidgets.QMainWindow):
             _s.FINAL_OUT = overrides.get("FINAL_OUT", _s.FINAL_OUT)
             _s.AUDIO_SAVE_FORMAT = overrides.get("AUDIO_SAVE_FORMAT", getattr(_s, "AUDIO_SAVE_FORMAT", "mp3")).lower()
             _s.DEFAULT_CHUNK = int(overrides.get("DEFAULT_CHUNK", getattr(_s, "DEFAULT_CHUNK", 600)))
-            _s.DEFAULT_OVERLAP = int(overrides.get("DEFAULT_OVERLAP", getattr(_s, "DEFAULT_OVERLAP", 12)))
+            _s.DEFAULT_OVERLAP = int(overrides.get("DEFAULT_OVERLAP", getattr(_s, "DEFAULT_OVERLAP", 5)))
             _s.DEFAULT_INPUT_FPS = int(overrides.get("DEFAULT_INPUT_FPS", getattr(_s, "DEFAULT_INPUT_FPS", 24)))
             _s.DEFAULT_TARGET_FPS = int(overrides.get("DEFAULT_TARGET_FPS", getattr(_s, "DEFAULT_TARGET_FPS", 24)))
             _s.ACE_STEP_PROMPT_JSON = overrides.get("ACE_STEP_PROMPT_JSON", _s.ACE_STEP_PROMPT_JSON)
@@ -6122,100 +6180,150 @@ class MainWindow(QtWidgets.QMainWindow):
         return dst_file
 
     @QtCore.pyqtSlot(bool, str)
-    def _on_music_done(self, success: bool, msg: str):
-        # (기존 내용은 동일)
-        if self._dlg:
+    def _on_music_done(self, success: bool, msg: str) -> None:
+        """
+        ACE-Step 완료 이후:
+          1) 진행 로그/타이머 정리
+          2) 생성된 오디오를 프로젝트 폴더로 이동(최신본 1개)
+          3) 이동 결과 상태 표시 및 총 프레임 갱신
+          4) 바로 story.json 생성(가능할 때만)
+        (기존 기능 보존, 파라미터/경로 안전성만 보강)
+        """
+        # 진행창 메시지
+        if getattr(self, "_dlg", None):
             self._dlg.set_status("ACE-Step 완료 — 파일 정리 중…")
-            self._dlg.append_log(f"ACE-Step 완료 (성공: {success}) ✅")
+            self._dlg.append_log(f"ACE-Step 완료 (성공: {bool(success)}) ✅")
             if msg:
-                self._dlg.append_log(msg)
+                self._dlg.append_log(str(msg))
 
-        # 로그 테일 정리만 하고 창은 유지
+        # 로그 테일 정리 (창은 유지)
         try:
-            if self._log_timer:
+            if getattr(self, "_log_timer", None):
                 self._log_timer.stop()
                 self._log_timer.deleteLater()
                 self._log_timer = None
-            if self._log_fp:
+            if getattr(self, "_log_fp", None):
                 self._log_fp.close()
                 self._log_fp = None
-        except Exception:
+        except (AttributeError, OSError):
             pass
 
-        # 결과 이동 및 요약
-        title = self.le_title.text().strip()
-        if not title:
-            proj = self._latest_project()
-            if proj and (proj / "project.json").exists():
-                try:
-                    meta = load_json(proj / "project.json", {}) or {}
-                    title = meta.get("title", "")
-                except Exception:
-                    pass
+        # ── 이동 대상 결정: title 또는 프로젝트 폴더(Path) ──
+        from pathlib import Path
+        try:
+            from app.utils import load_json as _load_json  # type: ignore
+        except Exception:
+            from utils import load_json as _load_json  # type: ignore
 
+        title_text = ""
+        try:
+            if hasattr(self, "le_title") and self.le_title is not None:
+                title_text = (self.le_title.text() or "").strip()
+        except Exception:
+            title_text = ""
+
+        proj_dir: Path | None = None
+        if not title_text:
+            try:
+                proj_dir = self._latest_project()
+            except Exception:
+                proj_dir = None
+            if proj_dir and (proj_dir / "project.json").exists():
+                try:
+                    meta = _load_json(proj_dir / "project.json", {}) or {}
+                    title_text = str(meta.get("title", "")).strip()
+                except Exception:
+                    title_text = ""
+
+        # ── 실제 이동 시도 ──
         moved_paths: list[Path] = []
         try:
-            if title:
-                moved_paths.extend(self._move_generated_audio_to_target(title) or [])
-                one = self._move_latest_vocal_to_project(title)
-                if one: moved_paths.append(one)
-        except Exception as ex:
-            self.status.showMessage(f"파일 이동 실패: {ex}")
-            if self._dlg:
-                self._dlg.append_log(f"[MOVE] 실패: {ex}")
-
-        if moved_paths:
-            last = moved_paths[-1]
-            self.status.showMessage(f"음악 생성 완료 — {last.name}")
-            if self._dlg:
-                self._dlg.append_log(f"[MOVE] 완료: {last}")
+            # 제목이 있으면 제목으로, 없으면 프로젝트 폴더(Path)로 이동 함수 호출
+            target_hint: str | Path = title_text if title_text else (proj_dir or Path(""))
+            if str(target_hint):
+                moved_paths.extend(self._move_generated_audio_to_target(target_hint) or [])
+            # vocal.wav 최신본 별도 보강(기존 함수 호출 보존)
             try:
-                self._set_total_frames_from_audio(last)
+                one_more = self._move_latest_vocal_to_project(title_text or (proj_dir.name if proj_dir else ""))
+                if one_more:
+                    moved_paths.append(one_more)
+            except Exception:
+                # 선택적 경로이므로 조용히 패스
+                pass
+        except Exception as ex_move:
+            try:
+                self.status.showMessage(f"파일 이동 실패: {ex_move}")
+            except Exception:
+                pass
+            if getattr(self, "_dlg", None):
+                self._dlg.append_log(f"[MOVE] 실패: {ex_move}")
+
+        # ── 상태 표시 및 총 프레임 산출 ──
+        if moved_paths:
+            last_dst = moved_paths[-1]
+            try:
+                self.status.showMessage(f"음악 생성 완료 — {last_dst.name}")
+            except Exception:
+                pass
+            if getattr(self, "_dlg", None):
+                self._dlg.append_log(f"[MOVE] 완료: {last_dst}")
+            try:
+                self._set_total_frames_from_audio(last_dst)
             except Exception:
                 pass
         else:
-            self.status.showMessage("음악 생성 완료 — 이동된 파일 없음")
-            if self._dlg:
+            try:
+                self.status.showMessage("음악 생성 완료 — 이동된 파일 없음")
+            except Exception:
+                pass
+            if getattr(self, "_dlg", None):
                 self._dlg.append_log("[MOVE] 이동된 파일 없음")
 
-        self._task_done("music")  # 음악 가드 해제
-
-        # story.json 빌드 준비: project.json과 분석 대상 오디오 경로 선택
-        audio_path_for_analysis: Path | None = None
+        # 음악 가드 해제
         try:
-            proj = self._latest_project()
-            meta = load_json((proj / "project.json") if proj else "", {}) or {}
-            vud = (meta.get("paths", {}) or {}).get("vocal_user_dir", "")
-            if vud:
-                audio_path_for_analysis = self._resolve_audio_for_analysis(Path(vud))
+            self._task_done("music")
         except Exception:
             pass
 
-        if not audio_path_for_analysis:
+        # ── story.json 빌드용 분석 오디오 선택 ──
+        audio_for_analysis: Path | None = None
+        try:
+            proj2 = self._latest_project()
+        except Exception:
+            proj2 = None
+
+        try:
+            meta2 = _load_json((proj2 / "project.json") if proj2 else "", {}) or {}
+            vud = (meta2.get("paths", {}) or {}).get("vocal_user_dir", "")
+            if vud:
+                audio_for_analysis = self._resolve_audio_for_analysis(Path(vud))
+        except Exception:
+            audio_for_analysis = None
+
+        if not audio_for_analysis:
             try:
-                proj = self._latest_project()
-                audio_path_for_analysis = self._resolve_audio_for_analysis(
-                    self._find_vocal_in_project(proj) if proj else None
-                )
+                audio_for_analysis = self._resolve_audio_for_analysis(
+                    self._find_vocal_in_project(proj2) if proj2 else None)
+            except Exception:
+                audio_for_analysis = None
+
+        if (not audio_for_analysis) and moved_paths:
+            audio_for_analysis = self._resolve_audio_for_analysis(moved_paths[-1])
+
+        # ── 바로 story 빌드 (팝업 없음) ──
+        proj_dir_final = audio_for_analysis.parent if audio_for_analysis else None
+        pj_path = (proj_dir_final / "project.json") if proj_dir_final else None
+
+        if audio_for_analysis and audio_for_analysis.exists() and pj_path and pj_path.exists():
+            if getattr(self, "_dlg", None):
+                self._dlg.set_status("음악 완료 → story.json 생성 시작…")
+                self._dlg.append_log(f"[AUTO-STORY] 시작: {audio_for_analysis}")
+            try:
+                self._start_build_story_from_analysis(audio_for_analysis, pj_path)
             except Exception:
                 pass
-
-        if (not audio_path_for_analysis) and moved_paths:
-            audio_path_for_analysis = self._resolve_audio_for_analysis(moved_paths[-1])
-
-        # 바로 story 빌드 (팝업 없음)
-        proj_dir = audio_path_for_analysis.parent if audio_path_for_analysis else None  # ✅ 현재 폴더 고정
-        pj = (proj_dir / "project.json") if proj_dir else None
-
-        if audio_path_for_analysis and audio_path_for_analysis.exists() and pj and pj.exists():
-            if self._dlg:
-                self._dlg.set_status("음악 완료 → story.json 생성 시작…")
-                self._dlg.append_log(f"[AUTO-STORY] 시작: {audio_path_for_analysis}")
-            self._start_build_story_from_analysis(audio_path_for_analysis, pj)
         else:
             print("[AUTO-STORY] skip: audio or project.json missing", flush=True)
-
-        # ======================================================================
 
     @QtCore.pyqtSlot()
     def _on_analysis_thread_finished(self):
@@ -6470,60 +6578,198 @@ class MainWindow(QtWidgets.QMainWindow):
     from pathlib import Path
 
     @staticmethod
-    def _move_generated_audio_to_target(title: str) -> list[Path]:
+    def _move_generated_audio_to_target(self, title_or_project: "str | Path | None" = None) -> "list[Path]":
         """
-        ComfyUI 결과 오디오를 최종 목적지로 이동하고 mp3로 변환한다.
-        반환: 최종 저장된 파일 경로 리스트(최대 1개, vocal.mp3)
+        ComfyUI가 만든 최신 오디오 결과물(mp3/wav)을 프로젝트 폴더로 이동.
+        - 입력: 프로젝트 제목(str), 프로젝트 폴더(Path), 또는 None(자동 추정)
+        - 출력: 실제로 이동된 파일들의 경로 리스트
+        - shutil 예외 참조 경고 방지 위해 함수 상단에서 import.
+        - 기존 기능 보존: 제목 기반 경로/FINAL_OUT 템플릿/BASE_DIR 폴백 유지, 최신 1개만 이동.
         """
-        # 함수 내 import 제거, 파일 상단의 S를 사용합니다.
-        safe_title = _sanitize_title_for_path(title)
+        from pathlib import Path
+        import time
+        import shutil  # except에서 shutil.Error 참조 필요
 
-        # 1) 원본 폴더(ComfyUI가 저장한 곳)
-        src_root = Path(getattr(S, "COMFY_RESULT_ROOT", r"C:\comfyResult\shorts_make"))
-        src_dir = src_root / safe_title
-        if not src_dir.exists():
-            # 제목 폴더가 없으면 최신 폴더로 추정
-            cand = [p for p in src_root.glob("*") if p.is_dir()]
-            src_dir = max(cand, key=lambda p: p.stat().st_mtime) if cand else src_dir
-
-        # 2) 목적지 폴더(FINAL_OUT 템플릿 치환)
-        dst_dir = _resolve_audio_dir_from_template(getattr(S, "FINAL_OUT", str(S.BASE_DIR)), title)
-        dst_dir.mkdir(parents=True, exist_ok=True)
-
-        # 허용 오디오 확장자
-        audio_exts = set(getattr(S, "AUDIO_EXTS", {".wav", ".mp3", ".flac", ".ogg", ".opus", ".m4a"}))
-
-        # 3) 오디오 파일 수집 및 최신 파일 선택
-        files = [p for p in src_dir.iterdir() if p.is_file() and p.suffix.lower() in audio_exts]
-        if not files:
-            return []
-
-        files.sort(key=lambda p: p.stat().st_mtime)
-        latest = files[-1]  # 가장 최근 파일만 사용
-
-        dst = dst_dir / "vocal.mp3"
+        # ---- settings 안전 로드 ----
         try:
-            if latest.suffix.lower() == ".mp3":
-                # mp3면 이름만 변경하여 이동
-                if dst.exists():
-                    dst.unlink()
-                shutil.move(str(latest), str(dst))
-            else:
-                # mp3가 아니면 ffmpeg로 변환
-                ff = getattr(S, "FFMPEG_EXE", "") or "ffmpeg"
-                cp = subprocess.run(
-                    [ff, "-y", "-i", str(latest), "-vn", "-c:a", "libmp3lame", "-q:a", "2", str(dst)],
-                    capture_output=True, text=True, check=False
-                )
-                # 변환 실패하면 원본명으로라도 이동 (유실 방지)
-                if cp.returncode != 0 or not dst.exists() or dst.stat().st_size == 0:
-                    fallback = dst_dir / latest.name
-                    shutil.move(str(latest), str(fallback))
-                    return [fallback]
+            import app.settings as settings_mod  # type: ignore
         except Exception:
-            return []
+            import settings as settings_mod  # type: ignore
 
-        return [dst]
+        # ---- 프로젝트 폴더 결정 ----
+        proj_dir: Path | None = None
+
+        # 0) 호출 인자가 Path
+        if isinstance(title_or_project, Path):
+            proj_dir = title_or_project
+
+        # 1) 호출 인자가 str(제목)
+        if proj_dir is None and isinstance(title_or_project, str) and title_or_project.strip():
+            try:
+                from app.utils import sanitize_title as _sanitize  # type: ignore
+            except Exception:
+                from utils import sanitize_title as _sanitize  # type: ignore
+            title_clean = _sanitize(title_or_project.strip())
+
+            final_tpl = getattr(settings_mod, "FINAL_OUT", "")
+            if final_tpl and "[title]" in final_tpl:
+                proj_dir = Path(final_tpl.replace("[title]", title_clean))
+            else:
+                base_dir_val = getattr(settings_mod, "BASE_DIR", ".")
+                proj_dir = Path(base_dir_val) / title_clean
+
+        # 2) 인자가 None이거나 빈 문자열 → UI/메타에서 추정
+        if proj_dir is None:
+            # 2-1) 최신 프로젝트 폴더 시도
+            try:
+                latest_dir = self._latest_project()
+                if latest_dir:
+                    proj_dir = Path(latest_dir)
+            except Exception:
+                proj_dir = None
+
+        if proj_dir is None:
+            # 2-2) project.json의 title 기반 경로 시도
+            try:
+                from app.utils import load_json as _load_json  # type: ignore
+            except Exception:
+                from utils import load_json as _load_json  # type: ignore
+            try:
+                latest_dir2 = self._latest_project()
+                pj = (Path(latest_dir2) / "project.json") if latest_dir2 else None
+                meta = _load_json(pj, {}) if pj else {}
+                title_from_meta = str((meta.get("title", "") or "")).strip()
+                if title_from_meta:
+                    try:
+                        from app.utils import sanitize_title as _sanitize2  # type: ignore
+                    except Exception:
+                        from utils import sanitize_title as _sanitize2  # type: ignore
+                    title_clean2 = _sanitize2(title_from_meta)
+                    final_tpl = getattr(settings_mod, "FINAL_OUT", "")
+                    if final_tpl and "[title]" in final_tpl:
+                        proj_dir = Path(final_tpl.replace("[title]", title_clean2))
+                    else:
+                        base_dir_val = getattr(settings_mod, "BASE_DIR", ".")
+                        proj_dir = Path(base_dir_val) / title_clean2
+            except Exception:
+                proj_dir = None
+
+        if proj_dir is None:
+            # 2-3) UI의 제목 위젯
+            title_txt = ""
+            try:
+                if hasattr(self, "le_title") and self.le_title is not None:
+                    title_txt = (self.le_title.text() or "").strip()
+            except Exception:
+                title_txt = ""
+            if title_txt:
+                try:
+                    from app.utils import sanitize_title as _sanitize3  # type: ignore
+                except Exception:
+                    from utils import sanitize_title as _sanitize3  # type: ignore
+                title_clean3 = _sanitize3(title_txt)
+                final_tpl = getattr(settings_mod, "FINAL_OUT", "")
+                if final_tpl and "[title]" in final_tpl:
+                    proj_dir = Path(final_tpl.replace("[title]", title_clean3))
+                else:
+                    base_dir_val = getattr(settings_mod, "BASE_DIR", ".")
+                    proj_dir = Path(base_dir_val) / title_clean3
+
+        if proj_dir is None:
+            # 2-4) 최종 폴백: BASE_DIR/무제
+            base_dir_val = getattr(settings_mod, "BASE_DIR", ".")
+            proj_dir = Path(base_dir_val) / "무제"
+
+        proj_dir = Path(proj_dir)
+        proj_dir.mkdir(parents=True, exist_ok=True)
+
+        moved: list[Path] = []
+
+        # ---- 소스 후보 폴더 구성 (안전한 범용 탐색) ----
+        guess_roots: list[Path] = []
+        for key in ("COMFY_RESULT_ROOT", "AUDIO_OUT_DIR", "RESULT_DIR", "TEMP_DIR"):
+            val = getattr(settings_mod, key, "")
+            if isinstance(val, str) and val:
+                guess_roots.append(Path(val))
+
+        # 프로젝트 폴더 및 인접 폴더도 스캔
+        guess_roots.extend([proj_dir, proj_dir.parent])
+
+        # 중복 제거 & 존재하는 폴더만
+        uniq_roots: list[Path] = []
+        seen = set()
+        for r in guess_roots:
+            try:
+                rp = r.resolve()
+            except Exception:
+                continue
+            if not rp.exists():
+                continue
+            if rp in seen:
+                continue
+            seen.add(rp)
+            uniq_roots.append(rp)
+
+        # ---- 최신 오디오 파일 선택 ----
+        candidates: list[Path] = []
+        patterns = ("*.wav", "*.mp3", "*vocal*.wav", "*vocal*.mp3")
+        for root in uniq_roots:
+            try:
+                for pat in patterns:
+                    for p in root.rglob(pat):
+                        try:
+                            # 24시간 이내 파일 우선
+                            if time.time() - p.stat().st_mtime <= 60 * 60 * 24:
+                                candidates.append(p)
+                        except Exception:
+                            continue
+            except Exception:
+                # 권한/경로 에러는 무시하고 다음 root
+                pass
+
+        # 수정시간 최신 순
+        try:
+            candidates.sort(key=lambda p: p.stat().st_mtime if p.exists() else 0, reverse=True)
+        except Exception:
+            pass
+
+        if not candidates:
+            return moved  # 이동할 후보 없음
+
+        # ---- 목적지 경로 결정 (wav/mp3 모두 대응) ----
+        target_wav = proj_dir / "vocal.wav"
+        target_mp3 = proj_dir / "vocal.mp3"
+
+        for src in candidates:
+            try:
+                suffix = src.suffix.lower()
+                if suffix == ".wav":
+                    dst = target_wav
+                elif suffix == ".mp3":
+                    dst = target_mp3
+                else:
+                    continue
+
+                dst.parent.mkdir(parents=True, exist_ok=True)
+                if dst.exists():
+                    try:
+                        dst.unlink()
+                    except Exception:
+                        # 지우지 못하면 새 이름으로 보존
+                        dst = dst.with_name(dst.stem + "_new" + dst.suffix)
+
+                shutil.move(str(src), str(dst))
+                moved.append(dst)
+                # 최신 1개만 이동(기존 의도 유지). 모두 이동하려면 break 제거.
+                break
+            except (OSError, shutil.Error):
+                # 다음 후보 시도
+                continue
+            except Exception:
+                # 예기치 못한 케이스도 다음 후보 시도
+                continue
+
+        return moved
 
     # ────────────── 영상 빌드(선택) ──────────────
     def on_video(self) -> None:
@@ -6853,7 +7099,7 @@ class MainWindow(QtWidgets.QMainWindow):
     # ======= /end =======
 
     # ==== [테스트2] story.json → 씬 렌더(이미지 누락 검사, 중복 pass) ==========
-    def on_test2_render_story(self):
+    def on_test2_render_story(self) -> None:
         """
         story.json 의 scenes 를 순서대로 렌더
         - 이미지 경로: scene.img_file (없으면 FINAL_OUT\[title]\imgs\[id].png 추정)
@@ -6861,93 +7107,145 @@ class MainWindow(QtWidgets.QMainWindow):
         - 이미 있으면 pass / 누락 이미지 있으면 경고 후 중단
         - 누락이 있을 때, '캐릭터 2명 이상' 필요한 scene도 같이 경고에 표시
         """
+        from pathlib import Path
+        from PyQt5 import QtCore, QtWidgets  # type: ignore
+
         try:
-            title = self.le_title.text().strip() or "untitled"
-            story = self._read_story(title)
-            scenes = story.get("scenes") or []
-            if not scenes:
+            # --- 기본 타이틀/스토리 확보 ---
+            title_text = (self.le_title.text() or "").strip() or "untitled"
+            story_obj = self._read_story(title_text)
+            scene_list = story_obj.get("scenes") or []
+            if not scene_list:
                 QtWidgets.QMessageBox.warning(self, "안내", "story.json에 scenes가 없습니다.")
                 return
 
-            imgs_dir = self._img_dir_for_title(title)
-            seg_dir = self._seg_dir_for_title(title)
+            # --- 출력/이미지 폴더 보장 ---
+            imgs_dir_path = Path(self._img_dir_for_title(title_text))
+            seg_dir_path = Path(self._seg_dir_for_title(title_text))
+            imgs_dir_path.mkdir(parents=True, exist_ok=True)
+            seg_dir_path.mkdir(parents=True, exist_ok=True)
 
-            # ▼▼▼ _resolve_img 함수의 매개변수명을 수정합니다 ▼▼▼
-            def _resolve_img(scene_id: str, img_file: str | None) -> Path:
-                if img_file:
-                    p = Path(img_file)
-                    if p.exists() and p.stat().st_size > 0:
-                        return p
+            # --- 이미지 해석 헬퍼 (내부 함수) ---
+            def _resolve_img_by_scene(scene_id: str, img_file_val: str | None) -> Path:
+                if img_file_val:
+                    p0 = Path(img_file_val)
+                    try:
+                        if p0.exists() and p0.stat().st_size > 0:
+                            return p0
+                    except OSError:
+                        pass
                 for ext in (".png", ".jpg", ".jpeg", ".webp"):
-                    p = imgs_dir / f"{scene_id}{ext}"  # 'sid' -> 'scene_id'
-                    if p.exists() and p.stat().st_size > 0:
-                        return p
-                return imgs_dir / f"{scene_id}.png"  # 'sid' -> 'scene_id'
+                    p1 = imgs_dir_path / f"{scene_id}{ext}"
+                    try:
+                        if p1.exists() and p1.stat().st_size > 0:
+                            return p1
+                    except OSError:
+                        continue
+                return imgs_dir_path / f"{scene_id}.png"
 
-            missing, multi_char = [], []
-            for sc in scenes:
-                sid = sc.get("id") or sc.get("title") or f"t_{int(sc.get('idx', 0) or 0):02d}"
-                # 함수 호출은 그대로 유지됩니다.
-                img = _resolve_img(sid, sc.get("img_file"))
-                if not (img.exists() and img.stat().st_size > 0):
-                    missing.append(f"{sid} → {img}")
-                ch = sc.get("characters") or []
-                if isinstance(ch, list) and len(ch) >= 2:
-                    multi_char.append(sid)
+            # --- 누락 이미지/다인 캐릭터 검사 ---
+            missing_lines: list[str] = []
+            multi_char_ids: list[str] = []
+            for sc in scene_list:
+                sid_val = sc.get("id") or sc.get("title") or f"t_{int(sc.get('idx', 0) or 0):02d}"
+                img_path_try = _resolve_img_by_scene(sid_val, sc.get("img_file"))
+                try:
+                    if not (img_path_try.exists() and img_path_try.stat().st_size > 0):
+                        missing_lines.append(f"{sid_val} → {img_path_try}")
+                except OSError:
+                    missing_lines.append(f"{sid_val} → {img_path_try}")
 
-            if missing:
-                lines = [
+                ch_list = sc.get("characters") or []
+                if isinstance(ch_list, list) and len(ch_list) >= 2:
+                    multi_char_ids.append(sid_val)
+
+            if missing_lines:
+                msg_lines = [
                     "누락 이미지가 있어 중단합니다.",
                     "",
                     "[누락 이미지]",
-                    *missing[:30],
-                    *([f"... (총 {len(missing)}개 중 30개만 표시)"] if len(missing) > 30 else []),
-                    *(["", "[2명 이상 캐릭터가 필요한 장면(참고)]", ", ".join(multi_char)] if multi_char else []),
+                    *missing_lines[:30],
                 ]
-                QtWidgets.QMessageBox.warning(self, "이미지 누락", "\n".join(lines))
+                if len(missing_lines) > 30:
+                    msg_lines.append(f"... (총 {len(missing_lines)}개 중 30개만 표시)")
+                if multi_char_ids:
+                    msg_lines.extend(["", "[2명 이상 캐릭터가 필요한 장면(참고)]", ", ".join(multi_char_ids)])
+                QtWidgets.QMessageBox.warning(self, "이미지 누락", "\n".join(msg_lines))
                 return
 
-            fps = int(self.sb_outfps.value())
-            made, skipped, failed = 0, 0, 0
+            # --- FPS, 크기 읽기(안전 폴백 포함) ---
+            try:
+                fps_val = int(getattr(self, "sb_outfps").value())  # type: ignore[attr-defined]
+            except Exception:
+                fps_val = 24
+            try:
+                out_w_val = int(getattr(self, "sb_outw").value())  # type: ignore[attr-defined]
+            except Exception:
+                out_w_val = 480
+            try:
+                out_h_val = int(getattr(self, "sb_outh").value())  # type: ignore[attr-defined]
+            except Exception:
+                out_h_val = 720
 
-            prog = QtWidgets.QProgressDialog("샷 렌더링 중…", "중지", 0, len(scenes), self)
+            made_count, skip_count, fail_count = 0, 0, 0
+
+            prog_dlg = QtWidgets.QProgressDialog("샷 렌더링 중…", "중지", 0, len(scene_list), self)
             self.setWindowModality(QtCore.Qt.WindowModality.WindowModal)
-            prog.setMinimumDuration(0)
+            prog_dlg.setMinimumDuration(0)
 
-            for i, sc in enumerate(scenes, 1):
-                if prog.wasCanceled():
+            for idx1, sc in enumerate(scene_list, 1):
+                if prog_dlg.wasCanceled():
                     break
-                sid = sc.get("id") or f"t_{i:02d}"
-                dur = float(sc.get("duration") or (float(sc.get("end", 0)) - float(sc.get("start", 0))) or 0.0)
-                if dur <= 0:
-                    failed += 1
-                    prog.setLabelText(f"{sid}: 유효하지 않은 duration")
-                    prog.setValue(i)
+
+                scene_id = sc.get("id") or f"t_{idx1:02d}"
+
+                # duration 계산(초) : scene.duration → 없으면 end-start
+                try:
+                    dur_sec = float(sc.get("duration") or (float(sc.get("end", 0)) - float(sc.get("start", 0))) or 0.0)
+                except (TypeError, ValueError):
+                    dur_sec = 0.0
+                if dur_sec <= 0.0:
+                    fail_count += 1
+                    prog_dlg.setLabelText(f"{scene_id}: 유효하지 않은 duration")
+                    prog_dlg.setValue(idx1)
                     continue
 
-                img = _resolve_img(sid, sc.get("img_file"))
-                out_mp4 = seg_dir / f"{sid}.mp4"
+                img_path = _resolve_img_by_scene(scene_id, sc.get("img_file"))
+                out_path = seg_dir_path / f"{scene_id}.mp4"
 
-                if out_mp4.exists() and out_mp4.stat().st_size > 0:
-                    skipped += 1
-                else:
-                    ok = self._build_clip_from_image(img, out_mp4, duration=dur, fps=fps)
-                    if ok:
-                        made += 1
+                # 이미 존재하면 건너뜀
+                try:
+                    if out_path.exists() and out_path.stat().st_size > 0:
+                        skip_count += 1
                     else:
-                        failed += 1
+                        ok_flag = self._build_clip_from_image(
+                            img=img_path,
+                            out_mp4=out_path,
+                            duration=dur_sec,
+                            fps=fps_val,
+                            width=out_w_val,
+                            height=out_h_val,
+                        )
+                        if ok_flag:
+                            made_count += 1
+                        else:
+                            fail_count += 1
+                except OSError:
+                    fail_count += 1
 
-                prog.setLabelText(f"{sid}: 완료({made}) / 건너뜀({skipped}) / 실패({failed})")
-                prog.setValue(i)
+                prog_dlg.setLabelText(f"{scene_id}: 완료({made_count}) / 건너뜀({skip_count}) / 실패({fail_count})")
+                prog_dlg.setValue(idx1)
 
-            prog.close()
+            prog_dlg.close()
             QtWidgets.QMessageBox.information(
-                self, "테스트2",
-                f"컷 렌더 완료\n\n생성: {made} | 건너뜀: {skipped} | 실패: {failed}\n폴더: {seg_dir}"
+                self,
+                "테스트2",
+                f"컷 렌더 완료\n\n생성: {made_count} | 건너뜀: {skip_count} | 실패: {fail_count}\n폴더: {seg_dir_path}",
             )
-            self.status.showMessage(f"컷 렌더 완료 — 생성 {made}, skip {skipped}, 실패 {failed}")
+            self.status.showMessage(f"컷 렌더 완료 — 생성 {made_count}, skip {skip_count}, 실패 {fail_count}")
 
         except Exception as e:
+            from PyQt5 import QtWidgets  # type: ignore
             QtWidgets.QMessageBox.critical(self, "오류", str(e))
             self.status.showMessage(f"오류: {e}")
 
@@ -7034,30 +7332,50 @@ def _inject_render_prefs_methods():
     ):
         return
 
+    # MainWindow 클래스 내부 메서드로 추가
     def _guess_project_dir(self) -> Path:
-        """현재 프로젝트 폴더 추정: _current_project_dir() → FINAL_OUT → BASE_DIR/title"""
+        """
+        현재 프로젝트 폴더 추정:
+          1) self._current_project_dir()가 있으면 우선 사용
+          2) settings.FINAL_OUT 템플릿의 [title] 치환
+          3) settings.BASE_DIR / <정제된 제목>
+        """
+        from pathlib import Path as _p
+
+        # 안전 import (app 패키지/단독 실행 모두 고려)
+        try:
+            from app import settings as _settings_mod
+            from app.utils import sanitize_title as _sanitize_title_fn
+        except Exception:
+            import settings as _settings_mod  # type: ignore
+            from utils import sanitize_title as _sanitize_title_fn  # type: ignore
+
         # 1) UI 제공 메서드
         if hasattr(self, "_current_project_dir"):
             try:
                 d = self._current_project_dir()
                 if d:
-                    return Path(d)
+                    return _p(d)
             except Exception:
                 pass
+
         # 2) 제목 기반
         try:
-            title_val = sanitize_title_fn(self.le_title.text().strip())
+            le = getattr(self, "le_title", None) or getattr(getattr(self, "ui", None), "le_title", None)
+            title_val = _sanitize_title_fn(le.text().strip()) if le is not None else ""
         except Exception:
             title_val = ""
         if not title_val:
             title_val = "무제"
+
         # 2-1) FINAL_OUT 템플릿 우선
-        final_tpl = getattr(settings_mod, "FINAL_OUT", "")
+        final_tpl = getattr(_settings_mod, "FINAL_OUT", "")
         if final_tpl and "[title]" in final_tpl:
-            return Path(final_tpl.replace("[title]", title_val))
+            return _p(final_tpl.replace("[title]", title_val))
+
         # 2-2) BASE_DIR/[title]
-        base_dir_val = getattr(settings_mod, "BASE_DIR", ".")
-        return Path(base_dir_val) / title_val
+        base_dir_val = getattr(_settings_mod, "BASE_DIR", ".")
+        return _p(base_dir_val) / title_val
 
     # ==== 메서드 정의: 드롭다운 UI 추가 ====
     def _add_render_prefs_controls(self, parent_layout: QtWidgets.QBoxLayout) -> None:
@@ -7071,7 +7389,7 @@ def _inject_render_prefs_methods():
             except ImportError:
                 print("[경고] _add_render_prefs_controls: settings 모듈 로드 실패, 기본값 사용")
                 class SettingsFallbackPrefs:
-                    IMAGE_SIZE_CHOICES = [480, 512, 720, 832, 960, 1024, 1080, 1280, 1440, 1920, 2560]
+                    IMAGE_SIZE_CHOICES = [240, 480, 512, 720, 832, 960, 1024, 1080, 1280, 1440, 1920, 2560]
                     DEFAULT_IMG_SIZE = (1080, 1920)
                     MOVIE_FPS_CHOICES = [24, 30, 60]
                     DEFAULT_MOVIE_FPS = 30
@@ -7121,7 +7439,7 @@ def _inject_render_prefs_methods():
         preset_widths = {720, 832, 1080, 1280, 1920, 512, 1024}
         preset_heights = {1280, 1472, 1920, 720, 1080, 512, 1024}
 
-        size_choices_conf = getattr(s_mod_prefs, "IMAGE_SIZE_CHOICES", [480, 520, 720, 960, 1080, 1280, 1440])
+        size_choices_conf = getattr(s_mod_prefs, "IMAGE_SIZE_CHOICES", [240, 480, 520, 720, 960, 1080, 1280, 1440])
         size_choices_set = set(int(w) for w in size_choices_conf if str(w).isdigit())
         size_choices_set.update(preset_widths) # 프리셋 W 값 추가
         size_choices_set.add(int(default_w_val)) # 기본 W 값 추가

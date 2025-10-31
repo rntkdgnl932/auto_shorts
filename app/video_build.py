@@ -2,10 +2,8 @@
 # i2v 분할/실행/합치기(교차 페이드) + 누락 이미지 생성 (ComfyUI 연동)
 from __future__ import annotations
 
-import subprocess
-from typing import List, Tuple, Optional, Dict, Any, Callable
+from typing import List, Tuple, Optional, Dict, Any
 import re
-import typing
 from pathlib import Path
 from pathlib import Path as _Path
 import json as _json
@@ -166,11 +164,10 @@ def _apply_overrides(graph: dict, overrides: Dict[str, Any]) -> None:
             pass
 
 # ── i2v 샷 생성 ────────────────────────────────────────────────────────────
-# video_build.py 파일의 build_shots_with_i2v 함수 전체를 아래 코드로 교체하세요.
 def build_shots_with_i2v(
         project_dir: str,
-        total_frames: int,  # 이 인자는 현재 사용되지 않으나, 호환성을 위해 유지합니다.
-        *,  # 키워드 전용 인자 시작
+        total_frames: int,
+        *,  # 키워드 전용
         ui_width: Optional[int] = None,
         ui_height: Optional[int] = None,
         ui_fps: Optional[int] = None,
@@ -179,147 +176,102 @@ def build_shots_with_i2v(
 ) -> None:
     """
     각 씬을 i2v로 생성합니다. UI 설정을 워크플로우에 적용하고, 파일 접두사에 현재 날짜를 사용합니다.
-    - [수정됨 v2] ComfyUI 출력(outputs)의 'videos' 또는 'gifs' 리스트에서 '마지막' .mp4 파일을 선택합니다.
-    - [수정됨] KSampler 노드의 noise_seed를 매번 랜덤값으로 변경하여 ComfyUI 캐시 방지.
-    - [수정됨] VHS_VideoCombine 노드의 filename_prefix에 현재 날짜(YYYY-MM-DD)를 적용합니다.
-    - [수정됨] 대기 중 로그 메시지를 50번에 1번만 전달하도록 조절합니다.
-    - [수정됨] 대기 시간을 3600초(1시간)로 설정합니다.
+    - 씬 레벨 시드 1회 생성 → 모든 청크 공통 사용
+    - 청크 2+ : 이전 청크의 '마지막/겹침 프레임'을 comfy_input에 PNG로 저장 후 파일명만 LoadImage에 전달
+    - 프레임 추출 후 5초 내 파일 안정화 폴링
+    - 기본 청크 크기 60f(메모리 안전)
+    - 임시 청크 mp4는 **항상 clips/xfade_work** 에만 저장
     """
-    # 필요 모듈 임포트
+    # ── 표준/타입 ─────────────────────────────────────────────
     import json as json_mod
     import shutil
     import time
-    import traceback
-    import datetime  # 날짜 처리
-    import random  # <-- 시드 생성을 위해 random 임포트
+    import datetime
+    import random
+    import subprocess
     from pathlib import Path
     from typing import Any, Dict, List, Optional, Callable, Tuple
 
-    # 써드파티 라이브러리 (requests)
-    try:
-        import requests
-    except ImportError as e_req_import_vfinal:  # 변수명 변경
-        # requests 없으면 진행 불가
-        raise ImportError(
-            "requests 라이브러리가 필요합니다. 'pip install requests'"
-        ) from e_req_import_vfinal
+    assert isinstance(total_frames, int)  # 호환용
 
-    # --- 로그 콜백 ---
     def _notify(msg: str) -> None:
-        """진행률 콜백을 호출하는 내부 함수. None 방지, 접두사 관리 포함."""
-        if on_progress:
-            try:
-                prefix = "[I2V] "
-                msg_str = str(msg or "").strip()  # None 방지 및 양끝 공백 제거
-                if not msg_str:
-                    return  # 빈 메시지 무시
+        if on_progress is None:
+            return
+        try:
+            text = str(msg or "").strip()
+            if text:
+                on_progress({"msg": "[I2V] " + text})
+        except (TypeError, ValueError):
+            print("[경고] on_progress 콜백 처리 실패")
 
-                msg_to_send: str  # 타입 명시
-                if not msg_str.startswith("[I2V]"):
-                    msg_to_send = prefix + msg_str
-                else:
-                    # 이미 접두사 있으면 내용만 추출하여 재조합 (중복 공백 방지)
-                    content_part = msg_str[msg_str.find("]") + 1:].strip()
-                    if not content_part:
-                        return  # 내용 없는 메시지 무시
-                    msg_to_send = prefix.strip() + " " + content_part
-
-                on_progress({"msg": msg_to_send})
-            except Exception as e_notify_vfinal:  # 구체적인 예외 대신 Exception 사용 (콜백 오류는 로깅만)
-                # 콜백 자체 오류 로깅 (작업 중단 방지)
-                print(f"[경고] on_progress 콜백 오류: {type(e_notify_vfinal).__name__}: {e_notify_vfinal}")
-
-    # --- 입력값 검증 및 로깅 ---
     _notify(f"영상 생성 시작: project_dir='{project_dir}'")
     _notify(f"UI 설정: W={ui_width}, H={ui_height}, FPS={ui_fps}, Steps={ui_steps}")
 
-    # 프로젝트 경로 객체화 및 유효성 검증
+    # ── 경로/파일 ─────────────────────────────────────────────
     try:
         pdir = Path(project_dir).resolve(strict=True)
         if not pdir.is_dir():
-            raise NotADirectoryError(f"프로젝트 경로가 디렉토리가 아닙니다: {pdir}")
+            _notify(f"[오류] 프로젝트 경로가 디렉토리가 아닙니다: {pdir}")
+            return
     except FileNotFoundError:
         _notify(f"[오류] 프로젝트 디렉토리를 찾을 수 없습니다: {project_dir}")
         return
-    except NotADirectoryError as e_not_dir_vfinal:  # 구체적인 예외 타입
-        _notify(f"[오류] {e_not_dir_vfinal}")
-        return
-    except OSError as e_os_proj_vfinal:  # 구체적인 예외 타입
-        _notify(f"[오류] 프로젝트 경로 접근 오류: {e_os_proj_vfinal}")
-        return
-    except Exception as e_proj_path_vfinal:  # 그 외 경로 관련 오류
-        _notify(f"[오류] 프로젝트 경로 처리 중 예상치 못한 오류: {e_proj_path_vfinal}")
+    except OSError as e_os:
+        _notify(f"[오류] 프로젝트 경로 접근 오류: {e_os}")
         return
 
     p_video = pdir / "video.json"
 
-    # --- 유틸 안전 바인딩 ---
-    load_json_fn: Callable[[Path, Any], Any]
-    ensure_dir_fn: Callable[[Path], Path]
+    # ── 유틸 ─────────────────────────────────────────────
     try:
         from app.utils import load_json as load_json_fn, ensure_dir as ensure_dir_fn  # type: ignore
-    except (ImportError, ModuleNotFoundError):  # 구체적인 예외 타입
+    except (ImportError, ModuleNotFoundError):
         try:
             from utils import load_json as load_json_fn, ensure_dir as ensure_dir_fn  # type: ignore
-        except (ImportError, ModuleNotFoundError) as e_util_import_vfinal:  # 구체적인 예외 타입
-            # 필수 유틸 로드 실패 시 에러
-            raise ImportError(f"필수 유틸리티(load_json, ensure_dir) 로드 실패: {e_util_import_vfinal}") from e_util_import_vfinal
+        except (ImportError, ModuleNotFoundError) as e_utils:
+            raise ImportError(f"필수 유틸리티(load_json, ensure_dir) 로드 실패: {e_utils}") from e_utils
 
-    # --- 안전하게 노드 입력값 설정 ---
-    def _set_input_safe(graph_dict: Dict, node_id: str, input_key: str, value: Any) -> bool:
-        """지정된 노드의 입력값을 안전하게 설정하고 성공 여부 반환."""
-        node_id_str = str(node_id or "")
-        input_key_str = str(input_key or "")
-        if not node_id_str or not input_key_str:
-            _notify(f"[경고] 노드 ID({node_id_str}) 또는 키({input_key_str}) 유효하지 않음.")
-            return False
+    # ── 설정 ─────────────────────────────────────────────
+    try:
+        import settings as settings_mod  # type: ignore
+        s_mod = settings_mod
+    except ImportError:
         try:
-            target_node = graph_dict.get(node_id_str)  # get으로 안전하게 접근
-            if isinstance(target_node, dict):
-                inputs_dict = target_node.setdefault("inputs", {})
-                if not isinstance(inputs_dict, dict):
-                    _notify(f"[경고] 노드 {node_id_str} 'inputs' 필드 오류.")
-                    return False
+            from app import settings as settings_mod_app  # type: ignore
+            s_mod = settings_mod_app
+        except ImportError:
+            class _SettingsFallback:
+                JSONS_DIR = r"C:\my_games\shorts_make\app\jsons"
+                I2V_WORKFLOW = None
+                COMFY_INPUT_DIR = r"C:\my_games\shorts_make\app\comfy_inputs"
+                COMFY_HOST = "http://127.0.0.1:8188"
+                FFMPEG_EXE = "ffmpeg"
+            s_mod = _SettingsFallback()
 
-                current_value = inputs_dict.get(input_key_str)
-                value_to_set: Any
-                # 타입 추정 및 변환 (int 우선)
-                target_type_int = isinstance(current_value, int) or input_key_str in (
-                    "steps", "frame_rate", "width", "height", "length", "seed", "loop_count", "crf", "noise_seed"
-                # noise_seed 추가
-                )
-                target_type_float = isinstance(current_value, float) or input_key_str in ("cfg",
-                                                                                          "strength_model")  # 추가적인 실수 키
+    jsons_dir_conf = getattr(s_mod, "JSONS_DIR", r"C:\my_games\shorts_make\app\jsons")
+    i2v_workflow_conf = getattr(s_mod, "I2V_WORKFLOW", None)
+    comfy_input_conf = getattr(s_mod, "COMFY_INPUT_DIR", r"C:\my_games\shorts_make\app\comfy_inputs")
+    comfy_host_conf = getattr(s_mod, "COMFY_HOST", "http://127.0.0.1:8188")
+    ffmpeg_exe = getattr(s_mod, "FFMPEG_EXE", "ffmpeg")
 
-                try:
-                    if target_type_int:
-                        value_to_set = int(value)
-                    elif target_type_float:
-                        value_to_set = float(value)
-                    else:
-                        value_to_set = value  # 다른 타입 (str, bool 등)
-                except (ValueError, TypeError):
-                    _notify(f"[경고] 노드 {node_id_str}.{input_key_str} 값({value}) 숫자 변환 실패.")
-                    value_to_set = value  # 변환 실패 시 원본 유지
+    base_jsons = Path(str(jsons_dir_conf))
+    comfy_input_dir = Path(str(comfy_input_conf))
+    comfy_input_dir.mkdir(parents=True, exist_ok=True)
 
-                inputs_dict[input_key_str] = value_to_set
-                return True
-            else:
-                _notify(f"[경고] 노드 ID '{node_id_str}' 없거나 dict 아님.")
-                return False
-        except Exception as e_set_input_vfinal:  # 그 외 예외
-            _notify(f"[오류] 노드 {node_id_str}.{input_key_str} 설정 중 오류: {e_set_input_vfinal}")
-            print(traceback.format_exc())  # 상세 로그
-            return False
+    base_url = "http://127.0.0.1:8188"
+    try:
+        base_url = str((load_json_fn(p_video, {}) or {}).get("comfy_host") or comfy_host_conf).rstrip("/")
+    except Exception:
+        base_url = str(comfy_host_conf).rstrip("/")
 
-    # --- video.json 로드 ---
+    # ── video.json ─────────────────────────────────────────────
     try:
         video = load_json_fn(p_video, {}) or {}
         if not isinstance(video, dict):
             _notify(f"[오류] video.json 형식 오류: {p_video}")
             return
-    except Exception as e_load_vjson_vfinal:  # 그 외 예외
-        _notify(f"[오류] video.json 로드 실패: {e_load_vjson_vfinal}")
+    except (OSError, ValueError) as e_load_video:
+        _notify(f"[오류] video.json 로드 실패: {e_load_video}")
         return
 
     scenes = list(video.get("scenes") or [])
@@ -328,526 +280,709 @@ def build_shots_with_i2v(
         return
 
     clips_dir = ensure_dir_fn(pdir / "clips")
-
-    # --- 설정 모듈 로드 및 값 안전하게 가져오기 ---
-    s_mod_vfinal: Any  # 변수명 변경 및 타입 명시
-    try:
-        import settings as settings_mod  # type: ignore
-        s_mod_vfinal = settings_mod
-    except ImportError:
+    work_dir = clips_dir / "xfade_work"
+    work_dir.mkdir(parents=True, exist_ok=True)
+    # 우리 temp만 초깃값 정리
+    for stale in list(work_dir.glob("_chunk_*.mp4")) + list(work_dir.glob("cur_*.mp4")) + list(work_dir.glob("tmp_*.mp4")):
         try:
-            from app import settings as settings_mod_app  # type: ignore
-            s_mod_vfinal = settings_mod_app
-        except ImportError:
-            print("[경고] 설정 모듈 로드 실패. 기본값 사용.")
+            stale.unlink()
+        except OSError:
+            pass
 
-            # 폴백 객체 정의 (필요한 속성만 포함)
-            class SettingsFallback:
-                JSONS_DIR = r"C:\my_games\shorts_make\app\jsons"
-                I2V_WORKFLOW = None
-                COMFY_INPUT_DIR = r"C:\my_games\shorts_make\app\comfy_inputs"
-                COMFY_HOST = "http://127.0.0.1:8188"
-
-            s_mod_vfinal = SettingsFallback()
-
-    # getattr으로 안전하게 속성 접근
-    _jsons_dir_setting_vfinal = getattr(s_mod_vfinal, "JSONS_DIR", r"C:\my_games\shorts_make\app\jsons")
-    _i2v_wf_setting_vfinal = getattr(s_mod_vfinal, "I2V_WORKFLOW", None)
-    _comfy_in_setting_vfinal = getattr(s_mod_vfinal, "COMFY_INPUT_DIR", r"C:\my_games\shorts_make\app\comfy_inputs")
-    _comfy_host_setting_vfinal = getattr(s_mod_vfinal, "COMFY_HOST", "http://127.0.0.1:8188")
-
-    base_jsons = Path(str(_jsons_dir_setting_vfinal))
-    comfy_input_dir = Path(str(_comfy_in_setting_vfinal))
-    comfy_input_dir.mkdir(parents=True, exist_ok=True)
-
-    base_url = str(video.get("comfy_host") or _comfy_host_setting_vfinal).rstrip("/")
-
-    defaults_v = video.get("defaults") or {}
-    defaults_i2v = defaults_v.get("i2v") or {}
-
-    # --- 워크플로우 경로 결정 ---
+    # ── 워크플로 경로 결정 ─────────────────────────────────────────
     wf_path: Optional[Path] = None
-    if _i2v_wf_setting_vfinal:
-        cand1_vfinal = Path(str(_i2v_wf_setting_vfinal))
-        if not cand1_vfinal.is_absolute():
-            cand1_vfinal = base_jsons / cand1_vfinal.name
-        if cand1_vfinal.is_file():
-            wf_path = cand1_vfinal
+    if i2v_workflow_conf:
+        c1 = Path(str(i2v_workflow_conf))
+        if not c1.is_absolute():
+            c1 = base_jsons / c1.name
+        if c1.is_file():
+            wf_path = c1
     if wf_path is None:
-        wf_from_video_vfinal = str(defaults_i2v.get("workflow") or "").strip()
-        if wf_from_video_vfinal:
-            cand2_vfinal = Path(wf_from_video_vfinal)
-            if not cand2_vfinal.is_absolute():
-                cand2_vfinal = base_jsons / cand2_vfinal.name
-            if cand2_vfinal.is_file():
-                wf_path = cand2_vfinal
+        defaults_all = video.get("defaults") or {}
+        defaults_i2v = defaults_all.get("i2v") or {}
+        wf_from_video_str = str(defaults_i2v.get("workflow") or "").strip()
+        if wf_from_video_str:
+            c2 = Path(wf_from_video_str)
+            if not c2.is_absolute():
+                c2 = base_jsons / c2.name
+            if c2.is_file():
+                wf_path = c2
     if wf_path is None:
-        wf_path_fallback_vfinal = base_jsons / "guff_movie.json"
-        if wf_path_fallback_vfinal.is_file():
-            wf_path = wf_path_fallback_vfinal
+        c3 = base_jsons / "guff_movie.json"
+        if c3.is_file():
+            wf_path = c3
         else:
-            tried_paths_vfinal = [
-                str(_i2v_wf_setting_vfinal or 'N/A'),
-                str(defaults_i2v.get('workflow') or 'N/A'),
-                str(wf_path_fallback_vfinal)
-            ]
-            raise FileNotFoundError(f"워크플로 파일을 찾을 수 없습니다: {tried_paths_vfinal}")
+            raise FileNotFoundError(f"워크플로 파일을 찾을 수 없습니다: {c3}")
 
     _notify(f"사용할 워크플로우: {wf_path.name} (경로: {wf_path})")
 
-    # --- 워크플로우 원본 로드 ---
+    # ── 워크플로 로드 ─────────────────────────────────────────────
     try:
-        with open(wf_path, "r", encoding="utf-8") as f_graph_vfinal:
-            graph_origin: Dict[str, Any] = json_mod.load(f_graph_vfinal)
-    except (OSError, json_mod.JSONDecodeError) as e_load_wf_vfinal:
-        raise RuntimeError(f"워크플로우 로드 실패: {wf_path} ({e_load_wf_vfinal})") from e_load_wf_vfinal
-    except Exception as e_load_wf_unknown_vfinal:
-        raise RuntimeError(
-            f"워크플로우 로드 중 예상치 못한 오류: {wf_path} ({e_load_wf_unknown_vfinal})") from e_load_wf_unknown_vfinal
+        with open(wf_path, "r", encoding="utf-8") as f_graph:
+            graph_origin: Dict[str, Any] = json_mod.load(f_graph)
+    except (OSError, json_mod.JSONDecodeError) as e_load_wf:
+        raise RuntimeError(f"워크플로우 로드 실패: {wf_path} ({e_load_wf})") from e_load_wf
 
-    # --- 제출/대기 코어 로드 ---
-    submit_and_wait_fn: Optional[Callable] = None
-    load_err_msg_vfinal: Optional[str] = None
+    # ── 제출/대기 코어 ────────────────────────────────────────────
+    submit_and_wait_fn: Optional[Callable[..., Dict[str, Any]]] = None
     try:
         from app.audio_sync import _submit_and_wait as submit_and_wait_fn  # type: ignore
     except Exception:
         try:
             from audio_sync import _submit_and_wait as submit_and_wait_fn  # type: ignore
-        except Exception as e_load_wait_main:
-            load_err_msg_vfinal = str(e_load_wait_main)
+        except Exception as e_wait:
+            raise RuntimeError(f"_submit_and_wait 함수 로드 실패: {e_wait}") from e_wait
 
-    if submit_and_wait_fn is None:
-        raise RuntimeError(f"_submit_and_wait 함수 로드 실패: {load_err_msg_vfinal or 'unknown'}")
+    # ── 필수 내부 도우미 ──────────────────────────────────────────
+    def _set_input_safe(graph_dict: Dict[str, Any], node_id: str, input_key: str, value: Any) -> bool:
+        node_id_s = str(node_id or "")
+        input_key_s = str(input_key or "")
+        if not node_id_s or not input_key_s:
+            _notify(f"[경고] 노드 ID({node_id_s}) 또는 키({input_key_s}) 유효하지 않음.")
+            return False
+        target = graph_dict.get(node_id_s)
+        if not isinstance(target, dict):
+            _notify(f"[경고] 노드 ID '{node_id_s}' 없음 또는 형식 오류.")
+            return False
+        inputs_dict = target.setdefault("inputs", {})
+        if not isinstance(inputs_dict, dict):
+            _notify(f"[경고] 노드 {node_id_s} 'inputs' 필드가 dict 아님.")
+            return False
+        current_value = inputs_dict.get(input_key_s)
+        must_int = isinstance(current_value, int) or input_key_s in {
+            "steps", "frame_rate", "width", "height", "length", "seed", "loop_count", "crf", "noise_seed"
+        }
+        must_float = isinstance(current_value, float) or input_key_s in {"cfg", "strength_model"}
+        try:
+            if must_int:
+                inputs_dict[input_key_s] = int(value)
+            elif must_float:
+                inputs_dict[input_key_s] = float(value)
+            else:
+                inputs_dict[input_key_s] = value
+        except (TypeError, ValueError):
+            _notify(f"[경고] 노드 {node_id_s}.{input_key_s} 값({value}) 변환 실패.")
+            inputs_dict[input_key_s] = value
+        return True
 
-    # --- 현재 날짜 문자열 생성 ---
+    # ── 날짜 접두사 ───────────────────────────────────────────────
     try:
-        current_date_str = datetime.date.today().strftime("%Y-%m-%d")
-    except Exception as e_date_vfinal:
-        _notify(f"[경고] 날짜 가져오기 실패: {e_date_vfinal}. 기본 접두사 사용.")
-        current_date_str = "YYYY-MM-DD"
+        date_prefix = datetime.date.today().strftime("%Y-%m-%d")
+    except Exception:
+        date_prefix = "YYYY-MM-DD"
 
-    # --- 씬 순회 및 생성 ---
-    for idx, sc in enumerate(scenes):
-        if not isinstance(sc, dict):
-            _notify(f"[경고] scenes[{idx}] 항목 오류. 건너<0xEB><0x9B><0x84>니다.")
+    # ── 기본 파라미터 ────────────────────────────────────────────
+    defaults_all = video.get("defaults") or {}
+    defaults_i2v = defaults_all.get("i2v") or {}
+    try:
+        max_frames_per_chunk = int(defaults_i2v.get("max_frames_per_chunk", 60))
+        overlap_frames_for_chunk = int(defaults_i2v.get("overlap_frames_chunk", 12))
+    except (TypeError, ValueError):
+        max_frames_per_chunk = 60
+        overlap_frames_for_chunk = 12
+    _notify(f"청크 설정: 최대 {max_frames_per_chunk}f, 겹침 {overlap_frames_for_chunk}f")
+
+    # ── 씬 루프 ──────────────────────────────────────────────────
+    for s_idx, scene in enumerate(scenes):
+        if not isinstance(scene, dict):
+            _notify(f"[경고] scenes[{s_idx}] 항목 형식 오류. 건너뜁니다.")
             continue
 
-        sid = str(sc.get("id") or f"scene_{idx:03d}").strip() or f"scene_{idx:03d}"
-
-        # --- 씬별 스킵 확인 ---
+        sid = (str(scene.get("id") or f"scene_{s_idx:05d}").strip() or f"scene_{s_idx:05d}")
         clip_mp4 = clips_dir / f"{sid}.mp4"
+
+        # 이미 존재하면 스킵
         try:
-            if clip_mp4.is_file() and clip_mp4.stat().st_size > 1024:  # 1KB 이상
-                _notify(f"skip scene={sid} → exists {clip_mp4.name} ({clip_mp4.stat().st_size / 1024:.1f} KB)")
+            if clip_mp4.is_file() and clip_mp4.stat().st_size > 1024:
+                size_kb = clip_mp4.stat().st_size / 1024.0
+                _notify(f"skip scene={sid} → exists {clip_mp4.name} ({size_kb:.1f} KB)")
                 continue
-        except Exception as e_skip_check_local:
-            _notify(f"[경고] 스킵 확인 중 오류 (씬 {sid}): {e_skip_check_local}. 생성 시도.")
+        except OSError as e_stat_clip:
+            _notify(f"[경고] 스킵 확인 중 오류 (씬 {sid}): {e_stat_clip}. 생성 시도.")
 
-        # --- 그래프 복제 ---
-        try:
-            graph = json_mod.loads(json_mod.dumps(graph_origin))
-        except Exception as e_clone_main:
-            _notify(f"[오류] 워크플로우 복제 실패 (씬 {sid}): {e_clone_main}")
-            continue
-
-        # --- 입력 이미지 찾기 및 준비 ---
+        # 입력 이미지 결정 + comfy input 반영
         img_path: Optional[Path] = None
         server_image_name: Optional[str] = None
-        img_from_scene_local = str(sc.get("img_file") or "").strip()
-        if img_from_scene_local:
-            p_img_local = Path(img_from_scene_local)
-            if not p_img_local.is_absolute():
-                paths_v_local_img = video.get("paths") or {}
-                root_dir_str_local_img = str(paths_v_local_img.get("root") or pdir)
-                root_dir_local_img = Path(root_dir_str_local_img)
-                imgs_dir_name_local_img = str(paths_v_local_img.get("imgs_dir") or "imgs")
-                p_img_local = root_dir_local_img / imgs_dir_name_local_img / p_img_local.name
+        img_declared = str(scene.get("img_file") or "").strip()
+        if img_declared:
+            p_img = Path(img_declared)
+            if not p_img.is_absolute():
+                paths_info = video.get("paths") or {}
+                root_dir_str = str(paths_info.get("root") or pdir)
+                imgs_dir_name = str(paths_info.get("imgs_dir") or "imgs")
+                p_img = Path(root_dir_str) / imgs_dir_name / p_img.name
             try:
-                if p_img_local.is_file() and p_img_local.stat().st_size > 0:
-                    img_path = p_img_local
-            except Exception as e_img1_check_local:
-                _notify(f"[경고] 이미지({p_img_local.name}) 상태 확인 오류: {e_img1_check_local}")
-
+                if p_img.is_file() and p_img.stat().st_size > 0:
+                    img_path = p_img
+            except OSError:
+                pass
         if img_path is None:
-            paths_v2_local_img = video.get("paths") or {}
-            root_dir2_str_local_img = str(paths_v2_local_img.get("root") or pdir)
-            root_dir2_local_img = Path(root_dir2_str_local_img)
-            imgs_dir_name2_local_img = str(paths_v2_local_img.get("imgs_dir") or "imgs")
-            cand_png_local_img = root_dir2_local_img / imgs_dir_name2_local_img / f"{sid}.png"
+            paths_info2 = video.get("paths") or {}
+            root_dir_str2 = str(paths_info2.get("root") or pdir)
+            imgs_dir_name2 = str(paths_info2.get("imgs_dir") or "imgs")
+            cand_png = Path(root_dir_str2) / imgs_dir_name2 / f"{sid}.png"
             try:
-                if cand_png_local_img.is_file() and cand_png_local_img.stat().st_size > 0:
-                    img_path = cand_png_local_img
-            except Exception as e_img2_check_local:
-                _notify(f"[경고] 기본 이미지({cand_png_local_img.name}) 상태 확인 오류: {e_img2_check_local}")
-
+                if cand_png.is_file() and cand_png.stat().st_size > 0:
+                    img_path = cand_png
+            except OSError:
+                pass
         if img_path is None:
-            _notify(f"scene={sid} 입력 이미지를 찾을 수 없음 → 건너<0xEB><0x9B><0x84>니다.")
+            _notify(f"scene={sid} 입력 이미지를 찾을 수 없음 → 건너뜁니다.")
             continue
 
         try:
             server_image_name = img_path.name
-            dest_path_vfinal = comfy_input_dir / server_image_name
-            should_copy_vfinal = True
-            if dest_path_vfinal.exists():
+            dest = comfy_input_dir / server_image_name
+            do_copy = True
+            if dest.exists():
                 try:
-                    if dest_path_vfinal.stat().st_mtime >= img_path.stat().st_mtime:
-                        should_copy_vfinal = False
-                except FileNotFoundError:
-                    should_copy_vfinal = True
-                except OSError as e_stat_comp_vfinal:
-                    _notify(f"[경고] 파일 시간 비교 오류({dest_path_vfinal.name}): {e_stat_comp_vfinal}.")
-
-            if should_copy_vfinal:
-                shutil.copy2(str(img_path), str(dest_path_vfinal))
+                    if dest.stat().st_mtime >= img_path.stat().st_mtime:
+                        do_copy = False
+                except OSError:
+                    do_copy = True
+            if do_copy:
+                shutil.copy2(str(img_path), str(dest))
                 _notify(f"이미지 복사 완료: {server_image_name} -> {comfy_input_dir.name}")
-
-        except Exception as e_copy_upload_local:
-            _notify(f"[경고] 이미지 준비 실패 ({img_path.name}): {e_copy_upload_local}, 업로드/다음 단계 시도.")
-
+        except OSError as e_copy:
+            _notify(f"[경고] 이미지 준비 실패({img_path.name}): {e_copy}")
         if not server_image_name:
             _notify(f"[오류] 이미지 이름 설정 불가 (씬 {sid}). 다음 씬으로.")
             continue
 
-        # --- 워크플로우 노드 값 수정 ---
-        nodes_updated_count = 0
-
-        # 1. LoadImage 주입
-        loadimage_nodes_found: List[Tuple[str, Dict]] = []
-        for nid_lnf, node_lnf in graph.items():
-            try:
-                if isinstance(node_lnf, dict) and str(node_lnf.get("class_type", "")).strip() == "LoadImage":
-                    loadimage_nodes_found.append((str(nid_lnf), node_lnf))
-            except Exception:
-                continue  # 노드 구조 오류 무시
-        if not loadimage_nodes_found:
-            _notify(f"[경고] LoadImage 노드 없음 (씬 {sid}).")
-        else:
-            for nid_lns, _ in loadimage_nodes_found:
-                if _set_input_safe(graph, nid_lns, "image", server_image_name):
-                    nodes_updated_count += 1
-                    _notify(f"LoadImage({nid_lns}) 이미지: {server_image_name}")
-
-        # 2. 새 난수 시드 생성 (캐시 방지)
+        # 씬 시드/타겟 fps
         try:
-            new_seed_value = random.randint(0, 999999999999999)
-        except Exception:
-            new_seed_value = int(time.time() * 1000000) % 999999999999999
+            scene_seed_value = random.randint(0, 999_999_999_999_999)
+        except ValueError:
+            scene_seed_value = int(time.time() * 1_000_000) % 999_999_999_999_999
+        _notify(f"씬 {sid}에 사용할 마스터 시드: {scene_seed_value}")
 
-        sampler_node_ids_for_seed = ["13", "14"]  # KSamplerAdvanced 노드 ID
-        seed_update_count = 0
-        for nid_seed_set in sampler_node_ids_for_seed:
-            if _set_input_safe(graph, nid_seed_set, "noise_seed", new_seed_value):
-                seed_update_count += 1
-        if seed_update_count > 0:
-            nodes_updated_count += seed_update_count
-            _notify(f"Sampler({', '.join(sampler_node_ids_for_seed)}) Seed: {new_seed_value}")
-
-        # 3. UI 설정값 주입 (W, H, FPS, Steps, Length)
-        resize_node_id = "24"
         combine_node_id = "21"
-        sampler_node_ids = ["13", "14"]  # 스텝 설정용
-        i2v_node_id = "25"  # WanImageToVideo
-
-        resize_update_count = 0
-        if ui_width is not None and ui_width > 0 and _set_input_safe(graph, resize_node_id, "width", ui_width):
-            resize_update_count += 1
-        if ui_height is not None and ui_height > 0 and _set_input_safe(graph, resize_node_id, "height", ui_height):
-            resize_update_count += 1
-        if resize_update_count > 0:
-            nodes_updated_count += resize_update_count
-            w_log_vfinal = ui_width if ui_width is not None and ui_width > 0 else '기본값'
-            h_log_vfinal = ui_height if ui_height is not None and ui_height > 0 else '기본값'
-            _notify(f"Resize({resize_node_id}) 크기: {w_log_vfinal}x{h_log_vfinal}")
-
-        if ui_fps is not None and ui_fps > 0 and _set_input_safe(graph, combine_node_id, "frame_rate", ui_fps):
-            nodes_updated_count += 1
-            _notify(f"Combine({combine_node_id}) FPS: {ui_fps}")
-
-        steps_update_count = 0
-        if ui_steps is not None and ui_steps > 0:
-            for nid_sus in sampler_node_ids:
-                if _set_input_safe(graph, nid_sus, "steps", ui_steps):
-                    steps_update_count += 1
-        if steps_update_count > 0:
-            nodes_updated_count += steps_update_count
-            _notify(f"Sampler({', '.join(sampler_node_ids)}) Steps: {ui_steps}")
+        i2v_node_id = "25"
+        target_fps_val: int = 16
 
         try:
-            scene_duration = float(sc.get("duration", 1.0))
-            target_fps_val: int = 16
-            if ui_fps is not None and ui_fps > 0:
-                target_fps_val = ui_fps
-            else:
+            scene_duration = float(scene.get("duration", 1.0))
+        except (TypeError, ValueError):
+            scene_duration = 1.0
+
+        if ui_fps is not None and ui_fps > 0:
+            target_fps_val = int(ui_fps)
+        else:
+            fps_wf = None
+            try:
+                fps_wf = graph_origin.get(combine_node_id, {}).get("inputs", {}).get("frame_rate")
+            except AttributeError:
+                fps_wf = None
+            if fps_wf is not None:
                 try:
-                    fps_wf = graph.get(combine_node_id, {}).get("inputs", {}).get("frame_rate")
-                    if fps_wf is not None:
-                        fps_int_wf = int(fps_wf)
-                        if fps_int_wf > 0:
-                            target_fps_val = fps_int_wf
-                except Exception:
-                    pass  # 오류 시 기본값 16 유지
+                    fps_int = int(fps_wf)
+                    if fps_int > 0:
+                        target_fps_val = fps_int
+                except (TypeError, ValueError):
+                    pass
+
+        try:
             frame_length = max(1, int(round(scene_duration * target_fps_val)))
-            if _set_input_safe(graph, i2v_node_id, "length", frame_length):
-                nodes_updated_count += 1
-                _notify(f"I2V({i2v_node_id}) Length: {frame_length}f ({scene_duration:.2f}s @ {target_fps_val}fps)")
-        except Exception as e_len_main:
-            _notify(f"[경고] 프레임 길이 설정 오류 (씬 {sid}): {e_len_main}")
+        except (TypeError, ValueError):
+            frame_length = 16
+            _notify(f"[경고] 프레임 길이 계산 오류 (씬 {sid}). 기본값 16f 사용.")
 
-        # 4. 프롬프트 주입
-        positive_prompt = str(sc.get("prompt_movie") or sc.get("prompt") or "")
-        negative_prompt = str(sc.get("prompt_negative") or "")
-        pos_node_id = "22"
-        neg_node_id = "23"
-        prompt_update_count = 0
-        if positive_prompt and pos_node_id in graph and _set_input_safe(graph, pos_node_id, "text", positive_prompt):
-            prompt_update_count += 1
-        if negative_prompt and neg_node_id in graph and _set_input_safe(graph, neg_node_id, "text", negative_prompt):
-            prompt_update_count += 1
-        if prompt_update_count > 0:
-            nodes_updated_count += prompt_update_count
-            _notify(f"프롬프트({pos_node_id}/{neg_node_id}) 설정 완료.")
+        # 분할
+        if frame_length > max_frames_per_chunk:
+            _notify(f"씬 {sid}이(가) 깁니다 ({frame_length}f > {max_frames_per_chunk}f). 청크로 분할합니다.")
+            segments_list: List[Tuple[int, int]] = plan_segments(  # 기존 외부 함수
+                frame_length, base_chunk=max_frames_per_chunk, overlap=overlap_frames_for_chunk
+            )
+        else:
+            segments_list = [(0, frame_length)]
 
-        # 5. 파일 접두사(filename_prefix)에 현재 날짜 적용
-        combine_node_id_prefix = "21"
-        if combine_node_id_prefix in graph:
-            original_prefix_vfinal = str(
-                graph.get(combine_node_id_prefix, {}).get("inputs", {}).get("filename_prefix", "unknown_prefix_"))
-            suffix_part_vfinal = original_prefix_vfinal.split("/", 1)[
-                -1] if "/" in original_prefix_vfinal else original_prefix_vfinal
-            if not suffix_part_vfinal or suffix_part_vfinal.isdigit() or suffix_part_vfinal.replace('-',
-                                                                                                    '').isdigit() or (
-                    suffix_part_vfinal.endswith('_') and suffix_part_vfinal[:-1].isdigit()):
-                suffix_part_vfinal = "wan22_"
-            new_prefix_vfinal = f"{current_date_str}/{suffix_part_vfinal}"
-            if _set_input_safe(graph, combine_node_id_prefix, "filename_prefix", new_prefix_vfinal):
-                nodes_updated_count += 1
-                _notify(f"Combine({combine_node_id_prefix}) Prefix: {new_prefix_vfinal}")
-            else:
-                _notify(f"[경고] Prefix 설정 실패.")
+        chunk_paths: List[Path] = []
+        scene_failed = False
+        current_input_image_name: str = server_image_name
+        temp_frames: List[Path] = []
 
-        # --- 로그 조절 콜백 래퍼 ---
-        _wait_counter = 0
+        # 각 청크 처리
+        for c_idx, (start_f, end_f) in enumerate(segments_list):
+            if scene_failed:
+                break
 
-        def _throttled_relay(prog: Dict[str, Any]) -> None:
-            nonlocal _wait_counter
-            _wait_counter += 1
-            if _wait_counter % 50 == 0:
+            chunk_len = end_f - start_f
+            chunk_label = f"씬 {sid} (청크 {c_idx + 1}/{len(segments_list)})"
+            _notify(f"{chunk_label}: 프레임 {start_f}-{end_f} (길이 {chunk_len}f) 처리 시작")
+
+            try:
+                graph = json_mod.loads(json_mod.dumps(graph_origin))
+            except (TypeError, ValueError) as e_clone:
+                _notify(f"[오류] 워크플로우 복제 실패 ({chunk_label}): {e_clone}")
+                scene_failed = True
+                continue
+
+            # LoadImage/Seed/사이즈/FPS/Steps/길이/프롬프트/접두사 주입
+            load_nodes: List[Tuple[str, Dict[str, Any]]] = []
+            for node_key, node_val in graph.items():
+                try:
+                    if isinstance(node_val, dict) and str(node_val.get("class_type") or "") == "LoadImage":
+                        load_nodes.append((str(node_key), node_val))
+                except (AttributeError, TypeError):
+                    continue
+            for load_node_id, _node in load_nodes:
+                _set_input_safe(graph, load_node_id, "image", current_input_image_name)
+                _notify(f"LoadImage({load_node_id}) 이미지: {current_input_image_name} ({chunk_label})")
+
+            for sampler_id in ("13", "14"):
+                _set_input_safe(graph, sampler_id, "noise_seed", scene_seed_value)
+            _notify(f"Sampler(13, 14) Seed: {scene_seed_value} ({chunk_label})")
+
+            resize_node_id = "24"
+            if ui_width and ui_width > 0:
+                _set_input_safe(graph, resize_node_id, "width", ui_width)
+            if ui_height and ui_height > 0:
+                _set_input_safe(graph, resize_node_id, "height", ui_height)
+            if ui_width or ui_height:
+                _notify(f"Resize({resize_node_id}) 크기: "
+                        f"{ui_width if ui_width else '기본값'}x{ui_height if ui_height else '기본값'} ({chunk_label})")
+
+            if ui_fps and ui_fps > 0:
+                _set_input_safe(graph, combine_node_id, "frame_rate", ui_fps)
+                _notify(f"Combine({combine_node_id}) FPS: {ui_fps} ({chunk_label})")
+
+            if ui_steps and ui_steps > 0:
+                steps_set = 0
+                for sampler_id in ("13", "14"):
+                    if _set_input_safe(graph, sampler_id, "steps", ui_steps):
+                        steps_set += 1
+                if steps_set:
+                    _notify(f"Sampler(13, 14) Steps: {ui_steps} ({chunk_label})")
+
+            _set_input_safe(graph, i2v_node_id, "length", chunk_len)
+            _notify(f"I2V({i2v_node_id}) Length: {chunk_len}f ({chunk_label})")
+
+            pos_txt = str(scene.get("prompt_movie") or scene.get("prompt") or "")
+            neg_txt = str(scene.get("prompt_negative") or "")
+            if pos_txt:
+                _set_input_safe(graph, "22", "text", pos_txt)
+            if neg_txt:
+                _set_input_safe(graph, "23", "text", neg_txt)
+            if pos_txt or neg_txt:
+                _notify(f"프롬프트(22/23) 설정 완료. ({chunk_label})")
+
+            # 파일 접두사
+            try:
+                raw_prefix = str(graph.get(combine_node_id, {}).get("inputs", {}).get("filename_prefix", "wan22_"))
+            except AttributeError:
+                raw_prefix = "wan22_"
+            suffix = raw_prefix.split("/", 1)[-1] if "/" in raw_prefix else raw_prefix
+            if (not suffix or suffix.isdigit()
+                    or suffix.replace("-", "").isdigit()
+                    or (suffix.endswith("_") and suffix[:-1].isdigit())):
+                suffix = "wan22_"
+            new_prefix = f"{date_prefix}/{suffix}"
+            _set_input_safe(graph, combine_node_id, "filename_prefix", new_prefix)
+            _notify(f"Combine({combine_node_id}) Prefix: {new_prefix} ({chunk_label})")
+
+            # 제출/대기
+            def _relay(prog: Dict[str, Any]) -> None:
                 msg_val = str(prog.get("msg") or "")
                 if msg_val:
-                    _notify(msg_val)
+                    on_progress and on_progress({"msg": msg_val})
 
-        # --- 워크플로우 실행 ---
-        _notify(f"워크플로우 제출 시작 (씬 {sid}, {nodes_updated_count}개 노드 업데이트)")
-        result: Dict[str, Any] = {}
-        try:
-            result = submit_and_wait_fn(
-                base_url, graph,
-                timeout=int(defaults_i2v.get("timeout_sec") or 3600),  # 1시간
-                poll=float(defaults_i2v.get("poll_sec") or 1.5),
-                on_progress=_throttled_relay
-            )
-        except TimeoutError as e_timeout_vfinal:
-            _notify(f"[오류] 워크플로우 시간 초과 (씬 {sid}): {e_timeout_vfinal}")
-            _notify(" -> ComfyUI 콘솔에서 OutOfMemory 등의 오류가 있는지 확인하세요.")
-            continue
-        except Exception as e_submit_vfinal:
-            _notify(f"[오류] 워크플로우 제출/대기 실패 (씬 {sid}): {e_submit_vfinal}")
-            print(traceback.format_exc())
-            continue
+            _notify(f"워크플로우 제출 시작 ({chunk_label})")
+            try:
+                result = submit_and_wait_fn(
+                    base_url, graph,
+                    timeout=int(defaults_i2v.get("timeout_sec") or 3600),
+                    poll=float(defaults_i2v.get("poll_sec") or 1.5),
+                    on_progress=_relay
+                )
+            except TimeoutError as e_to:
+                _notify(f"[오류] 워크플로우 시간 초과 ({chunk_label}): {e_to}")
+                scene_failed = True
+                continue
+            except (RuntimeError, ValueError) as e_submit:
+                _notify(f"[오류] 워크플로우 제출/대기 실패 ({chunk_label}): {e_submit}")
+                scene_failed = True
+                continue
 
-        # --- [수정] 결과 딕셔너리 구조 상세 디버깅 ---
-        _notify(f"[DEBUG] ComfyUI 작업 완료. API 응답(result) 수신.")
-        outputs_dict_debug = result.get("outputs") or {}
-        if not outputs_dict_debug:
-            _notify(f"[DEBUG] 'outputs' 딕셔너리가 비어있거나 존재하지 않습니다.")
-        elif not isinstance(outputs_dict_debug, dict):
-            _notify(f"[DEBUG] 'outputs'가 딕셔너리가 아님 (타입: {type(outputs_dict_debug)})")
-        else:
-            _notify(f"[DEBUG] 'outputs' 딕셔너리 키 (노드 ID): {list(outputs_dict_debug.keys())}")
-            for node_id_debug, node_output_debug in outputs_dict_debug.items():
-                if isinstance(node_output_debug, dict):
-                    # 노드 출력의 키만 로깅 (예: 'videos', 'images', 'ui', 'files' 등)
-                    _notify(f"[DEBUG] -> 노드 {node_id_debug}의 출력 키: {list(node_output_debug.keys())}")
-                    # VHS_VideoCombine('21') 노드의 출력을 더 자세히 로깅
-                    if node_id_debug == "21":
-                        # node_output_debug이 너무 클 수 있으므로 str() 변환하여 일부만 로깅
-                        output_str_debug = str(node_output_debug)
-                        _notify(f"[DEBUG] --> 노드 21 (VHS_VideoCombine) 상세 (일부): {output_str_debug[:500]}...")
-                else:
-                    _notify(f"[DEBUG] -> 노드 {node_id_debug}의 출력이 dict가 아님 (타입: {type(node_output_debug)})")
-        # --- [수정] 디버깅 로그 끝 ---
+            # 출력 선택
+            from typing import cast
+            outputs_dict = cast(dict, result.get("outputs") or {})
+            target_info: Optional[Dict[str, Any]] = None
+            valid_mp4_infos: List[Dict[str, Any]] = []
+            any_outputs: List[Dict[str, Any]] = []
 
-        # --- ▼▼▼ [수정 v2] 결과 처리 (마지막 .mp4 파일 선택) ▼▼▼ ---
-        valid_mp4_files: List[Dict[str, Any]] = []
-        all_outputs: List[Dict[str, Any]] = []
+            for node_out_id, out_val in outputs_dict.items():
+                if not isinstance(out_val, dict):
+                    continue
+                vids = out_val.get("videos") or out_val.get("gifs")
+                if isinstance(vids, list):
+                    any_outputs.extend(vids)
+                    for vinfo in vids:
+                        if isinstance(vinfo, dict):
+                            fn_lower = str(vinfo.get("filename") or "").lower()
+                            t_lower = str(vinfo.get("type") or "").lower()
+                            if fn_lower.endswith(".mp4") and t_lower != "preview":
+                                valid_mp4_infos.append(vinfo)
+                                _notify(f"MP4 후보 발견 (노드 {node_out_id}): {fn_lower} (type: {t_lower})")
+                imgs = out_val.get("images")
+                if isinstance(imgs, list):
+                    any_outputs.extend(imgs)
 
-        outputs_dict = result.get("outputs") or {}
-        if isinstance(outputs_dict, dict):
-            for node_output_id, out_value_vfinal in outputs_dict.items():
-                if isinstance(out_value_vfinal, dict):
+            if valid_mp4_infos:
+                target_info = valid_mp4_infos[-1]
+                _notify(f"최종 MP4 파일 선택: {target_info.get('filename')}")
+            elif any_outputs:
+                target_info = any_outputs[-1]
+                _notify(f"MP4 없음. 폴백 파일 선택: {target_info.get('filename')}")
+            else:
+                _notify("처리할 출력 파일 정보 없음")
+                scene_failed = True
+                continue
 
-                    # 'gifs' 또는 'videos' 키에서 MP4 파일 목록 수집
-                    vids_list_vfinal = out_value_vfinal.get("videos") or out_value_vfinal.get("gifs")
+            subfolder = str(target_info.get("subfolder") or "")
+            filename_pick = str(target_info.get("filename") or "")
+            filetype_pick = str(target_info.get("type") or "output")
+            if not filename_pick:
+                _notify("출력 파일명 없음")
+                scene_failed = True
+                continue
 
-                    if isinstance(vids_list_vfinal, list):
-                        all_outputs.extend(vids_list_vfinal)
-                        for vid_info in vids_list_vfinal:
-                            if not isinstance(vid_info, dict):
-                                continue
-                            fname_vid_check = str(vid_info.get("filename") or "").lower()
-                            type_vid_check = str(vid_info.get("type") or "").lower()
+            _notify(f"결과 파일 선택: filename='{filename_pick}', type='{filetype_pick}'")
 
-                            # 'temp' 타입도 허용 ('preview'만 제외)
-                            if fname_vid_check.endswith(".mp4") and type_vid_check != "preview":
-                                # [수정] 발견 시 'break' 대신 리스트에 '추가'
-                                valid_mp4_files.append(vid_info)
-                                _notify(f"MP4 후보 발견 (노드 {node_output_id}): {fname_vid_check} (type: {type_vid_check})")
-                        # (참고) 안쪽/바깥쪽 break 문이 여기서 제거되었습니다.
-
-                    # 'images' 키 확인 (폴백용)
-                    imgs_list_vfinal = out_value_vfinal.get("images")
-                    if isinstance(imgs_list_vfinal, list):
-                        all_outputs.extend(imgs_list_vfinal)
-
-                    # 'ui' 키 확인 (폴백용)
-                    ui_dict_vfinal = out_value_vfinal.get("ui")
-                    if isinstance(ui_dict_vfinal, dict):
-                        for ui_key, ui_value in ui_dict_vfinal.items():
-                            if isinstance(ui_value, list):
-                                all_outputs.extend(ui_value)
-
-                    # 'files' 키 확인 (폴백용)
-                    files_list_vfinal = out_value_vfinal.get("files")
-                    if isinstance(files_list_vfinal, list):
-                        all_outputs.extend(files_list_vfinal)
-
-        # [수정] mp4 후보가 있으면 '마지막' 파일을 선택
-        target_file_info: Optional[Dict[str, Any]] = None
-        if valid_mp4_files:
-            target_file_info = valid_mp4_files[-1]  # <-- 마지막 파일 선택
-            _notify(f"최종 MP4 파일 선택: {target_file_info.get('filename')}")
-        elif all_outputs:
-            target_file_info = all_outputs[-1]  # (기존 폴백)
-            _notify(f"MP4 없음. 폴백 파일 선택: {target_file_info.get('filename')}")
-        else:
-            target_file_info = None  # (기존 폴백)
-
-        # --- ▲▲▲ [수V2] 결과 처리 수정 완료 ▲▲▲ ---
-
-        if target_file_info is None:
-            _notify(f"처리할 출력 파일 정보 없음 (씬 {sid})")
-            continue
-
-        subfolder = str(target_file_info.get("subfolder") or "")
-        fname = str(target_file_info.get("filename") or "")
-        file_type = str(target_file_info.get("type") or "output")  # 기본값 output
-
-        if not fname:
-            _notify(f"출력 파일명 없음 (씬 {sid})")
-            continue
-
-        _notify(f"결과 파일 선택: filename='{fname}', type='{file_type}' (씬 {sid})")
-
-        # --- 파일 다운로드 및 저장 ---
-        save_path: Optional[Path] = None
-        try:
-            resp_view = requests.get(
-                base_url + "/view",
-                params={"filename": fname, "subfolder": subfolder, "type": file_type},
-                timeout=300
-            )
-            resp_view.raise_for_status()
-
-            save_path = clip_mp4  # 목표 경로는 항상 {id}.mp4
-
-            # .mp4 파일이 아닐 경우 저장 거부
-            if not fname.lower().endswith(".mp4"):
-                _notify(f"[오류] 결과 파일이 .mp4가 아닙니다! (실제: {fname}).")
-                _notify(" -> ComfyUI 워크플로우의 마지막 노드가 .mp4를 출력하는지 확인하세요.")
-                continue  # .png 등을 .mp4로 저장하지 않고 다음 씬으로
-
-            save_path.parent.mkdir(parents=True, exist_ok=True)
-            with open(save_path, "wb") as f_out_vfinal:
-                f_out_vfinal.write(resp_view.content)
+            # ── **중요**: 청크 파일은 clips/xfade_work 에 저장 ──
+            chunk_name = f"_chunk_{sid}_{c_idx:05d}.mp4"
+            chunk_path = work_dir / chunk_name
 
             try:
-                file_size_bytes = save_path.stat().st_size
-                _notify(f"파일 저장 완료: {save_path.name} ({file_size_bytes / 1024:.1f} KB) (씬 {sid})")
-            except OSError as e_stat_final:
-                _notify(f"[경고] 저장된 파일 크기 확인 실패 (씬 {sid}): {e_stat_final}")
-                _notify(f"파일 저장 시도 완료: {save_path.name} (씬 {sid})")
+                import requests
+                resp = requests.get(
+                    base_url + "/view",
+                    params={"filename": filename_pick, "subfolder": subfolder, "type": filetype_pick},
+                    timeout=300
+                )
+                resp.raise_for_status()
+                if not filename_pick.lower().endswith(".mp4"):
+                    _notify(f"[오류] 결과 파일이 .mp4가 아닙니다! (실제: {filename_pick}).")
+                    scene_failed = True
+                    continue
+                chunk_path.parent.mkdir(parents=True, exist_ok=True)
+                with open(chunk_path, "wb") as f_out_file:
+                    f_out_file.write(resp.content)
+                size_bytes = chunk_path.stat().st_size
+                _notify(f"청크 파일 저장 완료: {chunk_path.name} ({size_bytes / 1024:.1f} KB)")
+                chunk_paths.append(chunk_path)
+            except Exception as e_http:
+                _notify(f"[오류] 청크 파일 다운로드/저장 실패: {e_http}")
+                scene_failed = True
+                continue
 
-        except requests.RequestException as e_req_final:
-            _notify(f"[오류] 결과 파일 다운로드 실패 (씬 {sid}): {e_req_final}")
-            continue
-        except OSError as e_save_final:
-            save_path_str = str(save_path) if save_path else "알 수 없음"
-            _notify(f"[오류] 결과 파일 저장 실패 (씬 {sid}, 경로 {save_path_str}): {e_save_final}")
-            continue
-        except Exception as e_proc_final:
-            _notify(f"[오류] 결과 처리 중 예상치 못한 오류 (씬 {sid}): {e_proc_final}")
-            print(traceback.format_exc())
+            # 다음 청크 입력 PNG 추출/업로드
+            if not scene_failed and c_idx < len(segments_list) - 1:
+                _notify(f"청크 {c_idx + 1}의 마지막-겹침 프레임을 다음 청크 입력으로 추출합니다...")
+                next_frame_name = f"{sid}_temp_frame_{c_idx:05d}.png"
+                next_frame_path = comfy_input_dir / next_frame_name
+                temp_frames.append(next_frame_path)
+
+                try:
+                    overlap_sec = float(overlap_frames_for_chunk) / float(max(1, target_fps_val))
+                except (TypeError, ValueError, ZeroDivisionError):
+                    overlap_sec = 1.0 / float(max(1, target_fps_val))
+                if overlap_sec < (1.0 / float(max(1, target_fps_val))):
+                    overlap_sec = 1.0 / float(max(1, target_fps_val))
+
+                cmdline_ff = [
+                    ffmpeg_exe, "-y",
+                    "-sseof", f"-{overlap_sec:.6f}",
+                    "-i", str(chunk_path),
+                    "-frames:v", "1",
+                    str(next_frame_path)
+                ]
+                try:
+                    subprocess.run(cmdline_ff, check=True, stdout=subprocess.DEVNULL, stderr=subprocess.PIPE)
+                    t0 = time.monotonic()
+                    ready = False
+                    while time.monotonic() - t0 < 5.0:
+                        if next_frame_path.exists():
+                            try:
+                                if next_frame_path.stat().st_size > 0:
+                                    ready = True
+                                    break
+                            except OSError:
+                                time.sleep(0.1)
+                        time.sleep(0.1)
+                    if not ready:
+                        raise RuntimeError("PNG 파일이 5초 내에 준비되지 않음")
+
+                    # 업로드 시도(+view로 가시성 확인)
+                    try:
+                        import requests as _req
+                        with open(next_frame_path, "rb") as fbin:
+                            up = _req.post(
+                                base_url + "/upload/image",
+                                files={"image": (next_frame_name, fbin, "image/png")},
+                                data={"overwrite": "true"},
+                                timeout=60,
+                            )
+                        if not (200 <= up.status_code < 300):
+                            raise RuntimeError("upload/image 실패")
+                        vis_ok = False
+                        t0v = time.monotonic()
+                        while time.monotonic() - t0v < 3.0:
+                            vv = _req.get(
+                                base_url + "/view",
+                                params={"filename": next_frame_name, "subfolder": "", "type": "input"},
+                                timeout=10,
+                            )
+                            if vv.status_code == 200 and vv.content:
+                                vis_ok = True
+                                break
+                            time.sleep(0.2)
+                        current_input_image_name = next_frame_name if vis_ok else server_image_name
+                    except Exception:
+                        current_input_image_name = server_image_name
+                except Exception as e_ff:
+                    _notify(f"[오류] 마지막-겹침 프레임 추출/업로드 실패: {e_ff}. 원본 이미지로 계속.")
+                    current_input_image_name = server_image_name
+
+        # 임시 PNG 정리
+        for tmp_png in temp_frames:
+            try:
+                tmp_png.unlink(missing_ok=True)
+            except OSError:
+                pass
+
+        if scene_failed:
+            _notify(f"[오류] 씬 {sid} 처리 중 실패가 있어 최종 파일 생성을 건너뜁니다.")
+            for bad_chunk in chunk_paths:
+                try:
+                    bad_chunk.unlink(missing_ok=True)
+                except OSError:
+                    pass
             continue
 
-    # --- 최종 완료 로그 ---
+        if not chunk_paths:
+            _notify(f"[경고] 씬 {sid}에 대해 생성된 청크 파일이 없습니다. 건너뜁니다.")
+            continue
+
+        if len(chunk_paths) == 1:
+            _notify(f"씬 {sid} 단일 청크 완료. 최종 파일로 이동합니다.")
+            try:
+                shutil.move(str(chunk_paths[0]), str(clip_mp4))
+                _notify(f"파일 이동 완료: {clip_mp4.name}")
+            except OSError as e_mv:
+                _notify(f"[오류] 단일 청크 파일 이동 실패 ({sid}): {e_mv}")
+        else:
+            _notify(f"씬 {sid}의 청크 {len(chunk_paths)}개 병합 (겹침: {overlap_frames_for_chunk}f @ {target_fps_val}fps)...")
+            try:
+                xfade_concat(
+                    clip_paths=chunk_paths,
+                    overlap_frames=overlap_frames_for_chunk,
+                    fps=target_fps_val,
+                    audio_path=None,
+                    out_path=clip_mp4
+                )
+                _notify(f"청크 병합 완료: {clip_mp4.name}")
+            except (OSError, RuntimeError, ValueError) as e_merge:
+                _notify(f"[오류] 씬 {sid} 청크 병합 실패: {e_merge}")
+
+        # work 폴더의 우리 temp 정리
+        for tmp_mp4 in chunk_paths:
+            try:
+                tmp_mp4.unlink(missing_ok=True)
+            except OSError:
+                pass
+
     _notify("모든 씬 처리 완료.")
 
 
-def xfade_concat(clip_paths: List[Path], overlap_frames: int, fps: int,
-                 *, audio_path: Optional[Path] = None, out_path: Optional[Path] = None) -> Path:
+
+
+
+
+
+from pathlib import Path
+from typing import List, Tuple, Optional
+
+def xfade_concat(
+    clip_paths: List[Path],
+    *,
+    overlap_frames: int,
+    fps: int,
+    audio_path: Optional[str | Path],
+    out_path: Path,
+) -> None:
+    """
+    연속 xfade로 mp4 병합.
+    - 입력 클립들을 공통 규격(FPS/해상도/SAR/픽셀포맷)으로 '작업 복사본'으로 먼저 정규화.
+    - xfade offset은 '이전 클립 길이 - fade_sec'(음수 방지).
+    - 임시 산출물은 {out_path.parent}/xfade_work 아래에만 생성·정리.
+    - 기존 호출 시그니처/동작 100% 유지.
+    """
+    import json
+    import subprocess
+    import shutil
+
     if not clip_paths:
-        raise ValueError("clip_paths가 비어있습니다.")
+        raise ValueError("clip_paths 비어 있음")
 
-    # 단일 클립이면 오디오만 입히거나 그대로 반환
-    if len(clip_paths) == 1:
-        single = clip_paths[0]
-        if audio_path and audio_path.exists() and out_path:
-            cmd = [FFMPEG_EXE, "-y", "-i", str(single), "-i", str(audio_path),
-                   "-map", "0:v:0", "-map", "1:a:0", "-c:v", "copy", "-c:a", "aac", "-b:a", "192k", str(out_path)]
-            subprocess.run(cmd, check=True)
-            return out_path
-        return single
+    if not isinstance(out_path, Path):
+        out_path = Path(out_path)
 
-    work = clip_paths[0].parent / "xfade_work"
-    work.mkdir(exist_ok=True)
-    cur = work / "cur_000.mp4"
-    shutil.copy2(clip_paths[0], cur)
+    work_dir = out_path.parent / "xfade_work"
+    work_dir.mkdir(parents=True, exist_ok=True)
 
-    def _xfade_two(a: Path, b: Path, outp: Path, frames: int):
-        dur = frames / float(fps)
-        accel = ["-hwaccel", "cuda"] if USE_HWACCEL else []
-        cmdline = [
-            FFMPEG_EXE, *accel, "-y",
-            "-i", str(a), "-i", str(b),
-            "-filter_complex",
-            f"[0:v][1:v]xfade=transition=fade:duration={dur}:offset=PTS-STARTPTS[v];"
-            f"[0:a][1:a]acrossfade=d={dur}[a]",
-            "-map", "[v]", "-map", "[a]", "-c:v", "libx264", "-crf", "18", "-pix_fmt", "yuv420p",
-            "-c:a", "aac", "-b:a", "192k", str(outp)
+    # 1) 작업 폴더 비우기(이전 임시물 혼입 방지)
+    for path_item in list(work_dir.iterdir()):
+        try:
+            if path_item.is_file():
+                path_item.unlink(missing_ok=True)
+        except (FileNotFoundError, PermissionError):
+            pass
+
+    # ----- ffprobe 헬퍼들 (함수 내부 한정) -----
+    def _probe_json(cmd_list: List[str]) -> dict:
+        # stdout/stderr 캡처를 텍스트로 받지 않음(로케일/인코딩 이슈 회피)
+        proc = subprocess.run(cmd_list, capture_output=True, check=False)
+        if proc.returncode == 0 and proc.stdout:
+            try:
+                return json.loads(proc.stdout.decode("utf-8", errors="ignore"))
+            except json.JSONDecodeError:
+                return {}
+        return {}
+
+    def _probe_width_height(in_file: Path) -> Tuple[int, int]:
+        probe_dict = _probe_json([
+            "ffprobe", "-v", "error", "-select_streams", "v:0",
+            "-show_entries", "stream=width,height",
+            "-of", "json", str(in_file)
+        ])
+        streams = probe_dict.get("streams") or []
+        if streams:
+            try:
+                w_val = int(streams[0].get("width") or 0)
+                h_val = int(streams[0].get("height") or 0)
+                if w_val > 0 and h_val > 0:
+                    return w_val, h_val
+            except (TypeError, ValueError):
+                return 1280, 720
+        return 1280, 720  # 안전 폴백
+
+    def _probe_duration_sec(in_file: Path) -> float:
+        proc = subprocess.run(
+            [
+                "ffprobe", "-v", "error",
+                "-show_entries", "format=duration",
+                "-of", "default=noprint_wrappers=1:nokey=1",
+                str(in_file)
+            ],
+            capture_output=True, check=False
+        )
+        if proc.returncode == 0 and proc.stdout:
+            try:
+                v = float(proc.stdout.decode("utf-8", errors="ignore").strip())
+                return v if v > 0.0 else 0.001
+            except ValueError:
+                return 0.001
+        return 0.001
+    # ----------------------------------------
+
+    # 2) 기준 해상도: 첫 입력
+    base_w, base_h = _probe_width_height(clip_paths[0])
+    fade_sec = float(max(1, overlap_frames)) / float(max(1, fps))
+
+    # 3) 입력 정규화(공통 FPS/해상도/SAR/yuv420p/CFR)
+    #    - '1/0' FPS 오류 방지: fps 필터 + setpts + 재인코딩으로 CFR 보장
+    normalized_list: List[Path] = []
+    for idx, in_path in enumerate(clip_paths):
+        norm_path = work_dir / f"n_{idx:03d}.mp4"
+        vf_chain = (
+            f"fps={fps},"
+            f"scale=w={base_w}:h={base_h}:force_original_aspect_ratio=decrease,"
+            f"pad={base_w}:{base_h}:(ow-iw)/2:(oh-ih)/2,"
+            f"setsar=1,format=yuv420p,setpts=PTS-STARTPTS"
+        )
+        run_args = [
+            "ffmpeg", "-y",
+            "-fflags", "+genpts",
+            "-i", str(in_path),
+            "-an",
+            "-vf", vf_chain,
+            "-r", str(fps),
+            "-vsync", "cfr",
+            "-c:v", "libx264", "-crf", "18",
+            "-pix_fmt", "yuv420p",
+            str(norm_path),
         ]
-        subprocess.run(cmdline, check=True)
+        # 출력 캡처 안 함(로케일 인코딩 문제 회피) + check=True로 실패 즉시 예외
+        subprocess.run(run_args, check=True, stdout=subprocess.DEVNULL, stderr=subprocess.STDOUT)
+        normalized_list.append(norm_path)
 
-    for i in range(1, len(clip_paths)):
-        tmp_out = work / f"cur_{i:03d}.mp4"
-        _xfade_two(cur, clip_paths[i], tmp_out, overlap_frames)
-        cur = tmp_out
+    # 4) 순차 xfade (비디오만, 오디오는 마지막에 1회 입힘)
+    cur_path = work_dir / "cur_000.mp4"
+    shutil.copy2(normalized_list[0], cur_path)
 
-    if out_path is None:
-        # 기본 산출 위치: 상위 폴더 + FINAL_OUT 파일명(혹은 디렉토리 규칙에 맞게)
-        out_path = clip_paths[0].parent / (Path(FINAL_OUT).name if FINAL_OUT else "final.mp4")
+    for merge_idx, next_path in enumerate(normalized_list[1:], start=1):
+        prev_dur = _probe_duration_sec(cur_path)
+        offset_val = max(0.0, prev_dur - fade_sec)
+        out_cur_path = work_dir / f"cur_{merge_idx:03d}.mp4"
 
-    if audio_path and audio_path.exists():
-        cmd = [FFMPEG_EXE, "-y", "-i", str(cur), "-i", str(audio_path),
-               "-map", "0:v:0", "-map", "1:a:0", "-c:v", "copy", "-c:a", "aac", "-b:a", "192k", str(out_path)]
-        subprocess.run(cmd, check=True)
-        return out_path
+        # 각 입력에 다시 한번 fps/pts 고정(안전), xfade → output CFR
+        fc_expr = (
+            "[0:v]fps={fps},setsar=1,format=yuv420p,setpts=PTS-STARTPTS[v0];"
+            "[1:v]fps={fps},setsar=1,format=yuv420p,setpts=PTS-STARTPTS[v1];"
+            "[v0][v1]xfade=transition=fade:duration={dur:.6f}:offset={off:.6f}[v]".format(
+                fps=fps, dur=fade_sec, off=offset_val
+            )
+        )
+        run_args_merge = [
+            "ffmpeg", "-y",
+            "-fflags", "+genpts",
+            "-i", str(cur_path),
+            "-fflags", "+genpts",
+            "-i", str(next_path),
+            "-filter_complex", fc_expr,
+            "-map", "[v]",
+            "-r", str(fps),
+            "-vsync", "cfr",
+            "-c:v", "libx264", "-crf", "18",
+            "-pix_fmt", "yuv420p",
+            str(out_cur_path),
+        ]
+        subprocess.run(run_args_merge, check=True, stdout=subprocess.DEVNULL, stderr=subprocess.STDOUT)
+
+        try:
+            cur_path.unlink(missing_ok=True)
+        except (FileNotFoundError, PermissionError):
+            pass
+        cur_path = out_cur_path
+
+    # 5) (옵션) 오디오 입힘
+    if audio_path:
+        final_audio_path = Path(audio_path) if not isinstance(audio_path, Path) else audio_path
+        run_args_audio = [
+            "ffmpeg", "-y",
+            "-i", str(cur_path),
+            "-i", str(final_audio_path),
+            "-c:v", "copy",
+            "-c:a", "aac", "-b:a", "192k",
+            "-shortest",
+            str(out_path),
+        ]
+        subprocess.run(run_args_audio, check=True, stdout=subprocess.DEVNULL, stderr=subprocess.STDOUT)
     else:
-        shutil.copy2(cur, out_path)
-        return out_path
+        shutil.copy2(cur_path, out_path)
+
+    # 6) 임시물 정리 — xfade_work 안 파일만
+    for path_item in list(work_dir.iterdir()):
+        try:
+            if path_item.is_file():
+                path_item.unlink(missing_ok=True)
+        except (FileNotFoundError, PermissionError):
+            pass
 
 
 
-# === ADD: video_build.py ===
+
+
 
 
 
@@ -1045,7 +1180,8 @@ def build_missing_images_from_story(
 
     for idx, sc in enumerate(scenes):
         try:
-            sid = str(sc.get("id") or f"scene_{idx:03d}")
+            # ★ 변경: 기본 SID 패딩 3→5 (기능 동일, 명명 규칙만 조정)
+            sid = str(sc.get("id") or f"scene_{idx:05d}")
             img_path = img_root / f"{sid}.png"
 
             scene_img = str(sc.get("img_file") or "")
@@ -1276,6 +1412,7 @@ def build_missing_images_from_story(
 
     _notify("summary", f"[IMG] 생성={len(created)} / 요청={req_count}")
     return created
+
 
 
 
@@ -1816,7 +1953,7 @@ def build_movie_json(project_dir: str,
 
     # steps/overlap_frames 기본
     steps_val: int = int(movie_defaults.get("steps") or 24)
-    overlap_frames_val: int = int(movie_defaults.get("overlap_frames") or 12)
+    overlap_frames_val: int = int(movie_defaults.get("overlap_frames") or 5)
 
     # ---- 씬 목록 ----
     scenes: List[Dict[str, Any]] = list(story.get("scenes") or [])
