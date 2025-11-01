@@ -276,15 +276,15 @@ def build_shots_with_i2v(
             print("[경고] on_progress 콜백 처리 실패")
 
     # ── ffprobe: 프레임 수 확인 ───────────────────────────────
-    def _probe_nb_frames_ffprobe_local(ffprobe_bin_param: str, src_path: Path) -> int:
+    def _probe_nb_frames_ffprobe_local(ffprobe_exe_local: str, src_path_local: Path) -> int:
         cmd_probe = [
-            ffprobe_bin_param,
+            ffprobe_exe_local,
             "-v", "error",
             "-select_streams", "v:0",
             "-count_frames",
             "-show_entries", "stream=nb_read_frames",
             "-of", "default=nokey=1:noprint_wrappers=1",
-            str(src_path),
+            str(src_path_local),
         ]
         proc = subprocess.run(
             cmd_probe,
@@ -303,28 +303,31 @@ def build_shots_with_i2v(
             return 0
 
     # ── 최종 트림(원래 총프레임으로) ──────────────────────────
-    def _trim_to_frames(ffmpeg_bin_param: str, ffprobe_bin_param: str, src: Path, dst: Path, target_frames: int, fps_val: int) -> bool:
+    def _trim_to_frames(ffmpeg_exe_local: str, ffprobe_exe_local: str, src_local: Path, dst_local: Path, target_frames: int, fps_val: int) -> bool:
         if target_frames <= 0:
             return False
         try:
-            tmp_out = dst.with_suffix(".tmp.mp4")
-            if tmp_out.exists():
+            tmp_out_local = dst_local.with_suffix(".tmp.mp4")
+            if tmp_out_local.exists():
                 try:
-                    tmp_out.unlink()
+                    tmp_out_local.unlink()
                 except OSError:
                     pass
 
             cmd = [
-                ffmpeg_bin_param, "-y",
+                ffmpeg_exe_local, "-y",
                 "-fflags", "+genpts",
-                "-i", str(src),
+                "-i", str(src_local),
                 "-vf", f"trim=end_frame={int(target_frames)},setpts=PTS-STARTPTS",
                 "-r", f"{int(max(1, fps_val))}",
                 "-fps_mode", "cfr",
                 "-vsync", "cfr",
+                "-map_metadata", "-1",           # 메타데이터 제거
+                "-metadata", "title=",           # title 비우기
+                "-sn",                           # 자막 스트림 제거
                 "-c:v", "libx264", "-crf", "18",
                 "-pix_fmt", "yuv420p",
-                str(tmp_out),
+                str(tmp_out_local),
             ]
             proc = subprocess.run(
                 cmd,
@@ -337,24 +340,24 @@ def build_shots_with_i2v(
             )
             if proc.returncode != 0:
                 _notify(f"[TRIM][오류] ffmpeg 트림 실패\n{(proc.stdout or '')[:4000]}")
-                if tmp_out.exists():
+                if tmp_out_local.exists():
                     try:
-                        tmp_out.unlink()
+                        tmp_out_local.unlink()
                     except OSError:
                         pass
                 return False
 
-            got_frames = _probe_nb_frames_ffprobe_local(ffprobe_bin_param, tmp_out)
+            got_frames = _probe_nb_frames_ffprobe_local(ffprobe_exe_local, tmp_out_local)
             if got_frames != int(target_frames):
                 _notify(f"[TRIM][경고] 프레임 불일치: 기대 {target_frames}f vs 실제 {got_frames}f")
 
             try:
-                if dst.exists():
-                    dst.unlink()
+                if dst_local.exists():
+                    dst_local.unlink()
             except OSError:
                 pass
-            tmp_out.rename(dst)
-            _notify(f"[TRIM] 완료: {dst.name} → {target_frames}f")
+            tmp_out_local.rename(dst_local)
+            _notify(f"[TRIM] 완료: {dst_local.name} → {target_frames}f")
             return True
         except Exception as e_trim_any:
             _notify(f"[TRIM][오류] 트림 처리 예외: {e_trim_any}")
@@ -362,37 +365,39 @@ def build_shots_with_i2v(
 
     # ── 컷 병합(덮어쓰기) ──────────────────────────────────────
     def _concat_cut_no_fade(
-        ffmpeg_bin_arg: str,
-        ffprobe_bin_arg: str,
-        clip_paths_arg: List[Path],
-        overlap_frames_arg: int,
-        fps_arg: int,
-        out_path_arg: Path,
-        work_dir_arg: Path
+        ffmpeg_exe_local: str,
+        ffprobe_exe_local: str,
+        clip_paths_local: List[Path],
+        overlap_frames_local: int,
+        fps_local: int,
+        out_path_local: Path,
+        work_dir_local: Path
     ) -> bool:
         """
         fade 없이 덮어쓰기:
           - A, B, C... 를 순차 병합.
           - 매 단계에서 current(A')의 뒤 overlap만큼을 잘라내고 B 전체를 이어붙임.
           - 해상도/비율 통일: 1280x720, SAR=1, CFR=fps.
+          - 모든 단계에서 메타데이터/자막 제거로 '제목 오버레이' 방지.
         """
-        if not clip_paths_arg:
+        if not clip_paths_local:
             return False
 
-        def _norm(src: Path, dst: Path) -> Tuple[int, bool]:
+        def _norm(src_local: Path, dst_local: Path) -> Tuple[int, bool]:
             cmd = [
-                ffmpeg_bin_arg, "-y", "-fflags", "+genpts",
-                "-i", str(src),
+                ffmpeg_exe_local, "-y",
+                "-fflags", "+genpts",
+                "-i", str(src_local),
                 "-vf",
-                (
-                    f"fps={int(max(1, fps_arg))},"
-                    "scale=w=1280:h=720:force_original_aspect_ratio=decrease,"
-                    "pad=1280:720:(ow-iw)/2:(oh-ih)/2,setsar=1,format=yuv420p"
-                ),
-                "-r", f"{int(max(1, fps_arg))}",
+                "fps={fps},scale=w=1280:h=720:force_original_aspect_ratio=decrease,"
+                "pad=1280:720:(ow-iw)/2:(oh-ih)/2,setsar=1,format=yuv420p".format(fps=int(max(1, fps_local))),
+                "-r", f"{int(max(1, fps_local))}",
                 "-vsync", "cfr",
+                "-map_metadata", "-1",
+                "-metadata", "title=",
+                "-sn",
                 "-c:v", "libx264", "-crf", "18", "-pix_fmt", "yuv420p",
-                str(dst),
+                str(dst_local),
             ]
             proc = subprocess.run(
                 cmd,
@@ -405,20 +410,23 @@ def build_shots_with_i2v(
             )
             if proc.returncode != 0:
                 return (0, False)
-            frames = _probe_nb_frames_ffprobe_local(ffprobe_bin_arg, dst)
-            return (frames, frames > 0)
+            frames_local = _probe_nb_frames_ffprobe_local(ffprobe_exe_local, dst_local)
+            return (frames_local, frames_local > 0)
 
-        def _trim_tail(src: Path, dst: Path, keep_frames: int) -> bool:
+        def _trim_tail(src_local: Path, dst_local: Path, keep_frames_local: int) -> bool:
             cmd = [
-                ffmpeg_bin_arg, "-y",
+                ffmpeg_exe_local, "-y",
                 "-fflags", "+genpts",
-                "-i", str(src),
-                "-vf", f"trim=end_frame={int(max(0, keep_frames))},setpts=PTS-STARTPTS",
-                "-r", f"{int(max(1, fps_arg))}",
+                "-i", str(src_local),
+                "-vf", f"trim=end_frame={int(max(0, keep_frames_local))},setpts=PTS-STARTPTS",
+                "-r", f"{int(max(1, fps_local))}",
                 "-fps_mode", "cfr",
                 "-vsync", "cfr",
+                "-map_metadata", "-1",
+                "-metadata", "title=",
+                "-sn",
                 "-c:v", "libx264", "-crf", "18", "-pix_fmt", "yuv420p",
-                str(dst),
+                str(dst_local),
             ]
             proc = subprocess.run(
                 cmd,
@@ -431,18 +439,21 @@ def build_shots_with_i2v(
             )
             return proc.returncode == 0
 
-        def _concat_ab(a: Path, b: Path, dst: Path) -> bool:
+        def _concat_ab(a_local: Path, b_local: Path, dst_local: Path) -> bool:
             cmd = [
-                ffmpeg_bin_arg, "-y",
+                ffmpeg_exe_local, "-y",
                 "-fflags", "+genpts",
-                "-i", str(a), "-i", str(b),
+                "-i", str(a_local), "-i", str(b_local),
                 "-filter_complex", "[0:v][1:v]concat=n=2:v=1:a=0[v]",
                 "-map", "[v]",
-                "-r", f"{int(max(1, fps_arg))}",
+                "-r", f"{int(max(1, fps_local))}",
                 "-fps_mode", "cfr",
                 "-vsync", "cfr",
+                "-map_metadata", "-1",
+                "-metadata", "title=",
+                "-sn",
                 "-c:v", "libx264", "-crf", "18", "-pix_fmt", "yuv420p",
-                str(dst),
+                str(dst_local),
             ]
             proc = subprocess.run(
                 cmd,
@@ -455,61 +466,61 @@ def build_shots_with_i2v(
             )
             return proc.returncode == 0
 
-        print(f"[XC-BEGIN] items={len(clip_paths_arg)} fps={fps_arg} overlap_frames={overlap_frames_arg} out=1280x720")
+        print(f"[XC-BEGIN] items={len(clip_paths_local)} fps={fps_local} overlap_frames={overlap_frames_local} out=1280x720")
 
         # 첫 번째 정규화
-        cur = work_dir_arg / "cur_000.mp4"
-        n0 = work_dir_arg / "_norm_a.mp4"
-        f0, ok0 = _norm(clip_paths_arg[0], n0)
-        if not ok0:
+        cur_local = work_dir_local / "cur_000.mp4"
+        n0_local = work_dir_local / "_norm_a.mp4"
+        f0_local, ok0_local = _norm(clip_paths_local[0], n0_local)
+        if not ok0_local:
             print("[XC-ERR] 첫 청크 정규화 실패")
             return False
-        print(f"[XC-IN-000] {{'path': '{clip_paths_arg[0]}', 'frames': {f0}, 'fps': {fps_arg}}}")
-        shutil.copyfile(str(n0), str(cur))
+        print(f"[XC-IN-000] {{'path': '{clip_paths_local[0]}', 'frames': {f0_local}, 'fps': {fps_local}}}")
+        shutil.copyfile(str(n0_local), str(cur_local))
 
         # 나머지 반복
-        step_idx = 1
-        for idx in range(1, len(clip_paths_arg)):
-            nb = work_dir_arg / "_norm_b.mp4"
-            fb, okb = _norm(clip_paths_arg[idx], nb)
-            if not okb:
-                print(f"[XC-ERR] 청크 정규화 실패 idx={idx}")
+        step_idx_local = 1
+        for idx_local in range(1, len(clip_paths_local)):
+            nb_local = work_dir_local / "_norm_b.mp4"
+            fb_local, okb_local = _norm(clip_paths_local[idx_local], nb_local)
+            if not okb_local:
+                print(f"[XC-ERR] 청크 정규화 실패 idx={idx_local}")
                 return False
 
-            fa = _probe_nb_frames_ffprobe_local(ffprobe_bin_arg, cur)
-            print(f"[XC-CUR] A(frames)={fa}, B(frames)={fb}, overlap={overlap_frames_arg}")
+            fa_local = _probe_nb_frames_ffprobe_local(ffprobe_exe_local, cur_local)
+            print(f"[XC-CUR] A(frames)={fa_local}, B(frames)={fb_local}, overlap={overlap_frames_local}")
 
-            keep_a = max(0, fa - max(0, overlap_frames_arg))
-            a_cut = work_dir_arg / f"_a_cut_{step_idx:03d}.mp4"
-            ok_cut = _trim_tail(cur, a_cut, keep_a)
-            if not ok_cut:
-                print(f"[XC-ERR] A 컷 실패 keep={keep_a} step={step_idx}")
+            keep_a_local = max(0, fa_local - max(0, overlap_frames_local))  # A 뒤 꼬리를 overlap만큼 제거
+            a_cut_local = work_dir_local / f"_a_cut_{step_idx_local:03d}.mp4"
+            ok_cut_local = _trim_tail(cur_local, a_cut_local, keep_a_local)
+            if not ok_cut_local:
+                print(f"[XC-ERR] A 컷 실패 keep={keep_a_local} step={step_idx_local}")
                 return False
 
-            cur_next = work_dir_arg / f"cur_{step_idx:03d}.mp4"
-            ok_cat = _concat_ab(a_cut, nb, cur_next)
-            if not ok_cat:
-                print(f"[XC-ERR] concat 실패 step={step_idx}")
+            cur_next_local = work_dir_local / f"cur_{step_idx_local:03d}.mp4"
+            ok_cat_local = _concat_ab(a_cut_local, nb_local, cur_next_local)
+            if not ok_cat_local:
+                print(f"[XC-ERR] concat 실패 step={step_idx_local}")
                 return False
 
             try:
-                cur.unlink(missing_ok=True)
+                cur_local.unlink(missing_ok=True)
             except OSError:
                 pass
-            cur = cur_next
-            step_idx += 1
+            cur_local = cur_next_local
+            step_idx_local += 1
 
         # 최종 산출 이동
         try:
-            if out_path_arg.exists():
-                out_path_arg.unlink()
+            if out_path_local.exists():
+                out_path_local.unlink()
         except OSError:
             pass
-        shutil.copyfile(str(cur), str(out_path_arg))
+        shutil.copyfile(str(cur_local), str(out_path_local))
 
-        f_out = _probe_nb_frames_ffprobe_local(ffprobe_bin_arg, out_path_arg)
-        print(f"[XC-FINAL] {{'path': '{out_path_arg}', 'frames': {f_out}, 'fps': {fps_arg}}}")
-        print(f"[XC-DONE] out_path={out_path_arg}")
+        f_out_local = _probe_nb_frames_ffprobe_local(ffprobe_exe_local, out_path_local)
+        print(f"[XC-FINAL] {{'path': '{out_path_local}', 'frames': {f_out_local}, 'fps': {fps_local}}}")
+        print(f"[XC-DONE] out_path={out_path_local}")
         return True
 
     _notify(f"영상 생성 시작: project_dir='{project_dir}'")
@@ -677,6 +688,61 @@ def build_shots_with_i2v(
             _notify(f"[경고] 노드 {node_id_s}.{input_key_s} 값({value}) 변환 실패.")
             node_inputs_map[input_key_s] = value
         return True
+
+    # [NEW] 오버레이 제거 패스: 제출 전 그래프의 워터마크/오버레이/자막 관련 입력을 비활성화/비움
+    def _clear_overlay_inputs_safe(graph_dict: Dict[str, Any]) -> None:
+        """
+        ComfyUI 노드들의 입력 중 텍스트가 구워질 가능성이 있는 키를 안전하게 무력화.
+        - Boolean류: false로
+        - Text류: 빈 문자열로
+        - 존재할 때만 터치 (없는 함수/키 접근 금지)
+        """
+        # 널리 쓰일 수 있는 키 모음(보수적)
+        bool_like_keys = {
+            "enable_watermark", "enable_overlay", "enable_subtitle", "enable_caption",
+            "draw_text", "show_text", "use_text", "add_text", "overlay_enable",
+            "enable_logo", "use_logo", "show_caption", "show_subtitle"
+        }
+        text_like_keys = {
+            "watermark", "watermark_text", "overlay_text", "subtitle", "caption",
+            "text", "title_text", "logo_text", "header_text", "footer_text",
+            "credit_text"
+        }
+
+        for node_key, node_val in graph_dict.items():
+            try:
+                if not isinstance(node_val, dict):
+                    continue
+                inputs_map = node_val.get("inputs")
+                if not isinstance(inputs_map, dict):
+                    continue
+
+                # boolean류 off
+                for k_bool in list(bool_like_keys):
+                    if k_bool in inputs_map:
+                        try:
+                            inputs_map[k_bool] = False
+                        except Exception:
+                            pass
+                # text류 비움
+                for k_text in list(text_like_keys):
+                    if k_text in inputs_map:
+                        try:
+                            # 비움으로써 draw를 유발하지 않게 함
+                            inputs_map[k_text] = ""
+                        except Exception:
+                            pass
+
+                # VHS 계열에서 보이는 'watermark opacity' 류도 0으로
+                for k_dim in ("watermark_opacity", "overlay_opacity", "caption_opacity"):
+                    if k_dim in inputs_map:
+                        try:
+                            inputs_map[k_dim] = 0
+                        except Exception:
+                            pass
+            except Exception:
+                # 과도한 예외 X: 그냥 스킵
+                continue
 
     # ── 진행중 메시지 릴레이 ───────────────────────────────────
     def _relay(prog: Dict[str, Any]) -> None:
@@ -859,6 +925,9 @@ def build_shots_with_i2v(
                 scene_failed = True
                 continue
 
+            # [NEW] 오버레이 제거 패스 적용
+            _clear_overlay_inputs_safe(graph)
+
             # 입력 주입
             load_nodes: List[Tuple[str, Dict[str, Any]]] = []
             for node_key2, node_val2 in graph.items():
@@ -912,7 +981,9 @@ def build_shots_with_i2v(
             except AttributeError:
                 raw_prefix = "wan22_"
             suffix = raw_prefix.split("/", 1)[-1] if "/" in raw_prefix else raw_prefix
-            if not suffix or suffix.isdigit() or suffix.replace("-", "").isdigit() or (suffix.endswith("_") and suffix[:-1].isdigit()):
+            if (not suffix or suffix.isdigit()
+                    or suffix.replace("-", "").isdigit()
+                    or (suffix.endswith("_") and suffix[:-1].isdigit())):
                 suffix = "wan22_"
             new_prefix = f"{datetime.date.today().strftime('%Y-%m-%d')}/{suffix}"
             _set_input_safe(graph, combine_node_id, "filename_prefix", new_prefix)
@@ -1171,13 +1242,13 @@ def build_shots_with_i2v(
             print(f"[I2V][MERGE] id={sid} chunks={len(chunk_paths)} overlap={overlap_frames_for_chunk}f fps={target_fps_val}")
             # 페이드(xfade) 대신 덮어쓰기(컷) 병합
             ok_merge = _concat_cut_no_fade(
-                ffmpeg_bin_arg=ffmpeg_exe,
-                ffprobe_bin_arg=ffprobe_exe,
-                clip_paths_arg=chunk_paths,
-                overlap_frames_arg=overlap_frames_for_chunk,
-                fps_arg=target_fps_val,
-                out_path_arg=clip_mp4,
-                work_dir_arg=work_dir
+                ffmpeg_exe_local=ffmpeg_exe,
+                ffprobe_exe_local=ffprobe_exe,
+                clip_paths_local=chunk_paths,
+                overlap_frames_local=overlap_frames_for_chunk,
+                fps_local=target_fps_val,
+                out_path_local=clip_mp4,
+                work_dir_local=work_dir
             )
             if ok_merge:
                 _notify(f"청크 병합 완료(컷): {clip_mp4.name}")
@@ -1195,6 +1266,8 @@ def build_shots_with_i2v(
         _trim_to_frames(ffmpeg_exe, ffprobe_exe, clip_mp4, clip_mp4, frame_length, target_fps_val)
 
     _notify("모든 씬 처리 완료.")
+
+
 
 
 

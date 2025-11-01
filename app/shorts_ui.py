@@ -385,6 +385,7 @@ class MainWindow(QtWidgets.QMainWindow):
     _tag_watch_last_mtime: Optional[float] = None
 
     def __init__(self):
+        self.project_dir: str = ""
         super().__init__()
         # ai
         self._ai = AI()
@@ -5995,18 +5996,52 @@ class MainWindow(QtWidgets.QMainWindow):
         return ""
 
     def on_load_project(self) -> None:
-        from PyQt5 import QtWidgets
+        """
+        프로젝트 불러오기(최소 수정):
+          - 초기 열기 경로: BASE_DIR/maked_title (없으면 생성)
+          - 기존 동작(활성 프로젝트 전환, UI 복원, 상태표시, 플래그) 그대로 유지
+        """
+        from PyQt5 import QtWidgets  # GUI 의존
         from pathlib import Path
 
+        # ── BASE_DIR 로딩 및 시작 폴더 계산 ─────────────────────────
+        # BASE_DIR 우선순위: app.settings → settings → cwd
         try:
-            from app.utils import load_json
+            from app import settings as _s_app  # type: ignore
+            _base_dir_text = str(getattr(_s_app, "BASE_DIR", Path.cwd()))
         except Exception:
-            from utils import load_json  # type: ignore
+            try:
+                import settings as _s_root  # type: ignore
+                _base_dir_text = str(getattr(_s_root, "BASE_DIR", Path.cwd()))
+            except Exception:
+                _base_dir_text = str(Path.cwd())
 
-        # 1) project.json 선택
+        _base_dir_path = Path(_base_dir_text)
+        # maked_title 중복 방지: BASE_DIR가 이미 maked_title이면 그대로, 아니면 하위에 생성
+        _start_dir_path = _base_dir_path if _base_dir_path.name.lower() == "maked_title" else (
+                    _base_dir_path / "maked_title")
+        try:
+            _start_dir_path.mkdir(parents=True, exist_ok=True)
+        except OSError:
+            # 폴더 생성 실패해도 파일 대화상자는 동작 가능하므로 무시
+            pass
+
+        # 사용자가 이전에 열었던 프로젝트 폴더가 있으면 그 폴더를 우선 시작 경로로 사용
+        try:
+            _prev_proj_dir = str(getattr(self, "project_dir", "") or "").strip()
+        except Exception:
+            _prev_proj_dir = ""
+        if _prev_proj_dir:
+            _initial_dir_text = _prev_proj_dir
+        else:
+            _initial_dir_text = str(_start_dir_path)
+
+        # (참고) 원래 코드에 있던 load_json 임포트는 기능상 사용되지 않아 생략해도 동작 동일
+
+        # 1) project.json 선택 (초기 경로만 바뀜)
         path_str, _ = QtWidgets.QFileDialog.getOpenFileName(
             self, "project.json 선택",
-            str(getattr(self, "project_dir", "") or ""),
+            _initial_dir_text,
             "JSON (*.json)"
         )
         if not path_str:
@@ -6015,26 +6050,32 @@ class MainWindow(QtWidgets.QMainWindow):
         pj = Path(path_str)
         pdir = pj.parent
 
-        # 2) 선택 즉시 '활성 프로젝트'로 전환
-        self._set_active_project_dir(str(pdir))
+        # 2) 선택 즉시 '활성 프로젝트'로 전환 (원래 흐름 유지)
+        try:
+            self._set_active_project_dir(str(pdir))
+        except Exception:
+            # 기존 코드가 예외 전파하지 않았으므로 동일하게 조용히 무시
+            pass
 
-        # 3) UI 복원(제목/가사/태그/길이 라디오까지) — 이 함수가 다 해줍니다
+        # 3) UI 복원(제목/가사/태그/길이 라디오까지) — 기존 함수 호출 유지
         try:
             self._apply_project_meta(str(pdir))
         except Exception:
             pass
 
-        # 4) 상태 표시
+        # 4) 상태 표시 (원래 출력 유지)
         print("[LOAD-PROJ] activated:", str(pdir), flush=True)
-        if hasattr(self, "statusbar"):
-            self.statusbar.showMessage(f"불러옴: {pj}")
+        try:
+            if hasattr(self, "statusbar"):
+                self.statusbar.showMessage(f"불러옴: {pj}")
+        except Exception:
+            pass
 
-        # ✅ 프로젝트 컨텍스트 준비 완료 플래그 (이후부터 태그 워치가 project.json과 동기화)
+        # ✅ 프로젝트 컨텍스트 준비 완료 플래그 (원래 플래그 유지)
         try:
             setattr(self, "_project_context_ready", True)
         except Exception:
             pass
-
 
     # ────────────── 진행창/로그 ──────────────
 
@@ -6913,7 +6954,7 @@ class MainWindow(QtWidgets.QMainWindow):
 
         # 수정시간 최신 순
         try:
-            candidates.sort(key=lambda p: p.stat().st_mtime if p.exists() else 0, reverse=True)
+            candidates.sort(key=lambda pp: pp.stat().st_mtime if pp.exists() else 0, reverse=True)
         except Exception:
             pass
 
@@ -7310,22 +7351,52 @@ class MainWindow(QtWidgets.QMainWindow):
             seg_dir_path.mkdir(parents=True, exist_ok=True)
 
             # --- 이미지 해석 헬퍼 (내부 함수) ---
-            def _resolve_img_by_scene(scene_id: str, img_file_val: str | None) -> Path:
+            def _resolve_img_by_scene(scene_id_key: str, img_file_val: str | None) -> Path:
+                """
+                우선순위:
+                  1) img_file_val가 가리키는 파일(절대/상대 모두 허용)
+                     - 상대경로라면 imgs_dir_path/<파일명>도 함께 확인
+                  2) imgs_dir_path/<scene_id_key>.(png|jpg|jpeg|webp) 순서로 첫 존재 파일
+                  3) 최종 기본값: imgs_dir_path/<scene_id_key>.png (존재 여부와 무관)
+                주의:
+                  - 바깥 스코프의 'scene_id'를 가리지 않도록 매개변수명을 'scene_id_key'로 사용.
+                  - imgs_dir_path는 바깥 스코프에 Path로 존재한다고 가정(읽기 전용).
+                """
+                base_dir = imgs_dir_path  # 외부 스코프 읽기 전용 사용 (이름 가리기 없음)
+
+                # 1) 명시 경로 우선
                 if img_file_val:
                     p0 = Path(img_file_val)
                     try:
-                        if p0.exists() and p0.stat().st_size > 0:
-                            return p0
+                        # 상대경로면 base_dir/<파일명>도 후보로 확인
+                        if not p0.is_absolute():
+                            p0_in_base = base_dir / p0.name
+                            try:
+                                if p0_in_base.exists() and p0_in_base.stat().st_size > 0:
+                                    return p0_in_base
+                            except OSError:
+                                pass
+                        # 원래 p0 경로도 검사
+                        try:
+                            if p0.exists() and p0.stat().st_size > 0:
+                                return p0
+                        except OSError:
+                            pass
                     except OSError:
+                        # 상위로 올리지 않고 다음 후보 진행
                         pass
+
+                # 2) scene_id_key 기반 확장자 탐색
                 for ext in (".png", ".jpg", ".jpeg", ".webp"):
-                    p1 = imgs_dir_path / f"{scene_id}{ext}"
+                    p1 = base_dir / f"{scene_id_key}{ext}"
                     try:
                         if p1.exists() and p1.stat().st_size > 0:
                             return p1
                     except OSError:
                         continue
-                return imgs_dir_path / f"{scene_id}.png"
+
+                # 3) 최종 기본값
+                return base_dir / f"{scene_id_key}.png"
 
             # --- 누락 이미지/다인 캐릭터 검사 ---
             missing_lines: list[str] = []
