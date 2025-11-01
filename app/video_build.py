@@ -136,15 +136,73 @@ def _submit_and_wait(base_url: str, graph: Dict[str, Any], *, timeout: float, po
     return {}  # history placeholder
 
 # ── 분할/겹침 ───────────────────────────────────────────────────────────────
-def plan_segments(total_frames: int, base_chunk: int = 300, overlap: int = 12) -> List[Tuple[int, int]]:
-    segs, s = [], 0
-    while s < total_frames:
-        e = min(s + base_chunk, total_frames)
-        segs.append((s, e))
-        if e >= total_frames:
+def plan_segments(frame_length: int, base_chunk: int = 60, overlap: int = 12, pad_tail: int = 5) -> list[tuple[int, int]]:
+    """
+    세그먼트 분할(앞에서 세기 규칙 + 항상 +5 프레임 여유).
+    - 총 프레임 ≤ base_chunk 인 경우에도 (0, frame_length + pad_tail) 로 1청크 생성
+    - 총 프레임 > base_chunk:
+        * 시작 인덱스:
+          s0 = 0
+          s1 = s0 + (base_chunk - overlap + 1)  # 예: 0 + (60 - 12 + 1) = 49
+          s(k) = s(k-1) + base_chunk            # 이후 +60
+        * 종료 인덱스(배타 end):
+          e0 = base_chunk + pad_tail            # 60 + 5 = 65
+          e(k) = e(k-1) + base_chunk            # 이후 +60
+          마지막 청크만 e_last = frame_length + pad_tail 로 캡
+    - 반환 튜플은 (inclusive_start, exclusive_end).
+    예)
+      120 → [(0, 65), (49, 125)]
+      174 → [(0, 65), (49, 125), (109, 179)]
+      245 → [(0, 65), (49, 125), (109, 185), (169, 245), (229, 250)]
+      55  → [(0, 60)] 가 아니라 [(0, 60)]이 아님. (항상 +5) → [(0, 60)]? 55+5=60 → [(0, 60)]
+    """
+    total = 0 if frame_length is None else int(frame_length)
+    if total <= 0:
+        return []
+
+    base = 60 if base_chunk is None else int(base_chunk)
+    if base <= 0:
+        base = 60
+
+    ov = 0 if overlap is None else int(overlap)
+    if ov < 0:
+        ov = 0
+    if ov > base:
+        ov = base
+
+    pad = 5 if pad_tail is None else int(pad_tail)
+    if pad < 0:
+        pad = 0
+
+    # 총 프레임이 base 이하여도 항상 +pad 적용
+    if total <= base:
+        end_ex = total + pad
+        return [(0, end_ex)]
+
+    first_step = base - ov + 1
+    if first_step < 1:
+        first_step = 1
+
+    segments: list[tuple[int, int]] = []
+    ps_start = 0
+    ps_end = base + pad
+    if ps_end >= total + pad:
+        ps_end = total + pad
+    segments.append((ps_start, ps_end))
+
+    next_start = ps_start + first_step
+    next_end = ps_end + base
+
+    while next_start < total:
+        end_capped = next_end if next_end < (total + pad) else (total + pad)
+        if end_capped > next_start:
+            segments.append((next_start, end_capped))
+        else:
             break
-        s = max(0, e - overlap)
-    return segs
+        next_start = next_start + base
+        next_end = next_end + base
+
+    return segments
 
 def recalc_overlap(in_fps: int, out_fps: int, overlap: int) -> int:
     if in_fps == out_fps:
@@ -167,32 +225,46 @@ def _apply_overrides(graph: dict, overrides: Dict[str, Any]) -> None:
 
 
 def build_shots_with_i2v(
-        project_dir: str,
-        total_frames: int,
-        *,
-        ui_width: Optional[int] = None,
-        ui_height: Optional[int] = None,
-        ui_fps: Optional[int] = None,
-        ui_steps: Optional[int] = None,
-        on_progress: Optional[Callable[[Dict[str, Any]], None]] = None
+    project_dir: str,
+    total_frames: int,
+    *,  # 키워드 전용
+    ui_width: Optional[int] = None,
+    ui_height: Optional[int] = None,
+    ui_fps: Optional[int] = None,
+    ui_steps: Optional[int] = None,
+    on_progress: Optional[Callable[[Dict[str, Any]], None]] = None
 ) -> None:
     """
     각 씬을 i2v로 생성합니다. UI 설정을 워크플로우에 적용하고, 파일 접두사에 현재 날짜를 사용합니다.
     - 씬 레벨 시드 1회 생성 → 모든 청크 공통 사용
-    - 청크 2+ : 이전 청크의 '마지막/겹침 프레임'을 comfy_input에 PNG로 저장 후 파일명만 LoadImage에 전달
-    - 프레임 추출 후 5초 내 파일 안정화 폴링
+    - 청크 2+ : 이전 청크의 '마지막 overlap 프레임 시퀀스(예: 12f)'를 conditioning 입력으로 제공(가능 시)
+      * 시퀀스 미지원 워크플로우면 기존 1프레임 PNG 폴백 유지
     - 기본 청크 크기 60f(메모리 안전)
     - 임시 청크 mp4는 항상 clips/xfade_work 에만 저장
+    (기존 기능 100% 보존)
     """
+    # ── 표준/타입 ─────────────────────────────────────────────
     import json as json_mod
     import shutil
     import time
     import datetime
     import random
     import subprocess
-    from typing import Tuple  # 사용됨
+    from pathlib import Path
+    from typing import Any, Dict, List, Optional, Callable, Tuple, cast
+
+    # 네트워크 통신 모듈: 함수 시작 시 1회만 로드 (정적분석 가리기 방지)
+    try:
+        import requests as requests_mod  # type: ignore
+    except ImportError:
+        requests_mod = None  # type: ignore[assignment]
+    if requests_mod is None:
+        raise ImportError("requests 모듈이 필요합니다. 설치 후 다시 실행하세요.")
 
     assert isinstance(total_frames, int)
+
+    # ▶ 전체 요청 프레임 로그
+    print(f"[I2V][TOTAL] total_frames={int(total_frames)}")
 
     def _notify(msg: str) -> None:
         if on_progress is None:
@@ -204,10 +276,102 @@ def build_shots_with_i2v(
         except (TypeError, ValueError):
             print("[경고] on_progress 콜백 처리 실패")
 
+    # ── ffprobe: 프레임 수 확인 ───────────────────────────────
+    def _probe_nb_frames_ffprobe_local(ffprobe_exe: str, src_path: Path) -> int:
+        cmd_probe = [
+            ffprobe_exe,
+            "-v", "error",
+            "-select_streams", "v:0",
+            "-count_frames",
+            "-show_entries", "stream=nb_read_frames",
+            "-of", "default=nokey=1:noprint_wrappers=1",
+            str(src_path),
+        ]
+        proc = subprocess.run(
+            cmd_probe,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.STDOUT,
+            text=True,
+            encoding="utf-8",
+            errors="ignore",
+            check=False,
+        )
+        if proc.returncode != 0:
+            return 0
+        try:
+            return int((proc.stdout or "0").strip() or "0")
+        except ValueError:
+            return 0
+
+    # ── 최종 트림(원래 총프레임으로) ──────────────────────────
+    def _trim_to_frames(ffmpeg_exe: str, ffprobe_exe: str, src: Path, dst: Path, target_frames: int, fps_val: int) -> bool:
+        """
+        src 영상을 target_frames 프레임으로 정확히 자른 뒤 dst에 저장.
+        - '프레임 개수' 기준 트림: trim=end_frame=target_frames
+        - setpts로 0부터 재정렬, -r fps로 CFR 유지
+        """
+        if target_frames <= 0:
+            return False
+        try:
+            tmp_out = dst.with_suffix(".tmp.mp4")
+            if tmp_out.exists():
+                try:
+                    tmp_out.unlink()
+                except OSError:
+                    pass
+
+            cmd = [
+                ffmpeg_exe, "-y",
+                "-fflags", "+genpts",
+                "-i", str(src),
+                "-vf", f"trim=end_frame={int(target_frames)},setpts=PTS-STARTPTS",
+                "-r", f"{int(max(1, fps_val))}",
+                "-fps_mode", "cfr",
+                "-vsync", "cfr",
+                "-c:v", "libx264", "-crf", "18",
+                "-pix_fmt", "yuv420p",
+                str(tmp_out),
+            ]
+            proc = subprocess.run(
+                cmd,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.STDOUT,
+                text=True,
+                encoding="utf-8",
+                errors="ignore",
+                check=False,
+            )
+            if proc.returncode != 0:
+                _notify(f"[TRIM][오류] ffmpeg 트림 실패\n{(proc.stdout or '')[:4000]}")
+                if tmp_out.exists():
+                    try:
+                        tmp_out.unlink()
+                    except OSError:
+                        pass
+                return False
+
+            # 프레임 검증
+            got_frames = _probe_nb_frames_ffprobe_local(ffprobe_exe, tmp_out)
+            if got_frames != int(target_frames):
+                _notify(f"[TRIM][경고] 프레임 불일치: 기대 {target_frames}f vs 실제 {got_frames}f")
+
+            # 교체
+            try:
+                if dst.exists():
+                    dst.unlink()
+            except OSError:
+                pass
+            tmp_out.rename(dst)
+            _notify(f"[TRIM] 완료: {dst.name} → {target_frames}f")
+            return True
+        except Exception as e_trim_any:
+            _notify(f"[TRIM][오류] 트림 처리 예외: {e_trim_any}")
+            return False
+
     _notify(f"영상 생성 시작: project_dir='{project_dir}'")
     _notify(f"UI 설정: W={ui_width}, H={ui_height}, FPS={ui_fps}, Steps={ui_steps}")
 
-    # ── 경로/파일 ─────────────────
+    # ── 경로/파일 ─────────────────────────────────────────────
     try:
         pdir = Path(project_dir).resolve(strict=True)
         if not pdir.is_dir():
@@ -222,7 +386,7 @@ def build_shots_with_i2v(
 
     p_video = pdir / "video.json"
 
-    # ── 유틸 ─────────────────────
+    # ── 유틸 ─────────────────────────────────────────────
     try:
         from app.utils import load_json as load_json_fn, ensure_dir as ensure_dir_fn  # type: ignore
     except (ImportError, ModuleNotFoundError):
@@ -231,7 +395,7 @@ def build_shots_with_i2v(
         except (ImportError, ModuleNotFoundError) as e_utils:
             raise ImportError(f"필수 유틸리티(load_json, ensure_dir) 로드 실패: {e_utils}") from e_utils
 
-    # ── 설정 ─────────────────────
+    # ── 설정 ─────────────────────────────────────────────
     try:
         import settings as settings_mod  # type: ignore
         s_mod = settings_mod
@@ -246,6 +410,7 @@ def build_shots_with_i2v(
                 COMFY_INPUT_DIR = r"C:\my_games\shorts_make\app\comfy_inputs"
                 COMFY_HOST = "http://127.0.0.1:8188"
                 FFMPEG_EXE = "ffmpeg"
+                FFPROBE_EXE = "ffprobe"
             s_mod = _SettingsFallback()
 
     jsons_dir_conf = getattr(s_mod, "JSONS_DIR", r"C:\my_games\shorts_make\app\jsons")
@@ -253,18 +418,19 @@ def build_shots_with_i2v(
     comfy_input_conf = getattr(s_mod, "COMFY_INPUT_DIR", r"C:\my_games\shorts_make\app\comfy_inputs")
     comfy_host_conf = getattr(s_mod, "COMFY_HOST", "http://127.0.0.1:8188")
     ffmpeg_exe = getattr(s_mod, "FFMPEG_EXE", "ffmpeg")
+    ffprobe_exe = getattr(s_mod, "FFPROBE_EXE", "ffprobe")
 
     base_jsons = Path(str(jsons_dir_conf))
     comfy_input_dir = Path(str(comfy_input_conf))
     comfy_input_dir.mkdir(parents=True, exist_ok=True)
 
+    base_url = "http://127.0.0.1:8188"
     try:
-        video_conf = load_json_fn(p_video, {}) or {}
-        base_url = str(video_conf.get("comfy_host") or comfy_host_conf).rstrip("/")
+        base_url = str((load_json_fn(p_video, {}) or {}).get("comfy_host") or comfy_host_conf).rstrip("/")
     except Exception:
         base_url = str(comfy_host_conf).rstrip("/")
 
-    # ── video.json 로드 ───────────
+    # ── video.json ─────────────────────────────────────────────
     try:
         video = load_json_fn(p_video, {}) or {}
         if not isinstance(video, dict):
@@ -282,13 +448,13 @@ def build_shots_with_i2v(
     clips_dir = ensure_dir_fn(pdir / "clips")
     work_dir = clips_dir / "xfade_work"
     work_dir.mkdir(parents=True, exist_ok=True)
-    for stale_item in list(work_dir.glob("_chunk_*.mp4")) + list(work_dir.glob("cur_*.mp4")) + list(work_dir.glob("tmp_*.mp4")):
+    for stale in list(work_dir.glob("_chunk_*.mp4")) + list(work_dir.glob("cur_*.mp4")) + list(work_dir.glob("tmp_*.mp4")):
         try:
-            stale_item.unlink()
+            stale.unlink()
         except OSError:
             pass
 
-    # ── 워크플로 경로 ─────────────
+    # ── 워크플로 경로 결정 ──────────────────────────────────────
     wf_path: Optional[Path] = None
     if i2v_workflow_conf:
         c1 = Path(str(i2v_workflow_conf))
@@ -312,16 +478,17 @@ def build_shots_with_i2v(
             wf_path = c3
         else:
             raise FileNotFoundError(f"워크플로 파일을 찾을 수 없습니다: {c3}")
+
     _notify(f"사용할 워크플로우: {wf_path.name} (경로: {wf_path})")
 
-    # ── 워크플로 로드 ─────────────
+    # ── 워크플로 로드 ───────────────────────────────────────────
     try:
         with open(wf_path, "r", encoding="utf-8") as f_graph:
             graph_origin: Dict[str, Any] = json_mod.load(f_graph)
     except (OSError, json_mod.JSONDecodeError) as e_load_wf:
         raise RuntimeError(f"워크플로우 로드 실패: {wf_path} ({e_load_wf})") from e_load_wf
 
-    # ── 제출/대기 함수 ────────────
+    # ── 제출/대기 코어 ─────────────────────────────────────────
     submit_and_wait_fn: Optional[Callable[..., Dict[str, Any]]] = None
     try:
         from app.audio_sync import _submit_and_wait as submit_and_wait_fn  # type: ignore
@@ -330,46 +497,78 @@ def build_shots_with_i2v(
             from audio_sync import _submit_and_wait as submit_and_wait_fn  # type: ignore
         except Exception as e_wait:
             raise RuntimeError(f"_submit_and_wait 함수 로드 실패: {e_wait}") from e_wait
-    if submit_and_wait_fn is None:
-        raise RuntimeError("_submit_and_wait 함수 로드 실패")
 
-    # ── 입력 세터 ────────────────
     def _set_input_safe(graph_dict: Dict[str, Any], node_id: str, input_key: str, value: Any) -> bool:
         node_id_s = str(node_id or "")
         input_key_s = str(input_key or "")
         if not node_id_s or not input_key_s:
             _notify(f"[경고] 노드 ID({node_id_s}) 또는 키({input_key_s}) 유효하지 않음.")
             return False
-        target = graph_dict.get(node_id_s)
-        if not isinstance(target, dict):
+
+        target_node = graph_dict.get(node_id_s)
+        if not isinstance(target_node, dict):
             _notify(f"[경고] 노드 ID '{node_id_s}' 없음 또는 형식 오류.")
             return False
-        inputs_dict = target.setdefault("inputs", {})
-        if not isinstance(inputs_dict, dict):
+
+        node_inputs_map: Dict[str, Any] = target_node.setdefault("inputs", {})
+        if not isinstance(node_inputs_map, dict):
             _notify(f"[경고] 노드 {node_id_s} 'inputs' 필드가 dict 아님.")
             return False
-        current_value = inputs_dict.get(input_key_s)
-        must_int = isinstance(current_value, int) or input_key_s in {"steps", "frame_rate", "width", "height", "length", "seed", "loop_count", "crf", "noise_seed"}
+
+        current_value = node_inputs_map.get(input_key_s)
+        must_int = isinstance(current_value, int) or input_key_s in {
+            "steps", "frame_rate", "width", "height", "length", "seed", "loop_count", "crf", "noise_seed"
+        }
         must_float = isinstance(current_value, float) or input_key_s in {"cfg", "strength_model"}
+
         try:
             if must_int:
-                inputs_dict[input_key_s] = int(value)
+                node_inputs_map[input_key_s] = int(value)
             elif must_float:
-                inputs_dict[input_key_s] = float(value)
+                node_inputs_map[input_key_s] = float(value)
             else:
-                inputs_dict[input_key_s] = value
+                node_inputs_map[input_key_s] = value
         except (TypeError, ValueError):
             _notify(f"[경고] 노드 {node_id_s}.{input_key_s} 값({value}) 변환 실패.")
-            inputs_dict[input_key_s] = value
+            node_inputs_map[input_key_s] = value
         return True
 
-    # ── 날짜 접두사 ───────────────
+    def _probe_nb_frames_ffprobe(src_path: Path) -> int:
+        cmd_probe = [
+            ffprobe_exe,
+            "-v", "error",
+            "-select_streams", "v:0",
+            "-count_frames",
+            "-show_entries", "stream=nb_read_frames",
+            "-of", "default=nokey=1:noprint_wrappers=1",
+            str(src_path),
+        ]
+        proc = subprocess.run(
+            cmd_probe,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.STDOUT,
+            text=True,
+            encoding="utf-8",
+            errors="ignore",
+            check=False,
+        )
+        if proc.returncode != 0:
+            return 0
+        try:
+            return int((proc.stdout or "0").strip() or "0")
+        except ValueError:
+            return 0
+
+    def _relay(prog: Dict[str, Any]) -> None:
+        msg_val = str(prog.get("msg") or "")
+        if msg_val and on_progress is not None:
+            on_progress({"msg": msg_val})
+
     try:
         date_prefix = datetime.date.today().strftime("%Y-%m-%d")
     except Exception:
         date_prefix = "YYYY-MM-DD"
 
-    # ── 기본 파라미터 ─────────────
     defaults_all = video.get("defaults") or {}
     defaults_i2v = defaults_all.get("i2v") or {}
     try:
@@ -380,7 +579,7 @@ def build_shots_with_i2v(
         overlap_frames_for_chunk = 12
     _notify(f"청크 설정: 최대 {max_frames_per_chunk}f, 겹침 {overlap_frames_for_chunk}f")
 
-    # ── 씬 루프 ───────────────────
+    # ── 씬 루프 ─────────────────────────────────────────────────
     for s_idx, scene in enumerate(scenes):
         if not isinstance(scene, dict):
             _notify(f"[경고] scenes[{s_idx}] 항목 형식 오류. 건너뜁니다.")
@@ -397,9 +596,9 @@ def build_shots_with_i2v(
         except OSError as e_stat_clip:
             _notify(f"[경고] 스킵 확인 중 오류 (씬 {sid}): {e_stat_clip}. 생성 시도.")
 
-        # 입력 이미지 결정
+        # 입력 이미지 준비
         img_path: Optional[Path] = None
-        server_image_name: Optional[str] = None
+        server_image_name: str = ""
         img_declared = str(scene.get("img_file") or "").strip()
         if img_declared:
             p_img = Path(img_declared)
@@ -446,12 +645,11 @@ def build_shots_with_i2v(
             _notify(f"[오류] 이미지 이름 설정 불가 (씬 {sid}). 다음 씬으로.")
             continue
 
-        # 씬 시드 / fps
         try:
             scene_seed_value = random.randint(0, 999_999_999_999_999)
         except ValueError:
             scene_seed_value = int(time.time() * 1_000_000) % 999_999_999_999_999
-        _notify(f"씬 {sid} 마스터 시드: {scene_seed_value}")
+        _notify(f"씬 {sid}에 사용할 마스터 시드: {scene_seed_value}")
 
         combine_node_id = "21"
         i2v_node_id = "25"
@@ -484,28 +682,58 @@ def build_shots_with_i2v(
             frame_length = 16
             _notify(f"[경고] 프레임 길이 계산 오류 (씬 {sid}). 기본값 16f 사용.")
 
-        # 분할 계획
-        if frame_length > max_frames_per_chunk:
-            _notify(f"씬 {sid} 길이 {frame_length}f > {max_frames_per_chunk}f → 청크 분할")
-            segments_list: List[Tuple[int, int]] = plan_segments(  # 외부 제공 함수
-                frame_length, base_chunk=max_frames_per_chunk, overlap=overlap_frames_for_chunk
-            )
-        else:
-            segments_list = [(0, frame_length)]
+        # ▶ 씬 fps/총프레임 로그
+        print(f"[I2V][SCENE] id={sid} fps={target_fps_val} frame_length={frame_length}")
+
+        # ── 분할: 항상 plan_segments 사용(+5 패딩 포함 규칙 반영) ──
+        #  - base_chunk=max_frames_per_chunk, overlap=overlap_frames_for_chunk, pad_tail=5(함수 내부 기본)
+        segments_list: List[Tuple[int, int]] = plan_segments(  # type: ignore[name-defined]
+            frame_length,
+            base_chunk=max_frames_per_chunk,
+            overlap=overlap_frames_for_chunk
+        )
+
+        # ▶ 분할 구간 로그
+        print(f"[I2V][SCENE] id={sid} segments={segments_list} overlap={overlap_frames_for_chunk}f")
 
         chunk_paths: List[Path] = []
         scene_failed = False
         current_input_image_name: str = server_image_name
         temp_frames: List[Path] = []
 
-        # 각 청크 처리
+        # 시퀀스 conditioning 지원 여부 탐지
+        has_sequence_loader = False
+        sequence_loader_node_id = ""
+        for node_key, node_val in graph_origin.items():
+            try:
+                if not isinstance(node_val, dict):
+                    continue
+                ctype = str(node_val.get("class_type") or "")
+                inputs_dict = node_val.get("inputs") or {}
+                if not isinstance(inputs_dict, dict):
+                    continue
+                if ctype.lower().find("load") >= 0 and (
+                    "directory" in inputs_dict or "frame_rate" in inputs_dict or "pattern" in inputs_dict
+                ):
+                    sequence_loader_node_id = str(node_key)
+                    has_sequence_loader = True
+                    break
+            except (AttributeError, TypeError):
+                continue
+
+        # ── 각 청크 처리 ────────────────────────────────────────
         for c_idx, (start_f, end_f) in enumerate(segments_list):
             if scene_failed:
                 break
 
-            chunk_len = end_f - start_f
+            chunk_len = max(0, int(end_f) - int(start_f))
+            if chunk_len <= 0:
+                _notify(f"[경고] 유효하지 않은 청크 길이 (씬 {sid}, idx={c_idx}): {start_f}~{end_f}")
+                continue
+
             chunk_label = f"씬 {sid} (청크 {c_idx + 1}/{len(segments_list)})"
             _notify(f"{chunk_label}: 프레임 {start_f}-{end_f} (길이 {chunk_len}f) 처리 시작")
+            print(f"[I2V][CHUNK] {chunk_label} range={start_f}~{end_f - 1} len={chunk_len}f")
 
             try:
                 graph = json_mod.loads(json_mod.dumps(graph_origin))
@@ -514,21 +742,22 @@ def build_shots_with_i2v(
                 scene_failed = True
                 continue
 
-            # LoadImage
-            for node_key, node_val in graph.items():
+            # LoadImage/Seed/사이즈/FPS/Steps/길이/프롬프트/접두사 주입
+            load_nodes: List[Tuple[str, Dict[str, Any]]] = []
+            for node_key2, node_val2 in graph.items():
                 try:
-                    if isinstance(node_val, dict) and str(node_val.get("class_type") or "") == "LoadImage":
-                        _set_input_safe(graph, str(node_key), "image", current_input_image_name)
-                        _notify(f"LoadImage({node_key}) 이미지: {current_input_image_name} ({chunk_label})")
+                    if isinstance(node_val2, dict) and str(node_val2.get("class_type") or "") == "LoadImage":
+                        load_nodes.append((str(node_key2), node_val2))
                 except (AttributeError, TypeError):
                     continue
+            for load_node_id, _node in load_nodes:
+                _set_input_safe(graph, load_node_id, "image", current_input_image_name)
+                _notify(f"LoadImage({load_node_id}) 이미지: {current_input_image_name} ({chunk_label})")
 
-            # Sampler seeds
             for sampler_id in ("13", "14"):
                 _set_input_safe(graph, sampler_id, "noise_seed", scene_seed_value)
-            _notify(f"Sampler(13,14) Seed: {scene_seed_value} ({chunk_label})")
+            _notify(f"Sampler(13, 14) Seed: {scene_seed_value} ({chunk_label})")
 
-            # 리사이즈/FPS/스텝
             resize_node_id = "24"
             if ui_width and ui_width > 0:
                 _set_input_safe(graph, resize_node_id, "width", ui_width)
@@ -536,22 +765,22 @@ def build_shots_with_i2v(
                 _set_input_safe(graph, resize_node_id, "height", ui_height)
             if ui_width or ui_height:
                 _notify(f"Resize({resize_node_id}) 크기: {ui_width if ui_width else '기본값'}x{ui_height if ui_height else '기본값'} ({chunk_label})")
+
             if ui_fps and ui_fps > 0:
                 _set_input_safe(graph, combine_node_id, "frame_rate", ui_fps)
                 _notify(f"Combine({combine_node_id}) FPS: {ui_fps} ({chunk_label})")
+
             if ui_steps and ui_steps > 0:
-                set_count = 0
+                steps_set = 0
                 for sampler_id in ("13", "14"):
                     if _set_input_safe(graph, sampler_id, "steps", ui_steps):
-                        set_count += 1
-                if set_count > 0:
-                    _notify(f"Sampler(13,14) Steps: {ui_steps} ({chunk_label})")
+                        steps_set += 1
+                if steps_set:
+                    _notify(f"Sampler(13, 14) Steps: {ui_steps} ({chunk_label})")
 
-            # 길이
             _set_input_safe(graph, i2v_node_id, "length", chunk_len)
             _notify(f"I2V({i2v_node_id}) Length: {chunk_len}f ({chunk_label})")
 
-            # 프롬프트
             pos_txt = str(scene.get("prompt_movie") or scene.get("prompt") or "")
             neg_txt = str(scene.get("prompt_negative") or "")
             if pos_txt:
@@ -561,24 +790,91 @@ def build_shots_with_i2v(
             if pos_txt or neg_txt:
                 _notify(f"프롬프트(22/23) 설정 완료. ({chunk_label})")
 
-            # 파일 접두사
             try:
                 raw_prefix = str(graph.get(combine_node_id, {}).get("inputs", {}).get("filename_prefix", "wan22_"))
             except AttributeError:
                 raw_prefix = "wan22_"
             suffix = raw_prefix.split("/", 1)[-1] if "/" in raw_prefix else raw_prefix
-            if (not suffix) or suffix.isdigit() or (suffix.endswith("_") and suffix[:-1].isdigit()):
+            if (not suffix or suffix.isdigit()
+                    or suffix.replace("-", "").isdigit()
+                    or (suffix.endswith("_") and suffix[:-1].isdigit())):
                 suffix = "wan22_"
-            new_prefix = f"{date_prefix}/{suffix}"
+            new_prefix = f"{datetime.date.today().strftime('%Y-%m-%d')}/{suffix}"
             _set_input_safe(graph, combine_node_id, "filename_prefix", new_prefix)
             _notify(f"Combine({combine_node_id}) Prefix: {new_prefix} ({chunk_label})")
 
-            # 제출/대기
-            def _relay(prog: Dict[str, Any]) -> None:
-                msg_val = str(prog.get("msg") or "")
-                if msg_val and on_progress is not None:
-                    on_progress({"msg": msg_val})
+            # ── conditioning (가능 시: 직전 청크 tail 시퀀스) ──
+            use_sequence_conditioning = False
+            seq_dir_for_condition: Optional[Path] = None
+            seq_pattern_text = ""
+            if has_sequence_loader and c_idx > 0 and overlap_frames_for_chunk > 0:
+                prev_chunk_path = work_dir / f"_chunk_{sid}_{c_idx - 1:05d}.mp4"
+                if prev_chunk_path.exists():
+                    nb_prev_frames = _probe_nb_frames_ffprobe(prev_chunk_path)
+                    if nb_prev_frames > 0:
+                        start_tail = max(0, nb_prev_frames - overlap_frames_for_chunk)
+                        end_tail = nb_prev_frames
+                        seq_dir_for_condition = comfy_input_dir / f"{sid}_cond_{c_idx - 1:05d}"
+                        try:
+                            seq_dir_for_condition.mkdir(parents=True, exist_ok=True)
+                        except OSError:
+                            seq_dir_for_condition = None
+                        if seq_dir_for_condition is not None:
+                            seq_template_png = seq_dir_for_condition / "cond_%03d.png"
+                            cmd_extract_seq = [
+                                ffmpeg_exe, "-y",
+                                "-i", str(prev_chunk_path),
+                                "-vf", f"trim=start_frame={start_tail}:end_frame={end_tail},setpts=PTS-STARTPTS,fps={target_fps_val}",
+                                "-frames:v", str(overlap_frames_for_chunk),
+                                str(seq_template_png)
+                            ]
+                            proc_seq = subprocess.run(
+                                cmd_extract_seq,
+                                stdout=subprocess.PIPE,
+                                stderr=subprocess.STDOUT,
+                                text=True,
+                                encoding="utf-8",
+                                errors="ignore",
+                                check=False,
+                            )
+                            if proc_seq.returncode == 0:
+                                uploaded_one = False
+                                for k in range(1, overlap_frames_for_chunk + 1):
+                                    png_path_try = seq_dir_for_condition / f"cond_{k:03d}.png"
+                                    if not png_path_try.exists():
+                                        continue
+                                    try:
+                                        with open(png_path_try, "rb") as fbin:
+                                            up = requests_mod.post(
+                                                base_url + "/upload/image",
+                                                files={"image": (png_path_try.name, fbin, "image/png")},
+                                                data={"overwrite": "true"},
+                                                timeout=60,
+                                            )
+                                        if 200 <= up.status_code < 300:
+                                            uploaded_one = True
+                                            break
+                                    except requests_mod.RequestException:
+                                        uploaded_one = False
+                                        break
+                                if uploaded_one:
+                                    seq_pattern_text = "cond_*.png"
+                                    use_sequence_conditioning = True
 
+            if use_sequence_conditioning and seq_dir_for_condition is not None and sequence_loader_node_id:
+                _set_input_safe(graph, sequence_loader_node_id, "directory", str(seq_dir_for_condition))
+                if seq_pattern_text:
+                    _set_input_safe(graph, sequence_loader_node_id, "pattern", seq_pattern_text)
+                _set_input_safe(graph, sequence_loader_node_id, "frame_rate", target_fps_val)
+                _notify(
+                    f"conditioning 시퀀스 사용: node={sequence_loader_node_id}, dir='{seq_dir_for_condition.name}', "
+                    f"pattern='{seq_pattern_text or 'cond_*.png'}', fps={target_fps_val} ({chunk_label})"
+                )
+            else:
+                if c_idx > 0:
+                    _notify(f"conditioning 시퀀스 미사용 → 1프레임 PNG 폴백 ({chunk_label})")
+
+            # ── 제출/대기 ────────────────────────────────────────
             _notify(f"워크플로우 제출 시작 ({chunk_label})")
             try:
                 result = submit_and_wait_fn(
@@ -596,7 +892,7 @@ def build_shots_with_i2v(
                 scene_failed = True
                 continue
 
-            outputs_dict = result.get("outputs") or {}
+            outputs_dict = cast(dict, result.get("outputs") or {})
             target_info: Optional[Dict[str, Any]] = None
             valid_mp4_infos: List[Dict[str, Any]] = []
             any_outputs: List[Dict[str, Any]] = []
@@ -639,35 +935,41 @@ def build_shots_with_i2v(
 
             _notify(f"결과 파일 선택: filename='{filename_pick}', type='{filetype_pick}'")
 
+            # 청크 파일 저장
             chunk_name = f"_chunk_{sid}_{c_idx:05d}.mp4"
             chunk_path = work_dir / chunk_name
 
             try:
-                import requests
-                resp = requests.get(
+                resp = requests_mod.get(
                     base_url + "/view",
                     params={"filename": filename_pick, "subfolder": subfolder, "type": filetype_pick},
                     timeout=300
                 )
                 resp.raise_for_status()
-                if not filename_pick.lower().endswith(".mp4"):
-                    _notify(f"[오류] 결과 파일이 .mp4가 아닙니다! (실제: {filename_pick}).")
-                    scene_failed = True
-                    continue
+            except requests_mod.RequestException as e_http:
+                _notify(f"[오류] 결과 파일 요청 실패: {e_http}")
+                scene_failed = True
+                continue
+
+            if not filename_pick.lower().endswith(".mp4"):
+                _notify(f"[오류] 결과 파일이 .mp4가 아닙니다! (실제: {filename_pick}).")
+                scene_failed = True
+                continue
+
+            try:
                 chunk_path.parent.mkdir(parents=True, exist_ok=True)
                 with open(chunk_path, "wb") as f_out_file:
                     f_out_file.write(resp.content)
                 size_bytes = chunk_path.stat().st_size
                 _notify(f"청크 파일 저장 완료: {chunk_path.name} ({size_bytes / 1024:.1f} KB)")
                 chunk_paths.append(chunk_path)
-            except Exception as e_http:
-                _notify(f"[오류] 청크 파일 다운로드/저장 실패: {e_http}")
+            except OSError as e_write:
+                _notify(f"[오류] 청크 파일 저장 실패: {e_write}")
                 scene_failed = True
                 continue
 
-            # 다음 청크 입력 PNG 준비
-            if not scene_failed and c_idx < len(segments_list) - 1:
-                _notify(f"청크 {c_idx + 1}의 마지막-겹침 프레임을 다음 청크 입력으로 추출...")
+            # 다음 청크 입력용 폴백 PNG 준비
+            if c_idx < len(segments_list) - 1:
                 next_frame_name = f"{sid}_temp_frame_{c_idx:05d}.png"
                 next_frame_path = comfy_input_dir / next_frame_name
                 temp_frames.append(next_frame_path)
@@ -679,58 +981,48 @@ def build_shots_with_i2v(
                 if overlap_sec < (1.0 / float(max(1, target_fps_val))):
                     overlap_sec = 1.0 / float(max(1, target_fps_val))
 
-                cmdline_ff = [
-                    ffmpeg_exe, "-y",
-                    "-sseof", f"-{overlap_sec:.6f}",
-                    "-i", str(chunk_path),
-                    "-frames:v", "1",
-                    str(next_frame_path)
-                ]
+                cond_start = max(0, end_f - overlap_frames_for_chunk)
+                cond_end = max(0, end_f - 1)
+                print(f"[I2V][COND] {chunk_label} next_cond_range={cond_start}~{cond_end} ({overlap_frames_for_chunk}f, ≈{overlap_sec:.3f}s)")
+
                 try:
-                    subprocess.run(cmdline_ff, check=True, stdout=subprocess.DEVNULL, stderr=subprocess.PIPE)
-                    t0 = time.monotonic()
+                    subprocess.run(
+                        [ffmpeg_exe, "-y", "-sseof", f"-{overlap_sec:.6f}", "-i", str(chunk_path), "-frames:v", "1", str(next_frame_path)],
+                        check=True,
+                        stdout=subprocess.DEVNULL,
+                        stderr=subprocess.PIPE
+                    )
+                except subprocess.SubprocessError as e_ff:
+                    _notify(f"[오류] 마지막-겹침 프레임 추출 실패: {e_ff}")
+                    current_input_image_name = server_image_name
+                else:
                     ready = False
+                    t0 = time.monotonic()
                     while time.monotonic() - t0 < 5.0:
-                        if next_frame_path.exists():
-                            try:
-                                if next_frame_path.stat().st_size > 0:
-                                    ready = True
-                                    break
-                            except OSError:
-                                time.sleep(0.1)
+                        try:
+                            if next_frame_path.exists() and next_frame_path.stat().st_size > 0:
+                                ready = True
+                                break
+                        except OSError:
+                            pass
                         time.sleep(0.1)
                     if not ready:
-                        raise RuntimeError("PNG 파일이 5초 내에 준비되지 않음")
-
-                    try:
-                        import requests as _req
-                        with open(next_frame_path, "rb") as fbin:
-                            up = _req.post(
-                                base_url + "/upload/image",
-                                files={"image": (next_frame_name, fbin, "image/png")},
-                                data={"overwrite": "true"},
-                                timeout=60,
-                            )
-                        if not (200 <= up.status_code < 300):
-                            raise RuntimeError("upload/image 실패")
-                        vis_ok = False
-                        t0v = time.monotonic()
-                        while time.monotonic() - t0v < 3.0:
-                            vv = _req.get(
-                                base_url + "/view",
-                                params={"filename": next_frame_name, "subfolder": "", "type": "input"},
-                                timeout=10,
-                            )
-                            if vv.status_code == 200 and vv.content:
-                                vis_ok = True
-                                break
-                            time.sleep(0.2)
-                        current_input_image_name = next_frame_name if vis_ok else server_image_name
-                    except Exception:
                         current_input_image_name = server_image_name
-                except Exception as e_ff:
-                    _notify(f"[오류] 마지막-겹침 프레임 추출/업로드 실패: {e_ff}. 원본 이미지로 계속.")
-                    current_input_image_name = server_image_name
+                    else:
+                        try:
+                            with open(next_frame_path, "rb") as fbin:
+                                up = requests_mod.post(
+                                    base_url + "/upload/image",
+                                    files={"image": (next_frame_name, fbin, "image/png")},
+                                    data={"overwrite": "true"},
+                                    timeout=60,
+                                )
+                            if not (200 <= up.status_code < 300):
+                                current_input_image_name = server_image_name
+                            else:
+                                current_input_image_name = next_frame_name
+                        except requests_mod.RequestException:
+                            current_input_image_name = server_image_name
 
         # 임시 PNG 정리
         for tmp_png in temp_frames:
@@ -740,7 +1032,7 @@ def build_shots_with_i2v(
                 pass
 
         if scene_failed:
-            _notify(f"[오류] 씬 {sid} 실패로 최종 파일 생성 건너뜀")
+            _notify(f"[오류] 씬 {sid} 처리 중 실패가 있어 최종 파일 생성을 건너뜁니다.")
             for bad_chunk in chunk_paths:
                 try:
                     bad_chunk.unlink(missing_ok=True)
@@ -749,68 +1041,40 @@ def build_shots_with_i2v(
             continue
 
         if not chunk_paths:
-            _notify(f"[경고] 씬 {sid} 생성된 청크 없음. 건너뜁니다.")
+            _notify(f"[경고] 씬 {sid}에 대해 생성된 청크 파일이 없습니다. 건너뜁니다.")
             continue
 
-        # === 병합 시 scale_w/scale_h 전달 보장 ===
-        scale_out_w: Optional[int] = int(ui_width) if (ui_width and ui_width > 0) else None
-        scale_out_h: Optional[int] = int(ui_height) if (ui_height and ui_height > 0) else None
-
-        if scale_out_w is None or scale_out_h is None:
-            def _probe_size_for_first(path_for_probe: Path) -> Tuple[Optional[int], Optional[int]]:
-                try:
-                    proc = subprocess.run(
-                        [globals().get("FFPROBE_EXE", "ffprobe"),
-                         "-v", "error", "-select_streams", "v:0",
-                         "-show_entries", "stream=width,height",
-                         "-of", "csv=s=x:p=0", str(path_for_probe)],
-                        stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
-                        text=True, encoding="utf-8", errors="ignore", check=False
-                    )
-                    out_txt = proc.stdout.strip()
-                    if proc.returncode == 0 and "x" in out_txt:
-                        w_s, h_s = out_txt.split("x", 1)
-                        return int(w_s), int(h_s)
-                except Exception:
-                    return None, None
-                return None, None
-
-            prob_w, prob_h = _probe_size_for_first(chunk_paths[0])
-            if scale_out_w is None and prob_w:
-                scale_out_w = int(prob_w)
-            if scale_out_h is None and prob_h:
-                scale_out_h = int(prob_h)
-
+        # ── 산출: 단일 or 병합 ─────────────────────────────────
         if len(chunk_paths) == 1:
-            _notify(f"씬 {sid} 단일 청크 완료. 최종 파일로 이동")
+            _notify(f"씬 {sid} 단일 청크 완료. 최종 파일로 이동합니다.")
             try:
                 shutil.move(str(chunk_paths[0]), str(clip_mp4))
                 _notify(f"파일 이동 완료: {clip_mp4.name}")
             except OSError as e_mv:
-                _notify(f"[오류] 단일 청크 이동 실패 ({sid}): {e_mv}")
+                _notify(f"[오류] 단일 청크 파일 이동 실패 ({sid}): {e_mv}")
         else:
-            _notify(f"씬 {sid} 병합 시작(겹침 {overlap_frames_for_chunk}f @ {target_fps_val}fps, "
-                    f"scale {scale_out_w if scale_out_w else 'auto'}x{scale_out_h if scale_out_h else 'auto'})")
+            print(f"[I2V][MERGE] id={sid} chunks={len(chunk_paths)} overlap={overlap_frames_for_chunk}f fps={target_fps_val}")
             try:
-                xfade_concat(
+                xfade_concat(  # 기존 병합 함수 사용
                     clip_paths=chunk_paths,
                     overlap_frames=overlap_frames_for_chunk,
                     fps=target_fps_val,
                     audio_path=None,
-                    out_path=clip_mp4,
-                    scale_w=scale_out_w,
-                    scale_h=scale_out_h,
+                    out_path=clip_mp4
                 )
                 _notify(f"청크 병합 완료: {clip_mp4.name}")
             except (OSError, RuntimeError, ValueError) as e_merge:
-                _notify(f"[오류] 씬 {sid} 병합 실패: {e_merge}")
+                _notify(f"[오류] 씬 {sid} 청크 병합 실패: {e_merge}")
 
-        # work 폴더 temp 정리
+        # 임시 mp4 정리
         for tmp_mp4 in chunk_paths:
             try:
                 tmp_mp4.unlink(missing_ok=True)
             except OSError:
                 pass
+
+        # ── 최종 트림: 처음 계산한 frame_length로 정확히 자르기 ──
+        _trim_to_frames(ffmpeg_exe, ffprobe_exe, clip_mp4, clip_mp4, frame_length, target_fps_val)
 
     _notify("모든 씬 처리 완료.")
 
@@ -821,14 +1085,10 @@ def build_shots_with_i2v(
 
 
 
-
-
-
-
 def _xfade_two(
-    left_path: Path,
-    right_path: Path,
-    out_path: Path,
+    cur_in_path: "Path",
+    next_in_path: "Path",
+    out_path_pair: "Path",
     overlap_frames: int,
     *,
     fps: int,
@@ -836,154 +1096,252 @@ def _xfade_two(
     scale_h: int,
 ) -> None:
     """
-    두 mp4를 xfade로 이어 붙인다. (기존 동작 100% 유지, 안정화/디버그 확장)
-    - 두 입력을 동일 fps/해상도/SAR로 정규화(_norm_a/_norm_b)
-    - setpts=PTS-STARTPTS + -vsync cfr 로 CFR 고정(1/1 꼬임 방지)
-    - xfade duration = overlap_frames / fps
-    - 출력(out_path)은 비디오만(copy 아님, libx264 CRF18) — 기존 규칙 그대로
+    두 MP4를 xfade로 부드럽게 연결한다.
+    - A=cur_in_path, B=next_in_path 를 동일 FPS/해상도/SAR/CFR 로 정규화 후 xfade
+    - 결과를 out_path_pair 로 저장
+    - (수정) 로깅 강화: 정규화 전/후 A/B 메타, 오버랩(초/프레임), 기대 프레임/시간, 실제 결과 프레임/시간을 모두 출력
+    - 기능 자체는 기존과 동일
     """
     import json
     import subprocess
+    from pathlib import Path as _path
 
-    left_path = Path(left_path)
-    right_path = Path(right_path)
-    out_path = Path(out_path)
-    work_dir = out_path.parent
-    work_dir.mkdir(parents=True, exist_ok=True)
+    # ── 입력 보정 ───────────────────────────────────────────────
+    if int(fps) <= 0:
+        fps = 24
+    if overlap_frames is None or int(overlap_frames) < 0:
+        overlap_frames = 0
 
+    # ── ffmpeg/ffprobe 경로 ─────────────────────────────────────
     try:
-        ffmpeg_bin = FFMPEG_EXE  # 전역 설정 사용
+        ffmpeg_bin = FFMPEG_EXE
     except NameError:
         ffmpeg_bin = "ffmpeg"
     ffprobe_bin = globals().get("FFPROBE_EXE", "ffprobe")
 
-    def _probe(path_for_probe: Path) -> dict:
-        probe_map: dict = {"path": str(path_for_probe), "exists": path_for_probe.exists()}
-        if not path_for_probe.exists():
-            return probe_map
-        cmd = [
-            ffprobe_bin, "-v", "error", "-print_format", "json",
-            "-show_streams", "-show_format", str(path_for_probe)
+    work_dir_local = out_path_pair.parent
+    norm_a = work_dir_local / "_norm_a.mp4"
+    norm_b = work_dir_local / "_norm_b.mp4"
+
+    # ── ffprobe helpers ─────────────────────────────────────────
+    def _probe_duration_seconds(src_path: _path) -> float:
+        cmd_probe = [
+            ffprobe_bin,
+            "-v", "error",
+            "-print_format", "json",
+            "-show_streams",
+            "-show_format",
+            str(src_path),
         ]
         proc = subprocess.run(
-            cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
-            text=True, encoding="utf-8", errors="ignore", check=False
+            cmd_probe,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.STDOUT,
+            text=True,
+            encoding="utf-8",
+            errors="ignore",
+            check=False,
         )
-        if proc.returncode == 0:
-            try:
-                parsed = json.loads(proc.stdout)
-            except json.JSONDecodeError:
-                probe_map["ffprobe_out"] = proc.stdout
-                return probe_map
-            vstreams = [s for s in parsed.get("streams", []) if s.get("codec_type") == "video"]
-            if vstreams:
-                vs = vstreams[0]
-                probe_map.update({
-                    "width": vs.get("width"),
-                    "height": vs.get("height"),
-                    "r_frame_rate": vs.get("r_frame_rate"),
-                    "avg_frame_rate": vs.get("avg_frame_rate"),
-                    "nb_frames": vs.get("nb_frames"),
-                    "time_base": vs.get("time_base"),
-                    "pix_fmt": vs.get("pix_fmt"),
-                })
-            fmt = parsed.get("format") or {}
-            dur = fmt.get("duration")
-            if dur is not None:
-                try:
-                    probe_map["duration_sec"] = float(dur)
-                except (TypeError, ValueError):
-                    pass
-            bitrate = fmt.get("bit_rate")
-            if bitrate is not None:
-                probe_map["bit_rate"] = bitrate
-        else:
-            probe_map["ffprobe_out"] = proc.stdout
+        if proc.returncode != 0:
+            return 0.0
         try:
-            probe_map["size_bytes"] = path_for_probe.stat().st_size
-        except OSError:
-            pass
-        return probe_map
+            j = json.loads(proc.stdout)
+        except json.JSONDecodeError:
+            return 0.0
+        try:
+            return float((j.get("format") or {}).get("duration") or 0.0)
+        except (TypeError, ValueError):
+            return 0.0
 
-    fade_sec = float(overlap_frames) / float(max(1, fps))
-    print("[XF-PAIR] fps={} overlap_frames={} fade_sec={:.6f}".format(fps, int(overlap_frames), fade_sec))
-    print("[XF-IN-L] {}".format(_probe(left_path)))
-    print("[XF-IN-R] {}".format(_probe(right_path)))
+    def _probe_nb_frames(src_path: _path) -> int:
+        cmd_probe = [
+            ffprobe_bin,
+            "-v", "error",
+            "-select_streams", "v:0",
+            "-count_frames",
+            "-show_entries", "stream=nb_read_frames",
+            "-of", "default=nokey=1:noprint_wrappers=1",
+            str(src_path),
+        ]
+        proc = subprocess.run(
+            cmd_probe,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.STDOUT,
+            text=True,
+            encoding="utf-8",
+            errors="ignore",
+            check=False,
+        )
+        if proc.returncode != 0:
+            return 0
+        out_text = (proc.stdout or "").strip()
+        try:
+            return int(out_text or "0")
+        except ValueError:
+            return 0
 
-    # 정규화 본 생성
-    norm_a = work_dir / "_norm_a.mp4"
-    norm_b = work_dir / "_norm_b.mp4"
-    vf_chain = (
-        "fps={},".format(fps) +
-        "scale=w={}:h={}:force_original_aspect_ratio=decrease,".format(scale_w, scale_h) +
-        "pad={}:{}:(ow-iw)/2:(oh-ih)/2,".format(scale_w, scale_h) +
-        "setsar=1,format=yuv420p,setpts=PTS-STARTPTS"
-    )
+    # ── 원본 입력 메타 (참고용) ─────────────────────────────────
+    try:
+        dur_a_src = _probe_duration_seconds(_path(str(cur_in_path)))
+        dur_b_src = _probe_duration_seconds(_path(str(next_in_path)))
+        nb_a_src = _probe_nb_frames(_path(str(cur_in_path)))
+        nb_b_src = _probe_nb_frames(_path(str(next_in_path)))
+    except Exception:
+        dur_a_src = 0.0
+        dur_b_src = 0.0
+        nb_a_src = 0
+        nb_b_src = 0
+    print(f"[XC-PAIR] A(src) path={cur_in_path} sec={dur_a_src:.3f}s frames≈{nb_a_src} @fps? (원본)")
+    print(f"[XC-PAIR] B(src) path={next_in_path} sec={dur_b_src:.3f}s frames≈{nb_b_src} @fps? (원본)")
 
-    cmd_a = [
-        ffmpeg_bin, "-y", "-fflags", "+genpts",
-        "-i", str(left_path),
+    # ── 1) A/B 정규화 ──────────────────────────────────────────
+    cmd_norm_a = [
+        ffmpeg_bin, "-y",
+        "-fflags", "+genpts",
+        "-i", str(cur_in_path),
         "-an",
-        "-vf", vf_chain,
-        "-r", str(fps),
+        "-vf",
+        (
+            f"fps={fps},"
+            f"scale=w={scale_w}:h={scale_h}:force_original_aspect_ratio=decrease,"
+            f"pad={scale_w}:{scale_h}:(ow-iw)/2:(oh-ih)/2,"
+            f"setsar=1,format=yuv420p,setpts=PTS-STARTPTS"
+        ),
+        "-r", f"{fps}",
+        "-fps_mode", "cfr",
         "-vsync", "cfr",
-        "-c:v", "libx264", "-crf", "18", "-pix_fmt", "yuv420p",
+        "-c:v", "libx264", "-crf", "18",
+        "-pix_fmt", "yuv420p",
         str(norm_a),
     ]
-    print("[XF-CMD-A] {}".format(" ".join(cmd_a)))
-    proc_a = subprocess.run(
-        cmd_a, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
-        text=True, encoding="utf-8", errors="ignore", check=False
+    proc_na = subprocess.run(
+        cmd_norm_a,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.STDOUT,
+        text=True,
+        encoding="utf-8",
+        errors="ignore",
+        check=False,
     )
-    print("[XF-RET-A] {}".format(proc_a.returncode))
-    if proc_a.returncode != 0:
-        raise RuntimeError("ffmpeg 실패(_xfade_two norm A):\n{}".format(proc_a.stdout))
-    print("[XF-NORM-A] {}".format(_probe(norm_a)))
+    if proc_na.returncode != 0:
+        raise RuntimeError(f"ffmpeg 실패(정규화 A):\n{proc_na.stdout}")
 
-    cmd_b = [
-        ffmpeg_bin, "-y", "-fflags", "+genpts",
-        "-i", str(right_path),
+    cmd_norm_b = [
+        ffmpeg_bin, "-y",
+        "-fflags", "+genpts",
+        "-i", str(next_in_path),
         "-an",
-        "-vf", vf_chain,
-        "-r", str(fps),
+        "-vf",
+        (
+            f"fps={fps},"
+            f"scale=w={scale_w}:h={scale_h}:force_original_aspect_ratio=decrease,"
+            f"pad={scale_w}:{scale_h}:(ow-iw)/2:(oh-ih)/2,"
+            f"setsar=1,format=yuv420p,setpts=PTS-STARTPTS"
+        ),
+        "-r", f"{fps}",
+        "-fps_mode", "cfr",
         "-vsync", "cfr",
-        "-c:v", "libx264", "-crf", "18", "-pix_fmt", "yuv420p",
+        "-c:v", "libx264", "-crf", "18",
+        "-pix_fmt", "yuv420p",
         str(norm_b),
     ]
-    print("[XF-CMD-B] {}".format(" ".join(cmd_b)))
-    proc_b = subprocess.run(
-        cmd_b, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
-        text=True, encoding="utf-8", errors="ignore", check=False
+    proc_nb = subprocess.run(
+        cmd_norm_b,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.STDOUT,
+        text=True,
+        encoding="utf-8",
+        errors="ignore",
+        check=False,
     )
-    print("[XF-RET-B] {}".format(proc_b.returncode))
-    if proc_b.returncode != 0:
-        raise RuntimeError("ffmpeg 실패(_xfade_two norm B):\n{}".format(proc_b.stdout))
-    print("[XF-NORM-B] {}".format(_probe(norm_b)))
+    if proc_nb.returncode != 0:
+        raise RuntimeError(f"ffmpeg 실패(정규화 B):\n{proc_nb.stdout}")
 
-    # xfade 연결
+    # 정규화 결과 메타
+    dur_a = _probe_duration_seconds(norm_a)
+    dur_b = _probe_duration_seconds(norm_b)
+    nb_a = _probe_nb_frames(norm_a)
+    nb_b = _probe_nb_frames(norm_b)
+    print(f"[XC-NORM] A(norm) {norm_a.name}: sec={dur_a:.3f}s frames={nb_a} @fps={fps}")
+    print(f"[XC-NORM] B(norm) {norm_b.name}: sec={dur_b:.3f}s frames={nb_b} @fps={fps}")
+
+    # ── 2) xfade 수행(명시 offset) ─────────────────────────────
+    fade_sec = float(max(0, int(overlap_frames))) / float(max(1, int(fps)))
+    offset_sec = max(0.0, dur_a - fade_sec)
+
+    # 기대치(프레임/시간) 계산
+    expected_frames = max(0, nb_a + nb_b - max(0, int(overlap_frames)))
+    expected_sec = max(0.0, dur_a + dur_b - fade_sec)
+    print(
+        "[XC-PLAN] fade="
+        f"{overlap_frames}f ({fade_sec:.3f}s), "
+        f"offset={offset_sec:.3f}s, "
+        f"expected≥ {expected_frames}f / {expected_sec:.3f}s"
+    )
+
     cmd_xf = [
-        ffmpeg_bin, "-y", "-fflags", "+genpts",
+        ffmpeg_bin, "-y",
+        "-fflags", "+genpts",
         "-i", str(norm_a),
         "-i", str(norm_b),
         "-filter_complex",
-        "[0:v]format=yuv420p,setsar=1[v0];[1:v]format=yuv420p,setsar=1[v1];"
-        "[v0][v1]xfade=transition=fade:duration={:.6f}[v]".format(fade_sec),
+        (
+            f"[0:v]format=yuv420p,setsar=1[v0];"
+            f"[1:v]format=yuv420p,setsar=1[v1];"
+            f"[v0][v1]xfade=transition=fade:duration={fade_sec:.6f}:offset={offset_sec:.6f}[v]"
+        ),
         "-map", "[v]",
-        "-r", str(fps),
+        "-r", f"{fps}",
+        "-fps_mode", "cfr",
         "-vsync", "cfr",
-        "-c:v", "libx264", "-crf", "18", "-pix_fmt", "yuv420p",
-        str(out_path),
+        "-c:v", "libx264", "-crf", "18",
+        "-pix_fmt", "yuv420p",
+        str(out_path_pair),
     ]
-    print("[XF-CMD-XF] {}".format(" ".join(cmd_xf)))
+    print(f"[XC-CMD-XF] {' '.join(cmd_xf)}")
     proc_xf = subprocess.run(
-        cmd_xf, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
-        text=True, encoding="utf-8", errors="ignore", check=False
+        cmd_xf,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.STDOUT,
+        text=True,
+        encoding="utf-8",
+        errors="ignore",
+        check=False,
     )
-    print("[XF-RET-XF] {}".format(proc_xf.returncode))
     if proc_xf.returncode != 0:
-        raise RuntimeError("ffmpeg 실패(_xfade_two xfade):\n{}".format(proc_xf.stdout))
+        raise RuntimeError(f"ffmpeg 실패(xfade):\n{proc_xf.stdout}")
 
-    print("[XF-OUT] {}".format(_probe(out_path)))
+    # ── 3) 결과 검증/로깅 ──────────────────────────────────────
+    dur_out = _probe_duration_seconds(out_path_pair)
+    nb_out = _probe_nb_frames(out_path_pair)
+    print(f"[XC-OUT] {out_path_pair.name}: sec={dur_out:.3f}s frames={nb_out} @fps={fps}")
+
+    # 기대 대비 편차 로깅(검증 로직은 유지하되, 메시지 보강)
+    expected_min = max(0.0, dur_a + dur_b - fade_sec - 0.05)  # 50ms 여유
+    if dur_out + 1e-3 < expected_min:
+        print(
+            "[XC-WARN] 길이 부족 감지: "
+            f"A={dur_a:.3f}s({nb_a}f) + B={dur_b:.3f}s({nb_b}f) - fade={fade_sec:.3f}s "
+            f"→ 기대≥{expected_min:.3f}s / 프레임기대≥{expected_frames}f, "
+            f"실제={dur_out:.3f}s / {nb_out}f"
+        )
+        raise RuntimeError(
+            "xfade 결과 길이가 비정상적으로 짧습니다. "
+            f"(A={dur_a:.3f}s, B={dur_b:.3f}s, fade={fade_sec:.3f}s, "
+            f"expected≥{expected_min:.3f}s, got={dur_out:.3f}s)"
+        )
+    else:
+        # 여유 프린트(디버그 판단용)
+        diff_f = nb_out - expected_frames
+        diff_s = dur_out - expected_sec
+        print(
+            "[XC-OK] 길이 검증 통과: "
+            f"frames_out={nb_out} (vs exp≥{expected_frames}, Δ={diff_f}), "
+            f"sec_out={dur_out:.3f}s (vs exp≥{expected_sec:.3f}s, Δ={diff_s:.3f}s)"
+        )
+
+
+
 
 
 

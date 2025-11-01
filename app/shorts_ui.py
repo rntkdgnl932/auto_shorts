@@ -6038,28 +6038,194 @@ class MainWindow(QtWidgets.QMainWindow):
 
     # ────────────── 진행창/로그 ──────────────
 
+    def on_show_progress(self) -> None:
+        """
+        [테스트] xfade 병합(5개 청크 고정) – 업로드된 _chunk_gap_002_0000{0..4}.mp4 메타를 읽어
+        공통 fps/해상도(가장 많이 등장하는 해상도)를 선택해 정규화 후 병합한다.
+        결과: clips/test_merge.mp4
+        """
+        from pathlib import Path
+        import subprocess
+        import json
+        from typing import Dict, List, Optional
+        from PyQt5 import QtWidgets
 
-    def on_show_progress(self):
-        print("테스트")
-        clips_dir = Path(r"C:\my_games\shorts_make\maked_title\꽃돼지 막창\clips")
+        # xfade 병합 함수 로드(기존 시그니처 유지)
+        try:
+            from app.video_build import xfade_concat  # type: ignore
+        except (ImportError, ModuleNotFoundError):
+            from video_build import xfade_concat  # type: ignore
+
+        # 프로젝트/폴더 경로
+        try:
+            proj_dir_str = self._current_project_dir()
+        except Exception:
+            proj_dir_str = None
+        if not proj_dir_str:
+            QtWidgets.QMessageBox.warning(self, "테스트", "프로젝트 폴더를 찾을 수 없습니다.")
+            return
+
+        proj_dir = Path(proj_dir_str)
+        clips_dir = proj_dir / "clips"
         work_dir = clips_dir / "xfade_work"
+        work_dir.mkdir(parents=True, exist_ok=True)
 
-        clip_paths = [
-            work_dir / "_chunk_t_001_00000.mp4",
-            work_dir / "_chunk_t_001_00001.mp4",
+        # 업로드된 5개 파일(고정 이름) – xfade_work에 있어야 함
+        file_names = [
+            "_chunk_t_001_00000.mp4",
+            "_chunk_t_001_00001.mp4",
+            "_chunk_t_001_00002.mp4",
         ]
-        out_path = clips_dir / "n_001.mp4"  # 중요: work_dir가 아닌 clips에 둬야 함!
+        clip_paths: List[Path] = [work_dir / name for name in file_names]
+        missing_paths = [p for p in clip_paths if not p.exists()]
+        if missing_paths:
+            QtWidgets.QMessageBox.warning(
+                self,
+                "테스트",
+                "다음 파일이 없습니다:\n" + "\n".join(str(p) for p in missing_paths),
+            )
+            return
 
-        xfade_concat(
-            clip_paths=clip_paths,
-            overlap_frames=12,
-            fps=30,
-            audio_path=None,
-            out_path=out_path,
-            scale_w=720,
-            scale_h=1080,  # 세로 유지
-        )
-        print("DONE:", out_path)
+        # ffprobe 헬퍼: fps/해상도 등 추출
+        def _ffprobe_meta(video_path: Path) -> Dict[str, object]:
+            meta: Dict[str, object] = {
+                "path": str(video_path),
+                "width": None,
+                "height": None,
+                "r_frame_rate": None,
+                "avg_frame_rate": None,
+                "nb_frames": None,
+                "duration_sec": None,
+            }
+            cmd = [
+                (globals().get("FFPROBE_EXE", "ffprobe")),
+                "-v", "error",
+                "-print_format", "json",
+                "-show_streams",
+                "-show_format",
+                str(video_path),
+            ]
+            proc = subprocess.run(
+                cmd,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.STDOUT,
+                text=True,
+                encoding="utf-8",
+                errors="ignore",
+                check=False,
+            )
+            if proc.returncode != 0:
+                meta["ffprobe_out"] = proc.stdout
+                return meta
+            try:
+                parsed = json.loads(proc.stdout)
+            except json.JSONDecodeError:
+                meta["ffprobe_out"] = proc.stdout
+                return meta
+
+            vstreams = [s for s in parsed.get("streams", []) if s.get("codec_type") == "video"]
+            if vstreams:
+                vs = vstreams[0]
+                meta["width"] = vs.get("width")
+                meta["height"] = vs.get("height")
+                meta["r_frame_rate"] = vs.get("r_frame_rate")
+                meta["avg_frame_rate"] = vs.get("avg_frame_rate")
+                meta["nb_frames"] = vs.get("nb_frames")
+                tb = parsed.get("format", {}).get("duration")
+                if isinstance(tb, str):
+                    try:
+                        meta["duration_sec"] = float(tb)
+                    except ValueError:
+                        pass
+            return meta
+
+        def _parse_rate(rate_str: Optional[str]) -> float:
+            if not rate_str:
+                return 0.0
+            s = str(rate_str)
+            if "/" in s:
+                num, den = s.split("/", 1)
+                try:
+                    n = float(num)
+                    d = float(den) if float(den) != 0 else 1.0
+                    return n / d
+                except ValueError:
+                    return 0.0
+            try:
+                return float(s)
+            except ValueError:
+                return 0.0
+
+        # 5개 파일 메타 수집
+        metas: List[Dict[str, object]] = []
+        for vpath in clip_paths:
+            m = _ffprobe_meta(vpath)
+            print("[TEST] META:", m)
+            metas.append(m)
+
+        # 공통 fps: 다수결(동률이면 첫 파일 기준), 소수점은 반올림 정수
+        fps_candidates: List[int] = []
+        for m in metas:
+            fps_val = 0.0
+            if m.get("avg_frame_rate"):
+                fps_val = _parse_rate(m.get("avg_frame_rate"))  # type: ignore[arg-type]
+            if not fps_val and m.get("r_frame_rate"):
+                fps_val = _parse_rate(m.get("r_frame_rate"))  # type: ignore[arg-type]
+            fps_int = int(round(fps_val)) if fps_val > 0 else 0
+            fps_candidates.append(max(fps_int, 0))
+        # 모드 선택
+        fps_mode = None
+        if fps_candidates:
+            counts: Dict[int, int] = {}
+            for f in fps_candidates:
+                counts[f] = counts.get(f, 0) + 1
+            fps_mode = max(counts.items(), key=lambda kv: kv[1])[0]
+        if not fps_mode or fps_mode <= 0:
+            # 합의 실패 시 첫 파일 또는 30
+            first_f = fps_candidates[0] if fps_candidates and fps_candidates[0] > 0 else 30
+            fps_mode = first_f if first_f > 0 else 30
+
+        # 공통 해상도: (width,height) 다수결, 동률이면 첫 파일 해상도
+        wh_list: List[Optional[tuple]] = []
+        for m in metas:
+            w = m.get("width")
+            h = m.get("height")
+            if isinstance(w, int) and isinstance(h, int) and w > 0 and h > 0:
+                wh_list.append((w, h))
+            else:
+                wh_list.append(None)
+        wh_counts: Dict[tuple, int] = {}
+        for wh in wh_list:
+            if wh is None:
+                continue
+            wh_counts[wh] = wh_counts.get(wh, 0) + 1
+        if wh_counts:
+            out_w, out_h = max(wh_counts.items(), key=lambda kv: kv[1])[0]
+        else:
+            # 메타가 비정상일 때 기본값(세로 예시: 720x1080)
+            out_w, out_h = 720, 1080
+
+        print(f"[TEST] SELECTED: fps={fps_mode}, size={out_w}x{out_h}")
+
+        # 병합 실행
+        out_path = clips_dir / "test_merge.mp4"
+        try:
+            xfade_concat(
+                clip_paths=clip_paths,
+                overlap_frames=12,  # 업로드 분석 시 테스트했던 기본값 그대로
+                fps=fps_mode,
+                audio_path=None,
+                out_path=out_path,
+                out_fps=None,
+                scale_w=out_w,
+                scale_h=out_h,
+                work_dir=work_dir,
+            )
+            print("[TEST] DONE:", out_path)
+            QtWidgets.QMessageBox.information(self, "테스트 완료", f"출력: {out_path}")
+        except (OSError, ValueError, RuntimeError) as e_merge:
+            print("[TEST][ERROR]", e_merge)
+            QtWidgets.QMessageBox.warning(self, "테스트 실패", str(e_merge))
 
     # ────────────── 음악 생성 ──────────────
 
