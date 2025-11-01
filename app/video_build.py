@@ -968,13 +968,29 @@ def build_shots_with_i2v(
             _notify(f"I2V({i2v_node_id}) Length: {chunk_len}f ({chunk_label})")
 
             pos_txt = str(scene.get("prompt_movie") or scene.get("prompt") or "")
-            neg_txt = str(scene.get("prompt_negative") or "")
+
+            # 1. video.json에서 기존 네거티브 프롬프트를 읽어옵니다.
+            base_neg_txt = str(scene.get("prompt_negative") or "")
+
+            # 2. 파일 이름이나 제목이 텍스트로 생성되는 것을 막기 위한 '강제' 네거티브 태그를 정의합니다.
+            #    (AI가 긍정 프롬프트에 t_001 등을 넣더라도 이를 무시하도록 지시)
+            force_neg_tags = "text, watermark, logo, letters, (file name:1.5), (title:1.5), (t_001:1.5), (t_002:1.5), (mp4:1.5), signature, typography, caption, subtitles, text overlay"
+
+            # 3. 두 프롬프트를 쉼표로 합칩니다.
+            if base_neg_txt:
+                # 쉼표로 구분하여 기존 네거티브와 강제 네거티브를 결합
+                neg_txt = f"{base_neg_txt.rstrip(', ')}, {force_neg_tags}"
+            else:
+                neg_txt = force_neg_tags
+
+            # 4. 워크플로우에 주입합니다. (guff_movie.json의 노드 ID 22, 23 사용)
             if pos_txt:
                 _set_input_safe(graph, "22", "text", pos_txt)
-            if neg_txt:
-                _set_input_safe(graph, "23", "text", neg_txt)
-            if pos_txt or neg_txt:
-                _notify(f"프롬프트(22/23) 설정 완료. ({chunk_label})")
+
+            # neg_txt는 이제 항상 값이 있으므로 'if neg_txt:' 검사 없이 바로 주입
+            _set_input_safe(graph, "23", "text", neg_txt)
+
+            _notify(f"프롬프트(22/23) 설정 완료. (강제 텍스트 금지 네거티브 포함) ({chunk_label})")
 
             try:
                 raw_prefix = str(graph.get(combine_node_id, {}).get("inputs", {}).get("filename_prefix", "wan22_"))
