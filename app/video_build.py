@@ -221,6 +221,159 @@ def _apply_overrides(graph: dict, overrides: Dict[str, Any]) -> None:
         except Exception:
             pass
 
+# ── 영상 및 음악 합치기 ────────────────────────────────────────────────────────────
+
+# video_build.py (파일 하단에 추가)
+
+import subprocess
+import glob
+
+
+# (이미 파일 상단에 import 되어 있어야 함: Path, List, Callable, Dict, Any, load_json, build_shots_with_i2v, FFMPEG_EXE)
+
+def build_and_merge_full_video(project_dir: str,
+                               on_progress: Callable[[Dict[str, Any]], None]) -> str:
+    """
+    영상 생성부터 병합, 오디오 mux까지 전체 파이프라인을 실행합니다.
+    [사용자 요청 6단계 실행]
+    """
+
+    def _log(stage: int, msg: str):
+        print(f"[BuildPipeline] {stage}/6: {msg}", flush=True)
+        on_progress({"msg": f"[{stage}/6] {msg}"})
+
+    p_dir = Path(project_dir)
+    video_json_path = p_dir / "video.json"
+    clips_dir = p_dir / "clips"
+
+    # --- 1. video.json 읽기 ---
+    _log(1, "video.json 로드...")
+    if not video_json_path.exists():
+        raise FileNotFoundError(f"video.json을 찾을 수 없습니다: {video_json_path}")
+
+    video_data = load_json(video_json_path, {}) or {}
+    scenes = video_data.get("scenes", [])
+    if not scenes:
+        raise ValueError("video.json에 'scenes' 목록이 없습니다.")
+
+    scene_clip_paths = [clips_dir / f"{s['id']}.mp4" for s in scenes]
+
+    # --- 2. 누락된 씬(mp4) 확인 및 생성 (i2v) ---
+    _log(2, "누락된 씬(mp4) 확인...")
+    missing_clips = [p for p in scene_clip_paths if not p.exists() or p.stat().st_size == 0]
+
+    if missing_clips:
+        _log(3, f"누락된 씬 {len(missing_clips)}개 생성 시작 (i2v)...")
+        # build_shots_with_i2v는 이미 "skip if exists" 로직을 갖고 있음
+        # UI에서 읽어올 값이 없으므로 기본값으로 실행
+        build_shots_with_i2v(
+            project_dir=project_dir,
+            total_frames=0,  # (이 함수에서는 사용되지 않음)
+            ui_width=None,  # (video.json의 defaults 값을 따름)
+            ui_height=None,
+            ui_fps=None,
+            ui_steps=None,
+            on_progress=on_progress  # 로그 콜백 전달
+        )
+    else:
+        _log(3, "모든 씬(mp4)이 이미 존재합니다. (i2v 생략)")
+
+    # --- 4. 씬 병합 (Video Only) ---
+    _log(4, f"{len(scene_clip_paths)}개 씬 병합 중 (비디오만)...")
+    video_only_output = p_dir / "music_vocal_ready.mp4"
+
+    concatenate_scene_clips(
+        clip_paths=scene_clip_paths,
+        out_path=video_only_output,
+        ffmpeg_exe=FFMPEG_EXE  #
+    )
+
+    # --- 5. 오디오 파일 찾기 및 병합 (Muxing) ---
+    _log(5, "오디오 파일(vocal.wav/mp3) 탐색...")
+    audio_file = p_dir / "vocal.wav"
+    if not audio_file.exists():
+        audio_file = p_dir / "vocal.mp3"
+        if not audio_file.exists():
+            # glob로 유연하게 탐색
+            found = list(p_dir.glob("vocal.*"))
+            if not found:
+                raise FileNotFoundError(f"프로젝트 폴더에서 오디오 파일(vocal.wav/mp3)을 찾을 수 없습니다: {p_dir}")
+            audio_file = found[0]
+
+    _log(5, f"오디오 파일({audio_file.name})과 비디오 병합 중...")
+    final_output = p_dir / "music_ready.mp4"
+
+    mux_video_and_audio(
+        video_in_path=video_only_output,
+        audio_in_path=audio_file,
+        out_path=final_output,
+        ffmpeg_exe=FFMPEG_EXE  #
+    )
+
+    # --- 6. 완료 ---
+    _log(6, f"최종 영상 생성 완료: {final_output.name}")
+    return str(final_output)
+
+
+def concatenate_scene_clips(clip_paths: List[Path], out_path: Path, ffmpeg_exe: str):
+    """
+    [신규] FFMPEG concat demuxer를 사용해 여러 비디오 클립을 순서대로 병합합니다.
+    (가장 안정적인 방식)
+    """
+    work_dir = out_path.parent
+    list_file = work_dir / "ffmpeg_concat_list.txt"
+
+    try:
+        # 1. ffmpeg에 전달할 목록 파일(list.txt) 생성
+        with open(list_file, "w", encoding="utf-8") as f:
+            for clip in clip_paths:
+                if not clip.exists():
+                    raise FileNotFoundError(f"병합할 클립을 찾을 수 없습니다: {clip.name}")
+                # FFMPEG concat은 경로에 특수문자가 있으면 오류가 날 수 있으므로,
+                # 'file' 키워드와 함께 절대 경로를 따옴표로 감쌉니다.
+                f.write(f"file '{clip.as_posix()}'\n")
+
+        # 2. FFMPEG concat 실행
+        cmd = [
+            ffmpeg_exe,
+            "-y",  # 덮어쓰기
+            "-f", "concat",  # concat demuxer 사용
+            "-safe", "0",  # 절대 경로 허용
+            "-i", str(list_file),
+            "-c", "copy",  # 재인코딩 없이 스트림 복사 (매우 빠름)
+            str(out_path)
+        ]
+
+        result = subprocess.run(cmd, capture_output=True, text=True, encoding="utf-8", errors="ignore")
+        if result.returncode != 0:
+            raise RuntimeError(f"FFMPEG 씬 병합 실패:\n{result.stderr}")
+
+    finally:
+        # 3. 임시 목록 파일 삭제
+        if list_file.exists():
+            list_file.unlink()
+
+
+def mux_video_and_audio(video_in_path: Path, audio_in_path: Path, out_path: Path, ffmpeg_exe: str):
+    """
+    [신규] 비디오 파일과 오디오 파일을 하나로 합칩니다(Muxing).
+    """
+    cmd = [
+        ffmpeg_exe,
+        "-y",
+        "-i", str(video_in_path),  # 입력 1 (비디오)
+        "-i", str(audio_in_path),  # 입력 2 (오디오)
+        "-c:v", "copy",  # 비디오는 재인코딩 없이 복사
+        "-c:a", "aac",  # 오디오는 호환성을 위해 AAC로 인코딩 (wav -> aac)
+        "-b:a", "192k",
+        "-shortest",  # 비디오/오디오 중 짧은 쪽 길이에 맞춰 종료
+        str(out_path)
+    ]
+
+    result = subprocess.run(cmd, capture_output=True, text=True, encoding="utf-8", errors="ignore")
+    if result.returncode != 0:
+        raise RuntimeError(f"FFMPEG 오디오/비디오 병합 실패:\n{result.stderr}")
+
 # ── i2v 샷 생성 ────────────────────────────────────────────────────────────
 
 
@@ -709,11 +862,11 @@ def build_shots_with_i2v(
             "credit_text"
         }
 
-        for node_key, node_val in graph_dict.items():
+        for nid, n_val in graph_dict.items():
             try:
-                if not isinstance(node_val, dict):
+                if not isinstance(n_val, dict):
                     continue
-                inputs_map = node_val.get("inputs")
+                inputs_map = n_val.get("inputs")
                 if not isinstance(inputs_map, dict):
                     continue
 
@@ -1283,26 +1436,6 @@ def build_shots_with_i2v(
         _trim_to_frames(ffmpeg_exe, ffprobe_exe, clip_mp4, clip_mp4, frame_length, target_fps_val)
 
     _notify("모든 씬 처리 완료.")
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
 
 
 
@@ -1913,23 +2046,6 @@ def xfade_concat(
 
     print(f"[XC-DONE] out_path={out_path}")
     return Path(out_path)
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
 
 
 

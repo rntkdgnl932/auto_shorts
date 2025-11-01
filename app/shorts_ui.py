@@ -59,7 +59,10 @@ try:
     from utils import AI
 except ImportError:
     from app.ai import AI  # type: ignore
-
+try:
+    from app.video_build import build_and_merge_full_video
+except ImportError:
+    from video_build import build_and_merge_full_video
 # ── 유연한 임포트 ──────────────────────────────────────────────────────────────
 try:
     # 모듈 통째로도 가져오되, 하위 함수/상수는 직접 임포트(둘 다 지원)
@@ -7322,13 +7325,39 @@ class MainWindow(QtWidgets.QMainWindow):
     # ==== 완성된 영상 합치기 ==========
     def merging_videos_start(self) -> None:
         """
-        - video.json 을 보고 각 씬의 {id}.mp4가 프로젝트 폴더 내에 있는지 찾는다
-        - 없다면 영상생성(i2v) 실행하여 각 씬의 mp4를 모두 생성한다.
-        - 생성된 mp4를 각 씬의 순서에 맞게 병합한다.
-        - 병합된 mp4는 music_vocal_ready.mp4로 저장한다.(프로젝트폴더 내)
-        - music_ready.mp4 와 이미 만들어진 음악파일(vocal.wav)을 싱크해서 완전한 뮤직비디오를 완성한다. => music_ready.mp4
+        '영상 합치기' 버튼 핸들러:
+        1. 누락된 씬(i2v) 생성
+        2. 씬 비디오 병합 (music_vocal_ready.mp4)
+        3. 오디오(vocal.wav) 합치기 (music_ready.mp4)
         """
-        print("merging_videos_start")
+        proj_dir = self._current_project_dir()
+        if not proj_dir:
+            QtWidgets.QMessageBox.warning(self, "오류", "프로젝트가 열려있지 않습니다.")
+            return
+
+        # --- 백그라운드 작업 정의 ---
+        def job(progress_callback):
+            # 1. 메인 파이프라인 함수 호출
+            final_path = build_and_merge_full_video(
+                project_dir=str(proj_dir),
+                on_progress=progress_callback
+            )
+            return final_path # 성공 시 최종 파일 경로 반환
+
+        # --- 완료 콜백 정의 ---
+        def done(ok: bool, payload, err):
+            if not ok:
+                QtWidgets.QMessageBox.critical(self, "병합 실패", str(err))
+            else:
+                QtWidgets.QMessageBox.information(self, "병합 완료", f"최종 영상 생성 완료:\n{payload}")
+
+        # --- 비동기 실행 ---
+        run_job_with_progress_async(
+            owner=self,
+            title="최종 영상 병합",
+            job=job,
+            on_done=done
+        )
 
     # ==== 가사넣기 ================================
     def lyrics_in_start(self):
