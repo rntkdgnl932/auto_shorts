@@ -4053,7 +4053,7 @@ class MainWindow(QtWidgets.QMainWindow):
         self.btn_save = QtWidgets.QPushButton("프로젝트 저장")
         self.btn_load_proj = QtWidgets.QPushButton("프로젝트 불러오기")
         self.btn_music = QtWidgets.QPushButton("음악생성(ACE-Step)")
-        self.btn_show_progress = QtWidgets.QPushButton("진행상황 보기")
+        self.btn_show_progress = QtWidgets.QPushButton("테스트")
         self.btn_video = QtWidgets.QPushButton("영상생성(i2v)")
         self.btn_analyze = QtWidgets.QPushButton("음악분석")
         # self.btn_analyze.hide()  # 음악생성 완료 시 자동 분석으로 대체
@@ -6040,8 +6040,26 @@ class MainWindow(QtWidgets.QMainWindow):
 
 
     def on_show_progress(self):
-        if self._dlg:
-            self._dlg.show(); self._dlg.raise_(); self._dlg.activateWindow()
+        print("테스트")
+        clips_dir = Path(r"C:\my_games\shorts_make\maked_title\꽃돼지 막창\clips")
+        work_dir = clips_dir / "xfade_work"
+
+        clip_paths = [
+            work_dir / "_chunk_t_001_00000.mp4",
+            work_dir / "_chunk_t_001_00001.mp4",
+        ]
+        out_path = clips_dir / "n_001.mp4"  # 중요: work_dir가 아닌 clips에 둬야 함!
+
+        xfade_concat(
+            clip_paths=clip_paths,
+            overlap_frames=12,
+            fps=30,
+            audio_path=None,
+            out_path=out_path,
+            scale_w=720,
+            scale_h=1080,  # 세로 유지
+        )
+        print("DONE:", out_path)
 
     # ────────────── 음악 생성 ──────────────
 
