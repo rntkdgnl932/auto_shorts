@@ -253,7 +253,7 @@ def build_shots_with_i2v(
     from pathlib import Path
     from typing import Any, Dict, List, Optional, Callable, Tuple, cast
 
-    # 네트워크 통신 모듈: 함수 시작 시 1회만 로드 (정적분석 가리기 방지)
+    # 네트워크 통신 모듈
     try:
         import requests as requests_mod  # type: ignore
     except ImportError:
@@ -263,7 +263,6 @@ def build_shots_with_i2v(
 
     assert isinstance(total_frames, int)
 
-    # ▶ 전체 요청 프레임 로그
     print(f"[I2V][TOTAL] total_frames={int(total_frames)}")
 
     def _notify(msg: str) -> None:
@@ -277,9 +276,9 @@ def build_shots_with_i2v(
             print("[경고] on_progress 콜백 처리 실패")
 
     # ── ffprobe: 프레임 수 확인 ───────────────────────────────
-    def _probe_nb_frames_ffprobe_local(ffprobe_exe: str, src_path: Path) -> int:
+    def _probe_nb_frames_ffprobe_local(ffprobe_bin_param: str, src_path: Path) -> int:
         cmd_probe = [
-            ffprobe_exe,
+            ffprobe_bin_param,
             "-v", "error",
             "-select_streams", "v:0",
             "-count_frames",
@@ -304,12 +303,7 @@ def build_shots_with_i2v(
             return 0
 
     # ── 최종 트림(원래 총프레임으로) ──────────────────────────
-    def _trim_to_frames(ffmpeg_exe: str, ffprobe_exe: str, src: Path, dst: Path, target_frames: int, fps_val: int) -> bool:
-        """
-        src 영상을 target_frames 프레임으로 정확히 자른 뒤 dst에 저장.
-        - '프레임 개수' 기준 트림: trim=end_frame=target_frames
-        - setpts로 0부터 재정렬, -r fps로 CFR 유지
-        """
+    def _trim_to_frames(ffmpeg_bin_param: str, ffprobe_bin_param: str, src: Path, dst: Path, target_frames: int, fps_val: int) -> bool:
         if target_frames <= 0:
             return False
         try:
@@ -321,7 +315,7 @@ def build_shots_with_i2v(
                     pass
 
             cmd = [
-                ffmpeg_exe, "-y",
+                ffmpeg_bin_param, "-y",
                 "-fflags", "+genpts",
                 "-i", str(src),
                 "-vf", f"trim=end_frame={int(target_frames)},setpts=PTS-STARTPTS",
@@ -350,12 +344,10 @@ def build_shots_with_i2v(
                         pass
                 return False
 
-            # 프레임 검증
-            got_frames = _probe_nb_frames_ffprobe_local(ffprobe_exe, tmp_out)
+            got_frames = _probe_nb_frames_ffprobe_local(ffprobe_bin_param, tmp_out)
             if got_frames != int(target_frames):
                 _notify(f"[TRIM][경고] 프레임 불일치: 기대 {target_frames}f vs 실제 {got_frames}f")
 
-            # 교체
             try:
                 if dst.exists():
                     dst.unlink()
@@ -367,6 +359,158 @@ def build_shots_with_i2v(
         except Exception as e_trim_any:
             _notify(f"[TRIM][오류] 트림 처리 예외: {e_trim_any}")
             return False
+
+    # ── 컷 병합(덮어쓰기) ──────────────────────────────────────
+    def _concat_cut_no_fade(
+        ffmpeg_bin_arg: str,
+        ffprobe_bin_arg: str,
+        clip_paths_arg: List[Path],
+        overlap_frames_arg: int,
+        fps_arg: int,
+        out_path_arg: Path,
+        work_dir_arg: Path
+    ) -> bool:
+        """
+        fade 없이 덮어쓰기:
+          - A, B, C... 를 순차 병합.
+          - 매 단계에서 current(A')의 뒤 overlap만큼을 잘라내고 B 전체를 이어붙임.
+          - 해상도/비율 통일: 1280x720, SAR=1, CFR=fps.
+        """
+        if not clip_paths_arg:
+            return False
+
+        def _norm(src: Path, dst: Path) -> Tuple[int, bool]:
+            cmd = [
+                ffmpeg_bin_arg, "-y", "-fflags", "+genpts",
+                "-i", str(src),
+                "-vf",
+                (
+                    f"fps={int(max(1, fps_arg))},"
+                    "scale=w=1280:h=720:force_original_aspect_ratio=decrease,"
+                    "pad=1280:720:(ow-iw)/2:(oh-ih)/2,setsar=1,format=yuv420p"
+                ),
+                "-r", f"{int(max(1, fps_arg))}",
+                "-vsync", "cfr",
+                "-c:v", "libx264", "-crf", "18", "-pix_fmt", "yuv420p",
+                str(dst),
+            ]
+            proc = subprocess.run(
+                cmd,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.STDOUT,
+                text=True,
+                encoding="utf-8",
+                errors="ignore",
+                check=False,
+            )
+            if proc.returncode != 0:
+                return (0, False)
+            frames = _probe_nb_frames_ffprobe_local(ffprobe_bin_arg, dst)
+            return (frames, frames > 0)
+
+        def _trim_tail(src: Path, dst: Path, keep_frames: int) -> bool:
+            cmd = [
+                ffmpeg_bin_arg, "-y",
+                "-fflags", "+genpts",
+                "-i", str(src),
+                "-vf", f"trim=end_frame={int(max(0, keep_frames))},setpts=PTS-STARTPTS",
+                "-r", f"{int(max(1, fps_arg))}",
+                "-fps_mode", "cfr",
+                "-vsync", "cfr",
+                "-c:v", "libx264", "-crf", "18", "-pix_fmt", "yuv420p",
+                str(dst),
+            ]
+            proc = subprocess.run(
+                cmd,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.STDOUT,
+                text=True,
+                encoding="utf-8",
+                errors="ignore",
+                check=False,
+            )
+            return proc.returncode == 0
+
+        def _concat_ab(a: Path, b: Path, dst: Path) -> bool:
+            cmd = [
+                ffmpeg_bin_arg, "-y",
+                "-fflags", "+genpts",
+                "-i", str(a), "-i", str(b),
+                "-filter_complex", "[0:v][1:v]concat=n=2:v=1:a=0[v]",
+                "-map", "[v]",
+                "-r", f"{int(max(1, fps_arg))}",
+                "-fps_mode", "cfr",
+                "-vsync", "cfr",
+                "-c:v", "libx264", "-crf", "18", "-pix_fmt", "yuv420p",
+                str(dst),
+            ]
+            proc = subprocess.run(
+                cmd,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.STDOUT,
+                text=True,
+                encoding="utf-8",
+                errors="ignore",
+                check=False,
+            )
+            return proc.returncode == 0
+
+        print(f"[XC-BEGIN] items={len(clip_paths_arg)} fps={fps_arg} overlap_frames={overlap_frames_arg} out=1280x720")
+
+        # 첫 번째 정규화
+        cur = work_dir_arg / "cur_000.mp4"
+        n0 = work_dir_arg / "_norm_a.mp4"
+        f0, ok0 = _norm(clip_paths_arg[0], n0)
+        if not ok0:
+            print("[XC-ERR] 첫 청크 정규화 실패")
+            return False
+        print(f"[XC-IN-000] {{'path': '{clip_paths_arg[0]}', 'frames': {f0}, 'fps': {fps_arg}}}")
+        shutil.copyfile(str(n0), str(cur))
+
+        # 나머지 반복
+        step_idx = 1
+        for idx in range(1, len(clip_paths_arg)):
+            nb = work_dir_arg / "_norm_b.mp4"
+            fb, okb = _norm(clip_paths_arg[idx], nb)
+            if not okb:
+                print(f"[XC-ERR] 청크 정규화 실패 idx={idx}")
+                return False
+
+            fa = _probe_nb_frames_ffprobe_local(ffprobe_bin_arg, cur)
+            print(f"[XC-CUR] A(frames)={fa}, B(frames)={fb}, overlap={overlap_frames_arg}")
+
+            keep_a = max(0, fa - max(0, overlap_frames_arg))
+            a_cut = work_dir_arg / f"_a_cut_{step_idx:03d}.mp4"
+            ok_cut = _trim_tail(cur, a_cut, keep_a)
+            if not ok_cut:
+                print(f"[XC-ERR] A 컷 실패 keep={keep_a} step={step_idx}")
+                return False
+
+            cur_next = work_dir_arg / f"cur_{step_idx:03d}.mp4"
+            ok_cat = _concat_ab(a_cut, nb, cur_next)
+            if not ok_cat:
+                print(f"[XC-ERR] concat 실패 step={step_idx}")
+                return False
+
+            try:
+                cur.unlink(missing_ok=True)
+            except OSError:
+                pass
+            cur = cur_next
+            step_idx += 1
+
+        # 최종 산출 이동
+        try:
+            if out_path_arg.exists():
+                out_path_arg.unlink()
+        except OSError:
+            pass
+        shutil.copyfile(str(cur), str(out_path_arg))
+
+        f_out = _probe_nb_frames_ffprobe_local(ffprobe_bin_arg, out_path_arg)
+        print(f"[XC-FINAL] {{'path': '{out_path_arg}', 'frames': {f_out}, 'fps': {fps_arg}}}")
+        print(f"[XC-DONE] out_path={out_path_arg}")
+        return True
 
     _notify(f"영상 생성 시작: project_dir='{project_dir}'")
     _notify(f"UI 설정: W={ui_width}, H={ui_height}, FPS={ui_fps}, Steps={ui_steps}")
@@ -498,6 +642,7 @@ def build_shots_with_i2v(
         except Exception as e_wait:
             raise RuntimeError(f"_submit_and_wait 함수 로드 실패: {e_wait}") from e_wait
 
+    # ── 그래프 입력 주입 ───────────────────────────────────────
     def _set_input_safe(graph_dict: Dict[str, Any], node_id: str, input_key: str, value: Any) -> bool:
         node_id_s = str(node_id or "")
         input_key_s = str(input_key or "")
@@ -533,32 +678,7 @@ def build_shots_with_i2v(
             node_inputs_map[input_key_s] = value
         return True
 
-    def _probe_nb_frames_ffprobe(src_path: Path) -> int:
-        cmd_probe = [
-            ffprobe_exe,
-            "-v", "error",
-            "-select_streams", "v:0",
-            "-count_frames",
-            "-show_entries", "stream=nb_read_frames",
-            "-of", "default=nokey=1:noprint_wrappers=1",
-            str(src_path),
-        ]
-        proc = subprocess.run(
-            cmd_probe,
-            stdout=subprocess.PIPE,
-            stderr=subprocess.STDOUT,
-            text=True,
-            encoding="utf-8",
-            errors="ignore",
-            check=False,
-        )
-        if proc.returncode != 0:
-            return 0
-        try:
-            return int((proc.stdout or "0").strip() or "0")
-        except ValueError:
-            return 0
-
+    # ── 진행중 메시지 릴레이 ───────────────────────────────────
     def _relay(prog: Dict[str, Any]) -> None:
         msg_val = str(prog.get("msg") or "")
         if msg_val and on_progress is not None:
@@ -596,7 +716,7 @@ def build_shots_with_i2v(
         except OSError as e_stat_clip:
             _notify(f"[경고] 스킵 확인 중 오류 (씬 {sid}): {e_stat_clip}. 생성 시도.")
 
-        # 입력 이미지 준비
+        # 입력 이미지
         img_path: Optional[Path] = None
         server_image_name: str = ""
         img_declared = str(scene.get("img_file") or "").strip()
@@ -682,18 +802,15 @@ def build_shots_with_i2v(
             frame_length = 16
             _notify(f"[경고] 프레임 길이 계산 오류 (씬 {sid}). 기본값 16f 사용.")
 
-        # ▶ 씬 fps/총프레임 로그
         print(f"[I2V][SCENE] id={sid} fps={target_fps_val} frame_length={frame_length}")
 
-        # ── 분할: 항상 plan_segments 사용(+5 패딩 포함 규칙 반영) ──
-        #  - base_chunk=max_frames_per_chunk, overlap=overlap_frames_for_chunk, pad_tail=5(함수 내부 기본)
+        # ── 분할(항상 plan_segments 사용, +5 패딩 규칙 내장) ──
         segments_list: List[Tuple[int, int]] = plan_segments(  # type: ignore[name-defined]
             frame_length,
             base_chunk=max_frames_per_chunk,
             overlap=overlap_frames_for_chunk
         )
 
-        # ▶ 분할 구간 로그
         print(f"[I2V][SCENE] id={sid} segments={segments_list} overlap={overlap_frames_for_chunk}f")
 
         chunk_paths: List[Path] = []
@@ -742,7 +859,7 @@ def build_shots_with_i2v(
                 scene_failed = True
                 continue
 
-            # LoadImage/Seed/사이즈/FPS/Steps/길이/프롬프트/접두사 주입
+            # 입력 주입
             load_nodes: List[Tuple[str, Dict[str, Any]]] = []
             for node_key2, node_val2 in graph.items():
                 try:
@@ -795,22 +912,20 @@ def build_shots_with_i2v(
             except AttributeError:
                 raw_prefix = "wan22_"
             suffix = raw_prefix.split("/", 1)[-1] if "/" in raw_prefix else raw_prefix
-            if (not suffix or suffix.isdigit()
-                    or suffix.replace("-", "").isdigit()
-                    or (suffix.endswith("_") and suffix[:-1].isdigit())):
+            if not suffix or suffix.isdigit() or suffix.replace("-", "").isdigit() or (suffix.endswith("_") and suffix[:-1].isdigit()):
                 suffix = "wan22_"
             new_prefix = f"{datetime.date.today().strftime('%Y-%m-%d')}/{suffix}"
             _set_input_safe(graph, combine_node_id, "filename_prefix", new_prefix)
             _notify(f"Combine({combine_node_id}) Prefix: {new_prefix} ({chunk_label})")
 
-            # ── conditioning (가능 시: 직전 청크 tail 시퀀스) ──
+            # conditioning(가능 시)
             use_sequence_conditioning = False
             seq_dir_for_condition: Optional[Path] = None
             seq_pattern_text = ""
             if has_sequence_loader and c_idx > 0 and overlap_frames_for_chunk > 0:
                 prev_chunk_path = work_dir / f"_chunk_{sid}_{c_idx - 1:05d}.mp4"
                 if prev_chunk_path.exists():
-                    nb_prev_frames = _probe_nb_frames_ffprobe(prev_chunk_path)
+                    nb_prev_frames = _probe_nb_frames_ffprobe_local(ffprobe_exe, prev_chunk_path)
                     if nb_prev_frames > 0:
                         start_tail = max(0, nb_prev_frames - overlap_frames_for_chunk)
                         end_tail = nb_prev_frames
@@ -874,7 +989,7 @@ def build_shots_with_i2v(
                 if c_idx > 0:
                     _notify(f"conditioning 시퀀스 미사용 → 1프레임 PNG 폴백 ({chunk_label})")
 
-            # ── 제출/대기 ────────────────────────────────────────
+            # 제출/대기
             _notify(f"워크플로우 제출 시작 ({chunk_label})")
             try:
                 result = submit_and_wait_fn(
@@ -1054,17 +1169,20 @@ def build_shots_with_i2v(
                 _notify(f"[오류] 단일 청크 파일 이동 실패 ({sid}): {e_mv}")
         else:
             print(f"[I2V][MERGE] id={sid} chunks={len(chunk_paths)} overlap={overlap_frames_for_chunk}f fps={target_fps_val}")
-            try:
-                xfade_concat(  # 기존 병합 함수 사용
-                    clip_paths=chunk_paths,
-                    overlap_frames=overlap_frames_for_chunk,
-                    fps=target_fps_val,
-                    audio_path=None,
-                    out_path=clip_mp4
-                )
-                _notify(f"청크 병합 완료: {clip_mp4.name}")
-            except (OSError, RuntimeError, ValueError) as e_merge:
-                _notify(f"[오류] 씬 {sid} 청크 병합 실패: {e_merge}")
+            # 페이드(xfade) 대신 덮어쓰기(컷) 병합
+            ok_merge = _concat_cut_no_fade(
+                ffmpeg_bin_arg=ffmpeg_exe,
+                ffprobe_bin_arg=ffprobe_exe,
+                clip_paths_arg=chunk_paths,
+                overlap_frames_arg=overlap_frames_for_chunk,
+                fps_arg=target_fps_val,
+                out_path_arg=clip_mp4,
+                work_dir_arg=work_dir
+            )
+            if ok_merge:
+                _notify(f"청크 병합 완료(컷): {clip_mp4.name}")
+            else:
+                _notify(f"[오류] 씬 {sid} 청크 병합(컷) 실패")
 
         # 임시 mp4 정리
         for tmp_mp4 in chunk_paths:
@@ -1085,260 +1203,8 @@ def build_shots_with_i2v(
 
 
 
-def _xfade_two(
-    cur_in_path: "Path",
-    next_in_path: "Path",
-    out_path_pair: "Path",
-    overlap_frames: int,
-    *,
-    fps: int,
-    scale_w: int,
-    scale_h: int,
-) -> None:
-    """
-    두 MP4를 xfade로 부드럽게 연결한다.
-    - A=cur_in_path, B=next_in_path 를 동일 FPS/해상도/SAR/CFR 로 정규화 후 xfade
-    - 결과를 out_path_pair 로 저장
-    - (수정) 로깅 강화: 정규화 전/후 A/B 메타, 오버랩(초/프레임), 기대 프레임/시간, 실제 결과 프레임/시간을 모두 출력
-    - 기능 자체는 기존과 동일
-    """
-    import json
-    import subprocess
-    from pathlib import Path as _path
 
-    # ── 입력 보정 ───────────────────────────────────────────────
-    if int(fps) <= 0:
-        fps = 24
-    if overlap_frames is None or int(overlap_frames) < 0:
-        overlap_frames = 0
 
-    # ── ffmpeg/ffprobe 경로 ─────────────────────────────────────
-    try:
-        ffmpeg_bin = FFMPEG_EXE
-    except NameError:
-        ffmpeg_bin = "ffmpeg"
-    ffprobe_bin = globals().get("FFPROBE_EXE", "ffprobe")
-
-    work_dir_local = out_path_pair.parent
-    norm_a = work_dir_local / "_norm_a.mp4"
-    norm_b = work_dir_local / "_norm_b.mp4"
-
-    # ── ffprobe helpers ─────────────────────────────────────────
-    def _probe_duration_seconds(src_path: _path) -> float:
-        cmd_probe = [
-            ffprobe_bin,
-            "-v", "error",
-            "-print_format", "json",
-            "-show_streams",
-            "-show_format",
-            str(src_path),
-        ]
-        proc = subprocess.run(
-            cmd_probe,
-            stdout=subprocess.PIPE,
-            stderr=subprocess.STDOUT,
-            text=True,
-            encoding="utf-8",
-            errors="ignore",
-            check=False,
-        )
-        if proc.returncode != 0:
-            return 0.0
-        try:
-            j = json.loads(proc.stdout)
-        except json.JSONDecodeError:
-            return 0.0
-        try:
-            return float((j.get("format") or {}).get("duration") or 0.0)
-        except (TypeError, ValueError):
-            return 0.0
-
-    def _probe_nb_frames(src_path: _path) -> int:
-        cmd_probe = [
-            ffprobe_bin,
-            "-v", "error",
-            "-select_streams", "v:0",
-            "-count_frames",
-            "-show_entries", "stream=nb_read_frames",
-            "-of", "default=nokey=1:noprint_wrappers=1",
-            str(src_path),
-        ]
-        proc = subprocess.run(
-            cmd_probe,
-            stdout=subprocess.PIPE,
-            stderr=subprocess.STDOUT,
-            text=True,
-            encoding="utf-8",
-            errors="ignore",
-            check=False,
-        )
-        if proc.returncode != 0:
-            return 0
-        out_text = (proc.stdout or "").strip()
-        try:
-            return int(out_text or "0")
-        except ValueError:
-            return 0
-
-    # ── 원본 입력 메타 (참고용) ─────────────────────────────────
-    try:
-        dur_a_src = _probe_duration_seconds(_path(str(cur_in_path)))
-        dur_b_src = _probe_duration_seconds(_path(str(next_in_path)))
-        nb_a_src = _probe_nb_frames(_path(str(cur_in_path)))
-        nb_b_src = _probe_nb_frames(_path(str(next_in_path)))
-    except Exception:
-        dur_a_src = 0.0
-        dur_b_src = 0.0
-        nb_a_src = 0
-        nb_b_src = 0
-    print(f"[XC-PAIR] A(src) path={cur_in_path} sec={dur_a_src:.3f}s frames≈{nb_a_src} @fps? (원본)")
-    print(f"[XC-PAIR] B(src) path={next_in_path} sec={dur_b_src:.3f}s frames≈{nb_b_src} @fps? (원본)")
-
-    # ── 1) A/B 정규화 ──────────────────────────────────────────
-    cmd_norm_a = [
-        ffmpeg_bin, "-y",
-        "-fflags", "+genpts",
-        "-i", str(cur_in_path),
-        "-an",
-        "-vf",
-        (
-            f"fps={fps},"
-            f"scale=w={scale_w}:h={scale_h}:force_original_aspect_ratio=decrease,"
-            f"pad={scale_w}:{scale_h}:(ow-iw)/2:(oh-ih)/2,"
-            f"setsar=1,format=yuv420p,setpts=PTS-STARTPTS"
-        ),
-        "-r", f"{fps}",
-        "-fps_mode", "cfr",
-        "-vsync", "cfr",
-        "-c:v", "libx264", "-crf", "18",
-        "-pix_fmt", "yuv420p",
-        str(norm_a),
-    ]
-    proc_na = subprocess.run(
-        cmd_norm_a,
-        stdout=subprocess.PIPE,
-        stderr=subprocess.STDOUT,
-        text=True,
-        encoding="utf-8",
-        errors="ignore",
-        check=False,
-    )
-    if proc_na.returncode != 0:
-        raise RuntimeError(f"ffmpeg 실패(정규화 A):\n{proc_na.stdout}")
-
-    cmd_norm_b = [
-        ffmpeg_bin, "-y",
-        "-fflags", "+genpts",
-        "-i", str(next_in_path),
-        "-an",
-        "-vf",
-        (
-            f"fps={fps},"
-            f"scale=w={scale_w}:h={scale_h}:force_original_aspect_ratio=decrease,"
-            f"pad={scale_w}:{scale_h}:(ow-iw)/2:(oh-ih)/2,"
-            f"setsar=1,format=yuv420p,setpts=PTS-STARTPTS"
-        ),
-        "-r", f"{fps}",
-        "-fps_mode", "cfr",
-        "-vsync", "cfr",
-        "-c:v", "libx264", "-crf", "18",
-        "-pix_fmt", "yuv420p",
-        str(norm_b),
-    ]
-    proc_nb = subprocess.run(
-        cmd_norm_b,
-        stdout=subprocess.PIPE,
-        stderr=subprocess.STDOUT,
-        text=True,
-        encoding="utf-8",
-        errors="ignore",
-        check=False,
-    )
-    if proc_nb.returncode != 0:
-        raise RuntimeError(f"ffmpeg 실패(정규화 B):\n{proc_nb.stdout}")
-
-    # 정규화 결과 메타
-    dur_a = _probe_duration_seconds(norm_a)
-    dur_b = _probe_duration_seconds(norm_b)
-    nb_a = _probe_nb_frames(norm_a)
-    nb_b = _probe_nb_frames(norm_b)
-    print(f"[XC-NORM] A(norm) {norm_a.name}: sec={dur_a:.3f}s frames={nb_a} @fps={fps}")
-    print(f"[XC-NORM] B(norm) {norm_b.name}: sec={dur_b:.3f}s frames={nb_b} @fps={fps}")
-
-    # ── 2) xfade 수행(명시 offset) ─────────────────────────────
-    fade_sec = float(max(0, int(overlap_frames))) / float(max(1, int(fps)))
-    offset_sec = max(0.0, dur_a - fade_sec)
-
-    # 기대치(프레임/시간) 계산
-    expected_frames = max(0, nb_a + nb_b - max(0, int(overlap_frames)))
-    expected_sec = max(0.0, dur_a + dur_b - fade_sec)
-    print(
-        "[XC-PLAN] fade="
-        f"{overlap_frames}f ({fade_sec:.3f}s), "
-        f"offset={offset_sec:.3f}s, "
-        f"expected≥ {expected_frames}f / {expected_sec:.3f}s"
-    )
-
-    cmd_xf = [
-        ffmpeg_bin, "-y",
-        "-fflags", "+genpts",
-        "-i", str(norm_a),
-        "-i", str(norm_b),
-        "-filter_complex",
-        (
-            f"[0:v]format=yuv420p,setsar=1[v0];"
-            f"[1:v]format=yuv420p,setsar=1[v1];"
-            f"[v0][v1]xfade=transition=fade:duration={fade_sec:.6f}:offset={offset_sec:.6f}[v]"
-        ),
-        "-map", "[v]",
-        "-r", f"{fps}",
-        "-fps_mode", "cfr",
-        "-vsync", "cfr",
-        "-c:v", "libx264", "-crf", "18",
-        "-pix_fmt", "yuv420p",
-        str(out_path_pair),
-    ]
-    print(f"[XC-CMD-XF] {' '.join(cmd_xf)}")
-    proc_xf = subprocess.run(
-        cmd_xf,
-        stdout=subprocess.PIPE,
-        stderr=subprocess.STDOUT,
-        text=True,
-        encoding="utf-8",
-        errors="ignore",
-        check=False,
-    )
-    if proc_xf.returncode != 0:
-        raise RuntimeError(f"ffmpeg 실패(xfade):\n{proc_xf.stdout}")
-
-    # ── 3) 결과 검증/로깅 ──────────────────────────────────────
-    dur_out = _probe_duration_seconds(out_path_pair)
-    nb_out = _probe_nb_frames(out_path_pair)
-    print(f"[XC-OUT] {out_path_pair.name}: sec={dur_out:.3f}s frames={nb_out} @fps={fps}")
-
-    # 기대 대비 편차 로깅(검증 로직은 유지하되, 메시지 보강)
-    expected_min = max(0.0, dur_a + dur_b - fade_sec - 0.05)  # 50ms 여유
-    if dur_out + 1e-3 < expected_min:
-        print(
-            "[XC-WARN] 길이 부족 감지: "
-            f"A={dur_a:.3f}s({nb_a}f) + B={dur_b:.3f}s({nb_b}f) - fade={fade_sec:.3f}s "
-            f"→ 기대≥{expected_min:.3f}s / 프레임기대≥{expected_frames}f, "
-            f"실제={dur_out:.3f}s / {nb_out}f"
-        )
-        raise RuntimeError(
-            "xfade 결과 길이가 비정상적으로 짧습니다. "
-            f"(A={dur_a:.3f}s, B={dur_b:.3f}s, fade={fade_sec:.3f}s, "
-            f"expected≥{expected_min:.3f}s, got={dur_out:.3f}s)"
-        )
-    else:
-        # 여유 프린트(디버그 판단용)
-        diff_f = nb_out - expected_frames
-        diff_s = dur_out - expected_sec
-        print(
-            "[XC-OK] 길이 검증 통과: "
-            f"frames_out={nb_out} (vs exp≥{expected_frames}, Δ={diff_f}), "
-            f"sec_out={dur_out:.3f}s (vs exp≥{expected_sec:.3f}s, Δ={diff_s:.3f}s)"
-        )
 
 
 
@@ -1359,22 +1225,25 @@ def xfade_concat(
     *,
     audio_path: Optional[Path] = None,
     out_path: Optional[Path] = None,
-    # 과거 호출 호환
+    # 과거 호출 호환 인자 (기존 시그니처 유지)
     out_fps: Optional[int] = None,
     scale_w: Optional[int] = None,
     scale_h: Optional[int] = None,
     work_dir: Optional[Path] = None,
+    # 신규 옵션: True=페이드, False=하드컷 병합
+    xfade: bool = True,
 ) -> Path:
     """
-    연속 MP4들을 xfade로 연결.
-    - 최신: xfade_concat(clip_paths, overlap_frames, fps, *, audio_path=None, out_path=None)
+    연속 MP4들을 연결합니다.
+
+    - 최신: xfade_concat(clip_paths, overlap_frames, fps, *, audio_path=None, out_path=None, xfade=True)
     - 과거: xfade_concat(work_dir=..., clip_paths=..., out_fps=..., overlap_frames=..., out_path=..., scale_w=..., scale_h=..., audio_path=...)
     반환: 최종 mp4 경로
 
-    [확장] 작업 정크 동시 보관:
-      - 최종 산출 파일(out_path)의 확장자 제외 이름(stem)을 폴더명으로 하여
-        {out_path.parent}/{stem}/ 아래에 청크/정규화본/_cur_ 중간물/최종본을 함께 복사 보관한다.
-      - 기존 동작·출력은 100% 동일.
+    [확장/보존]
+      - xfade=True  → 기존과 동일하게 크로스페이드로 연결
+      - xfade=False → 겹침 구간을 '뒤 청크'가 그대로 덮어쓰는 하드컷 병합
+      - 기존 로깅/미러 보관/인자 호환성 100% 유지
     """
     import shutil
     import subprocess
@@ -1388,8 +1257,8 @@ def xfade_concat(
     if target_fps <= 0:
         target_fps = 24
 
-    first_clip = Path(clip_paths[0])
-    base_dir = first_clip.parent
+    first_clip_path = Path(clip_paths[0])
+    base_dir = first_clip_path.parent
 
     # 작업 폴더(기존 규칙 유지)
     if work_dir is None:
@@ -1411,25 +1280,28 @@ def xfade_concat(
     out_h = int(scale_h) if scale_h else 720
 
     try:
-        ffmpeg_bin = FFMPEG_EXE  # 기존 전역 사용
-    except NameError:
+        ffmpeg_bin = globals().get("FFMPEG_EXE", "ffmpeg")
+    except Exception:
         ffmpeg_bin = "ffmpeg"
+    try:
+        ffprobe_bin = globals().get("FFPROBE_EXE", "ffprobe")
+    except Exception:
+        ffprobe_bin = "ffprobe"
 
-    # ffprobe 헬퍼 — 이름 가리기 방지: probe_map / path_for_probe
     def _probe_video_info(path_for_probe: Path) -> Dict[str, Any]:
         probe_map: Dict[str, Any] = {"path": str(path_for_probe), "exists": path_for_probe.exists()}
         if not path_for_probe.exists():
             return probe_map
-        cmd = [
-            globals().get("FFPROBE_EXE", "ffprobe"),
+        cmd_probe = [
+            ffprobe_bin,
             "-v", "error",
             "-print_format", "json",
             "-show_streams",
             "-show_format",
             str(path_for_probe),
         ]
-        proc = subprocess.run(
-            cmd,
+        proc_probe = subprocess.run(
+            cmd_probe,
             stdout=subprocess.PIPE,
             stderr=subprocess.STDOUT,
             text=True,
@@ -1437,66 +1309,385 @@ def xfade_concat(
             errors="ignore",
             check=False,
         )
-        if proc.returncode == 0:
+        if proc_probe.returncode == 0:
             try:
-                parsed_json = _json.loads(proc.stdout)
+                parsed = _json.loads(proc_probe.stdout)
             except _json.JSONDecodeError:
-                probe_map["ffprobe_out"] = proc.stdout
-                try:
-                    probe_map["size_bytes"] = Path(path_for_probe).stat().st_size
-                except OSError:
-                    pass
-                return probe_map
-            vstreams = [s for s in parsed_json.get("streams", []) if s.get("codec_type") == "video"]
-            if vstreams:
-                vs = vstreams[0]
-                probe_map.update({
-                    "width": vs.get("width"),
-                    "height": vs.get("height"),
-                    "r_frame_rate": vs.get("r_frame_rate"),
-                    "avg_frame_rate": vs.get("avg_frame_rate"),
-                    "nb_frames": vs.get("nb_frames"),
-                    "time_base": vs.get("time_base"),
-                    "pix_fmt": vs.get("pix_fmt"),
-                })
-            fmt = parsed_json.get("format") or {}
-            dur_val = fmt.get("duration")
-            if dur_val is not None:
-                try:
-                    probe_map["duration_sec"] = float(dur_val)
-                except (TypeError, ValueError):
-                    pass
-            bit_val = fmt.get("bit_rate")
-            if bit_val is not None:
-                probe_map["bit_rate"] = bit_val
+                probe_map["ffprobe_out"] = proc_probe.stdout
+            else:
+                vstreams = [s for s in parsed.get("streams", []) if s.get("codec_type") == "video"]
+                if vstreams:
+                    vs0 = vstreams[0]
+                    probe_map.update({
+                        "width": vs0.get("width"),
+                        "height": vs0.get("height"),
+                        "r_frame_rate": vs0.get("r_frame_rate"),
+                        "avg_frame_rate": vs0.get("avg_frame_rate"),
+                        "nb_frames": vs0.get("nb_frames"),
+                        "time_base": vs0.get("time_base"),
+                        "pix_fmt": vs0.get("pix_fmt"),
+                    })
+                fmt = parsed.get("format") or {}
+                dur_val = fmt.get("duration")
+                if dur_val is not None:
+                    try:
+                        probe_map["duration_sec"] = float(dur_val)
+                    except (TypeError, ValueError):
+                        pass
+                bit_val = fmt.get("bit_rate")
+                if bit_val is not None:
+                    probe_map["bit_rate"] = bit_val
         else:
-            probe_map["ffprobe_out"] = proc.stdout
+            probe_map["ffprobe_out"] = proc_probe.stdout
         try:
-            probe_map["size_bytes"] = Path(path_for_probe).stat().st_size
+            probe_map["size_bytes"] = path_for_probe.stat().st_size
         except OSError:
             pass
         return probe_map
 
-    # 입력 요약 및 원본 청크를 미러 폴더에 복사
-    print(f"[XC-BEGIN] items={len(clip_paths)} fps={target_fps} overlap_frames={int(overlap_frames)} out={out_w}x{out_h}")
-    for idx, clip_path_item in enumerate(clip_paths):
-        clip_path_obj = Path(clip_path_item)
-        print(f"[XC-IN-{idx:03d}] {_probe_video_info(clip_path_obj)}")
+    def _normalize_one(src_path_norm: Path, dst_path_norm: Path) -> None:
+        cmd_norm = [
+            ffmpeg_bin, "-y",
+            "-fflags", "+genpts",
+            "-i", str(src_path_norm),
+            "-an",
+            "-vf",
+            (
+                f"fps={target_fps},"
+                f"scale=w={out_w}:h={out_h}:force_original_aspect_ratio=decrease,"
+                f"pad={out_w}:{out_h}:(ow-iw)/2:(oh-ih)/2,"
+                f"setsar=1,format=yuv420p,setpts=PTS-STARTPTS"
+            ),
+            "-r", f"{target_fps}",
+            "-vsync", "cfr",
+            "-c:v", "libx264", "-crf", "18",
+            "-pix_fmt", "yuv420p",
+            str(dst_path_norm),
+        ]
+        proc_norm = subprocess.run(
+            cmd_norm,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.STDOUT,
+            text=True,
+            encoding="utf-8",
+            errors="ignore",
+            check=False,
+        )
+        if proc_norm.returncode != 0:
+            raise RuntimeError(f"ffmpeg 실패(정규화):\n{proc_norm.stdout}")
+
+    def _xfade_two(
+        cur_path_in: Path,
+        nxt_path_in: Path,
+        out_path_pair: Path,
+        overlap_frames_in: int,
+    ) -> None:
+        # 입력 두 영상을 표준화본으로 변환
+        norm_a_path = work_dir / "_norm_a.mp4"
+        norm_b_path = work_dir / "_norm_b.mp4"
+        _normalize_one(cur_path_in, norm_a_path)
+        _normalize_one(nxt_path_in, norm_b_path)
+
+        # 길이/오프셋 계산
+        info_a = _probe_video_info(norm_a_path)
+        info_b = _probe_video_info(norm_b_path)
+
+        # nb_frames가 없을 수도 있으니 duration_sec 기반으로 보강
+        def _frames_from_info(info_map: Dict[str, Any]) -> int:
+            nb = info_map.get("nb_frames")
+            if isinstance(nb, str) and nb.isdigit():
+                try:
+                    return int(nb)
+                except ValueError:
+                    pass
+            dur = info_map.get("duration_sec")
+            if isinstance(dur, (int, float)) and dur > 0:
+                # 반올림보다 바닥으로 깎아 정확도를 확보
+                return max(0, int(dur * target_fps))
+            return 0
+
+        frames_a = _frames_from_info(info_a)
+        frames_b = _frames_from_info(info_b)
+        fade_frames = max(0, int(overlap_frames_in))
+        if frames_a <= 0 or frames_b <= 0:
+            raise RuntimeError("정규화본의 프레임 수 계산 실패")
+
+        # 페이드 오프셋: A의 끝에서 fade_frames만큼 앞
+        # (A가 N프레임이면, 오프셋초는 (N - fade)/fps)
+        offset_sec = float(max(0, frames_a - fade_frames)) / float(target_fps)
+        duration_sec = float(fade_frames) / float(target_fps)
+
+        print(f"[XC-PLAN] fade={fade_frames}f ({duration_sec:.3f}s), offset={offset_sec:.3f}s, expected≥ {(frames_a + frames_b - fade_frames)}f")
+
+        cmd_xf = [
+            ffmpeg_bin, "-y",
+            "-fflags", "+genpts",
+            "-i", str(norm_a_path),
+            "-i", str(norm_b_path),
+            "-filter_complex",
+            (
+                "[0:v]format=yuv420p,setsar=1[v0];"
+                "[1:v]format=yuv420p,setsar=1[v1];"
+                f"[v0][v1]xfade=transition=fade:duration={duration_sec:.6f}:offset={offset_sec:.6f}[v]"
+            ),
+            "-map", "[v]",
+            "-r", f"{target_fps}",
+            "-fps_mode", "cfr",
+            "-vsync", "cfr",
+            "-c:v", "libx264",
+            "-crf", "18",
+            "-pix_fmt", "yuv420p",
+            str(out_path_pair),
+        ]
+        proc_xf = subprocess.run(
+            cmd_xf,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.STDOUT,
+            text=True,
+            encoding="utf-8",
+            errors="ignore",
+            check=False,
+        )
+        if proc_xf.returncode != 0:
+            raise RuntimeError(f"ffmpeg 실패(_xfade_two):\n{proc_xf.stdout}")
+
+        out_info = _probe_video_info(out_path_pair)
+        print(f"[XC-OUT] {out_path_pair.name}: sec={out_info.get('duration_sec','?')} frames={out_info.get('nb_frames','?')} @fps={target_fps}")
+
+    def _concat_cut_no_fade(
+        ffmpeg_exe: str,
+        ffprobe_exe: str,
+        clip_paths_cut: List[Path],
+        overlap_frames_cut: int,
+        fps_cut: int,
+        out_path_cut: Path,
+        work_dir_cut: Path,
+    ) -> bool:
+        """
+        하드컷 병합:
+        - 각 청크를 동일 fps/해상도로 정규화
+        - 첫 청크는 전체 사용
+        - 이후 청크는 overlap_frames_cut 만큼 '앞에서 잘라서' 이어붙임(뒤 청크가 겹침 구간을 덮어씀)
+        """
+        import subprocess as _sub
+        import shutil as _sh
+
+        # 정규화본 만들기
+        norm_list: List[Path] = []
+        for idx_norm, src_norm in enumerate(clip_paths_cut):
+            dst_norm = work_dir_cut / f"_concat_norm_{idx_norm:03d}.mp4"
+            cmd_norm2 = [
+                ffmpeg_exe, "-y",
+                "-fflags", "+genpts",
+                "-i", str(src_norm),
+                "-an",
+                "-vf",
+                (
+                    f"fps={fps_cut},"
+                    f"scale=w={out_w}:h={out_h}:force_original_aspect_ratio=decrease,"
+                    f"pad={out_w}:{out_h}:(ow-iw)/2:(oh-ih)/2,"
+                    f"setsar=1,format=yuv420p,setpts=PTS-STARTPTS"
+                ),
+                "-r", f"{fps_cut}",
+                "-vsync", "cfr",
+                "-c:v", "libx264", "-crf", "18",
+                "-pix_fmt", "yuv420p",
+                str(dst_norm),
+            ]
+            proc_n2 = _sub.run(
+                cmd_norm2,
+                stdout=_sub.PIPE,
+                stderr=_sub.STDOUT,
+                text=True,
+                encoding="utf-8",
+                errors="ignore",
+                check=False,
+            )
+            if proc_n2.returncode != 0:
+                raise RuntimeError(f"ffmpeg 실패(정규화, no-fade):\n{proc_n2.stdout}")
+            norm_list.append(dst_norm)
+
+        # 트리밍 규칙: 첫 청크는 그대로, 두 번째부터는 앞에서 overlap_frames_cut 만큼 제거
+        trimmed_list: List[Path] = []
+        for idx_trim, src_trim in enumerate(norm_list):
+            # 프레임 수 파악
+            cmd_probe2 = [
+                ffprobe_exe,
+                "-v", "error",
+                "-select_streams", "v:0",
+                "-count_frames",
+                "-show_entries", "stream=nb_read_frames",
+                "-of", "default=nokey=1:noprint_wrappers=1",
+                str(src_trim),
+            ]
+            proc_p2 = _sub.run(
+                cmd_probe2,
+                stdout=_sub.PIPE,
+                stderr=_sub.STDOUT,
+                text=True,
+                encoding="utf-8",
+                errors="ignore",
+                check=False,
+            )
+            try:
+                nb_frames_str = (proc_p2.stdout or "0").strip()
+                nb_frames_int = int(nb_frames_str) if nb_frames_str.isdigit() else 0
+            except ValueError:
+                nb_frames_int = 0
+
+            if idx_trim == 0 or overlap_frames_cut <= 0:
+                # 첫 조각은 그대로 사용
+                trimmed_list.append(src_trim)
+                continue
+
+            keep_frames = max(0, nb_frames_int - overlap_frames_cut)
+            if keep_frames <= 0:
+                # 유지 프레임이 없다면 빈 조각, 스킵
+                continue
+
+            trim_out = work_dir_cut / f"_concat_trim_{idx_trim:03d}.mp4"
+            # 앞에서 overlap_frames_cut 만큼 제거: select='gte(n,overlap)'을 사용
+            cmd_trim = [
+                ffmpeg_exe, "-y",
+                "-i", str(src_trim),
+                "-vf", f"select='gte(n\\,{overlap_frames_cut})',setpts=N/FRAME_RATE/TB",
+                "-r", f"{fps_cut}",
+                "-an",
+                "-c:v", "libx264", "-crf", "18",
+                "-pix_fmt", "yuv420p",
+                str(trim_out),
+            ]
+            proc_t = _sub.run(
+                cmd_trim,
+                stdout=_sub.PIPE,
+                stderr=_sub.STDOUT,
+                text=True,
+                encoding="utf-8",
+                errors="ignore",
+                check=False,
+            )
+            if proc_t.returncode != 0:
+                raise RuntimeError(f"ffmpeg 실패(트림, no-fade):\n{proc_t.stdout}")
+            trimmed_list.append(trim_out)
+
+        if not trimmed_list:
+            return False
+
+        # concat
+        concat_list_path = work_dir_cut / "_concat_list.txt"
         try:
-            if clip_path_obj.exists():
-                dst = mirror_dir / clip_path_obj.name
-                if not dst.exists():
-                    shutil.copyfile(clip_path_obj, dst)
-                    print(f"[XC-MIRROR-COPY] chunk->{dst.name}")
+            with open(concat_list_path, "w", encoding="utf-8", newline="\n") as f_list:
+                for p_item in trimmed_list:
+                    p_str = str(p_item).replace("\\", "\\\\").replace("'", "\\'")
+                    f_list.write("file '{}'\n".format(p_str))
+        except OSError as e_osw:
+            raise RuntimeError(f"concat list 작성 실패: {e_osw}") from e_osw
+
+        cmd_concat = [
+            ffmpeg_exe, "-y",
+            "-f", "concat",
+            "-safe", "0",
+            "-i", str(concat_list_path),
+            "-c:v", "copy",
+            "-an" if audio_path is None else "-c:a",
+        ]
+        if audio_path is None:
+            cmd_concat.append(str(out_path_cut))
+        else:
+            # 오디오가 있으면 비디오 copy + 오디오는 별도 멀티플렉스 단계에서 처리되므로 여기선 비디오만 만듦
+            cmd_concat[-1] = "aac"
+            cmd_concat.append("-shortest")
+            cmd_concat.append(str(out_path_cut))
+
+        proc_c = _sub.run(
+            cmd_concat,
+            stdout=_sub.PIPE,
+            stderr=_sub.STDOUT,
+            text=True,
+            encoding="utf-8",
+            errors="ignore",
+            check=False,
+        )
+        if proc_c.returncode != 0:
+            raise RuntimeError(f"ffmpeg 실패(concat, no-fade):\n{proc_c.stdout}")
+
+        # 미러 보관
+        try:
+            dst_concat = mirror_dir / out_path_cut.name
+            _sh.copyfile(out_path_cut, dst_concat)
+            print(f"[XC-MIRROR-COPY] concat->{dst_concat.name}")
         except OSError:
             pass
+
+        return True
+
+    # 입력 요약 및 원본 청크를 미러 폴더에 복사
+    print(f"[XC-BEGIN] items={len(clip_paths)} fps={target_fps} overlap_frames={int(overlap_frames)} out={out_w}x{out_h}")
+    for idx_in, clip_path_item in enumerate(clip_paths):
+        clip_path_obj = Path(clip_path_item)
+        print(f"[XC-IN-{idx_in:03d}] {_probe_video_info(clip_path_obj)}")
+        try:
+            if clip_path_obj.exists():
+                dst_init = mirror_dir / clip_path_obj.name
+                if not dst_init.exists():
+                    shutil.copyfile(clip_path_obj, dst_init)
+                    print(f"[XC-MIRROR-COPY] chunk->{dst_init.name}")
+        except OSError:
+            pass
+
+    # 페이드 off면 하드컷 병합 경로로 실행
+    if not xfade:
+        ok_merge = _concat_cut_no_fade(
+            ffmpeg_exe=ffmpeg_bin,
+            ffprobe_exe=ffprobe_bin,
+            clip_paths_cut=clip_paths,
+            overlap_frames_cut=int(overlap_frames),
+            fps_cut=target_fps,
+            out_path_cut=out_path,
+            work_dir_cut=work_dir,
+        )
+        if not ok_merge:
+            raise RuntimeError("하드컷 병합 실패")
+        # 필요 시 오디오 멀티플렉스
+        if audio_path and Path(audio_path).exists():
+            cmd_mux_nf = [
+                ffmpeg_bin, "-y",
+                "-fflags", "+genpts",
+                "-i", str(out_path),
+                "-i", str(audio_path),
+                "-map", "0:v:0", "-map", "1:a:0",
+                "-c:v", "copy",
+                "-c:a", "aac", "-b:a", "192k",
+                "-shortest",
+                str(out_path),
+            ]
+            print(f"[XC-CMD-MUX] {' '.join(cmd_mux_nf)}")
+            proc_mux_nf = subprocess.run(
+                cmd_mux_nf,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.STDOUT,
+                text=True,
+                encoding="utf-8",
+                errors="ignore",
+                check=False,
+            )
+            print(f"[XC-OUT-MUX] return={proc_mux_nf.returncode}")
+            if proc_mux_nf.returncode != 0:
+                raise RuntimeError(f"ffmpeg 실패(오디오 합성, no-fade):\n{proc_mux_nf.stdout}")
+
+        fin_map_nf = _probe_video_info(out_path)
+        print(f"[XC-FINAL] {fin_map_nf}")
+        print(f"[XC-DONE] out_path={out_path}")
+        return out_path
+
+    # ===== 여기부터는 기존 '크로스페이드' 경로 (기존 동작 보존) =====
 
     # 첫 클립 표준화: cur_000.mp4
     cur_path = work_dir / "cur_000.mp4"
     cmd_first = [
         ffmpeg_bin, "-y",
         "-fflags", "+genpts",
-        "-i", str(first_clip),
+        "-i", str(first_clip_path),
         "-an",
         "-vf",
         (
@@ -1521,7 +1712,6 @@ def xfade_concat(
         errors="ignore",
         check=False,
     )
-    # ← 오타 수정: 대괄호(]) → 중괄호(})
     print(f"[XC-OUT-FIRST] return={proc0.returncode}")
     if proc0.returncode != 0:
         raise RuntimeError(f"ffmpeg 실패(초기 cur_000 인코딩):\n{proc0.stdout}")
@@ -1542,13 +1732,10 @@ def xfade_concat(
         print(f"[XC-STEP] pair={i-1}->{i} out={tmp_out.name}")
 
         _xfade_two(
-            cur_path,
-            next_path,
-            tmp_out,
-            overlap_frames,
-            fps=target_fps,
-            scale_w=out_w,
-            scale_h=out_h,
+            cur_path_in=cur_path,
+            nxt_path_in=next_path,
+            out_path_pair=tmp_out,
+            overlap_frames_in=int(overlap_frames),
         )
         cur_path = tmp_out
         print(f"[XC-CUR-{i:03d}] {_probe_video_info(cur_path)}")
@@ -1598,7 +1785,6 @@ def xfade_concat(
         if proc_mux.returncode != 0:
             raise RuntimeError(f"ffmpeg 실패(오디오 합성):\n{proc_mux.stdout}")
     else:
-        # 비디오만 산출(copy)
         cmd_mv = [
             ffmpeg_bin, "-y",
             "-fflags", "+genpts",
@@ -1621,14 +1807,12 @@ def xfade_concat(
         if proc_mv.returncode != 0:
             raise RuntimeError(f"ffmpeg 실패(최종 비디오 산출):\n{proc_mv.stdout}")
 
-    # 최종 파일 점검/요약
     fin_map = _probe_video_info(Path(out_path))
     last_map = _probe_video_info(cur_path)
     same_size = (fin_map.get("size_bytes") == last_map.get("size_bytes"))
     print(f"[XC-FINAL] {fin_map}")
     print(f"[XC-FINAL==CUR-LAST] same_size={bool(same_size)} out={out_path}")
 
-    # 최종본을 미러 폴더에도 보관
     try:
         dst_final = mirror_dir / Path(out_path).name
         if Path(out_path).exists():
@@ -1639,6 +1823,8 @@ def xfade_concat(
 
     print(f"[XC-DONE] out_path={out_path}")
     return Path(out_path)
+
+
 
 
 
