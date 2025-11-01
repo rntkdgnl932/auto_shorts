@@ -53,7 +53,7 @@ FINAL_OUT: str = r"C:\my_games\shorts_make\maked_title\[title]"
 # ComfyUI 로그 tail (원하면 환경변수로 덮어쓰기)
 COMFY_LOG_FILE: str | None = os.getenv("COMFY_LOG_FILE", r"C:\comfy310\ComfyUI\user\comfyui.log")
 CHARACTER_DIR = r"C:\my_games\shorts_make\character"
-COMFY_INPUT_DIR   = r"C:\my_games\shorts_make\comfy_input"       # (원하면) Comfy input
+COMFY_INPUT_DIR   = r"C:\comfy310\ComfyUI\input"       # (원하면) Comfy input
 COMFY_OUTPUT_DIR  = r"C:\my_games\shorts_make\comfy_output"      # (원하면) Comfy output
 # ComfyUI 서버 주소
 COMFY_HOST: str = os.environ.get("COMFY_HOST", "http://127.0.0.1:8188")

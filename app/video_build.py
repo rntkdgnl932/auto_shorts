@@ -812,21 +812,22 @@ def build_shots_with_i2v(
             _notify(f"scene={sid} 입력 이미지를 찾을 수 없음 → 건너뜁니다.")
             continue
 
+        _notify(f"[{sid}] 씬 처리 시작. 입력 이미지: {str(img_path)}")
+
         try:
             server_image_name = img_path.name
             dest = comfy_input_dir / server_image_name
-            do_copy = True
-            if dest.exists():
-                try:
-                    if dest.stat().st_mtime >= img_path.stat().st_mtime:
-                        do_copy = False
-                except OSError:
-                    do_copy = True
-            if do_copy:
-                shutil.copy2(str(img_path), str(dest))
-                _notify(f"이미지 복사 완료: {server_image_name} -> {comfy_input_dir.name}")
+
+            # [수정됨] 타임스탬프 검사 없이 항상 덮어쓰도록 강제합니다.
+            # shutil.copy2는 대상 파일이 있어도 덮어씁니다.
+            shutil.copy2(str(img_path), str(dest))
+            _notify(f"이미지 복사 완료 (덮어쓰기): {server_image_name} -> {comfy_input_dir.name}")
+
         except OSError as e_copy:
             _notify(f"[경고] 이미지 준비 실패({img_path.name}): {e_copy}")
+
+
+
         if not server_image_name:
             _notify(f"[오류] 이미지 이름 설정 불가 (씬 {sid}). 다음 씬으로.")
             continue

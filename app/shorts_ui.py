@@ -860,8 +860,8 @@ class MainWindow(QtWidgets.QMainWindow):
             # ▶ 프로젝트분석 버튼: seg → story → AI (비동기)
             (_btn(ui, "btn_test1_story") or _btn(self, "btn_test1_story"), self.on_click_build_story_from_seg_async),
 
-            (_btn(ui, "btn_test2_1_img") or _btn(self, "btn_test2_1_img"),
-             self.on_click_test2_1_generate_missing_images_with_log),
+            (_btn(ui, "btn_missing_img") or _btn(self, "btn_missing_img"),
+             self.on_click_generate_missing_images_with_log),
             (_btn(ui, "btn_analyze") or _btn(self, "btn_analyze"), self.on_click_analyze_music),
             (_btn(ui, "btn_convert_toggle") or _btn(self, "btn_convert_toggle"), self.on_convert_toggle),
         ]
@@ -1524,14 +1524,14 @@ class MainWindow(QtWidgets.QMainWindow):
         run_job_with_progress_async(self, "가사 생성", job, tail_file=log_path, on_done=done)
 
     # --- 누락 이미지 생성: 비동기 + 진행창 로그 (no _guess_project_dir) ---
-    def on_click_test2_1_generate_missing_images_with_log(self) -> None:
+    def on_click_generate_missing_images_with_log(self) -> None:
         """video.json만 대상으로 누락된 씬 이미지를 생성한다(진행창/실시간 로그)."""
         from PyQt5 import QtWidgets
         from pathlib import Path
         from typing import Optional
 
         # ----- 0) 버튼 비활성화(있을 때만) -----
-        btn = getattr(self, "btn_test2_1_img", None) or getattr(getattr(self, "ui", None), "btn_test2_1_img", None)
+        btn = getattr(self, "btn_missing_img", None) or getattr(getattr(self, "ui", None), "btn_missing_img", None)
         if isinstance(btn, QtWidgets.QAbstractButton):
             btn.setEnabled(False)
 
@@ -4070,12 +4070,12 @@ class MainWindow(QtWidgets.QMainWindow):
 
         # ==== ★ 테스트 버튼 3개 추가 ====
         self.btn_test1_story = QtWidgets.QPushButton("프로젝트분석")
-        self.btn_test2_render = QtWidgets.QPushButton("테스트2: story→샷 렌더")
-        self.btn_test3_concat = QtWidgets.QPushButton("테스트3: 샷 합치기")
-        self.btn_test2_1_img = QtWidgets.QPushButton("테스트2_1: 누락 이미지 생성")
+        self.btn_merging_videos = QtWidgets.QPushButton("영상합치기")
+        self.btn_lyrics_in = QtWidgets.QPushButton("가사넣기")
+        self.btn_missing_img = QtWidgets.QPushButton("누락 이미지 생성")
 
         row_test = QtWidgets.QHBoxLayout()
-        for b in (self.btn_test1_story, self.btn_test2_render, self.btn_test3_concat, self.btn_test2_1_img):
+        for b in (self.btn_test1_story, self.btn_merging_videos, self.btn_lyrics_in, self.btn_missing_img):
             row_test.addWidget(b)
 
         # 메인 탭
@@ -4779,10 +4779,6 @@ class MainWindow(QtWidgets.QMainWindow):
         self.btn_video.clicked.connect(self.on_video)
 
 
-        # self.btn_test2_1_img.clicked.connect(self.on_generate_missing_images)
-
-
-
         # 라디오 ↔ JSON 즉시 동기화 (toggled True일 때만 저장)
         self.rb_20s.toggled.connect(lambda on: on and self._on_seconds_changed(20))
         self.rb_1m.toggled.connect(lambda on: on and self._on_seconds_changed(60))
@@ -4790,8 +4786,8 @@ class MainWindow(QtWidgets.QMainWindow):
         self.rb_3m.toggled.connect(lambda on: on and self._on_seconds_changed(180))
 
         # 테스트
-        self.btn_test2_render.clicked.connect(self.on_test2_render_story)
-        self.btn_test3_concat.clicked.connect(self.on_test3_concat_segments)
+        self.btn_merging_videos.clicked.connect(self.merging_videos_start)
+        self.btn_lyrics_in.clicked.connect(self.lyrics_in_start)
 
     # ────────────── 토글/태그 유틸 ──────────────
     def _on_tags_changed(self, *_args) -> None:
@@ -6578,7 +6574,7 @@ class MainWindow(QtWidgets.QMainWindow):
 
     def _force_unlock_all_buttons(self):
         for name in (
-                "btn_test1_story", "btn_test2_render", "btn_test3_concat",
+                "btn_test1_story", "btn_merging_videos", "btn_lyrics_in",
                 "btn_analyze", "btn_test1",
                 "btn_gen", "btn_save"
         ):
@@ -7323,236 +7319,23 @@ class MainWindow(QtWidgets.QMainWindow):
 
     # ======= /end =======
 
-    # ==== [테스트2] story.json → 씬 렌더(이미지 누락 검사, 중복 pass) ==========
-    def on_test2_render_story(self) -> None:
+    # ==== 완성된 영상 합치기 ==========
+    def merging_videos_start(self) -> None:
         """
-        story.json 의 scenes 를 순서대로 렌더
-        - 이미지 경로: scene.img_file (없으면 FINAL_OUT\[title]\imgs\[id].png 추정)
-        - 출력:       FINAL_OUT\[title]\segmentation\[id].mp4
-        - 이미 있으면 pass / 누락 이미지 있으면 경고 후 중단
-        - 누락이 있을 때, '캐릭터 2명 이상' 필요한 scene도 같이 경고에 표시
+        - video.json 을 보고 각 씬의 {id}.mp4가 프로젝트 폴더 내에 있는지 찾는다
+        - 없다면 영상생성(i2v) 실행하여 각 씬의 mp4를 모두 생성한다.
+        - 생성된 mp4를 각 씬의 순서에 맞게 병합한다.
+        - 병합된 mp4는 music_vocal_ready.mp4로 저장한다.(프로젝트폴더 내)
+        - music_ready.mp4 와 이미 만들어진 음악파일(vocal.wav)을 싱크해서 완전한 뮤직비디오를 완성한다. => music_ready.mp4
         """
-        from pathlib import Path
-        from PyQt5 import QtCore, QtWidgets  # type: ignore
+        print("merging_videos_start")
 
-        try:
-            # --- 기본 타이틀/스토리 확보 ---
-            title_text = (self.le_title.text() or "").strip() or "untitled"
-            story_obj = self._read_story(title_text)
-            scene_list = story_obj.get("scenes") or []
-            if not scene_list:
-                QtWidgets.QMessageBox.warning(self, "안내", "story.json에 scenes가 없습니다.")
-                return
-
-            # --- 출력/이미지 폴더 보장 ---
-            imgs_dir_path = Path(self._img_dir_for_title(title_text))
-            seg_dir_path = Path(self._seg_dir_for_title(title_text))
-            imgs_dir_path.mkdir(parents=True, exist_ok=True)
-            seg_dir_path.mkdir(parents=True, exist_ok=True)
-
-            # --- 이미지 해석 헬퍼 (내부 함수) ---
-            def _resolve_img_by_scene(scene_id_key: str, img_file_val: str | None) -> Path:
-                """
-                우선순위:
-                  1) img_file_val가 가리키는 파일(절대/상대 모두 허용)
-                     - 상대경로라면 imgs_dir_path/<파일명>도 함께 확인
-                  2) imgs_dir_path/<scene_id_key>.(png|jpg|jpeg|webp) 순서로 첫 존재 파일
-                  3) 최종 기본값: imgs_dir_path/<scene_id_key>.png (존재 여부와 무관)
-                주의:
-                  - 바깥 스코프의 'scene_id'를 가리지 않도록 매개변수명을 'scene_id_key'로 사용.
-                  - imgs_dir_path는 바깥 스코프에 Path로 존재한다고 가정(읽기 전용).
-                """
-                base_dir = imgs_dir_path  # 외부 스코프 읽기 전용 사용 (이름 가리기 없음)
-
-                # 1) 명시 경로 우선
-                if img_file_val:
-                    p0 = Path(img_file_val)
-                    try:
-                        # 상대경로면 base_dir/<파일명>도 후보로 확인
-                        if not p0.is_absolute():
-                            p0_in_base = base_dir / p0.name
-                            try:
-                                if p0_in_base.exists() and p0_in_base.stat().st_size > 0:
-                                    return p0_in_base
-                            except OSError:
-                                pass
-                        # 원래 p0 경로도 검사
-                        try:
-                            if p0.exists() and p0.stat().st_size > 0:
-                                return p0
-                        except OSError:
-                            pass
-                    except OSError:
-                        # 상위로 올리지 않고 다음 후보 진행
-                        pass
-
-                # 2) scene_id_key 기반 확장자 탐색
-                for ext in (".png", ".jpg", ".jpeg", ".webp"):
-                    p1 = base_dir / f"{scene_id_key}{ext}"
-                    try:
-                        if p1.exists() and p1.stat().st_size > 0:
-                            return p1
-                    except OSError:
-                        continue
-
-                # 3) 최종 기본값
-                return base_dir / f"{scene_id_key}.png"
-
-            # --- 누락 이미지/다인 캐릭터 검사 ---
-            missing_lines: list[str] = []
-            multi_char_ids: list[str] = []
-            for sc in scene_list:
-                sid_val = sc.get("id") or sc.get("title") or f"t_{int(sc.get('idx', 0) or 0):02d}"
-                img_path_try = _resolve_img_by_scene(sid_val, sc.get("img_file"))
-                try:
-                    if not (img_path_try.exists() and img_path_try.stat().st_size > 0):
-                        missing_lines.append(f"{sid_val} → {img_path_try}")
-                except OSError:
-                    missing_lines.append(f"{sid_val} → {img_path_try}")
-
-                ch_list = sc.get("characters") or []
-                if isinstance(ch_list, list) and len(ch_list) >= 2:
-                    multi_char_ids.append(sid_val)
-
-            if missing_lines:
-                msg_lines = [
-                    "누락 이미지가 있어 중단합니다.",
-                    "",
-                    "[누락 이미지]",
-                    *missing_lines[:30],
-                ]
-                if len(missing_lines) > 30:
-                    msg_lines.append(f"... (총 {len(missing_lines)}개 중 30개만 표시)")
-                if multi_char_ids:
-                    msg_lines.extend(["", "[2명 이상 캐릭터가 필요한 장면(참고)]", ", ".join(multi_char_ids)])
-                QtWidgets.QMessageBox.warning(self, "이미지 누락", "\n".join(msg_lines))
-                return
-
-            # --- FPS, 크기 읽기(안전 폴백 포함) ---
-            try:
-                fps_val = int(getattr(self, "sb_outfps").value())  # type: ignore[attr-defined]
-            except Exception:
-                fps_val = 24
-            try:
-                out_w_val = int(getattr(self, "sb_outw").value())  # type: ignore[attr-defined]
-            except Exception:
-                out_w_val = 480
-            try:
-                out_h_val = int(getattr(self, "sb_outh").value())  # type: ignore[attr-defined]
-            except Exception:
-                out_h_val = 720
-
-            made_count, skip_count, fail_count = 0, 0, 0
-
-            prog_dlg = QtWidgets.QProgressDialog("샷 렌더링 중…", "중지", 0, len(scene_list), self)
-            self.setWindowModality(QtCore.Qt.WindowModality.WindowModal)
-            prog_dlg.setMinimumDuration(0)
-
-            for idx1, sc in enumerate(scene_list, 1):
-                if prog_dlg.wasCanceled():
-                    break
-
-                scene_id = sc.get("id") or f"t_{idx1:02d}"
-
-                # duration 계산(초) : scene.duration → 없으면 end-start
-                try:
-                    dur_sec = float(sc.get("duration") or (float(sc.get("end", 0)) - float(sc.get("start", 0))) or 0.0)
-                except (TypeError, ValueError):
-                    dur_sec = 0.0
-                if dur_sec <= 0.0:
-                    fail_count += 1
-                    prog_dlg.setLabelText(f"{scene_id}: 유효하지 않은 duration")
-                    prog_dlg.setValue(idx1)
-                    continue
-
-                img_path = _resolve_img_by_scene(scene_id, sc.get("img_file"))
-                out_path = seg_dir_path / f"{scene_id}.mp4"
-
-                # 이미 존재하면 건너뜀
-                try:
-                    if out_path.exists() and out_path.stat().st_size > 0:
-                        skip_count += 1
-                    else:
-                        ok_flag = self._build_clip_from_image(
-                            img=img_path,
-                            out_mp4=out_path,
-                            duration=dur_sec,
-                            fps=fps_val,
-                            width=out_w_val,
-                            height=out_h_val,
-                        )
-                        if ok_flag:
-                            made_count += 1
-                        else:
-                            fail_count += 1
-                except OSError:
-                    fail_count += 1
-
-                prog_dlg.setLabelText(f"{scene_id}: 완료({made_count}) / 건너뜀({skip_count}) / 실패({fail_count})")
-                prog_dlg.setValue(idx1)
-
-            prog_dlg.close()
-            QtWidgets.QMessageBox.information(
-                self,
-                "테스트2",
-                f"컷 렌더 완료\n\n생성: {made_count} | 건너뜀: {skip_count} | 실패: {fail_count}\n폴더: {seg_dir_path}",
-            )
-            self.status.showMessage(f"컷 렌더 완료 — 생성 {made_count}, skip {skip_count}, 실패 {fail_count}")
-
-        except Exception as e:
-            from PyQt5 import QtWidgets  # type: ignore
-            QtWidgets.QMessageBox.critical(self, "오류", str(e))
-            self.status.showMessage(f"오류: {e}")
-
-    # ==== [테스트3] 샷 합치기 (이미 있으면 pass) ================================
-    def on_test3_concat_segments(self):
+    # ==== 가사넣기 ================================
+    def lyrics_in_start(self):
         """
-        FINAL_OUT\[title]\segmentation 의 t_xx.mp4 들을 scenes 순서대로 합쳐 final_story.mp4 생성
-        - 이미 최종 파일 있으면 pass
+        - music_ready.mp4 파일에 제목과 가사를 주입하고 완성하기 => music.mp4
         """
-        try:
-            title = self.le_title.text().strip() or "untitled"
-            story = self._read_story(title)
-            scenes = story.get("scenes") or []
-            if not scenes:
-                QtWidgets.QMessageBox.warning(self, "테스트3", "story.json 에 scenes 가 없습니다.")
-                return
-
-            seg_dir = self._seg_dir_for_title(title)
-            out_dir = self._final_out_for_title(title)
-            final_path = out_dir / "final_story.mp4"
-            if final_path.exists() and final_path.stat().st_size > 0:
-                QtWidgets.QMessageBox.information(self, "테스트3", f"이미 최종 파일이 있습니다.\n{final_path}")
-                return
-
-            clips = [seg_dir / f"{sc.get('id')}.mp4" for sc in scenes]
-            clips = [p for p in clips if p.exists() and p.stat().st_size > 0]
-            if not clips:
-                QtWidgets.QMessageBox.warning(self, "테스트3", "합칠 mp4를 찾지 못했습니다.")
-                return
-
-            filelist = seg_dir / "_concat.txt"
-            with open(filelist, "w", encoding="utf-8") as fp:
-                for p in clips:
-                    safe = str(p).replace("\\", "\\\\").replace("'", "\\'")
-                    fp.write(f"file '{safe}'\n")
-
-            import subprocess, shlex
-            ff = self._ff()
-            cmd = [ff, "-y", "-f", "concat", "-safe", "0", "-i", str(filelist),
-                   "-c", "copy", str(final_path)]
-            print("[TEST3] ffmpeg:", " ".join(shlex.quote(x) for x in cmd), flush=True)
-            cp = subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
-            if cp.returncode != 0 or not final_path.exists():
-                QtWidgets.QMessageBox.critical(self, "테스트3", f"합치기 실패\n{cp.stderr[:1200]}")
-                return
-
-            QtWidgets.QMessageBox.information(self, "테스트3", f"완료: {final_path}")
-            self.status.showMessage(f"완료: {final_path}")
-
-        except Exception as e:
-            QtWidgets.QMessageBox.critical(self, "오류", str(e))
-            self.status.showMessage(f"오류: {e}")
+        print("lyrics_in_start")
 
 
 # ───────── 워크플로 저장 노드(class_type) 영구 수정 도우미 ─────────

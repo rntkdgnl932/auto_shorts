@@ -1,0 +1,9 @@
+[ui] 가사 생성 시작
+[ai] prefer=gemini, secs=30
+[ai] prefer=gemini, allow_fallback=False, sec=30, lines=6-8
+[gemini] model=gemini-2.5-pro
+[gemini] len=354
+[provider] gemini model=gemini-2.5-pro
+[parse] text_len=354
+[parse] ok
+[normalize] lyrics generated without language tags
