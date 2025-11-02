@@ -4058,33 +4058,40 @@ class MainWindow(QtWidgets.QMainWindow):
 
         # 버튼들
         self.btn_gen = QtWidgets.QPushButton("가사생성")
-
         self.btn_save = QtWidgets.QPushButton("프로젝트 저장")
         self.btn_load_proj = QtWidgets.QPushButton("프로젝트 불러오기")
         self.btn_music = QtWidgets.QPushButton("음악생성(ACE-Step)")
-        self.btn_show_progress = QtWidgets.QPushButton("테스트")
+        self.btn_show_progress = QtWidgets.QPushButton("테스트")  # (생성하지만 레이아웃에 추가 안 함)
         self.btn_video = QtWidgets.QPushButton("영상생성(i2v)")
         self.btn_analyze = QtWidgets.QPushButton("음악분석")
-        # self.btn_analyze.hide()  # 음악생성 완료 시 자동 분석으로 대체
 
-
-
-        row = QtWidgets.QHBoxLayout()
-        row.addWidget(self.btn_gen)  # ① 가사생성 추가
-        self._add_clear_button_next_to_generate(row)  # ② ← 여기로 이동/교체
-        for b in (self.btn_save, self.btn_load_proj, self.btn_music, # ③ 나머지 버튼들
-                  self.btn_show_progress, self.btn_video, self.btn_analyze):
-            row.addWidget(b)
-
-        # ==== ★ 테스트 버튼 3개 추가 ====
         self.btn_test1_story = QtWidgets.QPushButton("프로젝트분석")
         self.btn_merging_videos = QtWidgets.QPushButton("영상합치기")
         self.btn_lyrics_in = QtWidgets.QPushButton("가사넣기")
         self.btn_missing_img = QtWidgets.QPushButton("누락 이미지 생성")
 
+        # --- [수정됨] 버튼 레이아웃 재배치 ---
+
+        # 첫째 줄: 가사생성, 초기화, 프로젝트저장, 프로젝트불러오기, 음악생성
+        row = QtWidgets.QHBoxLayout()
+        row.addWidget(self.btn_gen)
+        self._add_clear_button_next_to_generate(row)  # "초기화" 버튼 추가
+        row.addWidget(self.btn_save)
+        row.addWidget(self.btn_load_proj)
+        row.addWidget(self.btn_music)
+        row.addStretch(1)  # 버튼을 왼쪽으로 정렬
+
+        # 둘째 줄: 음악분석, 프로젝트분석, 누락이미지 생성, 영상생성, 영상합치기, 가사넣기
         row_test = QtWidgets.QHBoxLayout()
-        for b in (self.btn_test1_story, self.btn_merging_videos, self.btn_lyrics_in, self.btn_missing_img):
-            row_test.addWidget(b)
+        row_test.addWidget(self.btn_analyze)
+        row_test.addWidget(self.btn_test1_story)
+        row_test.addWidget(self.btn_missing_img)
+        row_test.addWidget(self.btn_video)
+        row_test.addWidget(self.btn_merging_videos)
+        row_test.addWidget(self.btn_lyrics_in)
+        row_test.addStretch(1)  # 버튼을 왼쪽으로 정렬
+
+        # --- [수정 끝] ---
 
         # 메인 탭
         main_tab = QtWidgets.QWidget()
