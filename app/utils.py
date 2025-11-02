@@ -297,8 +297,8 @@ try:
     from app import settings as settings    # 소문자 별칭
     from app.settings import BASE_DIR
 except ImportError:
-    import settings as settings             # 소문자 별칭
-    from settings import BASE_DIR
+    from app import settings as settings  # 소문자 별칭
+    from app.settings import BASE_DIR
 
 S = settings  # noqa: N816
 

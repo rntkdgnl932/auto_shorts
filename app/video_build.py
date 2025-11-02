@@ -8,6 +8,7 @@ from pathlib import Path
 from pathlib import Path as _Path
 import json as _json
 import time, requests, shutil
+import os       # (파일 상단에 import os 추가)
 
 try:
     from app.utils import load_json, save_json, ensure_dir
@@ -226,7 +227,6 @@ def _apply_overrides(graph: dict, overrides: Dict[str, Any]) -> None:
 # video_build.py (파일 하단에 추가)
 
 import subprocess
-import glob
 
 
 # (이미 파일 상단에 import 되어 있어야 함: Path, List, Callable, Dict, Any, load_json, build_shots_with_i2v, FFMPEG_EXE)
@@ -373,6 +373,93 @@ def mux_video_and_audio(video_in_path: Path, audio_in_path: Path, out_path: Path
     result = subprocess.run(cmd, capture_output=True, text=True, encoding="utf-8", errors="ignore")
     if result.returncode != 0:
         raise RuntimeError(f"FFMPEG 오디오/비디오 병합 실패:\n{result.stderr}")
+
+
+def add_subtitles_with_ffmpeg(video_in_path: Path,
+                              video_json_path: Path,
+                              out_path: Path,
+                              ffmpeg_exe: str,
+                              font_path: str = "C:/Windows/Fonts/malgun.ttf") -> str:
+    """
+    FFMPEG의 drawtext 필터를 사용하여 video.json의 자막을 비디오에 직접 하드코딩합니다.
+    MoviePy가 필요 없습니다.
+    """
+
+    # 1. 폰트 경로 FFMPEG 호환 형식으로 변경 (Windows 용)
+    # [수정됨] 1. os.path.sep ('\')을 FFMPEG 친화적인 '/'로 먼저 변경합니다.
+    font_path_ffmpeg = font_path.replace(os.path.sep, "/")
+    # [수정됨] 2. 그 다음, Windows 드라이브 문자의 ':'를 이스케이프합니다.
+    font_path_ffmpeg = font_path_ffmpeg.replace(":", "\\:")
+
+    # 2. video.json 로드
+    video_data = load_json(video_json_path, {}) or {}
+    scenes = video_data.get("scenes", [])
+    title = video_data.get("title", "제목 없음")
+
+    filters = []
+
+    # 3. 제목 필터 생성 (예: 0.5초 ~ 3.5초간 표시)
+    if title:
+        # FFMPEG 텍스트 필터는 특수문자(' : \) 이스케이프 처리가 필요합니다.
+        title_escaped = title.replace("'", "'\\\\''").replace(":", "\\:").replace("\\", "\\\\")
+        filters.append(
+            f"drawtext=fontfile='{font_path_ffmpeg}':text='{title_escaped}':"
+            f"fontsize=70:fontcolor=white:box=1:boxcolor=black@0.5:boxborderw=5:"
+            f"x=(w-text_w)/2:y=h*0.2:"  # 상단 20% 위치
+            f"enable='between(t,0.5,3.5)'"
+        )
+
+    # 4. 가사 필터 생성
+    for scene in scenes:
+        lyric = scene.get("lyric", "").strip()
+        if not lyric:
+            continue  # 가사가 없는 씬(gap_002 등) 건너뛰기
+
+        start = scene.get("start", 0.0)
+        end = scene.get("end", 0.0)
+        if end <= start:
+            continue
+
+        # FFMPEG 텍스트 필터 이스케이프
+        lyric_escaped = lyric.replace("'", "'\\\\''").replace(":", "\\:").replace("\\", "\\\\").replace("\n", "\\n")
+
+        filters.append(
+            f"drawtext=fontfile='{font_path_ffmpeg}':text='{lyric_escaped}':"
+            f"fontsize=48:fontcolor=white:box=1:boxcolor=black@0.5:boxborderw=4:"
+            f"x=(w-text_w)/2:y=h*0.8:"  # 하단 80% 위치
+            f"enable='between(t,{start},{end})'"
+        )
+
+    if not filters:
+        # 자막이 없으면 그냥 복사하고 반환
+        shutil.copy2(str(video_in_path), str(out_path))
+        return str(out_path)
+
+    # 5. FFMPEG 명령어 생성
+    filter_complex_string = ",".join(filters)
+
+    cmd = [
+        ffmpeg_exe,
+        "-y",
+        "-i", str(video_in_path),
+        "-vf", filter_complex_string,  # 비디오 필터로 자막 적용
+        "-c:a", "copy",  # 오디오는 그대로 복사
+        "-c:v", "libx264",  # 비디오는 재인코딩 (자막을 입혀야 하므로)
+        "-preset", "fast",  # 빠른 인코딩
+        "-crf", "22",  # 적절한 품질
+        "-pix_fmt", "yuv420p",  # 호환성
+        str(out_path)
+    ]
+
+    # 6. FFMPEG 실행
+    result = subprocess.run(cmd, capture_output=True, text=True, encoding="utf-8", errors="ignore")
+    if result.returncode != 0:
+        # 오류 발생 시, FFMPEG 로그를 포함하여 예외 발생
+        raise RuntimeError(f"FFMPEG 자막 삽입 실패:\n{result.stderr}")
+
+    return str(out_path)
+
+
 
 # ── i2v 샷 생성 ────────────────────────────────────────────────────────────
 
@@ -2542,7 +2629,7 @@ def _set_face_on_reactors(
 
 
 
-from settings import CHARACTER_DIR, COMFY_INPUT_DIR
+from app.settings import CHARACTER_DIR, COMFY_INPUT_DIR
 
 def _resolve_character_image_path(scene: dict, story: dict) -> str | None:
     from pathlib import Path

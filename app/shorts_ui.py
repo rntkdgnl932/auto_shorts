@@ -1,6 +1,7 @@
 ﻿from __future__ import annotations
 # ↓ 최상단, 어떤 import보다 먼저 들어가야 함!
 
+
 # CPU 강제(선택)
 # ★ 다른 import 전에 최상단에 추가 (가장 중요)
 import os
@@ -35,7 +36,7 @@ try:
     from app.image_movie_docs import normalize_to_v11  # type: ignore
 except Exception:
     try:
-        from video_build import normalize_to_v11  # type: ignore
+        from app.video_build import normalize_to_v11  # type: ignore
     except Exception:
         def normalize_to_v11(story: dict) -> dict:  # type: ignore
             return story
@@ -47,7 +48,7 @@ from app.audio_sync import build_story_json  # ← story/analyze 사용
 try:
     from app.image_movie_docs import apply_intro_outro_to_story_json
 except ImportError:
-    from video_build import apply_intro_outro_to_story_json
+    from app.video_build import apply_intro_outro_to_story_json
 # shorts_ui.py (상단 import 구역에 추가)
 try:
     from app.utils import save_story_overwrite_with_prompts
@@ -56,13 +57,17 @@ except ImportError:
 import re
 _CANON_RE = re.compile(r"[^a-z0-9]+")
 try:
-    from utils import AI
+    from app.utils import AI
 except ImportError:
-    from app.ai import AI  # type: ignore
+    from app.utils import AI  # type: ignore
 try:
     from app.video_build import build_and_merge_full_video
 except ImportError:
     from video_build import build_and_merge_full_video
+try:
+    from app.video_build import add_subtitles_with_ffmpeg
+except ImportError:
+    from video_build import add_subtitles_with_ffmpeg
 # ── 유연한 임포트 ──────────────────────────────────────────────────────────────
 try:
     # 모듈 통째로도 가져오되, 하위 함수/상수는 직접 임포트(둘 다 지원)
@@ -80,17 +85,17 @@ try:
     from app.tag_norm import normalize_tags_to_english
 except ImportError:
     # noinspection PyPep8Naming
-    import settings as S  # type: ignore
-    from settings import (  # type: ignore
+    from app import settings as S  # type: ignore
+    from app.settings import (  # type: ignore
         BASE_DIR, COMFY_HOST, DEFAULT_CHUNK, DEFAULT_OVERLAP, DEFAULT_INPUT_FPS, DEFAULT_TARGET_FPS,
         JSONS_DIR, ACE_STEP_PROMPT_JSON, I2V_WORKFLOW, AUDIO_SAVE_FORMAT, FFMPEG_EXE, USE_HWACCEL, FINAL_OUT,
         DEFAULT_HOST_CANDIDATES, save_overrides
     )
-    from utils import sanitize_title, audio_duration_sec, load_json, save_json            # type: ignore
-    from lyrics_gen import generate_title_lyrics_tags, create_project_files               # type: ignore
-    from video_build import build_shots_with_i2v, xfade_concat, recalc_overlap                             # type: ignore
-    from audio_sync import generate_music_with_acestep, rewrite_prompt_audio_format                         # type: ignore
-    from utils import normalize_tags_to_english                                                          # type: ignore                                                       # type: ignore                                                   # type: ignore
+    from app.utils import sanitize_title, audio_duration_sec, load_json, save_json  # type: ignore
+    from app.lyrics_gen import generate_title_lyrics_tags, create_project_files  # type: ignore
+    from app.video_build import build_shots_with_i2v, xfade_concat, recalc_overlap  # type: ignore
+    from app.audio_sync import generate_music_with_acestep, rewrite_prompt_audio_format  # type: ignore
+    from app.utils import normalize_tags_to_english                                                        # type: ignore                                                       # type: ignore                                                   # type: ignore
 
 # ==== CRASH LOGGER (붙여넣기) ====
 # from pathlib import Path as _Path # Path 중복 import
@@ -2166,7 +2171,7 @@ class MainWindow(QtWidgets.QMainWindow):
                     from ai import AI  # type: ignore #
                 except ImportError:
                     # utils.AI가 최종 폴백인지 확인 필요, 없다면 NameError 발생 가능
-                    from utils import AI  # type: ignore
+                    from app.utils import AI  # type: ignore
 
         except ImportError as import_err_libs:
             QtWidgets.QMessageBox.critical(self, "오류", f"필수 라이브러리 로드 실패: {import_err_libs}")
@@ -7362,9 +7367,61 @@ class MainWindow(QtWidgets.QMainWindow):
     # ==== 가사넣기 ================================
     def lyrics_in_start(self):
         """
-        - music_ready.mp4 파일에 제목과 가사를 주입하고 완성하기 => music.mp4
+        [수정됨] music_ready.mp4 파일에 video.json의 제목과 가사를 주입하고
+        최종본인 music.mp4 (또는 final_with_subs.mp4)를 생성합니다.
+        (MoviePy 대신 FFMPEG drawtext 사용)
         """
-        print("lyrics_in_start")
+        proj_dir_str = self._current_project_dir()
+        if not proj_dir_str:
+            QtWidgets.QMessageBox.warning(self, "오류", "프로젝트가 열려있지 않습니다.")
+            return
+
+        proj_dir = Path(proj_dir_str)
+        video_ready_path = proj_dir / "music_ready.mp4"
+        video_json_path = proj_dir / "video.json"
+        final_output_path = proj_dir / "final_with_subs.mp4"  # 최종 파일 이름
+
+        if not video_ready_path.exists():
+            QtWidgets.QMessageBox.warning(self, "오류", f"원본 영상({video_ready_path.name})이 없습니다.\n'영상 합치기'를 먼저 실행하세요.")
+            return
+
+        if not video_json_path.exists():
+            QtWidgets.QMessageBox.warning(self, "오류", f"자막 정보({video_json_path.name})가 없습니다.\n'프로젝트분석'을 먼저 실행하세요.")
+            return
+
+        # FFMPEG 경로 가져오기
+        try:
+            from app.settings import FFMPEG_EXE
+        except ImportError:
+            from settings import FFMPEG_EXE  # type: ignore
+
+        # --- 백그라운드 작업 정의 ---
+        def job(progress_callback):
+            progress_callback({"msg": "FFMPEG으로 자막/제목 삽입 시작..."})
+
+            final_path = add_subtitles_with_ffmpeg(
+                video_in_path=video_ready_path,
+                video_json_path=video_json_path,
+                out_path=final_output_path,
+                ffmpeg_exe=FFMPEG_EXE,  #
+                font_path="C:/Windows/Fonts/malgun.ttf"  # 폰트 경로 (필요시 수정)
+            )
+            return final_path
+
+        # --- 완료 콜백 정의 ---
+        def done(ok: bool, payload, err):
+            if not ok:
+                QtWidgets.QMessageBox.critical(self, "자막 삽입 실패", str(err))
+            else:
+                QtWidgets.QMessageBox.information(self, "자막 삽입 완료", f"최종 영상 생성 완료:\n{payload}")
+
+        # --- 비동기 실행 ---
+        run_job_with_progress_async(
+            owner=self,
+            title="자막 및 제목 삽입 중",
+            job=job,
+            on_done=done
+        )
 
 
 # ───────── 워크플로 저장 노드(class_type) 영구 수정 도우미 ─────────

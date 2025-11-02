@@ -4,9 +4,9 @@ import re
 from typing import List
 
 try:
-    from utils import AI
+    from app.utils import AI
 except Exception:
-    from app.ai import AI  # type: ignore
+    from app.utils import AI  # type: ignore
 
 # 유연한 임포트 (패키지/단일 파일 실행 모두 지원)
 from app.utils import ensure_project_dir, save_json, write_text, now_kr, today_str
