@@ -1859,10 +1859,10 @@ class MainWindow(QtWidgets.QMainWindow):
             self._music_inflight = False
             QtWidgets.QMessageBox.warning(self, "음악 생성 오류", str(e))
 
-    def on_click_analyze_music(self) -> None:
+    def on_click_analyze_music(self, *, on_done_override: Optional[Callable] = None) -> None: # <-- 시그니처 수정
         """
         (단순화) 음악분석: UI에서 필요한 정보를 수집하여 audio_sync.py의 핵심 분석 함수를 호출하고
-        결과를 다이얼로그로 표시합니다. 모든 복잡한 로직은 audio_sync 모듈로 이전되었습니다.
+        ...
         """
         from pathlib import Path
         from PyQt5 import QtWidgets
@@ -1931,29 +1931,31 @@ class MainWindow(QtWidgets.QMainWindow):
         # --- 3. 작업 완료 후(done) 콜백 정의 ---
         def done(ok: bool, payload: dict, err):
             try:
-                if not ok:
+                if on_done_override:
+                    on_done_override(ok, payload, err)  # 매크로 콜백이 있으면 그것만 호출
+                elif not ok:
                     QtWidgets.QMessageBox.critical(self, "음악분석 실패", str(err))
                     return
+                else:
+                    summary = (payload or {}).get("summary_text", "분석 결과 요약을 가져오지 못했습니다.")
+                    print("\n[음악분석 결과]\n" + summary, flush=True)
 
-                summary = (payload or {}).get("summary_text", "분석 결과 요약을 가져오지 못했습니다.")
-                print("\n[음악분석 결과]\n" + summary, flush=True)
-
-                # 결과 표시 다이얼로그
-                dlg = QtWidgets.QDialog(self)
-                dlg.setWindowTitle("음악분석 결과")
-                dlg.resize(1000, 760)
-                vbox = QtWidgets.QVBoxLayout(dlg)
-                ed = QtWidgets.QPlainTextEdit()
-                ed.setReadOnly(True)
-                ed.setPlainText(summary)
-                vbox.addWidget(ed)
-                btn_close = QtWidgets.QPushButton("닫기")
-                btn_close.clicked.connect(dlg.accept)
-                row = QtWidgets.QHBoxLayout()
-                row.addStretch(1)
-                row.addWidget(btn_close)
-                vbox.addLayout(row)
-                dlg.exec_()
+                    # 결과 표시 다이얼로그
+                    dlg = QtWidgets.QDialog(self)
+                    dlg.setWindowTitle("음악분석 결과")
+                    dlg.resize(1000, 760)
+                    vbox = QtWidgets.QVBoxLayout(dlg)
+                    ed = QtWidgets.QPlainTextEdit()
+                    ed.setReadOnly(True)
+                    ed.setPlainText(summary)
+                    vbox.addWidget(ed)
+                    btn_close = QtWidgets.QPushButton("닫기")
+                    btn_close.clicked.connect(dlg.accept)
+                    row = QtWidgets.QHBoxLayout()
+                    row.addStretch(1)
+                    row.addWidget(btn_close)
+                    vbox.addLayout(row)
+                    dlg.exec_()
             finally:
                 if isinstance(btn, QtWidgets.QAbstractButton):
                     btn.setEnabled(True)
@@ -4070,22 +4072,32 @@ class MainWindow(QtWidgets.QMainWindow):
         self.btn_lyrics_in = QtWidgets.QPushButton("가사넣기")
         self.btn_missing_img = QtWidgets.QPushButton("누락 이미지 생성")
 
+        # --- ▼▼▼ 신규 매크로 버튼 생성 ▼▼▼ ---
+        self.btn_macro_analyze = QtWidgets.QPushButton("분석")
+        self.btn_macro_analyze.setToolTip("음악분석 -> 프로젝트분석을 순차적으로 실행합니다.")
+        self.btn_macro_build_video = QtWidgets.QPushButton("영상만들기")
+        self.btn_macro_build_video.setToolTip("영상생성(i2v) -> 영상합치기 -> 가사넣기를 순차적으로 실행합니다.")
+        # --- ▲▲▲ 신규 매크로 버튼 생성 ▲▲▲ ---
+
         # --- [수정됨] 버튼 레이아웃 재배치 ---
 
-        # 첫째 줄: 가사생성, 초기화, 프로젝트저장, 프로젝트불러오기, 음악생성
+        # 첫째 줄: 가사생성, 초기화, 프로젝트저장, 프로젝트불러오기, 음악생성, 분석(매크로), 누락 이미지 생성, 영상만들기(매크로)
         row = QtWidgets.QHBoxLayout()
         row.addWidget(self.btn_gen)
         self._add_clear_button_next_to_generate(row)  # "초기화" 버튼 추가
         row.addWidget(self.btn_save)
         row.addWidget(self.btn_load_proj)
         row.addWidget(self.btn_music)
+        row.addSpacing(15)  # 구분선
+        row.addWidget(self.btn_macro_analyze)  # <-- "분석" 매크로 추가
+        row.addWidget(self.btn_missing_img)  # <-- "누락 이미지 생성" 이동
+        row.addWidget(self.btn_macro_build_video)  # <-- "영상만들기" 매크로 추가
         row.addStretch(1)  # 버튼을 왼쪽으로 정렬
 
-        # 둘째 줄: 음악분석, 프로젝트분석, 누락이미지 생성, 영상생성, 영상합치기, 가사넣기
+        # 둘째 줄: 음악분석, 프로젝트분석, 영상생성, 영상합치기, 가사넣기
         row_test = QtWidgets.QHBoxLayout()
         row_test.addWidget(self.btn_analyze)
         row_test.addWidget(self.btn_test1_story)
-        row_test.addWidget(self.btn_missing_img)
         row_test.addWidget(self.btn_video)
         row_test.addWidget(self.btn_merging_videos)
         row_test.addWidget(self.btn_lyrics_in)
@@ -4803,6 +4815,11 @@ class MainWindow(QtWidgets.QMainWindow):
         # 테스트
         self.btn_merging_videos.clicked.connect(self.merging_videos_start)
         self.btn_lyrics_in.clicked.connect(self.lyrics_in_start)
+
+        # --- ▼▼▼ 신규 매크로 버튼 연결 ▼▼▼ ---
+        self.btn_macro_analyze.clicked.connect(self.on_click_macro_analyze)
+        self.btn_macro_build_video.clicked.connect(self.on_click_macro_build_video)
+        # --- ▲▲▲ 신규 매크로 버튼 연결 ▲▲▲ ---
 
     # ────────────── 토글/태그 유틸 ──────────────
     def _on_tags_changed(self, *_args) -> None:
@@ -7008,7 +7025,7 @@ class MainWindow(QtWidgets.QMainWindow):
         return moved
 
     # ────────────── 영상 빌드(선택) ──────────────
-    def on_video(self) -> None:
+    def on_video(self, *, on_done_override: Optional[Callable] = None) -> None:  # <-- 시그니처 수정
         """
         영상 생성:
           - UI에서 W/H/FPS/스텝 값을 읽어 build_shots_with_i2v로 전달.
@@ -7019,19 +7036,17 @@ class MainWindow(QtWidgets.QMainWindow):
         from pathlib import Path
         from typing import Any, Dict, Optional, Callable
         from PyQt5 import QtWidgets
-        import inspect # inspect 모듈은 시그니처 확인에 필요
+        import inspect  # inspect 모듈은 시그니처 확인에 필요
         import traceback
-
-
 
         # --- 버튼 상태 관리 ---
         btn_video_widget: Optional[QtWidgets.QAbstractButton] = None
         for btn_name in ("btn_video", "btn_build_video"):
-             widget_candidate = getattr(self, btn_name, None) or \
-                                getattr(getattr(self, "ui", None), btn_name, None)
-             if isinstance(widget_candidate, QtWidgets.QAbstractButton):
-                  btn_video_widget = widget_candidate
-                  break
+            widget_candidate = getattr(self, btn_name, None) or \
+                               getattr(getattr(self, "ui", None), btn_name, None)
+            if isinstance(widget_candidate, QtWidgets.QAbstractButton):
+                btn_video_widget = widget_candidate
+                break
 
         if btn_video_widget:
             btn_video_widget.setEnabled(False)
@@ -7043,7 +7058,8 @@ class MainWindow(QtWidgets.QMainWindow):
             ui_fps: Optional[int] = None
             ui_steps: Optional[int] = None
 
-            def _get_ui_int_value(widget_name: str, data_attr: str = "currentData", default_val: Optional[int] = None) -> Optional[int]:
+            def _get_ui_int_value(widget_name: str, data_attr: str = "currentData",
+                                  default_val: Optional[int] = None) -> Optional[int]:
                 """UI 위젯에서 정수 값을 안전하게 읽어옴."""
                 widget = getattr(self, widget_name, None)
                 if widget is not None:
@@ -7052,20 +7068,20 @@ class MainWindow(QtWidgets.QMainWindow):
                         if callable(value_method):
                             raw_value = value_method()
                             if callable(raw_value):
-                                 print(f"[경고] UI 값 읽기 오류 ({widget_name}): 함수 반환.")
-                                 return default_val
+                                print(f"[경고] UI 값 읽기 오류 ({widget_name}): 함수 반환.")
+                                return default_val
                             if raw_value is not None:
                                 try:
-                                    return int(raw_value) # type: ignore
+                                    return int(raw_value)  # type: ignore
                                 except (ValueError, TypeError) as e_int_conv:
                                     print(f"[경고] UI 값 정수 변환 실패 ({widget_name}, 값: '{raw_value}'): {e_int_conv}")
                                     return default_val
                             else:
                                 return default_val
                     except (AttributeError) as e_attr:
-                         print(f"[경고] UI 위젯 속성 접근 실패 ({widget_name}.{data_attr}): {e_attr}")
+                        print(f"[경고] UI 위젯 속성 접근 실패 ({widget_name}.{data_attr}): {e_attr}")
                     except Exception as e_get_val_unexpected:
-                         print(f"[경고] UI 값 읽기 중 예상치 못한 오류 ({widget_name}): {e_get_val_unexpected}")
+                        print(f"[경고] UI 값 읽기 중 예상치 못한 오류 ({widget_name}): {e_get_val_unexpected}")
                 return default_val
 
             ui_w = _get_ui_int_value("cmb_img_w", "currentData")
@@ -7084,28 +7100,29 @@ class MainWindow(QtWidgets.QMainWindow):
                 except Exception as e_get_proj_inner:
                     print(f"[경고] 프로젝트 경로 얻기 실패 (_current_project_dir): {e_get_proj_inner}")
             if not proj_dir_val:
-                 proj_dir_attr = getattr(self, "project_dir", None)
-                 if isinstance(proj_dir_attr, (str, Path)):
-                     proj_dir_val = str(proj_dir_attr)
+                proj_dir_attr = getattr(self, "project_dir", None)
+                if isinstance(proj_dir_attr, (str, Path)):
+                    proj_dir_val = str(proj_dir_attr)
 
             if not proj_dir_val:
                 QtWidgets.QMessageBox.warning(self, "오류", "프로젝트 폴더가 선택되지 않았습니다.")
-                return # finally 블록에서 버튼 활성화
+                return  # finally 블록에서 버튼 활성화
             pdir = Path(proj_dir_val)
 
             # --- 백그라운드 작업 함수 정의 (콜백 인자 추가) ---
-            def _job(progress_callback: Callable[[Dict[str, Any]], None]) -> None: # <-- 콜백 인자 명시
+            def _job(progress_callback: Callable[[Dict[str, Any]], None]) -> None:  # <-- 콜백 인자 명시
                 """영상 생성을 수행하는 백그라운드 작업 함수."""
-                build_func_local: Optional[Callable] = None # <-- 변수명 변경
+                build_func_local: Optional[Callable] = None  # <-- 변수명 변경
                 try:
-                    from app.video_build import build_shots_with_i2v as build_func_imp # type: ignore
+                    from app.video_build import build_shots_with_i2v as build_func_imp  # type: ignore
                     build_func_local = build_func_imp
                 except (ImportError, ModuleNotFoundError, AttributeError):
                     try:
-                         from video_build import build_shots_with_i2v as build_func_imp2 # type: ignore
-                         build_func_local = build_func_imp2
+                        from video_build import build_shots_with_i2v as build_func_imp2  # type: ignore
+                        build_func_local = build_func_imp2
                     except (ImportError, ModuleNotFoundError, AttributeError) as e_import_vb_inner:
-                         raise ImportError(f"video_build.build_shots_with_i2v 로드 실패: {e_import_vb_inner}") from e_import_vb_inner
+                        raise ImportError(
+                            f"video_build.build_shots_with_i2v 로드 실패: {e_import_vb_inner}") from e_import_vb_inner
 
                 tframes = 0
                 sb_total_widget = getattr(self, "sb_total", None)
@@ -7115,56 +7132,77 @@ class MainWindow(QtWidgets.QMainWindow):
                     except (TypeError, ValueError):
                         tframes = 0
                 if tframes <= 0:
-                     progress_callback({"msg": "[경고] total_frames가 0 이하입니다."})
+                    progress_callback({"msg": "[경고] total_frames가 0 이하입니다."})
 
                 try:
-                    sig_build_inner = inspect.signature(build_func_local) # <-- 변수명 변경
+                    sig_build_inner = inspect.signature(build_func_local)  # <-- 변수명 변경
                     build_kwargs_inner: Dict[str, Any] = {
                         "project_dir": str(pdir),
                         "total_frames": tframes,
-                        "on_progress": progress_callback # <-- 전달받은 콜백 명시적으로 사용
+                        "on_progress": progress_callback  # <-- 전달받은 콜백 명시적으로 사용
                     }
                     # UI 값 인자 추가 (시그니처 확인 후, None이 아닐 때만)
-                    if "ui_width" in sig_build_inner.parameters and ui_w is not None: build_kwargs_inner["ui_width"] = ui_w
-                    if "ui_height" in sig_build_inner.parameters and ui_h is not None: build_kwargs_inner["ui_height"] = ui_h
-                    if "ui_fps" in sig_build_inner.parameters and ui_fps is not None: build_kwargs_inner["ui_fps"] = ui_fps
-                    if "ui_steps" in sig_build_inner.parameters and ui_steps is not None: build_kwargs_inner["ui_steps"] = ui_steps
+                    if "ui_width" in sig_build_inner.parameters and ui_w is not None: build_kwargs_inner[
+                        "ui_width"] = ui_w
+                    if "ui_height" in sig_build_inner.parameters and ui_h is not None: build_kwargs_inner[
+                        "ui_height"] = ui_h
+                    if "ui_fps" in sig_build_inner.parameters and ui_fps is not None: build_kwargs_inner[
+                        "ui_fps"] = ui_fps
+                    if "ui_steps" in sig_build_inner.parameters and ui_steps is not None: build_kwargs_inner[
+                        "ui_steps"] = ui_steps
 
-                    build_func_local(**build_kwargs_inner) # <-- 변수명 변경
+                    build_func_local(**build_kwargs_inner)  # <-- 변수명 변경
 
                 except TypeError as e_type_build_inner:
-                    progress_callback({"msg": f"[경고] build_shots_with_i2v 호출 시그니처 불일치 ({e_type_build_inner}), UI 값 없이 호출 시도."})
+                    progress_callback(
+                        {"msg": f"[경고] build_shots_with_i2v 호출 시그니처 불일치 ({e_type_build_inner}), UI 값 없이 호출 시도."})
                     try:
-                        build_func_local(str(pdir), tframes, on_progress=progress_callback) # <-- 변수명 변경
+                        build_func_local(str(pdir), tframes, on_progress=progress_callback)  # <-- 변수명 변경
                     except TypeError:
-                         progress_callback({"msg": "[경고] on_progress 인자도 실패, 인자 없이 호출 시도."})
-                         build_func_local(str(pdir), tframes) # type: ignore[call-arg] # <-- 변수명 변경
+                        progress_callback({"msg": "[경고] on_progress 인자도 실패, 인자 없이 호출 시도."})
+                        build_func_local(str(pdir), tframes)  # type: ignore[call-arg] # <-- 변수명 변경
                     except Exception as e_fallback_call_inner:
-                         raise RuntimeError(f"build_shots_with_i2v 최종 호출 실패: {e_fallback_call_inner}") from e_fallback_call_inner
+                        raise RuntimeError(
+                            f"build_shots_with_i2v 최종 호출 실패: {e_fallback_call_inner}") from e_fallback_call_inner
                 except Exception as e_build_other_inner:
                     raise RuntimeError(f"build_shots_with_i2v 실행 오류: {e_build_other_inner}") from e_build_other_inner
 
             # --- 작업 완료 콜백 ---
-            def _done(ok: bool, _payload: Any, err: Optional[Exception]) -> None: # <-- _payload 사용 안 함 명시
-                 """작업 완료 후 UI 업데이트 및 메시지 표시."""
-                 if not ok and err:
-                      err_type_name = type(err).__name__
-                      err_message = str(err)
-                      print(f"[오류] 영상 생성 작업 실패: {err_type_name}: {err_message}")
-                      print(traceback.format_exc())
-                      QtWidgets.QMessageBox.critical(self, "영상 생성 오류", f"오류 발생:\n{err_type_name}: {err_message}\n\n상세 내용은 콘솔 로그를 확인하세요.")
-                 elif ok:
-                      print("[정보] 영상 생성 작업 완료.")
-                      QtWidgets.QMessageBox.information(self, "완료", "영상 생성 작업이 완료되었습니다.")
+            def _done(ok: bool, payload: Any, err: Optional[Exception]) -> None:  # <-- payload 타입 Any로
+                """작업 완료 후 UI 업데이트 및 메시지 표시."""
+
+                # --- ▼▼▼ 수정된 부분 (on_done_override 호출) ▼▼▼ ---
+                if on_done_override:
+                    try:
+                        # 매크로 콜백이 있으면 팝업을 띄우지 않고, 결과를 매크로로 전달
+                        on_done_override(ok, payload, err)
+                    except Exception as e_override:
+                        print(f"[오류] on_video의 on_done_override 호출 실패: {e_override}")
+                        # 폴백: 매크로 콜백 실패 시 직접 팝업 표시
+                        QtWidgets.QMessageBox.critical(self, "매크로 오류", f"영상 생성 후 콜백 실패:\n{e_override}")
+                    return  # 매크로가 호출되었으므로 여기서 종료
+                # --- ▲▲▲ 수정된 부분 끝 ▲▲▲ ---
+
+                # (단독 실행 시 기존 로직)
+                if not ok and err:
+                    err_type_name = type(err).__name__
+                    err_message = str(err)
+                    print(f"[오류] 영상 생성 작업 실패: {err_type_name}: {err_message}")
+                    print(traceback.format_exc())
+                    QtWidgets.QMessageBox.critical(self, "영상 생성 오류",
+                                                   f"오류 발생:\n{err_type_name}: {err_message}\n\n상세 내용은 콘솔 로그를 확인하세요.")
+                elif ok:
+                    print("[정보] 영상 생성 작업 완료.")
+                    QtWidgets.QMessageBox.information(self, "완료", "영상 생성 작업이 완료되었습니다.")
 
             # --- 진행창 유틸 로드 ---
-            run_async_local: Optional[Callable] = None # <-- 변수명 변경
+            run_async_local: Optional[Callable] = None  # <-- 변수명 변경
             try:
-                from app.utils import run_job_with_progress_async as run_async_imp # type: ignore
+                from app.utils import run_job_with_progress_async as run_async_imp  # type: ignore
                 run_async_local = run_async_imp
             except (ImportError, ModuleNotFoundError, AttributeError):
                 try:
-                    from utils import run_job_with_progress_async as run_async_imp2 # type: ignore
+                    from utils import run_job_with_progress_async as run_async_imp2  # type: ignore
                     run_async_local = run_async_imp2
                 except (ImportError, ModuleNotFoundError, AttributeError):
                     run_async_local = None
@@ -7172,59 +7210,66 @@ class MainWindow(QtWidgets.QMainWindow):
             if run_async_local is None:
                 # 유틸 로드 실패 시 동기 실행
                 print("[경고] run_job_with_progress_async 로드 실패, 동기 실행합니다.")
+
                 def _notify_sync(data: Dict[str, Any]) -> None:
-                     print(f"[I2V][Sync] {data.get('msg', '')}")
+                    print(f"[I2V][Sync] {data.get('msg', '')}")
+
                 try:
                     _job(_notify_sync)
                     _done(True, None, None)
                 except Exception as e_sync_job_inner:
                     _done(False, None, e_sync_job_inner)
-                return # 동기 실행 후 종료
+                return  # 동기 실행 후 종료
 
             # --- run_async 호출 준비 ---
             # run_job_with_progress_async 함수 시그니처 확인 (utils.py 기준)
             # def run_job_with_progress_async(owner, title, job, *, tail_file=None, on_done=None)
             kw_run_async: Dict[str, Any] = {}
             try:
-                 sig_run_async_check = inspect.signature(run_async_local)
-                 if "tail_file" in sig_run_async_check.parameters:
-                      kw_run_async["tail_file"] = None # 영상 생성은 tail 불필요
-                 if "on_done" in sig_run_async_check.parameters:
-                      kw_run_async["on_done"] = _done
+                sig_run_async_check = inspect.signature(run_async_local)
+                if "tail_file" in sig_run_async_check.parameters:
+                    kw_run_async["tail_file"] = None  # 영상 생성은 tail 불필요
+                if "on_done" in sig_run_async_check.parameters:
+                    kw_run_async["on_done"] = _done
             except (TypeError, ValueError) as e_sig_check:
-                 print(f"[경고] run_async 시그니처 분석 실패 (호출은 시도): {e_sig_check}")
-                 # 기본 키워드 인자 설정 (on_done은 중요하므로 포함 시도)
-                 kw_run_async = {"tail_file": None, "on_done": _done}
+                print(f"[경고] run_async 시그니처 분석 실패 (호출은 시도): {e_sig_check}")
+                # 기본 키워드 인자 설정 (on_done은 중요하므로 포함 시도)
+                kw_run_async = {"tail_file": None, "on_done": _done}
 
             # --- run_async 실행 (정확한 인자 전달) ---
             try:
-                 # utils.py 시그니처에 맞춰 owner, title, job을 위치 인자로 전달
-                 run_async_local(self, "영상 생성", _job, **kw_run_async) # <-- 호출 방식 수정
+                # utils.py 시그니처에 맞춰 owner, title, job을 위치 인자로 전달
+                run_async_local(self, "영상 생성", _job, **kw_run_async)  # <-- 호출 방식 수정
             except Exception as e_run_call_final:
-                 # 호출 실패 시 오류 로깅 및 동기 실행
-                 print(f"[오류] run_job_with_progress_async 호출 실패: {e_run_call_final}")
-                 print("[경고] 동기 실행으로 전환합니다.")
-                 def _notify_sync_fallback(data: Dict[str, Any]) -> None:
-                      print(f"[I2V][SyncFallback] {data.get('msg', '')}")
-                 try:
-                      _job(_notify_sync_fallback)
-                      _done(True, None, None)
-                 except Exception as e_sync_job_fallback_inner:
-                      _done(False, None, e_sync_job_fallback_inner)
+                # 호출 실패 시 오류 로깅 및 동기 실행
+                print(f"[오류] run_job_with_progress_async 호출 실패: {e_run_call_final}")
+                print("[경고] 동기 실행으로 전환합니다.")
+
+                def _notify_sync_fallback(data: Dict[str, Any]) -> None:
+                    print(f"[I2V][SyncFallback] {data.get('msg', '')}")
+
+                try:
+                    _job(_notify_sync_fallback)
+                    _done(True, None, None)
+                except Exception as e_sync_job_fallback_inner:
+                    _done(False, None, e_sync_job_fallback_inner)
 
         except Exception as e_outer_inner:
-             # on_video 함수 자체의 최상위 예외 처리
-             print(f"[오류] on_video 실행 중 오류 발생: {type(e_outer_inner).__name__}: {e_outer_inner}")
-             print(traceback.format_exc())
-             QtWidgets.QMessageBox.critical(self, "오류", f"영상 생성 시작 중 오류 발생:\n{e_outer_inner}")
+            # on_video 함수 자체의 최상위 예외 처리
+            print(f"[오류] on_video 실행 중 오류 발생: {type(e_outer_inner).__name__}: {e_outer_inner}")
+            print(traceback.format_exc())
+            QtWidgets.QMessageBox.critical(self, "오류", f"영상 생성 시작 중 오류 발생:\n{e_outer_inner}")
 
         finally:
             # 버튼 활성화 (항상 실행)
-            if btn_video_widget:
-                 try:
-                      btn_video_widget.setEnabled(True)
-                 except RuntimeError: # 위젯 소멸 등 예외
-                      pass
+            # --- ▼▼▼ 수정 (매크로가 아닐 때만 버튼 활성화) ▼▼▼ ---
+            if on_done_override is None:
+                if btn_video_widget:
+                    try:
+                        btn_video_widget.setEnabled(True)
+                    except RuntimeError:  # 위젯 소멸 등 예외
+                        pass
+            # --- ▲▲▲ 수정 끝 ▲▲▲ ---
     # ────────────── 기타 ──────────────
     def _set_total_frames_from_audio(self, audio_path: Path) -> None:
         dur = audio_duration_sec(audio_path)
@@ -7335,7 +7380,7 @@ class MainWindow(QtWidgets.QMainWindow):
     # ======= /end =======
 
     # ==== 완성된 영상 합치기 ==========
-    def merging_videos_start(self) -> None:
+    def merging_videos_start(self, *, on_done_override: Optional[Callable] = None) -> None: # <-- 시그니처 수정
         """
         '영상 합치기' 버튼 핸들러:
         1. 누락된 씬(i2v) 생성
@@ -7358,10 +7403,14 @@ class MainWindow(QtWidgets.QMainWindow):
 
         # --- 완료 콜백 정의 ---
         def done(ok: bool, payload, err):
-            if not ok:
+            # --- ▼▼▼ 수정된 콜백 로직 ▼▼▼ ---
+            if on_done_override:
+                on_done_override(ok, payload, err) # 매크로 콜백이 있으면 그것만 호출
+            elif not ok:
                 QtWidgets.QMessageBox.critical(self, "병합 실패", str(err))
             else:
                 QtWidgets.QMessageBox.information(self, "병합 완료", f"최종 영상 생성 완료:\n{payload}")
+            # --- ▲▲▲ 수정된 콜백 로직 ▲▲▲ ---
 
         # --- 비동기 실행 ---
         run_job_with_progress_async(
@@ -7372,7 +7421,7 @@ class MainWindow(QtWidgets.QMainWindow):
         )
 
     # ==== 가사넣기 ================================
-    def lyrics_in_start(self):
+    def lyrics_in_start(self, *, on_done_override: Optional[Callable] = None): # <-- 시그니처 수정
         """
         [수정됨] music_ready.mp4 파일에 video.json의 제목과 가사를 주입하고
         최종본인 music.mp4 (또는 final_with_subs.mp4)를 생성합니다.
@@ -7423,10 +7472,14 @@ class MainWindow(QtWidgets.QMainWindow):
 
         # --- 완료 콜백 정의 ---
         def done(ok: bool, payload, err):
-            if not ok:
+            # --- ▼▼▼ 수정된 콜백 로직 ▼▼▼ ---
+            if on_done_override:
+                on_done_override(ok, payload, err) # 매크로 콜백이 있으면 그것만 호출
+            elif not ok:
                 QtWidgets.QMessageBox.critical(self, "자막 삽입 실패", str(err))
             else:
                 QtWidgets.QMessageBox.information(self, "자막 삽입 완료", f"최종 영상 생성 완료:\n{payload}")
+            # --- ▲▲▲ 수정된 콜백 로직 ▲▲▲ ---
 
         # --- 비동기 실행 ---
         run_job_with_progress_async(
@@ -7435,6 +7488,80 @@ class MainWindow(QtWidgets.QMainWindow):
             job=job,
             on_done=done
         )
+
+        # ────────────── 신규 매크로 핸들러 ──────────────
+
+    def on_click_macro_analyze(self) -> None:
+        """매크로: 1. 음악분석 -> 2. 프로젝트분석"""
+
+        def _on_analysis_done(ok: bool, payload: Any, err: Optional[Exception]):
+            """1단계(음악분석) 완료 콜백"""
+            if not ok:
+                print(f"[MACRO-ANALYZE] 1단계 (음악분석) 실패: {err}")
+                QtWidgets.QMessageBox.critical(self, "분석 매크로 1단계 실패", f"음악 분석 중 오류가 발생했습니다:\n{err}")
+                return
+
+            print("[MACRO-ANALYZE] 1단계 (음악분석) 완료. 2단계 (프로젝트분석) 시작...")
+
+            # 2단계(프로젝트분석) 호출
+            # on_click_build_story_from_seg_async는 자체적으로 팝업을 띄우므로 on_done_override 불필요
+            try:
+                self.on_click_build_story_from_seg_async()
+            except Exception as e:
+                QtWidgets.QMessageBox.critical(self, "분석 매크로 2단계 오류", f"프로젝트 분석 시작 중 오류:\n{e}")
+
+        # 1단계(음악분석) 호출
+        print("[MACRO-ANALYZE] 1단계 (음악분석) 시작...")
+        try:
+            # on_done_override를 전달하여 1단계 완료 시 _on_analysis_done이 호출되도록 함
+            self.on_click_analyze_music(on_done_override=_on_analysis_done)
+        except Exception as e:
+            QtWidgets.QMessageBox.critical(self, "분석 매크로 1단계 오류", f"음악 분석 시작 중 오류:\n{e}")
+
+        # shorts_ui.py
+
+    def on_click_macro_build_video(self) -> None:
+            """매크로: 1. 영상생성(i2v) -> 2. 영상합치기 -> 3. 가사넣기"""
+
+            # --- 3단계 (가사넣기) ---
+            def _on_merge_done(ok: bool, payload: Any, err: Optional[Exception]):
+                """2단계(영상합치기) 완료 콜백"""
+                if not ok:
+                    print(f"[MACRO-BUILD] 2단계 (영상합치기) 실패: {err}")
+                    QtWidgets.QMessageBox.critical(self, "영상만들기 2단계 실패", f"영상 병합 중 오류:\n{err}")
+                    return
+
+                print("[MACRO-BUILD] 2단계 (영상합치기) 완료. 3단계 (가사넣기) 시작...")
+                try:
+                    # 3단계(가사넣기) 호출. 이게 마지막이므로 override 불필요.
+                    # (lyrics_in_start는 작업 완료 시 자체적으로 팝업을 띄웁니다)
+                    self.lyrics_in_start()
+                except Exception as e:
+                    QtWidgets.QMessageBox.critical(self, "영상만들기 3단계 오류", f"가사 삽입 시작 중 오류:\n{e}")
+
+            # --- 2단계 (영상합치기) ---
+            def _on_video_gen_done(ok: bool, payload: Any, err: Optional[Exception]):
+                """1단계(영상생성) 완료 콜백"""
+                if not ok:
+                    print(f"[MACRO-BUILD] 1단계 (영상생성) 실패: {err}")
+                    QtWidgets.QMessageBox.critical(self, "영상만들기 1단계 실패", f"영상 생성(i2v) 중 오류:\n{err}")
+                    return
+
+                print("[MACRO-BUILD] 1단계 (영상생성) 완료. 2단계 (영상합치기) 시작...")
+                try:
+                    # 2단계(영상합치기) 호출, 3단계를 콜백으로 전달
+                    self.merging_videos_start(on_done_override=_on_merge_done)
+                except Exception as e:
+                    QtWidgets.QMessageBox.critical(self, "영상만들기 2단계 오류", f"영상 합치기 시작 중 오류:\n{e}")
+
+            # --- 1단계 (영상생성) ---
+            print("[MACRO-BUILD] 1단계 (영상생성) 시작...")
+            try:
+                # 1단계(영상생성) 호출, 2단계를 콜백으로 전달
+                # 이 on_video 함수는 UI의 W/H/FPS/스텝 설정을 읽어옵니다.
+                self.on_video(on_done_override=_on_video_gen_done)
+            except Exception as e:
+                QtWidgets.QMessageBox.critical(self, "영상만들기 1단계 오류", f"영상 생성 시작 중 오류:\n{e}")
 
 
 # ───────── 워크플로 저장 노드(class_type) 영구 수정 도우미 ─────────
@@ -7825,10 +7952,20 @@ def _inject_render_prefs_methods():
     setattr(MainWindow, "on_click_test2_1_generate_missing_images", on_click_test2_1_generate_missing_images)
 
 
+
+
 # === 주입을 즉시 실행 (MainWindow 인스턴스 생성 전에!) ===
 _inject_render_prefs_methods()
 
 # ───────────────────────────── 실행 진입점 ─────────────────────────────
+
+
+
+
+
+
+# (기존 main() 함수 시작)
+
 def main():
     try:
         sys.stdout.reconfigure(line_buffering=True)
