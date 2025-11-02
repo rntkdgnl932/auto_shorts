@@ -1082,6 +1082,84 @@ def build_shots_with_i2v(
             scene_seed_value = int(time.time() * 1_000_000) % 999_999_999_999_999
         _notify(f"씬 {sid}에 사용할 마스터 시드: {scene_seed_value}")
 
+        # --- ▼▼▼ [신규] ReActor 동적 설정 로직 ▼▼▼ ---
+
+        # 1. 씬의 캐릭터 목록 가져오기 (video.json 스키마 기준)
+        #    (예: ["female_01", "male_01"])
+        scene_characters = []
+        try:
+            chars_raw = scene.get("characters", [])
+            if isinstance(chars_raw, list):
+                # ["female_01:0"] 같은 형식일 수 있으므로 : 앞부분만 추출
+                scene_characters = [str(c).split(":")[0].strip() for c in chars_raw if str(c).strip()]
+            scene_characters = list(dict.fromkeys(scene_characters))  # 중복 제거
+        except Exception as e_char_parse:
+            _notify(f"[경고] 씬 {sid} 캐릭터 파싱 실패: {e_char_parse}")
+
+        _notify(f"[{sid}] ReActor 대상 캐릭터: {scene_characters}")
+
+        # 2. (guff_movie.json 기준) 캐릭터 ID와 노드 ID 매핑
+        #    (이 매핑은 guff_movie.json의 ReActor 체인을 직접 보고 만듭니다)
+        #    "캐릭터ID": ("얼굴LoadImage 노드ID", "ReActor 노드ID")
+        CHAR_NODE_MAP = {
+            "male_01": ("32", "29"),  # male_01.png -> LoadImage(32) -> ReActor(29)
+            "female_01": ("31", "28"),  # female_01.png -> LoadImage(31) -> ReActor(28)
+            # "female_02": ("30", "27"), # 3번째 캐릭터(Node 30)를 쓴다면 여기에 추가
+        }
+
+        # 3. 이 씬에서 활성화할 ReActor 노드 목록
+        reactor_nodes_to_enable = []
+        # 이 씬에서 주입할 얼굴 파일 목록 (LoadImage노드ID, 파일명)
+        face_files_to_inject = []
+
+        # 4. 캐릭터별 파일 준비 및 주입 목록 생성
+        CHAR_DIR_PATH: Optional[Path] = None     # <--- [수정] 변수 선언
+        INPUT_DIR_PATH: Optional[Path] = None    # <--- [수정] 변수 선언
+        try:
+            # settings에서 CHARACTER_DIR, COMFY_INPUT_DIR 가져오기
+            # (build_shots_with_i2v 상단에 'from settings import ...'이 이미 있어야 함)
+            from settings import CHARACTER_DIR, COMFY_INPUT_DIR  # type: ignore
+            CHAR_DIR_PATH = Path(CHARACTER_DIR)
+            INPUT_DIR_PATH = Path(COMFY_INPUT_DIR)
+        except ImportError:
+            _notify("[오류] settings.py에서 CHARACTER_DIR, COMFY_INPUT_DIR 임포트 실패. ReActor 스킵.")
+            CHAR_DIR_PATH = None
+            INPUT_DIR_PATH = None # <--- [수정] 이 줄을 추가합니다.
+
+        # <--- [수정] if CHAR_DIR_PATH: 를 if CHAR_DIR_PATH and INPUT_DIR_PATH: 로 변경
+        if CHAR_DIR_PATH and INPUT_DIR_PATH:
+            for char_id in scene_characters:
+                if char_id in CHAR_NODE_MAP:
+                    load_node, reactor_node = CHAR_NODE_MAP[char_id]
+
+                    # 원본 캐릭터 이미지 경로 탐색 (e.g., C:\...\character\female_01.png)
+                    char_img_path = None
+                    for ext in (".png", ".jpg", ".jpeg", ".webp"):
+                        p_try = CHAR_DIR_PATH / f"{char_id}{ext}"
+                        if p_try.exists():
+                            char_img_path = p_try
+                            break
+
+                    if char_img_path:
+                        try:
+                            # ComfyUI input 폴더로 복사 (덮어쓰기)
+                            target_face_file = INPUT_DIR_PATH / char_img_path.name
+                            shutil.copy2(str(char_img_path), str(target_face_file))
+
+                            # 주입 목록에 추가
+                            face_files_to_inject.append((load_node, char_img_path.name))
+                            reactor_nodes_to_enable.append(reactor_node)
+                            _notify(
+                                f"[{sid}] ReActor 준비: {char_id} -> {char_img_path.name} (Node {load_node} -> {reactor_node})")
+                        except Exception as e_copy_face:
+                            _notify(f"[경고] ReActor 얼굴({char_id}) 복사 실패: {e_copy_face}")
+                    else:
+                        _notify(f"[경고] ReActor: {char_id}의 이미지 파일({CHAR_DIR_PATH}/{char_id}.png/jpg)을 찾을 수 없음")
+                else:
+                    _notify(f"[{sid}] ReActor 스킵: {char_id}가 CHAR_NODE_MAP에 없음")
+
+        # --- ▲▲▲ [신규] ReActor 동적 설정 로직 끝 ▲▲▲ ---
+
         combine_node_id = "21"
         i2v_node_id = "25"
         target_fps_val: int = 16
@@ -1172,6 +1250,29 @@ def build_shots_with_i2v(
 
             # [NEW] 오버레이 제거 패스 적용
             _clear_overlay_inputs_safe(graph)
+
+            # --- ▼▼▼ [신규] ReActor 노드 활성화/비활성화 및 파일 주입 ▼▼▼ ---
+
+            # 1. (guff_movie.json 기준) 모든 ReActor 노드 ID
+            ALL_REACTOR_NODES = ["27", "28", "29"]
+
+            # 2. 씬 기준으로 찾은 '활성화할' 노드 목록 (바깥 루프에서 계산됨)
+            #    (예: {"28"})
+            enabled_set = set(reactor_nodes_to_enable)
+
+            for reactor_id in ALL_REACTOR_NODES:
+                is_enabled = reactor_id in enabled_set
+                _set_input_safe(graph, reactor_id, "enabled", is_enabled)
+                if is_enabled:
+                    _notify(f"ReActor(Node {reactor_id}) 활성화 ({chunk_label})")
+
+            # 3. (guff_movie.json 기준) 얼굴 파일 주입
+            #    (예: [("31", "female_01.png")])
+            for load_node_id, face_filename in face_files_to_inject:
+                _set_input_safe(graph, load_node_id, "image", face_filename)
+                _notify(f"LoadImage(Node {load_node_id}) 얼굴 주입: {face_filename} ({chunk_label})")
+
+            # --- ▲▲▲ [신규] ReActor 로직 끝 ▲▲▲ ---
 
             # 입력 주입
             load_nodes: List[Tuple[str, Dict[str, Any]]] = []

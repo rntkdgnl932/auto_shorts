@@ -157,8 +157,9 @@ def _extract_char_tags(char_id: str, style_str: str) -> List[str]:
     base: List[str] = []
     if char_id.startswith("female"):
         base.append("young woman")
-        # 요청: 여성 캐릭터에는 필수 태그
-        base.append("huge breasts")
+        # [수정] UI에서 설정한 환경 변수가 '1'일 때만 주입
+        if os.environ.get("FORCE_HUGE_BREASTS") == "1":
+            base.append("huge breasts")
     elif char_id.startswith("male"):
         base.append("young man")
     else:

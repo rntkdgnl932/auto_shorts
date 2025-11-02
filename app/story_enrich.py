@@ -257,6 +257,7 @@ def _segment_lyrics_for_scenes(record: dict, audio_info: dict=None, ai=None, lan
 
 def _enforce_character_style_rules(styles: Dict[str, str]) -> Dict[str, str]:
     """여성: 'huge breasts, slim legs' 강제 포함, 성별 한국어 명시."""
+    force_huge = os.environ.get("FORCE_HUGE_BREASTS") == "1"
     out: Dict[str, str] = {}
     for cid, txt in (styles or {}).items():
         s = (txt or '').strip()
@@ -267,8 +268,9 @@ def _enforce_character_style_rules(styles: Dict[str, str]) -> Dict[str, str]:
             if '여성' not in s:
                 s = '여성, ' + s
             # 필수 문구 강제
-            if 'huge breasts' not in s:
-                s += ', huge breasts'
+            if force_huge:  # UI에서 체크했을 때만 주입
+                if 'huge breasts' not in s:
+                    s += ', huge breasts'
             if 'slim legs' not in s:
                 s += ', slim legs'
         elif re.search(r'male|남성', cid, re.I) or re.search(r'\bM\b', cid):
@@ -362,6 +364,7 @@ def apply_gpt_to_story_v11(
     # [신규] 캐릭터 스타일 한국어 설명을 영어 태그로 변환 (간단 버전)
     def _convert_char_style_ko_to_en(style_ko: str) -> List[str]:
         """간단한 규칙과 키워드 매핑으로 한국어 설명을 영어 태그 리스트로 변환"""
+        force_huge = os.environ.get("FORCE_HUGE_BREASTS") == "1"
         if not style_ko: return []
         tags: List[str] = []
         style_lower = style_ko.lower()
@@ -372,7 +375,10 @@ def apply_gpt_to_story_v11(
 
         # 필수 태그 (여성)
         if "young woman" in tags:
-            tags.extend(["huge breasts", "slim legs"]) # 필수 태그 추가
+            if force_huge:  # UI에서 체크했을 때만 주입
+                tags.extend(["huge breasts", "slim legs"]) # 필수 태그 추가
+            else:
+                tags.extend(["slim legs"]) # 필수 태그 추가
 
         # 헤어 스타일
         hair_map = {"긴": "long hair", "짧은": "short hair", "중간": "medium hair", "웨이브": "wavy hair", "펌": "permed hair", "생머리": "straight hair"}

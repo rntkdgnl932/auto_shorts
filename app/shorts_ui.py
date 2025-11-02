@@ -2348,6 +2348,23 @@ class MainWindow(QtWidgets.QMainWindow):
         # job 함수 정의 (가독성 개선 및 오류 처리 강화)
         def job(on_progress_callback: Callable[[dict], None]) -> Dict[str, str]:  #
             from typing import List, Dict, Any  # job 함수 내에서만 사용
+            import os  # <--- [신규] os 모듈 임포트
+
+            # --- ▼▼▼ [신규] 체크박스 상태 읽기 ▼▼▼ ---
+            try:
+                # getattr을 사용하여 self.chk_huge_breasts가 없어도 오류 방지
+                checkbox = getattr(self, "chk_huge_breasts", None)
+                if checkbox and callable(getattr(checkbox, "isChecked", None)):
+                    force_huge = bool(checkbox.isChecked())
+                else:
+                    force_huge = False  # 위젯이 없으면 False
+            except Exception:
+                force_huge = False  # 혹시 모를 UI 오류에도 False
+
+            # [신규] utils.py의 Fallback 로직을 위한 환경 변수 설정
+            os.environ["FORCE_HUGE_BREASTS"] = "1" if force_huge else "0"
+
+            # --- ▲▲▲ [신규] 체크박스 상태 읽기 끝 ▲▲▲ ---
 
             def _log_progress(message: str) -> None:
                 """진행률 콜백을 호출하는 내부 헬퍼 함수."""
@@ -2667,8 +2684,30 @@ class MainWindow(QtWidgets.QMainWindow):
                         pass
 
                 # 실제 호출
-                result_text = ask_smart(str(system), str(user), **call_kwargs)
+                # --- ▼▼▼ [신규] 시스템 프롬프트 동적 주입 ▼▼▼ ---
+                system_prompt_final = str(system)
+
+                # job 스코프의 force_huge 변수 사용
+                if force_huge:
+                    # 2)번 규칙을 찾아 'huge breasts' 주입
+                    rule_2_marker = "2) Always include character traits for each referenced character."
+                    if rule_2_marker in system_prompt_final:
+                        rule_2_replacement = (
+                            "2) Always include character traits for each referenced character.\n"
+                            "       - For any character id that starts with \"female\", you MUST include \"adult woman\" AND \"huge breasts\"."
+                        )
+                        system_prompt_final = system_prompt_final.replace(rule_2_marker, rule_2_replacement)
+                    else:
+                        # 2번 규칙을 못찾으면 그냥 맨 뒤에 추가
+                        system_prompt_final += "\n\nRULE: For 'female' characters, you MUST include 'huge breasts'."
+
+                # --- ▲▲▲ [신규] 주입 끝 ▲▲▲ ---
+
+                # 실제 호출
+                # [수정] str(system) 대신 system_prompt_final 사용
+                result_text = ask_smart(system_prompt_final, str(user), **call_kwargs)
                 return str(result_text or "")
+
 
             # video.json AI 강화 실행 (video_path_str 유효성 검증 후)
             if video_path_str and Path(video_path_str).is_file():
@@ -3019,7 +3058,7 @@ class MainWindow(QtWidgets.QMainWindow):
     Rules:
     1) Convert any Korean hints to clean, model-friendly English tags.
     2) Always include character traits for each referenced character.
-       - For any character id that starts with "female", you MUST include "adult woman" and "huge breasts".
+       - For any character id that starts with "female", you MUST include "adult woman".
        - For any character id that starts with "male", include "adult man".
     3) Merge global themes, palette, and section mood into concise tags (English).
     4) Keep quality tags concise (e.g., "photorealistic, cinematic lighting, high detail, 8k, masterpiece").
@@ -4053,9 +4092,18 @@ class MainWindow(QtWidgets.QMainWindow):
         self.sb_overlap = self._spin(1,     120,   DEFAULT_OVERLAP, " overlap")
         self.sb_infps   = self._spin(1,     240,   DEFAULT_INPUT_FPS,  " inFPS")
         self.sb_outfps  = self._spin(1,     240,   DEFAULT_TARGET_FPS, " outFPS")
+
+        # --- ▼▼▼ [신규] "huge" 체크박스 생성 (그룹박스 제거) ▼▼▼ ---
+        self.chk_huge_breasts = QtWidgets.QCheckBox("huge breasts")
+        self.chk_huge_breasts.setChecked(False)  # 기본값 False (체크 해제)
+        self.chk_huge_breasts.setToolTip("체크 시 여성 캐릭터 프롬프트에 'huge breasts'를 강제로 추가합니다.")
+        # --- ▲▲▲ [신규] 생성 끝 ▲▲▲ ---
+
         opts = QtWidgets.QHBoxLayout()
         for w in (self.sb_total, self.sb_chunk, self.sb_overlap, self.sb_infps, self.sb_outfps):
             opts.addWidget(w)
+        opts.addStretch(1)
+        opts.addWidget(self.chk_huge_breasts)
         opts.addStretch(1)
 
         # 버튼들

@@ -181,12 +181,12 @@
       "format": "video/h264-mp4",
       "pix_fmt": "yuv420p",
       "crf": 19,
-      "save_metadata": true,
+      "save_metadata": false,
       "trim_to_audio": false,
       "pingpong": false,
-      "save_output": true,
+      "save_output": false,
       "images": [
-        "29",
+        "3",
         0
       ]
     },
@@ -282,123 +282,6 @@
     "class_type": "LoadImage",
     "_meta": {
       "title": "이미지 로드"
-    }
-  },
-  "27": {
-    "inputs": {
-      "enabled": true,
-      "swap_model": "inswapper_128.onnx",
-      "facedetection": "retinaface_resnet50",
-      "face_restore_model": "GFPGANv1.4.pth",
-      "face_restore_visibility": 1,
-      "codeformer_weight": 0.9,
-      "detect_gender_input": "no",
-      "detect_gender_source": "no",
-      "input_faces_index": "2",
-      "source_faces_index": "0",
-      "console_log_level": 1,
-      "input_image": [
-        "3",
-        0
-      ],
-      "source_image": [
-        "30",
-        0
-      ]
-    },
-    "class_type": "ReActorFaceSwap",
-    "_meta": {
-      "title": "ReActor 🌌 Fast Face Swap_2"
-    }
-  },
-  "28": {
-    "inputs": {
-      "enabled": true,
-      "swap_model": "inswapper_128.onnx",
-      "facedetection": "retinaface_resnet50",
-      "face_restore_model": "GFPGANv1.4.pth",
-      "face_restore_visibility": 1,
-      "codeformer_weight": 0.9,
-      "detect_gender_input": "no",
-      "detect_gender_source": "no",
-      "input_faces_index": "1",
-      "source_faces_index": "0",
-      "console_log_level": 1,
-      "input_image": [
-        "27",
-        0
-      ],
-      "source_image": [
-        "31",
-        0
-      ]
-    },
-    "class_type": "ReActorFaceSwap",
-    "_meta": {
-      "title": "ReActor 🌌 Fast Face Swap_1"
-    }
-  },
-  "29": {
-    "inputs": {
-      "enabled": true,
-      "swap_model": "inswapper_128.onnx",
-      "facedetection": "retinaface_resnet50",
-      "face_restore_model": "GFPGANv1.4.pth",
-      "face_restore_visibility": 1,
-      "codeformer_weight": 0.9,
-      "detect_gender_input": "no",
-      "detect_gender_source": "no",
-      "input_faces_index": "0",
-      "source_faces_index": "0",
-      "console_log_level": 1,
-      "input_image": [
-        "28",
-        0
-      ],
-      "source_image": [
-        "32",
-        0
-      ]
-    },
-    "class_type": "ReActorFaceSwap",
-    "_meta": {
-      "title": "ReActor 🌌 Fast Face Swap_0"
-    }
-  },
-  "30": {
-    "inputs": {
-      "image": "ComfyUI_00063_.png"
-    },
-    "class_type": "LoadImage",
-    "_meta": {
-      "title": "이미지 로드"
-    }
-  },
-  "31": {
-    "inputs": {
-      "image": "female_01.png"
-    },
-    "class_type": "LoadImage",
-    "_meta": {
-      "title": "이미지 로드"
-    }
-  },
-  "32": {
-    "inputs": {
-      "image": "male_01.png"
-    },
-    "class_type": "LoadImage",
-    "_meta": {
-      "title": "이미지 로드"
-    }
-  },
-  "33": {
-    "inputs": {
-      "model_name": "RealESRGAN_x4plus.pth"
-    },
-    "class_type": "UpscaleModelLoader",
-    "_meta": {
-      "title": "Upscaler"
     }
   }
 }
