@@ -5841,6 +5841,8 @@ class MainWindow(QtWidgets.QMainWindow):
 
     from pathlib import Path
 
+    # shorts_ui.py 파일의 _apply_project_meta 함수 전체를 이걸로 교체하세요.
+
     def _apply_project_meta(self, proj_dir: str) -> None:
         """
         project.json을 읽어 제목/가사/길이/변환/자동태그/프롬프트 UI에 반영.
@@ -5851,6 +5853,8 @@ class MainWindow(QtWidgets.QMainWindow):
             from app.utils import load_json  # type: ignore
         except Exception:
             from utils import load_json  # type: ignore
+
+        from PyQt5.QtGui import QFont  # <--- [신규] QFont 임포트
 
         pj = Path(proj_dir) / "project.json"
         meta = load_json(pj, {}) or {}
@@ -5895,6 +5899,51 @@ class MainWindow(QtWidgets.QMainWindow):
                     prompt_widget.setPlainText(prompt_val)
         except Exception:
             pass
+
+        # --- ▼▼▼ [수정] 렌더 설정(ui_prefs) 불러오기 (role= 제거) ▼▼▼ ---
+        ui_prefs = meta.get("ui_prefs") or {}
+        if ui_prefs:
+            try:
+                # W, H, FPS, Steps
+                w, h = ui_prefs.get("image_size", [720, 1080])
+                fps = ui_prefs.get("movie_fps", 30)
+                steps = ui_prefs.get("t2i_steps", 6)
+
+                # findData로 정확한 값(int)을 찾아 인덱스 설정
+                idx_w = self.cmb_img_w.findData(int(w))  # <--- role= 제거
+                self.cmb_img_w.setCurrentIndex(idx_w if idx_w >= 0 else 0)
+
+                idx_h = self.cmb_img_h.findData(int(h))  # <--- role= 제거
+                self.cmb_img_h.setCurrentIndex(idx_h if idx_h >= 0 else 0)
+
+                idx_fps = self.cmb_movie_fps.findData(int(fps))  # <--- role= 제거
+                self.cmb_movie_fps.setCurrentIndex(idx_fps if idx_fps >= 0 else 0)
+
+                self.spn_t2i_steps.setValue(int(steps))
+
+                # 프리셋 (W/H 설정 후 프리셋을 설정해야 UI 잠금/해제가 올바르게 동작)
+                preset_key = ui_prefs.get("resolution_preset", "custom")
+                preset_index = 0  # 기본값 (custom)
+                for i in range(self.cmb_res_preset.count()):
+                    item_data = self.cmb_res_preset.itemData(i)  # <--- role= 제거
+                    if isinstance(item_data, tuple) and len(item_data) == 3 and item_data[2] == preset_key:
+                        preset_index = i
+                        break
+                self.cmb_res_preset.setCurrentIndex(preset_index)
+
+                # 폰트
+                font_family = ui_prefs.get("font_family", "굴림")
+                self.cmb_font.setCurrentFont(QFont(font_family))
+
+                # 폰트 크기
+                title_size = ui_prefs.get("title_font_size", 55)
+                lyric_size = ui_prefs.get("lyric_font_size", 25)
+                self.spn_title_font_size.setValue(int(title_size))
+                self.spn_lyric_font_size.setValue(int(lyric_size))
+
+            except Exception as e:
+                print(f"[UI] 렌더 설정 불러오기 실패: {e}")
+        # --- ▲▲▲ [수정] 불러오기 끝 ▲▲▲ ---
 
     def _sync_convert_ui_from_meta(self, meta: dict) -> None:
         """
@@ -7074,6 +7123,10 @@ class MainWindow(QtWidgets.QMainWindow):
 
     # ────────────── 영상 빌드(선택) ──────────────
     def on_video(self, *, on_done_override: Optional[Callable] = None) -> None:  # <-- 시그니처 수정
+        try:
+            self._save_ui_prefs_to_project()
+        except Exception as e_save_prefs:
+            print(f"[UI] on_video: UI 설정 저장 실패: {e_save_prefs}")
         """
         영상 생성:
           - UI에서 W/H/FPS/스텝 값을 읽어 build_shots_with_i2v로 전달.
@@ -7811,15 +7864,15 @@ def _inject_render_prefs_methods():
 
         self.spn_t2i_steps = QtWidgets.QSpinBox()
         self.spn_t2i_steps.setRange(1, 200)
-        self.spn_t2i_steps.setValue(12) # 기본값 12
+        self.spn_t2i_steps.setValue(6) # 기본값 12
         self.spn_t2i_steps.setToolTip("샘플링 스텝 수(확산 단계 수)")
 
         self.cmb_font = QFontComboBox()
         self.cmb_font.setToolTip("자막에 사용할 폰트를 선택합니다.")
         self.cmb_font.setMinimumWidth(150)  # 폰트 이름이 잘 보이도록 최소 너비 지정
 
-        self.spn_title_font_size = self._spin(10, 200, 60, " px")
-        self.spn_lyric_font_size = self._spin(10, 200, 30, " px")
+        self.spn_title_font_size = self._spin(10, 200, 55, " px")
+        self.spn_lyric_font_size = self._spin(10, 200, 25, " px")
         self.spn_title_font_size.setToolTip("제목 폰트 크기 (기본값 70)")
         self.spn_lyric_font_size.setToolTip("가사 폰트 크기 (기본값 48)")
 
@@ -7849,7 +7902,7 @@ def _inject_render_prefs_methods():
         _set_combo_safe(self.cmb_movie_fps, ui_fps_val, default_fps_val)
 
         preset_key_from_json = str((ui_prefs_current.get("resolution_preset") or "custom"))
-        steps_from_json = int(ui_prefs_current.get("t2i_steps") or 12)
+        steps_from_json = int(ui_prefs_current.get("t2i_steps") or 6)
         self.spn_t2i_steps.setValue(steps_from_json)
 
         def _lock_wh_inputs(lock: bool) -> None:
@@ -7947,6 +8000,13 @@ def _inject_render_prefs_methods():
         ui["movie_fps"] = fps_sel
         ui["resolution_preset"] = str(preset_key_sel)
         ui["t2i_steps"] = int(self.spn_t2i_steps.value())
+
+        try:
+            ui["font_family"] = self.cmb_font.currentFont().family()
+            ui["title_font_size"] = self.spn_title_font_size.value()
+            ui["lyric_font_size"] = self.spn_lyric_font_size.value()
+        except Exception as e:
+            print(f"[UI] 폰트/크기 저장 실패: {e}")
 
         meta["ui_prefs"] = ui
         save_json(pj, meta)
