@@ -469,14 +469,14 @@ def add_subtitles_with_ffmpeg(video_in_path: Path,
 
 
 def build_shots_with_i2v(
-    project_dir: str,
-    total_frames: int,
-    *,  # 키워드 전용
-    ui_width: Optional[int] = None,
-    ui_height: Optional[int] = None,
-    ui_fps: Optional[int] = None,
-    ui_steps: Optional[int] = None,
-    on_progress: Optional[Callable[[Dict[str, Any]], None]] = None
+        project_dir: str,
+        total_frames: int,
+        *,  # 키워드 전용
+        ui_width: Optional[int] = None,
+        ui_height: Optional[int] = None,
+        ui_fps: Optional[int] = None,
+        ui_steps: Optional[int] = None,
+        on_progress: Optional[Callable[[Dict[str, Any]], None]] = None
 ) -> None:
     """
     각 씬을 i2v로 생성합니다. UI 설정을 워크플로우에 적용하고, 파일 접두사에 현재 날짜를 사용합니다.
@@ -547,7 +547,8 @@ def build_shots_with_i2v(
             return 0
 
     # ── 최종 트림(원래 총프레임으로) ──────────────────────────
-    def _trim_to_frames(ffmpeg_exe_local: str, ffprobe_exe_local: str, src_local: Path, dst_local: Path, target_frames: int, fps_val: int) -> bool:
+    def _trim_to_frames(ffmpeg_exe_local: str, ffprobe_exe_local: str, src_local: Path, dst_local: Path,
+                        target_frames: int, fps_val: int) -> bool:
         if target_frames <= 0:
             return False
         try:
@@ -566,9 +567,9 @@ def build_shots_with_i2v(
                 "-r", f"{int(max(1, fps_val))}",
                 "-fps_mode", "cfr",
                 "-vsync", "cfr",
-                "-map_metadata", "-1",           # 메타데이터 제거
-                "-metadata", "title=",           # title 비우기
-                "-sn",                           # 자막 스트림 제거
+                "-map_metadata", "-1",  # 메타데이터 제거
+                "-metadata", "title=",  # title 비우기
+                "-sn",  # 자막 스트림 제거
                 "-c:v", "libx264", "-crf", "18",
                 "-pix_fmt", "yuv420p",
                 str(tmp_out_local),
@@ -609,13 +610,13 @@ def build_shots_with_i2v(
 
     # ── 컷 병합(덮어쓰기) ──────────────────────────────────────
     def _concat_cut_no_fade(
-        ffmpeg_exe_local: str,
-        ffprobe_exe_local: str,
-        clip_paths_local: List[Path],
-        overlap_frames_local: int,
-        fps_local: int,
-        out_path_local: Path,
-        work_dir_local: Path
+            ffmpeg_exe_local: str,
+            ffprobe_exe_local: str,
+            clip_paths_local: List[Path],
+            overlap_frames_local: int,
+            fps_local: int,
+            out_path_local: Path,
+            work_dir_local: Path
     ) -> bool:
         """
         fade 없이 덮어쓰기:
@@ -710,7 +711,8 @@ def build_shots_with_i2v(
             )
             return proc.returncode == 0
 
-        print(f"[XC-BEGIN] items={len(clip_paths_local)} fps={fps_local} overlap_frames={overlap_frames_local} out=1280x720")
+        print(
+            f"[XC-BEGIN] items={len(clip_paths_local)} fps={fps_local} overlap_frames={overlap_frames_local} out=1280x720")
 
         # 첫 번째 정규화
         cur_local = work_dir_local / "cur_000.mp4"
@@ -810,6 +812,7 @@ def build_shots_with_i2v(
                 COMFY_HOST = "http://127.0.0.1:8188"
                 FFMPEG_EXE = "ffmpeg"
                 FFPROBE_EXE = "ffprobe"
+
             s_mod = _SettingsFallback()
 
     jsons_dir_conf = getattr(s_mod, "JSONS_DIR", r"C:\my_games\shorts_make\app\jsons")
@@ -847,7 +850,8 @@ def build_shots_with_i2v(
     clips_dir = ensure_dir_fn(pdir / "clips")
     work_dir = clips_dir / "xfade_work"
     work_dir.mkdir(parents=True, exist_ok=True)
-    for stale in list(work_dir.glob("_chunk_*.mp4")) + list(work_dir.glob("cur_*.mp4")) + list(work_dir.glob("tmp_*.mp4")):
+    for stale in list(work_dir.glob("_chunk_*.mp4")) + list(work_dir.glob("cur_*.mp4")) + list(
+            work_dir.glob("tmp_*.mp4")):
         try:
             stale.unlink()
         except OSError:
@@ -1070,8 +1074,6 @@ def build_shots_with_i2v(
         except OSError as e_copy:
             _notify(f"[경고] 이미지 준비 실패({img_path.name}): {e_copy}")
 
-
-
         if not server_image_name:
             _notify(f"[오류] 이미지 이름 설정 불가 (씬 {sid}). 다음 씬으로.")
             continue
@@ -1082,57 +1084,71 @@ def build_shots_with_i2v(
             scene_seed_value = int(time.time() * 1_000_000) % 999_999_999_999_999
         _notify(f"씬 {sid}에 사용할 마스터 시드: {scene_seed_value}")
 
-        # --- ▼▼▼ [신규] ReActor 동적 설정 로직 ▼▼▼ ---
+        # --- ▼▼▼ [수정됨] ReActor 동적 인덱스 파싱 로직 ▼▼▼ ---
 
-        # 1. 씬의 캐릭터 목록 가져오기 (video.json 스키마 기준)
-        #    (예: ["female_01", "male_01"])
-        scene_characters = []
+        # 1. 씬의 캐릭터 목록 파싱 (video.json 스키마 기준)
+        #    (예: ["female_01:0", "male_01:1"])
+        scene_character_tuples: List[Tuple[str, str]] = []  # (char_id, face_index_str)
         try:
             chars_raw = scene.get("characters", [])
             if isinstance(chars_raw, list):
-                # ["female_01:0"] 같은 형식일 수 있으므로 : 앞부분만 추출
-                scene_characters = [str(c).split(":")[0].strip() for c in chars_raw if str(c).strip()]
-            scene_characters = list(dict.fromkeys(scene_characters))  # 중복 제거
+                for c in chars_raw:
+                    c_str = str(c).strip()
+                    if not c_str:
+                        continue
+                    if ":" in c_str:
+                        char_id, face_index = c_str.split(":", 1)
+                        scene_character_tuples.append((char_id.strip(), face_index.strip()))
+                    else:
+                        # 인덱스가 없으면 "0"으로 간주
+                        scene_character_tuples.append((c_str, "0"))
+
+                        # 중복 ID 제거 (첫 번째 인덱스 우선)
+            seen_ids = set()
+            final_tuples = []
+            for char_id, face_index in scene_character_tuples:
+                if char_id not in seen_ids:
+                    final_tuples.append((char_id, face_index))
+                    seen_ids.add(char_id)
+            scene_character_tuples = final_tuples
+
         except Exception as e_char_parse:
             _notify(f"[경고] 씬 {sid} 캐릭터 파싱 실패: {e_char_parse}")
 
-        _notify(f"[{sid}] ReActor 대상 캐릭터: {scene_characters}")
+        _notify(f"[{sid}] ReActor 대상 캐릭터: {scene_character_tuples}")
 
         # 2. (guff_movie.json 기준) 캐릭터 ID와 노드 ID 매핑
-        #    (이 매핑은 guff_movie.json의 ReActor 체인을 직접 보고 만듭니다)
         #    "캐릭터ID": ("얼굴LoadImage 노드ID", "ReActor 노드ID")
         CHAR_NODE_MAP = {
             "male_01": ("32", "29"),  # male_01.png -> LoadImage(32) -> ReActor(29)
             "female_01": ("31", "28"),  # female_01.png -> LoadImage(31) -> ReActor(28)
-            # "female_02": ("30", "27"), # 3번째 캐릭터(Node 30)를 쓴다면 여기에 추가
+            # "female_02": ("30", "27"), # 3번째 캐릭터(Node 30)
         }
 
         # 3. 이 씬에서 활성화할 ReActor 노드 목록
-        reactor_nodes_to_enable = []
+        reactor_nodes_to_enable: List[Tuple[str, str]] = []  # (reactor_node_id, input_faces_index)
         # 이 씬에서 주입할 얼굴 파일 목록 (LoadImage노드ID, 파일명)
-        face_files_to_inject = []
+        face_files_to_inject: List[Tuple[str, str]] = []
 
         # 4. 캐릭터별 파일 준비 및 주입 목록 생성
-        CHAR_DIR_PATH: Optional[Path] = None     # <--- [수정] 변수 선언
-        INPUT_DIR_PATH: Optional[Path] = None    # <--- [수정] 변수 선언
+        CHAR_DIR_PATH: Optional[Path] = None
+        INPUT_DIR_PATH: Optional[Path] = None
         try:
             # settings에서 CHARACTER_DIR, COMFY_INPUT_DIR 가져오기
-            # (build_shots_with_i2v 상단에 'from settings import ...'이 이미 있어야 함)
             from settings import CHARACTER_DIR, COMFY_INPUT_DIR  # type: ignore
             CHAR_DIR_PATH = Path(CHARACTER_DIR)
             INPUT_DIR_PATH = Path(COMFY_INPUT_DIR)
         except ImportError:
             _notify("[오류] settings.py에서 CHARACTER_DIR, COMFY_INPUT_DIR 임포트 실패. ReActor 스킵.")
             CHAR_DIR_PATH = None
-            INPUT_DIR_PATH = None # <--- [수정] 이 줄을 추가합니다.
+            INPUT_DIR_PATH = None
 
-        # <--- [수정] if CHAR_DIR_PATH: 를 if CHAR_DIR_PATH and INPUT_DIR_PATH: 로 변경
         if CHAR_DIR_PATH and INPUT_DIR_PATH:
-            for char_id in scene_characters:
+            for char_id, face_index in scene_character_tuples:  # (char_id, face_index) 튜플 사용
                 if char_id in CHAR_NODE_MAP:
                     load_node, reactor_node = CHAR_NODE_MAP[char_id]
 
-                    # 원본 캐릭터 이미지 경로 탐색 (e.g., C:\...\character\female_01.png)
+                    # 원본 캐릭터 이미지 경로 탐색
                     char_img_path = None
                     for ext in (".png", ".jpg", ".jpeg", ".webp"):
                         p_try = CHAR_DIR_PATH / f"{char_id}{ext}"
@@ -1148,9 +1164,9 @@ def build_shots_with_i2v(
 
                             # 주입 목록에 추가
                             face_files_to_inject.append((load_node, char_img_path.name))
-                            reactor_nodes_to_enable.append(reactor_node)
+                            reactor_nodes_to_enable.append((reactor_node, face_index))  # (노드ID, 인덱스) 튜플 저장
                             _notify(
-                                f"[{sid}] ReActor 준비: {char_id} -> {char_img_path.name} (Node {load_node} -> {reactor_node})")
+                                f"[{sid}] ReActor 준비: {char_id} -> {char_img_path.name} (Node {load_node} -> {reactor_node}, FaceIdx {face_index})")
                         except Exception as e_copy_face:
                             _notify(f"[경고] ReActor 얼굴({char_id}) 복사 실패: {e_copy_face}")
                     else:
@@ -1158,7 +1174,14 @@ def build_shots_with_i2v(
                 else:
                     _notify(f"[{sid}] ReActor 스킵: {char_id}가 CHAR_NODE_MAP에 없음")
 
-        # --- ▲▲▲ [신규] ReActor 동적 설정 로직 끝 ▲▲▲ ---
+        # --- ▼▼▼ [수정됨] ReActor가 사용하는 LoadImage ID 목록 생성 (self 제거) ▼▼▼ ---
+        # (예: {"31", "32", "30"})
+        # 이 노드들은 씬 이미지(t_003.jpg)로 덮어쓰면 안 됨
+        _current_scene_face_loader_ids = set(t[0] for t in face_files_to_inject)  # <--- 'self' 제거
+        _notify(f"[{sid}] ReActor가 사용할 얼굴 로더 노드: {_current_scene_face_loader_ids}")
+        # --- ▲▲▲ [수정] ID 목록 생성 끝 ▲▲▲ ---
+
+        # --- ▲▲▲ [수정됨] ReActor 로직 끝 ▲▲▲ ---
 
         combine_node_id = "21"
         i2v_node_id = "25"
@@ -1219,7 +1242,7 @@ def build_shots_with_i2v(
                 if not isinstance(inputs_dict, dict):
                     continue
                 if ctype.lower().find("load") >= 0 and (
-                    "directory" in inputs_dict or "frame_rate" in inputs_dict or "pattern" in inputs_dict
+                        "directory" in inputs_dict or "frame_rate" in inputs_dict or "pattern" in inputs_dict
                 ):
                     sequence_loader_node_id = str(node_key)
                     has_sequence_loader = True
@@ -1251,20 +1274,25 @@ def build_shots_with_i2v(
             # [NEW] 오버레이 제거 패스 적용
             _clear_overlay_inputs_safe(graph)
 
-            # --- ▼▼▼ [신규] ReActor 노드 활성화/비활성화 및 파일 주입 ▼▼▼ ---
+            # --- ▼▼▼ [수정됨] ReActor 동적 인덱스 주입 ▼▼▼ ---
 
             # 1. (guff_movie.json 기준) 모든 ReActor 노드 ID
             ALL_REACTOR_NODES = ["27", "28", "29"]
 
             # 2. 씬 기준으로 찾은 '활성화할' 노드 목록 (바깥 루프에서 계산됨)
-            #    (예: {"28"})
-            enabled_set = set(reactor_nodes_to_enable)
+            #    (예: { "28": "0", "29": "1" })
+            enabled_map: Dict[str, str] = {node_id: face_idx for node_id, face_idx in reactor_nodes_to_enable}
 
             for reactor_id in ALL_REACTOR_NODES:
-                is_enabled = reactor_id in enabled_set
-                _set_input_safe(graph, reactor_id, "enabled", is_enabled)
-                if is_enabled:
-                    _notify(f"ReActor(Node {reactor_id}) 활성화 ({chunk_label})")
+                if reactor_id in enabled_map:
+                    # 활성화하고, 동적 인덱스 주입
+                    face_index_to_use = enabled_map[reactor_id]
+                    _set_input_safe(graph, reactor_id, "enabled", True)
+                    _set_input_safe(graph, reactor_id, "input_faces_index", face_index_to_use)  # <-- 동적 인덱스 주입
+                    _notify(f"ReActor(Node {reactor_id}) 활성화 (FaceIdx {face_index_to_use}) ({chunk_label})")
+                else:
+                    # 비활성화
+                    _set_input_safe(graph, reactor_id, "enabled", False)
 
             # 3. (guff_movie.json 기준) 얼굴 파일 주입
             #    (예: [("31", "female_01.png")])
@@ -1272,9 +1300,10 @@ def build_shots_with_i2v(
                 _set_input_safe(graph, load_node_id, "image", face_filename)
                 _notify(f"LoadImage(Node {load_node_id}) 얼굴 주입: {face_filename} ({chunk_label})")
 
-            # --- ▲▲▲ [신규] ReActor 로직 끝 ▲▲▲ ---
+            # --- ▲▲▲ [수정됨] ReActor 로직 끝 ▲▲▲ ---
 
-            # 입력 주입
+            # --- ▼▼▼ [수정됨] I2V 소스 이미지만 덮어쓰기 ▼▼▼ ---
+            # 입력 주입 (I2V 소스 이미지)
             load_nodes: List[Tuple[str, Dict[str, Any]]] = []
             for node_key2, node_val2 in graph.items():
                 try:
@@ -1282,9 +1311,21 @@ def build_shots_with_i2v(
                         load_nodes.append((str(node_key2), node_val2))
                 except (AttributeError, TypeError):
                     continue
+
+            # ReActor가 사용하는 얼굴 로더 ID (바깥 루프에서 계산됨)
+            # (예: {"30", "31", "32"})
+            face_loader_ids_in_loop = _current_scene_face_loader_ids  # <--- [수정됨] self 제거
+
             for load_node_id, _node in load_nodes:
+                if load_node_id in face_loader_ids_in_loop:
+                    # 이 노드는 ReActor가 얼굴 소스(female_01.png)로 사용하므로 건너뜀
+                    _notify(f"LoadImage({load_node_id}) 스킵 (ReActor 전용 얼굴 소스)")
+                    continue
+
+                # ReActor용이 아닌 LoadImage 노드만 씬 이미지(t_003.jpg)로 설정
                 _set_input_safe(graph, load_node_id, "image", current_input_image_name)
-                _notify(f"LoadImage({load_node_id}) 이미지: {current_input_image_name} ({chunk_label})")
+                _notify(f"LoadImage({load_node_id}) I2V 소스 이미지 주입: {current_input_image_name} ({chunk_label})")
+            # --- ▲▲▲ [수정] 로직 끝 ▲▲▲ ---
 
             for sampler_id in ("13", "14"):
                 _set_input_safe(graph, sampler_id, "noise_seed", scene_seed_value)
@@ -1296,7 +1337,8 @@ def build_shots_with_i2v(
             if ui_height and ui_height > 0:
                 _set_input_safe(graph, resize_node_id, "height", ui_height)
             if ui_width or ui_height:
-                _notify(f"Resize({resize_node_id}) 크기: {ui_width if ui_width else '기본값'}x{ui_height if ui_height else '기본값'} ({chunk_label})")
+                _notify(
+                    f"Resize({resize_node_id}) 크기: {ui_width if ui_width else '기본값'}x{ui_height if ui_height else '기본값'} ({chunk_label})")
 
             if ui_fps and ui_fps > 0:
                 _set_input_safe(graph, combine_node_id, "frame_rate", ui_fps)
@@ -1372,7 +1414,8 @@ def build_shots_with_i2v(
                             cmd_extract_seq = [
                                 ffmpeg_exe, "-y",
                                 "-i", str(prev_chunk_path),
-                                "-vf", f"trim=start_frame={start_tail}:end_frame={end_tail},setpts=PTS-STARTPTS,fps={target_fps_val}",
+                                "-vf",
+                                f"trim=start_frame={start_tail}:end_frame={end_tail},setpts=PTS-STARTPTS,fps={target_fps_val}",
                                 "-frames:v", str(overlap_frames_for_chunk),
                                 str(seq_template_png)
                             ]
@@ -1531,11 +1574,13 @@ def build_shots_with_i2v(
 
                 cond_start = max(0, end_f - overlap_frames_for_chunk)
                 cond_end = max(0, end_f - 1)
-                print(f"[I2V][COND] {chunk_label} next_cond_range={cond_start}~{cond_end} ({overlap_frames_for_chunk}f, ≈{overlap_sec:.3f}s)")
+                print(
+                    f"[I2V][COND] {chunk_label} next_cond_range={cond_start}~{cond_end} ({overlap_frames_for_chunk}f, ≈{overlap_sec:.3f}s)")
 
                 try:
                     subprocess.run(
-                        [ffmpeg_exe, "-y", "-sseof", f"-{overlap_sec:.6f}", "-i", str(chunk_path), "-frames:v", "1", str(next_frame_path)],
+                        [ffmpeg_exe, "-y", "-sseof", f"-{overlap_sec:.6f}", "-i", str(chunk_path), "-frames:v", "1",
+                         str(next_frame_path)],
                         check=True,
                         stdout=subprocess.DEVNULL,
                         stderr=subprocess.PIPE
@@ -1601,7 +1646,8 @@ def build_shots_with_i2v(
             except OSError as e_mv:
                 _notify(f"[오류] 단일 청크 파일 이동 실패 ({sid}): {e_mv}")
         else:
-            print(f"[I2V][MERGE] id={sid} chunks={len(chunk_paths)} overlap={overlap_frames_for_chunk}f fps={target_fps_val}")
+            print(
+                f"[I2V][MERGE] id={sid} chunks={len(chunk_paths)} overlap={overlap_frames_for_chunk}f fps={target_fps_val}")
             # 페이드(xfade) 대신 덮어쓰기(컷) 병합
             ok_merge = _concat_cut_no_fade(
                 ffmpeg_exe_local=ffmpeg_exe,
