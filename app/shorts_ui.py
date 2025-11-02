@@ -31,7 +31,7 @@ import faulthandler
 import traceback
 import datetime
 from PyQt5 import QtCore, QtWidgets
-from PyQt5.QtWidgets import QPlainTextEdit, QTextEdit
+from PyQt5.QtWidgets import QPlainTextEdit, QTextEdit, QFontComboBox
 try:
     from app.image_movie_docs import normalize_to_v11  # type: ignore
 except Exception:
@@ -7395,6 +7395,10 @@ class MainWindow(QtWidgets.QMainWindow):
         except ImportError:
             from settings import FFMPEG_EXE  # type: ignore
 
+        selected_font_name = self.cmb_font.currentFont().family()
+        title_size = self.spn_title_font_size.value()  # <-- 1줄 추가
+        lyric_size = self.spn_lyric_font_size.value()  # <-- 1줄 추가
+
         # --- 백그라운드 작업 정의 ---
         def job(progress_callback):
             progress_callback({"msg": "FFMPEG으로 자막/제목 삽입 시작..."})
@@ -7404,7 +7408,9 @@ class MainWindow(QtWidgets.QMainWindow):
                 video_json_path=video_json_path,
                 out_path=final_output_path,
                 ffmpeg_exe=FFMPEG_EXE,  #
-                font_path="C:/Windows/Fonts/malgun.ttf"  # 폰트 경로 (필요시 수정)
+                font_name=selected_font_name,
+                title_fontsize=title_size,  # 이제 'title_size' 변수가 존재함
+                lyric_fontsize=lyric_size  # 이제 'lyric_size' 변수가 존재함
             )
             return final_path
 
@@ -7626,6 +7632,15 @@ def _inject_render_prefs_methods():
         self.spn_t2i_steps.setValue(12) # 기본값 12
         self.spn_t2i_steps.setToolTip("샘플링 스텝 수(확산 단계 수)")
 
+        self.cmb_font = QFontComboBox()
+        self.cmb_font.setToolTip("자막에 사용할 폰트를 선택합니다.")
+        self.cmb_font.setMinimumWidth(150)  # 폰트 이름이 잘 보이도록 최소 너비 지정
+
+        self.spn_title_font_size = self._spin(10, 200, 60, " px")
+        self.spn_lyric_font_size = self._spin(10, 200, 30, " px")
+        self.spn_title_font_size.setToolTip("제목 폰트 크기 (기본값 70)")
+        self.spn_lyric_font_size.setToolTip("가사 폰트 크기 (기본값 48)")
+
         # project.json 초기값 반영
         proj_dir_current = _guess_project_dir_local()
         pj_current = proj_dir_current / "project.json"
@@ -7714,6 +7729,12 @@ def _inject_render_prefs_methods():
         row.addSpacing(12)
         row.addWidget(QtWidgets.QLabel("프리셋")); row.addWidget(self.cmb_res_preset)
         row.addWidget(QtWidgets.QLabel("스텝")); row.addWidget(self.spn_t2i_steps)
+        row.addWidget(self.cmb_font)
+        row.addSpacing(10)
+        row.addWidget(QtWidgets.QLabel("제목크기:"))
+        row.addWidget(self.spn_title_font_size)
+        row.addWidget(QtWidgets.QLabel("가사크기:"))
+        row.addWidget(self.spn_lyric_font_size)
         row.addStretch(1)
         parent_layout.addWidget(grp)
 

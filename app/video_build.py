@@ -8,8 +8,7 @@ from pathlib import Path
 from pathlib import Path as _Path
 import json as _json
 import time, requests, shutil
-import os       # (파일 상단에 import os 추가)
-
+import os
 try:
     from app.utils import load_json, save_json, ensure_dir
     from app.settings import COMFY_HOST, JSONS_DIR
@@ -376,19 +375,24 @@ def mux_video_and_audio(video_in_path: Path, audio_in_path: Path, out_path: Path
 
 
 def add_subtitles_with_ffmpeg(video_in_path: Path,
-                              video_json_path: Path,
-                              out_path: Path,
-                              ffmpeg_exe: str,
-                              font_path: str = "C:/Windows/Fonts/malgun.ttf") -> str:
+                             video_json_path: Path,
+                             out_path: Path,
+                             ffmpeg_exe: str,
+                             font_name: str = "Malgun Gothic", # UI에서 이 값을 보내지만, 아래에서 무시합니다.
+                             title_fontsize: int = 70,
+                             lyric_fontsize: int = 48
+                             ) -> str:
     """
     FFMPEG의 drawtext 필터를 사용하여 video.json의 자막을 비디오에 직접 하드코딩합니다.
-    MoviePy가 필요 없습니다.
+    (MoviePy 불필요)
+    [수정됨] 폰트 경로(fontfile) 대신 폰트 이름(font)을 사용합니다.
     """
 
-    # 1. 폰트 경로 FFMPEG 호환 형식으로 변경 (Windows 용)
-    # [수정됨] 1. os.path.sep ('\')을 FFMPEG 친화적인 '/'로 먼저 변경합니다.
-    font_path_ffmpeg = font_path.replace(os.path.sep, "/")
-    # [수정됨] 2. 그 다음, Windows 드라이브 문자의 ':'를 이스케이프합니다.
+    # 1. [수정] 사용할 폰트 경로를 하드코딩하고, 올바르게 이스케이프합니다.
+    #    (UI에서 전달된 font_name은 무시됩니다.)
+    font_path_hardcoded = "C:/Windows/Fonts/malgun.ttf"  # <-- 사용할 폰트 경로
+
+    font_path_ffmpeg = font_path_hardcoded.replace(os.path.sep, "/")
     font_path_ffmpeg = font_path_ffmpeg.replace(":", "\\:")
 
     # 2. video.json 로드
@@ -404,7 +408,7 @@ def add_subtitles_with_ffmpeg(video_in_path: Path,
         title_escaped = title.replace("'", "'\\\\''").replace(":", "\\:").replace("\\", "\\\\")
         filters.append(
             f"drawtext=fontfile='{font_path_ffmpeg}':text='{title_escaped}':"
-            f"fontsize=70:fontcolor=white:box=1:boxcolor=black@0.5:boxborderw=5:"
+            f"fontsize={int(title_fontsize)}:fontcolor=white:box=1:boxcolor=black@0.5:boxborderw=5:"
             f"x=(w-text_w)/2:y=h*0.2:"  # 상단 20% 위치
             f"enable='between(t,0.5,3.5)'"
         )
@@ -425,7 +429,7 @@ def add_subtitles_with_ffmpeg(video_in_path: Path,
 
         filters.append(
             f"drawtext=fontfile='{font_path_ffmpeg}':text='{lyric_escaped}':"
-            f"fontsize=48:fontcolor=white:box=1:boxcolor=black@0.5:boxborderw=4:"
+            f"fontsize={int(lyric_fontsize)}:fontcolor=white:box=1:boxcolor=black@0.5:boxborderw=4:"
             f"x=(w-text_w)/2:y=h*0.8:"  # 하단 80% 위치
             f"enable='between(t,{start},{end})'"
         )
