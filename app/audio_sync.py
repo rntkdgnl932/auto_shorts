@@ -2120,18 +2120,557 @@ def _choose_host() -> str:
 
 
 # ───────────────────────────── 태그/노드 유틸 ──────────────────────────────────
+# audio_sync.py 파일의 _collect_effective_tags 함수를 교체하세요. (약 722 라인 근처)
+
+# C:\my_games\shorts_make\app\audio_sync.py
+
 def _collect_effective_tags(meta: dict) -> List[str]:
     """
-    project.json에서 실제 주입할 태그 리스트:
-    - auto_tags == True : ace_tags + tags_in_use
-    - auto_tags == False: manual_tags
+    [수정 v15] project.json에서 실제 주입할 태그 리스트:
+    - 1순위: AI가 긍정 프롬프트로 생성한 태그 (meta['prompt_user_ai_tags'])
+    - 2순위 (폴백): auto_tags==True시 (UI태그) + (AI추천태그)
+    - 3순위 (폴백): auto_tags==False시 (UI태그)
+    - [수정 v16] 긍정 프롬프트(prompt_user) 텍스트를 태그로 분리하는 로직 *제거*.
     """
+
+    # --- 1. [신규] 긍정 프롬프트 기반 AI 태그 (최우선) ---
+    ai_tags = meta.get("prompt_user_ai_tags")
+
+    # UI 체크박스 태그 (auto_tags==True일 때만 '추가'로 사용)
+    ui_tags = []
     if meta.get("auto_tags", True):
-        tags = list(meta.get("ace_tags") or [])
-        tags = list(dict.fromkeys(tags + (meta.get("tags_in_use") or [])))
-        return tags
+        ui_tags = list(meta.get("ace_tags") or [])
+        ui_tags.extend(meta.get("tags_in_use") or [])
+        _dlog("[_collect_effective_tags] Using AI Tags (if present) + UI 'Auto' Tags")
     else:
-        return list(meta.get("manual_tags") or [])
+        ui_tags = list(meta.get("manual_tags") or [])
+        _dlog("[_collect_effective_tags] Using AI Tags (if present) + UI 'Manual' Tags")
+
+    if isinstance(ai_tags, list) and ai_tags:
+        # AI 태그가 있으면 UI 태그와 결합
+        combined = ai_tags + ui_tags
+    else:
+        # AI 태그가 없으면 (v14 폴백 제거됨), UI 태그만 사용
+        _dlog("[_collect_effective_tags] No AI tags found (prompt_user_ai_tags). Using UI tags only.")
+        combined = ui_tags
+
+    # 3. 모두 합치고 중복 제거 (공통)
+    seen = set()
+    unique_tags = []
+    for tag in combined:
+        t_lower = tag.lower()
+        if t_lower not in seen:
+            seen.add(t_lower)
+            unique_tags.append(tag)
+
+    _dlog(f"[_collect_effective_tags] Total tags collected: {len(unique_tags)}")
+    return unique_tags
+
+
+# audio_sync.py 파일의 generate_music_with_acestep 함수 전체를 교체하세요.
+
+def generate_music_with_acestep(
+        project_dir: str,
+        *,
+        on_progress: Optional[Callable[[dict], None]] = None,
+        target_seconds: int | None = None,
+) -> str:
+    """
+    ComfyUI(ACE-Step) 단일 트랙 음악 생성 — project.json 단일 소스 정책.
+    - [수정 v15] 요청하신 대로 세미콜론(;)을 제거하고 줄바꿈을 적용하여 구문 오류를 수정합니다.
+    - [수정 v14] 태그가 적용되지 않는 문제 해결 (v13 로직 폐기):
+        * 긍정 프롬프트 박스 + UI 태그를 결합하여 Node 14('tags')에 주입.
+        * Node 74('lyrics')에는 순수 가사만 주입.
+    - lyrics_lls_after 복원 등 이전 수정사항 유지.
+    """
+
+    # --- 내부 헬퍼 함수 ---
+    def notify(stage: str, **kw: Any) -> None:
+        if on_progress:
+            try:
+                info: Dict[str, Any] = {"stage": stage}
+                info.update(kw)
+                on_progress(info)
+            except (TypeError, ValueError, RuntimeError):
+                pass
+
+    def _iter_nodes(graph: dict) -> Any:
+        if not isinstance(graph, dict):
+            return
+        nodes_list = graph.get("nodes")
+        if isinstance(nodes_list, list):
+            for nobj in nodes_list:
+                if isinstance(nobj, dict):
+                    yield nobj
+        else:
+            for _k, nobj in graph.items():
+                if isinstance(nobj, dict) and "class_type" in nobj:
+                    yield nobj
+                elif isinstance(nobj, dict) and "prompt" in nobj and isinstance(nobj["prompt"], dict):
+                    for _pk, p_nobj in nobj["prompt"].items():
+                        if isinstance(p_nobj, dict) and "class_type" in p_nobj:
+                            yield p_nobj
+
+    def _force_wav_save_for_this_graph(graph: dict, *, proj_dir: Path, filename_prefix: str) -> str:
+        for nobj in _iter_nodes(graph):
+            ct_local = str(nobj.get("class_type", "")).lower()
+            if ct_local.startswith("saveaudio"):
+                inputs_map_local = nobj.setdefault("inputs", {})
+                inputs_map_local["filename_prefix"] = filename_prefix
+                if "output_path" in inputs_map_local:
+                    inputs_map_local["output_path"] = str(proj_dir)
+                for base_key in ("basename", "base_filename", "filename"):
+                    if base_key in inputs_map_local:
+                        inputs_map_local[base_key] = "vocal"
+                for wav_key, wav_val in (("format", "wav"), ("container", "wav"), ("codec", "pcm_s16le")):
+                    if wav_key in inputs_map_local:
+                        inputs_map_local[wav_key] = wav_val
+                if "sample_rate" in inputs_map_local:
+                    inputs_map_local.setdefault("sample_rate", 44100)
+                for bd_key in ("bit_depth", "bitdepth", "bits"):
+                    if bd_key in inputs_map_local:
+                        inputs_map_local[bd_key] = 16
+        return ".wav"
+
+    # --- Comfy API 호출 로직 (generate_music_with_acestep 함수 내부에 통합) ---
+    def _call_comfy_api_for_ko_chunk(text_chunk: str, host_address: str) -> str:
+        """
+        한글 덩어리를 전용 워크플로우로 변환 시도. (v12 파싱 로직 유지)
+        """
+        lyrics_node_id = "74"
+        result_node_id = "75"  # PreviewAny 노드
+        save_text_node_id = "79"
+
+        transformed_result = text_chunk
+        api_workflow_path: Optional[Path] = None
+
+        try:
+            jsons_dir_val = getattr(S, "JSONS_DIR", "jsons")
+            api_workflow_path = Path(jsons_dir_val) / "ace_step_text_change.json"
+            if not api_workflow_path.exists():
+                api_workflow_path = Path("jsons") / "ace_step_text_change.json"
+                if not api_workflow_path.exists():
+                    raise FileNotFoundError("API workflow not found")
+            with open(api_workflow_path, 'r', encoding='utf-8') as f_api_wf:
+                api_workflow_graph = json.load(f_api_wf)
+        except Exception as load_api_wf_err:
+            error_path_str = str(api_workflow_path) if api_workflow_path else "configured/default path"
+            _dlog(f"[ERROR] Comfy API(Chunk): Failed load/parse API WF '{error_path_str}'. Err: {load_api_wf_err}.")
+            return transformed_result
+
+        try:
+            if lyrics_node_id in api_workflow_graph:
+                api_workflow_graph[lyrics_node_id].setdefault("inputs", {})["lyrics"] = text_chunk
+            else:
+                _dlog(f"[WARN] Comfy API(Chunk): Node {lyrics_node_id} not found.")
+                return transformed_result
+            if save_text_node_id in api_workflow_graph:
+                save_inputs = api_workflow_graph[save_text_node_id].setdefault("inputs", {})
+                save_inputs["text"] = [lyrics_node_id, 0]
+                save_inputs["filename_prefix"] = f"comfy_api_transform_temp_{uuid.uuid4().hex[:8]}"
+                save_inputs["append"] = "overwrite"
+
+            prompt_payload_api = {"prompt": api_workflow_graph, "client_id": str(uuid.uuid4())}
+            api_url_post = f"{host_address.rstrip('/')}/prompt"
+            response_post_api = requests.post(api_url_post, json=prompt_payload_api, timeout=10)
+            response_post_api.raise_for_status()
+            response_json_api = response_post_api.json()
+            prompt_id_api = response_json_api.get('prompt_id')
+            if not prompt_id_api:
+                _dlog("[WARN] Comfy API(Chunk): Prompt ID 없음.")
+                return transformed_result
+
+            start_time_poll_api = time.time()
+            api_url_get = f"{host_address.rstrip('/')}/history/{prompt_id_api}"
+            history_data_api: Optional[Dict] = None
+            found_result_text: Optional[str] = None
+
+            while time.time() - start_time_poll_api < 15:
+                try:
+                    response_get_api = requests.get(api_url_get, timeout=5)
+                    if response_get_api.ok:
+                        history_data_api = response_get_api.json()
+                        if prompt_id_api in history_data_api:
+                            history_entry = history_data_api[prompt_id_api]
+                            status_obj = history_entry.get("status", {})
+                            status_str = status_obj.get("status_str", "")
+                            if status_str == "error":
+                                _dlog(
+                                    f"[ERROR] Comfy API(Chunk): Job failed. Err: {status_obj.get('exception_message')}")
+                                return transformed_result
+
+                            outputs_api = history_entry.get('outputs')
+                            if isinstance(outputs_api, dict):
+                                result_node_output = outputs_api.get(result_node_id)
+                                if isinstance(result_node_output, dict):
+                                    result_list = result_node_output.get('text')
+                                    if isinstance(result_list, list) and result_list:
+                                        potential_text = result_list[0]
+                                        if isinstance(potential_text, str) and potential_text.strip():
+                                            found_result_text = potential_text.strip()
+                                            break
+
+                            if status_obj.get("completed", False):
+                                _dlog(
+                                    f"[WARN] Comfy API(Chunk): Job completed but Node {result_node_id} output was missing or invalid.")
+                                _dlog("       History Entry:", json.dumps(history_entry, indent=2, ensure_ascii=False))
+                                break
+
+                except requests.exceptions.Timeout:
+                    pass
+                except requests.exceptions.RequestException as poll_err:
+                    _dlog(f"[WARN] Comfy API(Chunk): History polling error: {poll_err}")
+
+                time.sleep(0.5)
+
+            if found_result_text is not None:
+                transformed_result = found_result_text
+                _dlog("[DEBUG] Comfy API(Chunk) 변환 성공:", text_chunk, "->", transformed_result)
+                return transformed_result
+            else:
+                _dlog("[WARN] Comfy API(Chunk): 폴링 시간 초과 또는 최종 결과 없음. 원본 반환:", text_chunk)
+                if history_data_api:
+                    _dlog("       Last History Response:",
+                          json.dumps(history_data_api.get(prompt_id_api, {}), indent=2, ensure_ascii=False))
+                return text_chunk
+
+        except requests.exceptions.RequestException as req_err_api:
+            _dlog(f"[ERROR] Comfy API(Chunk) 호출 실패: {req_err_api}.")
+        except Exception as exy:
+            _dlog(f"[ERROR] Comfy API(Chunk) 처리 오류: {exy}.")
+        return text_chunk
+
+        # --- 메인 로직 시작 ---
+
+    _dlog("ENTER", f"project_dir={project_dir}")
+    proj = Path(project_dir)
+    proj.mkdir(parents=True, exist_ok=True)
+    pj = proj / "project.json"
+    meta: Dict[str, Any] = load_json(pj, {}) or {}
+    title = effective_title(meta)
+    lyrics_raw = (meta.get("lyrics") or "").strip()
+
+    use_lls = meta.get("lls_enabled") is True
+    _dlog("LLS_CHECK", f"lls_enabled is {meta.get('lls_enabled')}, use_lls set to {use_lls}")
+
+    try:
+        comfy_host_addr_local = _choose_host()
+    except Exception as host_err:
+        _dlog(f"[ERROR] ComfyUI host selection failed: {host_err}.")
+        return f"Music generation failed: Cannot connect to ComfyUI host ({getattr(S, 'COMFY_HOST', 'default')})."
+
+    lyrics_eff: str
+    if use_lls:
+        lyrics_eff = (meta.get("lyrics_lls") or "").strip()
+        _dlog("LYRICS_MODE", "Using LLS (from project.json)")
+        if not lyrics_eff:
+            _dlog("[ERROR] LLS enabled but 'lyrics_lls' is empty.")
+            return "Music generation failed: LLS enabled but lyrics_lls is empty."
+    else:
+        _dlog("LYRICS_MODE", "Using Raw Lyrics (Applying split/API transform with dedicated workflow)")
+        processed_lines_new: List[str] = []
+        chunk_pattern = re.compile(r'[가-힣]+(?:[,\s]*[가-힣]+)*|[^가-힣]+(?:[,\s]*[^가-힣]+)*')
+        original_lines = lyrics_raw.splitlines()
+        total_lines_to_process = len(original_lines)
+        _dlog("LYRICS_PROCESSING_START", f"Total lines: {total_lines_to_process}")
+
+        for line_index, line in enumerate(original_lines):
+            stripped_line = line.strip()
+            if (line_index + 1) % 5 == 0 or (line_index + 1) == total_lines_to_process:
+                _dlog("LYRICS_PROCESSING_PROGRESS", f"Processing line {line_index + 1}/{total_lines_to_process}")
+            if not stripped_line:
+                processed_lines_new.append("")
+                continue
+            if stripped_line.startswith('[') and stripped_line.endswith(']'):
+                processed_lines_new.append(stripped_line.lower())
+                continue
+
+            tagged_chunks: List[str] = []
+            found_chunks = chunk_pattern.findall(stripped_line)
+
+            if not found_chunks and stripped_line:
+                tagged_chunks.append(f"[en]{stripped_line}")
+            else:
+                for chunk_text in found_chunks:
+                    stripped_chunk = chunk_text.strip()
+                    if not stripped_chunk:
+                        continue
+                    if re.search(r'[가-힣]', stripped_chunk):
+                        transformed_ko_chunk = _call_comfy_api_for_ko_chunk(stripped_chunk, comfy_host_addr_local)
+                        if transformed_ko_chunk.startswith("[ko]"):
+                            tagged_chunks.append(transformed_ko_chunk)
+                        else:
+                            tagged_chunks.append(f"[ko]{stripped_chunk}")
+                            _dlog(f"[WARN] API result for '{stripped_chunk}' invalid. Used original.")
+                    else:
+                        tagged_chunks.append(f"[en]{stripped_chunk}")
+
+            processed_line_result = " ".join(tagged_chunks)
+            processed_lines_new.append(processed_line_result)
+
+        lyrics_eff = "\n".join(processed_lines_new)
+        _dlog("LYRICS_PROCESSING_END", f"Finished processing {total_lines_to_process} lines.")
+        _dlog("[DEBUG] Final lyrics_eff preview (New Logic, first 200 chars):", lyrics_eff[:200])
+
+    if not lyrics_eff:
+        _dlog("[ERROR] No effective lyrics.")
+        return "Music generation failed: No effective lyrics."
+
+    seconds_val: int = 60
+    positive_tags: List[str] = []
+    negative_tags: List[str] = []
+    main_wf_path: Union[str, Path] = getattr(S, "ACE_STEP_PROMPT_JSON", "jsons/ace_step_1_t2m.json")
+    graph_loaded: Optional[Dict] = None
+    base_host: str = comfy_host_addr_local
+    subfolder_path: str = ""
+    save_prefix: str = ""
+    output_ext: str = ".wav"
+    history_result: Optional[Dict] = None
+    final_audio_path: Optional[Path] = None
+    library_saved_path: Optional[Path] = None
+    lls_after_result: str = ""
+
+    try:
+        if target_seconds is not None:
+            seconds_val = int(max(1, target_seconds))
+        else:
+            time_meta = meta.get("time")
+            ts_meta = meta.get("target_seconds")
+            try:
+                seconds_val = int(ts_meta) if ts_meta is not None else int(time_meta)  # type: ignore
+            except (ValueError, TypeError):
+                seconds_val = 60
+            seconds_val = int(max(1, seconds_val))
+
+        meta["target_seconds"] = seconds_val
+        meta["time"] = seconds_val
+        meta["lyrics_lls_now"] = lyrics_eff
+
+        try:
+            save_json(pj, meta)
+            _dlog("META_SAVE_PRE", f"Saved target_seconds={seconds_val} and lyrics_lls_now")
+        except OSError as e:
+            _dlog(f"[WARN] Failed save pre-gen meta: {e}")
+
+        positive_tags = _collect_effective_tags(meta)
+        tags_string = ", ".join(positive_tags)
+        _dlog("TAGS_TO_INJECT (Combined)", tags_string)
+
+        neg_raw = meta.get("prompt_neg") or ""
+        negative_tags = [t.strip() for t in re.split(r'[,;\n]+', str(neg_raw)) if t.strip()]
+
+        try:
+            graph_loaded = _load_workflow_graph(main_wf_path)
+        except Exception as e:
+            _dlog(f"[ERROR] Failed load main WF: {e}")
+            raise
+
+        _dlog("HOST", base_host, "| DESIRED_FMT wav")
+        sanitized_title = sanitize_title(title)
+        subfolder_path = f"shorts_make/{sanitized_title}"
+        save_prefix = f"{subfolder_path}/vocal_final"
+        output_ext = _force_wav_save_for_this_graph(graph_loaded, proj_dir=proj, filename_prefix=save_prefix)
+
+        try:
+            lyrics_id = "74"
+            txt_pos_id = "14"
+            sec_id = "17"
+            sampler_id = "52"
+
+            if lyrics_id in graph_loaded:
+                graph_loaded[lyrics_id].setdefault("inputs", {})["lyrics"] = lyrics_eff
+                _dlog("INJECT", f"Node {lyrics_id} (Pure Lyrics)")
+
+            if txt_pos_id in graph_loaded:
+                graph_loaded[txt_pos_id].setdefault("inputs", {})["tags"] = tags_string
+                _dlog("INJECT", f"Node {txt_pos_id} (Combined Tags)")
+
+            if sec_id in graph_loaded:
+                graph_loaded[sec_id].setdefault("inputs", {})["seconds"] = seconds_val
+                _dlog("INJECT", f"Node {sec_id} (Seconds)")
+            if sampler_id in graph_loaded:
+                graph_loaded[sampler_id].setdefault("inputs", {})["seed"] = _rand_seed()
+                _dlog("INJECT", f"Node {sampler_id} (Seed)")
+            if negative_tags:
+                _dlog("INFO",
+                      f"Negative tags ({len(negative_tags)}) not injected (expected behavior, uses prompt_neg).")
+        except Exception as e:
+            _dlog(f"[ERROR] Main WF injection failed: {e}")
+            raise
+
+        notify("submitting", host=base_host)
+        progress_cb = on_progress if callable(on_progress) else (lambda i: _dlog("PROG", i))
+
+        try:
+            dbg_wf = proj / "_debug_workflow_sent.json"
+            save_json(dbg_wf, {"prompt": graph_loaded})
+            _dlog("DEBUG_WORKFLOW_SAVE", f"Saved final WF to {dbg_wf.name}")
+        except Exception as e:
+            _dlog(f"[WARN] Failed save debug WF: {e}")
+
+        history_result = _submit_and_wait(base_host, graph_loaded, timeout=_ace_wait_timeout_sec(),
+                                          poll=_ace_poll_interval_sec(), on_progress=progress_cb)
+
+        saved_files_list: List[Path] = []
+        outputs_hist = history_result.get("outputs") if isinstance(history_result, dict) else None
+
+        if isinstance(outputs_hist, dict):
+            for _nid, node_out in outputs_hist.items():
+                for key in ("audio", "audios", "files", "wav", "mp3", "output"):
+                    arr = node_out.get(key)
+                    if not isinstance(arr, list):
+                        continue
+                    for item in arr:
+                        if not isinstance(item, dict):
+                            continue
+                        fn = (item.get("filename") or "").strip()
+                        sf = (item.get("subfolder") or "").strip()
+                        if not fn or fn.startswith("ComfyUI_temp_"):
+                            continue
+                        sf_norm = sf.replace("\\", "/").lstrip("/")
+                        if not sf_norm.startswith(subfolder_path):
+                            continue
+                        try:
+                            dl_file = _download_output_file(base_host, fn, sf_norm, out_dir=proj)
+                            if isinstance(dl_file, Path) and dl_file.exists() and dl_file.stat().st_size > 0:
+                                saved_files_list.append(dl_file)
+                                _dlog("DOWNLOAD_SUCCESS", f"File: '{fn}' -> '{dl_file.name}'")
+                        except Exception as e:
+                            _dlog("DOWNLOAD_ERROR", f"'{fn}': {type(e).__name__}")
+
+        if saved_files_list:
+            wavs = sorted([p for p in saved_files_list if p.suffix.lower() == ".wav"], key=lambda p: p.stat().st_mtime,
+                          reverse=True)
+            others = sorted([p for p in saved_files_list if p.suffix.lower() != ".wav"],
+                            key=lambda p: p.stat().st_mtime, reverse=True)
+            candidates = wavs + others
+            source_audio: Optional[Path] = candidates[0] if candidates else None
+
+            if source_audio and source_audio.exists():
+                _dlog("SELECTED_SOURCE_AUDIO", f"Selected '{source_audio.name}'.")
+                ffmpeg_p = getattr(S, "FFMPEG_EXE", "ffmpeg") or "ffmpeg"
+                try:
+                    final_audio_path = _ensure_vocal_wav(source_audio, proj, ffmpeg_exe=ffmpeg_p)
+                    _dlog("ENSURED_WAV", f"Final WAV: '{final_audio_path.name}'")
+
+                    master_fn = globals().get("_master_wav_precise")
+                    if callable(master_fn) and isinstance(final_audio_path, Path) and final_audio_path.exists():
+                        _dlog("MASTERING_START", "Applying mastering...")
+                        try:
+                            ti = float(getattr(S, "MASTER_TARGET_I", -12.0))
+                            tp = float(getattr(S, "MASTER_TARGET_TP", -1.0))
+                            tl = float(getattr(S, "MASTER_TARGET_LRA", 11.0))
+                            mastered_p = master_fn(final_audio_path, I=ti, TP=tp, LRA=tl, ffmpeg_exe=ffmpeg_p)
+
+                            if isinstance(mastered_p, Path) and mastered_p.exists():
+                                if mastered_p.resolve() != final_audio_path.resolve():
+                                    try:
+                                        final_audio_path.unlink()
+                                        mastered_p.rename(final_audio_path)
+                                        _dlog("MASTERING_SUCCESS_REPLACED", f"Mastered: '{final_audio_path.name}'")
+                                    except OSError as e:
+                                        _dlog(
+                                            f"[WARN] Failed replace after mastering: {e}. Kept at '{mastered_p.name}'.")
+                                        final_audio_path = mastered_p
+                                else:
+                                    _dlog("MASTERING_SUCCESS_INPLACE", f"Mastered in-place: '{final_audio_path.name}'")
+                        except Exception as e:
+                            _dlog("MASTERING_ERROR", f"Error: {type(e).__name__}")
+                except Exception as e:
+                    _dlog(f"[ERROR] Ensuring WAV failed: {e}")
+                    final_audio_path = None
+
+        if isinstance(outputs_hist, dict):
+            buffer_lls_after: List[str] = []
+            main_lyrics_node_output = outputs_hist.get("74", {})
+            if main_lyrics_node_output:
+                for key_lls_res in ("text", "result", "string", "strings"):
+                    value_lls_res = main_lyrics_node_output.get(key_lls_res)
+                    if isinstance(value_lls_res, str) and value_lls_res.strip():
+                        buffer_lls_after.append(value_lls_res.strip())
+                        break
+                    elif isinstance(value_lls_res, list):
+                        found = False
+                        for item in value_lls_res:
+                            if isinstance(item, str) and item.strip():
+                                buffer_lls_after.append(item.strip())
+                                found = True
+                        if found:
+                            break
+
+            if not buffer_lls_after:
+                preview_node_output = outputs_hist.get("75", {})
+                if isinstance(preview_node_output, dict):
+                    for key_preview in ("text", "previews"):
+                        value_preview = preview_node_output.get(key_preview)
+                        if isinstance(value_preview, str) and value_preview.strip():
+                            buffer_lls_after.append(value_preview.strip())
+                            break
+                        elif isinstance(value_preview, list):
+                            found_preview = False
+                            for item_preview in value_preview:
+                                if isinstance(item_preview, str) and item_preview.strip():
+                                    buffer_lls_after.append(item_preview.strip())
+                                    found_preview = True
+                            if found_preview:
+                                break
+
+            if buffer_lls_after:
+                lls_after_result = "\n".join(buffer_lls_after).strip()
+                if lls_after_result:
+                    meta["lyrics_lls_after"] = lls_after_result
+                    _dlog("LLS_AFTER_CAPTURE", f"Captured Node 74/75 output: {len(lls_after_result)} chars")
+
+        if isinstance(final_audio_path, Path) and final_audio_path.exists() and final_audio_path.stat().st_size > 0:
+            meta.setdefault("paths", {})["vocal"] = str(final_audio_path)
+            meta["audio"] = str(final_audio_path)
+        else:
+            final_audio_path = None
+
+        comfy_debug_section = meta.setdefault("comfy_debug", {})
+        comfy_debug_section.update({"host": base_host, "prompt_json": str(main_wf_path), "prompt_seconds": seconds_val,
+                                    "requested_format": "wav", "requested_ext": output_ext,
+                                    "subfolder": subfolder_path})
+        meta["tags_effective"] = {"positive": positive_tags, "negative": negative_tags}
+
+        try:
+            save_json(pj, meta)
+            _dlog("META_SAVE_FINAL", f"Final project.json saved: '{pj.name}'")
+        except Exception as e:
+            _dlog(f"[ERROR] Failed save final pj: {e}")
+
+        if isinstance(final_audio_path, Path) and final_audio_path.exists():
+            try:
+                library_path = save_to_user_library("audio", title, final_audio_path, rename=True)
+                if isinstance(library_path, Path) and library_path.exists():
+                    library_saved_path = library_path
+            except Exception as e:
+                _dlog("LIBRARY_COPY_ERROR", f"Failed: {e}")
+
+    except Exception as main_execution_err:
+        _dlog(f"[FATAL] Music generation failed: {main_execution_err}")
+        notify("error", error=f"음악 생성 실패: {main_execution_err}")
+        summary_final = f"ACE-Step 실패 ❌\n- 오류: {main_execution_err}"
+        _dlog("LEAVE", summary_final.replace("\n", " | "))
+        return summary_final
+
+    # --- 최종 요약 ---
+    wf_name = Path(main_wf_path).name if main_wf_path else "Unknown WF"
+    message_lines: List[str] = [f"ACE-Step 완료 ✅", f"- 프롬프트: {wf_name}", f"- 길이: {seconds_val}s",
+                                f"- 태그: +{len(positive_tags)} / -{len(negative_tags)}"]
+
+    if isinstance(final_audio_path, Path) and final_audio_path.exists():
+        message_lines.append(f"- 저장:     '{final_audio_path.name}'")
+    else:
+        message_lines.append("- 저장:     (오류 또는 파일 없음)")
+
+    if isinstance(library_saved_path, Path) and library_saved_path.exists():
+        message_lines.append(f"- 라이브러리: '{library_saved_path.name}'")
+
+    summary_final = "\n".join(message_lines)
+    _dlog("LEAVE", summary_final.replace("\n", " | "))
+    notify("finished", summary=summary_final)
+    return summary_final
 
 def _graph(prompt) -> dict:
     """
@@ -2523,7 +3062,7 @@ import json
 import uuid
 import time
 from pathlib import Path
-from typing import Optional, List, Dict, Callable, Any # Tuple 제거됨
+from typing import Optional, List, Dict, Any # Tuple 제거됨
 import subprocess
 import numpy as np
 import shutil # Added for _ensure_vocal_wav
@@ -2540,342 +3079,7 @@ except ImportError:
             ACE_STEP_PROMPT_JSON = "jsons/ace_step_1_t2m.json"; JSONS_DIR = "jsons"; FFMPEG_EXE = "ffmpeg"; BASE_DIR = "."; FINAL_OUT = "."; COMFY_HOST = "http://127.0.0.1:8188"; DEFAULT_HOST_CANDIDATES: List[str] = []; MASTER_TARGET_I = -12.0; MASTER_TARGET_TP = -1.0; MASTER_TARGET_LRA = 11.0
         S = DummySettings(); print("[WARN] Settings module not found, using dummy.")
 
-# audio_sync.py 파일에서 이 함수를 찾아 아래 내용으로 전체를 교체하세요.
-def generate_music_with_acestep(
-        project_dir: str,
-        *,
-        on_progress: Optional[Callable[[dict], None]] = None,
-        target_seconds: int | None = None,
-) -> str:
-    """
-    ComfyUI(ACE-Step) 단일 트랙 음악 생성 — project.json 단일 소스 정책.
-    - [수정 v12] API 결과 추출 노드 ID(75) 재확인 및 파싱 강화, 세미콜론 제거 완료:
-        * 청크 변환 API 결과 추출 시, 로그에서 확인된 Node 75(PreviewAny)의 'outputs.text[0]'을 정확히 파싱 시도.
-        * 폴링 로직 및 history 파싱 부분 안정성 강화.
-        * 코드 내 모든 후행 세미콜론 제거 완료.
-    - lyrics_lls_after 복원 등 이전 수정사항 유지.
-    - 모든 코딩 규칙 준수.
-    """
-    # --- 내부 헬퍼 함수 ---
-    def notify(stage: str, **kw: Any) -> None: # (v11과 동일)
-        if on_progress:
-            try: info: Dict[str, Any] = {"stage": stage}; info.update(kw); on_progress(info)
-            except (TypeError, ValueError, RuntimeError): pass
 
-    def _iter_nodes(graph: dict) -> Any: # (v11과 동일)
-        if not isinstance(graph, dict): return
-        nodes_list = graph.get("nodes")
-        if isinstance(nodes_list, list):
-            for nobj in nodes_list:
-                if isinstance(nobj, dict): yield nobj
-        else:
-            for _k, nobj in graph.items():
-                if isinstance(nobj, dict) and "class_type" in nobj: yield nobj
-                elif isinstance(nobj, dict) and "prompt" in nobj and isinstance(nobj["prompt"], dict):
-                     for _pk, p_nobj in nobj["prompt"].items():
-                          if isinstance(p_nobj, dict) and "class_type" in p_nobj: yield p_nobj
-
-    def _force_wav_save_for_this_graph(graph: dict, *, proj_dir: Path, filename_prefix: str) -> str: # (v11과 동일)
-        for nobj in _iter_nodes(graph):
-            ct_local = str(nobj.get("class_type", "")).lower()
-            if ct_local.startswith("saveaudio"):
-                inputs_map_local = nobj.setdefault("inputs", {})
-                inputs_map_local["filename_prefix"] = filename_prefix
-                if "output_path" in inputs_map_local: inputs_map_local["output_path"] = str(proj_dir)
-                for base_key in ("basename", "base_filename", "filename"):
-                    if base_key in inputs_map_local: inputs_map_local[base_key] = "vocal"
-                for wav_key, wav_val in (("format", "wav"), ("container", "wav"), ("codec", "pcm_s16le")):
-                     if wav_key in inputs_map_local: inputs_map_local[wav_key] = wav_val
-                if "sample_rate" in inputs_map_local: inputs_map_local.setdefault("sample_rate", 44100)
-                for bd_key in ("bit_depth", "bitdepth", "bits"):
-                     if bd_key in inputs_map_local: inputs_map_local[bd_key] = 16
-        return ".wav"
-
-    # --- Comfy API 호출 로직 (generate_music_with_acestep 함수 내부에 통합) ---
-    def _call_comfy_api_for_ko_chunk(text_chunk: str, host_address: str) -> str:
-        """
-        [수정됨 v12] 한글 덩어리를 전용 워크플로우로 변환 시도. 결과 추출 노드 ID=75 재확인 및 파싱 강화.
-        """
-        lyrics_node_id = "74"
-        # ★★ 결과 추출 대상 노드 ID 재확인 및 명시 ★★
-        result_node_id = "75" # PreviewAny 노드
-        save_text_node_id = "79" # SaveText 노드 (워크플로우에는 존재)
-
-        transformed_result = text_chunk
-        api_workflow_path: Optional[Path] = None
-
-        try: # 워크플로우 로드 (v11과 동일)
-            jsons_dir_val = getattr(S, "JSONS_DIR", "jsons")
-            api_workflow_path = Path(jsons_dir_val) / "ace_step_text_change.json"
-            if not api_workflow_path.exists():
-                api_workflow_path = Path("jsons") / "ace_step_text_change.json"
-                if not api_workflow_path.exists(): raise FileNotFoundError("API workflow not found")
-            with open(api_workflow_path, 'r', encoding='utf-8') as f_api_wf: api_workflow_graph = json.load(f_api_wf)
-        except Exception as load_api_wf_err:
-             error_path_str = str(api_workflow_path) if api_workflow_path else "configured/default path"
-             _dlog(f"[ERROR] Comfy API(Chunk): Failed load/parse API WF '{error_path_str}'. Err: {load_api_wf_err}.")
-             return transformed_result
-
-        try:
-            # Node 74 입력 수정 (v11과 동일)
-            if lyrics_node_id in api_workflow_graph: api_workflow_graph[lyrics_node_id].setdefault("inputs", {})["lyrics"] = text_chunk
-            else: _dlog(f"[WARN] Comfy API(Chunk): Node {lyrics_node_id} not found."); return transformed_result
-            # Node 79 설정 (v11과 동일)
-            if save_text_node_id in api_workflow_graph:
-                save_inputs = api_workflow_graph[save_text_node_id].setdefault("inputs", {}); save_inputs["text"] = [lyrics_node_id, 0]; save_inputs["filename_prefix"] = f"comfy_api_transform_temp_{uuid.uuid4().hex[:8]}"; save_inputs["append"] = "overwrite"
-
-            # API 제출 (v11과 동일)
-            prompt_payload_api = {"prompt": api_workflow_graph, "client_id": str(uuid.uuid4())}
-            api_url_post = f"{host_address.rstrip('/')}/prompt"
-            response_post_api = requests.post(api_url_post, json=prompt_payload_api, timeout=10); response_post_api.raise_for_status()
-            response_json_api = response_post_api.json(); prompt_id_api = response_json_api.get('prompt_id')
-            if not prompt_id_api: _dlog("[WARN] Comfy API(Chunk): Prompt ID 없음."); return transformed_result
-
-            # 결과 폴링 (타임아웃 15초, 파싱 로직 강화)
-            start_time_poll_api = time.time(); api_url_get = f"{host_address.rstrip('/')}/history/{prompt_id_api}"
-            history_data_api: Optional[Dict] = None
-            found_result_text: Optional[str] = None # ★★ 결과 저장 변수 ★★
-
-            while time.time() - start_time_poll_api < 15:
-                try:
-                    response_get_api = requests.get(api_url_get, timeout=5)
-                    if response_get_api.ok:
-                        history_data_api = response_get_api.json()
-                        if prompt_id_api in history_data_api:
-                            history_entry = history_data_api[prompt_id_api]
-                            status_obj = history_entry.get("status", {}); status_str = status_obj.get("status_str", "")
-                            if status_str == "error": _dlog(f"[ERROR] Comfy API(Chunk): Job failed. Err: {status_obj.get('exception_message')}"); return transformed_result # 실패 시 즉시 반환
-
-                            outputs_api = history_entry.get('outputs')
-                            # ★★ Node 75 결과 파싱 강화 ★★
-                            if isinstance(outputs_api, dict):
-                                result_node_output = outputs_api.get(result_node_id) # Node 75 시도
-                                if isinstance(result_node_output, dict):
-                                    # 로그 확인 결과: 'text' 키에 리스트 형태로 저장됨
-                                    result_list = result_node_output.get('text')
-                                    if isinstance(result_list, list) and result_list:
-                                        potential_text = result_list[0]
-                                        if isinstance(potential_text, str) and potential_text.strip():
-                                            found_result_text = potential_text.strip() # 결과 찾음!
-                                            break # 결과 찾으면 폴링 중단
-
-                            # 작업 완료 시 (결과 못 찾았어도) 폴링 중단
-                            if status_obj.get("completed", False):
-                                 # Node 75에서 결과를 못 찾았다는 로그 남기기
-                                 _dlog(f"[WARN] Comfy API(Chunk): Job completed but Node {result_node_id} output was missing or invalid.")
-                                 _dlog("       History Entry:", json.dumps(history_entry, indent=2, ensure_ascii=False))
-                                 break # 루프 종료
-
-                except requests.exceptions.Timeout: pass
-                except requests.exceptions.RequestException as poll_err: _dlog(f"[WARN] Comfy API(Chunk): History polling error: {poll_err}")
-                time.sleep(0.5)
-
-            # ★★ 최종 결과 처리 ★★
-            if found_result_text is not None:
-                transformed_result = found_result_text
-                _dlog("[DEBUG] Comfy API(Chunk) 변환 성공:", text_chunk, "->", transformed_result)
-                return transformed_result # 성공 (태그 포함 가능)
-            else:
-                # 폴링 시간 초과 또는 완료되었으나 결과 못 찾음
-                _dlog("[WARN] Comfy API(Chunk): 폴링 시간 초과 또는 최종 결과 없음. 원본 반환:", text_chunk)
-                if history_data_api: _dlog("       Last History Response:", json.dumps(history_data_api.get(prompt_id_api, {}), indent=2, ensure_ascii=False))
-                return text_chunk # 실패 시 원본 반환 (태그 없음)
-
-        except requests.exceptions.RequestException as req_err_api: _dlog(f"[ERROR] Comfy API(Chunk) 호출 실패: {req_err_api}.")
-        except Exception as exy: _dlog(f"[ERROR] Comfy API(Chunk) 처리 오류: {exy}.")
-        return text_chunk # 최종 실패 시 원본 반환
-
-    # --- 메인 로직 시작 ---
-    _dlog("ENTER", f"project_dir={project_dir}")
-    proj = Path(project_dir); proj.mkdir(parents=True, exist_ok=True)
-    pj = proj / "project.json"; meta: Dict[str, Any] = load_json(pj, {}) or {}
-    title = effective_title(meta); lyrics_raw = (meta.get("lyrics") or "").strip()
-
-    # LLS 사용 여부 판단 (v11과 동일)
-    use_lls = meta.get("lls_enabled") is True
-    _dlog("LLS_CHECK", f"lls_enabled is {meta.get('lls_enabled')}, use_lls set to {use_lls}")
-
-    # 가사 처리 로직 시작 (v11과 동일 - API 호출 로직은 위에서 수정됨)
-    try: comfy_host_addr_local = _choose_host()
-    except Exception as host_err: _dlog(f"[ERROR] ComfyUI host selection failed: {host_err}."); return f"Music generation failed: Cannot connect to ComfyUI host ({getattr(S, 'COMFY_HOST', 'default')})."
-
-    lyrics_eff: str
-    if use_lls: # (v11과 동일)
-        lyrics_eff = (meta.get("lyrics_lls") or "").strip(); _dlog("LYRICS_MODE", "Using LLS (from project.json)")
-        if not lyrics_eff: _dlog("[ERROR] LLS enabled but 'lyrics_lls' is empty."); return "Music generation failed: LLS enabled but lyrics_lls is empty."
-    else: # (v11과 동일 - 내부 API 호출 로직 변경됨)
-        _dlog("LYRICS_MODE", "Using Raw Lyrics (Applying split/API transform with dedicated workflow)")
-        processed_lines_new: List[str] = []; chunk_pattern = re.compile(r'[가-힣]+(?:[,\s]*[가-힣]+)*|[^가-힣]+(?:[,\s]*[^가-힣]+)*')
-        original_lines = lyrics_raw.splitlines(); total_lines_to_process = len(original_lines); _dlog("LYRICS_PROCESSING_START", f"Total lines: {total_lines_to_process}")
-        for line_index, line in enumerate(original_lines):
-            stripped_line = line.strip()
-            if (line_index + 1) % 5 == 0 or (line_index + 1) == total_lines_to_process: _dlog("LYRICS_PROCESSING_PROGRESS", f"Processing line {line_index + 1}/{total_lines_to_process}")
-            if not stripped_line: processed_lines_new.append(""); continue
-            if stripped_line.startswith('[') and stripped_line.endswith(']'): processed_lines_new.append(stripped_line.lower()); continue
-            tagged_chunks: List[str] = []; found_chunks = chunk_pattern.findall(stripped_line)
-            if not found_chunks and stripped_line: tagged_chunks.append(f"[en]{stripped_line}")
-            else:
-                 for chunk_text in found_chunks:
-                     stripped_chunk = chunk_text.strip()
-                     if not stripped_chunk: continue
-                     if re.search(r'[가-힣]', stripped_chunk):
-                         transformed_ko_chunk = _call_comfy_api_for_ko_chunk(stripped_chunk, comfy_host_addr_local)
-                         if transformed_ko_chunk.startswith("[ko]"): tagged_chunks.append(transformed_ko_chunk)
-                         else: tagged_chunks.append(f"[ko]{stripped_chunk}"); _dlog(f"[WARN] API result for '{stripped_chunk}' invalid. Used original.")
-                     else: tagged_chunks.append(f"[en]{stripped_chunk}")
-            processed_line_result = " ".join(tagged_chunks); processed_lines_new.append(processed_line_result)
-        lyrics_eff = "\n".join(processed_lines_new)
-        _dlog("LYRICS_PROCESSING_END", f"Finished processing {total_lines_to_process} lines.")
-        _dlog("[DEBUG] Final lyrics_eff preview (New Logic, first 200 chars):", lyrics_eff[:200])
-
-    # --- 이하 로직 (초 계산 ~ 음악 생성 완료)은 v11과 동일 ---
-    if not lyrics_eff: _dlog("[ERROR] No effective lyrics."); return "Music generation failed: No effective lyrics."
-
-    # 변수 초기화 (v11과 동일)
-    seconds_val: int = 60; positive_tags: List[str] = []; negative_tags: List[str] = []
-    main_wf_path: Union[str, Path] = getattr(S, "ACE_STEP_PROMPT_JSON", "jsons/ace_step_1_t2m.json")
-    graph_loaded: Optional[Dict] = None; base_host: str = comfy_host_addr_local
-    subfolder_path: str = ""; save_prefix: str = ""; output_ext: str = ".wav"
-    history_result: Optional[Dict] = None; final_audio_path: Optional[Path] = None; library_saved_path: Optional[Path] = None; lls_after_result: str = ""
-
-    try: # 전체 메인 로직 try 블록 (v11과 동일)
-        # 초 계산 (v11과 동일)
-        if target_seconds is not None: seconds_val = int(max(1, target_seconds))
-        else:
-            time_meta = meta.get("time"); ts_meta = meta.get("target_seconds")
-            try: seconds_val = int(ts_meta) if ts_meta is not None else int(time_meta) # type: ignore
-            except (ValueError, TypeError): seconds_val = 60
-            seconds_val = int(max(1, seconds_val))
-        meta["target_seconds"] = seconds_val; meta["time"] = seconds_val; meta["lyrics_lls_now"] = lyrics_eff
-        try: save_json(pj, meta); _dlog("META_SAVE_PRE", f"Saved target_seconds={seconds_val} and lyrics_lls_now")
-        except OSError as e: _dlog(f"[WARN] Failed save pre-gen meta: {e}")
-        # 태그 수집 (v11과 동일)
-        positive_tags = _collect_effective_tags(meta)
-        neg_raw = meta.get("prompt_neg") or ""; negative_tags = [t.strip() for t in re.split(r'[,;\n]+', str(neg_raw)) if t.strip()]
-        # 워크플로 로드 (v11과 동일)
-        try: graph_loaded = _load_workflow_graph(main_wf_path)
-        except Exception as e: _dlog(f"[ERROR] Failed load main WF: {e}"); raise
-        # 서버 주소 및 저장 경로 (v11과 동일)
-        _dlog("HOST", base_host, "| DESIRED_FMT wav")
-        sanitized_title = sanitize_title(title); subfolder_path = f"shorts_make/{sanitized_title}"; save_prefix = f"{subfolder_path}/vocal_final"
-        output_ext = _force_wav_save_for_this_graph(graph_loaded, proj_dir=proj, filename_prefix=save_prefix)
-        # 워크플로 노드 주입 (v11과 동일)
-        try:
-            lyrics_id="74"; txt_pos_id="14"; sec_id="17"; sampler_id="52"
-            if lyrics_id in graph_loaded: graph_loaded[lyrics_id].setdefault("inputs", {})["lyrics"]=lyrics_eff; _dlog("INJECT", f"Node {lyrics_id} (Lyrics)")
-            if txt_pos_id in graph_loaded: graph_loaded[txt_pos_id].setdefault("inputs", {})["tags"]=", ".join(positive_tags); _dlog("INJECT", f"Node {txt_pos_id} (Pos Tags)")
-            if sec_id in graph_loaded: graph_loaded[sec_id].setdefault("inputs", {})["seconds"]=seconds_val; _dlog("INJECT", f"Node {sec_id} (Seconds)")
-            if sampler_id in graph_loaded: graph_loaded[sampler_id].setdefault("inputs", {})["seed"]=_rand_seed(); _dlog("INJECT", f"Node {sampler_id} (Seed)")
-            if negative_tags: _dlog("INFO", f"Negative tags ({len(negative_tags)}) not injected.")
-        except Exception as e: _dlog(f"[ERROR] Main WF injection failed: {e}"); raise
-        # 작업 제출 및 대기 (v11과 동일)
-        notify("submitting", host=base_host); progress_cb = on_progress if callable(on_progress) else (lambda i: _dlog("PROG", i))
-        try: dbg_wf = proj / "_debug_workflow_sent.json"; save_json(dbg_wf, {"prompt": graph_loaded}); _dlog("DEBUG_WORKFLOW_SAVE", f"Saved final WF to {dbg_wf.name}")
-        except Exception as e: _dlog(f"[WARN] Failed save debug WF: {e}")
-        history_result = _submit_and_wait(base_host, graph_loaded, timeout=_ace_wait_timeout_sec(), poll=_ace_poll_interval_sec(), on_progress=progress_cb)
-
-        # 결과 처리 (v11과 동일)
-        saved_files_list: List[Path] = []; outputs_hist = history_result.get("outputs") if isinstance(history_result, dict) else None
-        if isinstance(outputs_hist, dict):
-            for _nid, node_out in outputs_hist.items():
-                for key in ("audio", "audios", "files", "wav", "mp3", "output"):
-                    arr = node_out.get(key)
-                    if not isinstance(arr, list): continue
-                    for item in arr:
-                        if not isinstance(item, dict): continue
-                        fn = (item.get("filename") or "").strip(); sf = (item.get("subfolder") or "").strip()
-                        if not fn or fn.startswith("ComfyUI_temp_"): continue
-                        sf_norm = sf.replace("\\", "/").lstrip("/")
-                        if not sf_norm.startswith(subfolder_path): continue
-                        try:
-                            dl_file = _download_output_file(base_host, fn, sf_norm, out_dir=proj)
-                            if isinstance(dl_file, Path) and dl_file.exists() and dl_file.stat().st_size > 0: saved_files_list.append(dl_file); _dlog("DOWNLOAD_SUCCESS", f"File: '{fn}' -> '{dl_file.name}'")
-                        except Exception as e: _dlog("DOWNLOAD_ERROR", f"'{fn}': {type(e).__name__}")
-
-        # 최종 파일 선택 및 처리 (v11과 동일)
-        if saved_files_list:
-            wavs=sorted([p for p in saved_files_list if p.suffix.lower()==".wav"],key=lambda p:p.stat().st_mtime,reverse=True); others=sorted([p for p in saved_files_list if p.suffix.lower()!=".wav"],key=lambda p:p.stat().st_mtime,reverse=True)
-            candidates=wavs+others; source_audio:Optional[Path]=candidates[0] if candidates else None
-            if source_audio and source_audio.exists():
-                _dlog("SELECTED_SOURCE_AUDIO", f"Selected '{source_audio.name}'.")
-                ffmpeg_p = getattr(S, "FFMPEG_EXE", "ffmpeg") or "ffmpeg"
-                try:
-                    final_audio_path = _ensure_vocal_wav(source_audio, proj, ffmpeg_exe=ffmpeg_p); _dlog("ENSURED_WAV", f"Final WAV: '{final_audio_path.name}'")
-                    master_fn = globals().get("_master_wav_precise")
-                    if callable(master_fn) and isinstance(final_audio_path, Path) and final_audio_path.exists():
-                         _dlog("MASTERING_START", f"Applying mastering...")
-                         try:
-                             ti=float(getattr(S,"MASTER_TARGET_I",-12.0)); tp=float(getattr(S,"MASTER_TARGET_TP",-1.0)); tl=float(getattr(S,"MASTER_TARGET_LRA",11.0))
-                             mastered_p = master_fn(final_audio_path, I=ti, TP=tp, LRA=tl, ffmpeg_exe=ffmpeg_p)
-                             if isinstance(mastered_p, Path) and mastered_p.exists():
-                                 if mastered_p.resolve() != final_audio_path.resolve():
-                                     try: final_audio_path.unlink(); mastered_p.rename(final_audio_path); _dlog("MASTERING_SUCCESS_REPLACED", f"Mastered: '{final_audio_path.name}'")
-                                     except OSError as e: _dlog(f"[WARN] Failed replace after mastering: {e}. Kept at '{mastered_p.name}'."); final_audio_path = mastered_p
-                                 else: _dlog("MASTERING_SUCCESS_INPLACE", f"Mastered in-place: '{final_audio_path.name}'")
-                         except Exception as e: _dlog("MASTERING_ERROR", f"Error: {type(e).__name__}")
-                except Exception as e: _dlog(f"[ERROR] Ensuring WAV failed: {e}"); final_audio_path = None
-
-        # lyrics_lls_after 저장 로직 (v11과 동일)
-        if isinstance(outputs_hist, dict):
-            buffer_lls_after: List[str] = []; main_lyrics_node_output = outputs_hist.get("74", {})
-            if main_lyrics_node_output:
-                for key_lls_res in ("text", "result", "string", "strings"):
-                    value_lls_res = main_lyrics_node_output.get(key_lls_res)
-                    if isinstance(value_lls_res, str) and value_lls_res.strip(): buffer_lls_after.append(value_lls_res.strip()); break
-                    elif isinstance(value_lls_res, list):
-                         found = False
-                         for item in value_lls_res:
-                             if isinstance(item, str) and item.strip(): buffer_lls_after.append(item.strip()); found = True
-                         if found: break
-            if not buffer_lls_after: # 폴백: Node 75 시도
-                preview_node_output = outputs_hist.get("75", {})
-                if isinstance(preview_node_output, dict):
-                    for key_preview in ("text", "previews"):
-                        value_preview = preview_node_output.get(key_preview)
-                        if isinstance(value_preview, str) and value_preview.strip(): buffer_lls_after.append(value_preview.strip()); break
-                        elif isinstance(value_preview, list):
-                            found_preview = False
-                            for item_preview in value_preview:
-                                if isinstance(item_preview, str) and item_preview.strip(): buffer_lls_after.append(item_preview.strip()); found_preview = True
-                            if found_preview: break
-            if buffer_lls_after:
-                 lls_after_result = "\n".join(buffer_lls_after).strip()
-                 if lls_after_result: meta["lyrics_lls_after"] = lls_after_result; _dlog("LLS_AFTER_CAPTURE", f"Captured Node 74/75 output: {len(lls_after_result)} chars")
-                 # else: _dlog("LLS_AFTER_CAPTURE", "Captured output empty.") # 로그 간소화
-            # else: _dlog("LLS_AFTER_CAPTURE", "Node 74/75 output not found.") # 로그 간소화
-        # else: _dlog("LLS_AFTER_CAPTURE", "History 'outputs' missing.") # 로그 간소화
-
-        # 최종 메타 업데이트 (v11과 동일)
-        if isinstance(final_audio_path, Path) and final_audio_path.exists() and final_audio_path.stat().st_size > 0: meta.setdefault("paths", {})["vocal"] = str(final_audio_path); meta["audio"] = str(final_audio_path)
-        else: final_audio_path = None
-        comfy_debug_section = meta.setdefault("comfy_debug", {})
-        comfy_debug_section.update({"host": base_host, "prompt_json": str(main_wf_path), "prompt_seconds": seconds_val, "requested_format": "wav", "requested_ext": output_ext, "subfolder": subfolder_path})
-        meta["tags_effective"] = {"positive": positive_tags, "negative": negative_tags}
-        try: save_json(pj, meta); _dlog("META_SAVE_FINAL", f"Final project.json saved: '{pj.name}'")
-        except Exception as e: _dlog(f"[ERROR] Failed save final pj: {e}")
-
-        # 라이브러리 복사 (v11과 동일)
-        if isinstance(final_audio_path, Path) and final_audio_path.exists():
-            try:
-                library_path = save_to_user_library("audio", title, final_audio_path, rename=True)
-                if isinstance(library_path, Path) and library_path.exists(): library_saved_path = library_path
-            except Exception as e: _dlog("LIBRARY_COPY_ERROR", f"Failed: {e}")
-
-    except Exception as main_execution_err: # 메인 로직 오류 처리 (v11과 동일)
-        _dlog(f"[FATAL] Music generation failed: {main_execution_err}")
-        notify("error", error=f"음악 생성 실패: {main_execution_err}")
-        summary_final = f"ACE-Step 실패 ❌\n- 오류: {main_execution_err}"; _dlog("LEAVE", summary_final.replace("\n", " | ")); return summary_final
-
-    # --- 최종 요약 (v11과 동일) ---
-    wf_name = Path(main_wf_path).name if main_wf_path else "Unknown WF"
-    message_lines: List[str] = [f"ACE-Step 완료 ✅", f"- 프롬프트: {wf_name}", f"- 길이: {seconds_val}s", f"- 태그: +{len(positive_tags)} / -{len(negative_tags)}"]
-    if isinstance(final_audio_path, Path) and final_audio_path.exists(): message_lines.append(f"- 저장:     '{final_audio_path.name}'")
-    else: message_lines.append("- 저장:     (오류 또는 파일 없음)")
-    if isinstance(library_saved_path, Path) and library_saved_path.exists(): message_lines.append(f"- 라이브러리: '{library_saved_path.name}'")
-    summary_final = "\n".join(message_lines); _dlog("LEAVE", summary_final.replace("\n", " | ")); notify("finished", summary=summary_final)
-    return summary_final
-
-# (... 기존 audio_sync.py 파일의 나머지 부분 ...)
 
 
 ##########################################################################

@@ -7,3 +7,12 @@
 [parse] text_len=354
 [parse] ok
 [normalize] lyrics generated without language tags
+[ui] 가사 생성 시작
+[ai] prefer=gemini, secs=120
+[ai] prefer=gemini, allow_fallback=False, sec=120, lines=22-26
+[gemini] model=gemini-2.5-pro
+[gemini] len=864
+[provider] gemini model=gemini-2.5-pro
+[parse] text_len=864
+[parse] ok
+[normalize] lyrics generated without language tags
