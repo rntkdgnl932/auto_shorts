@@ -29,8 +29,10 @@ import sys
 import os
 import faulthandler
 import traceback
+import shutil  # <-- 이 줄을 추가하세요
+import functools # <-- 이 줄을 추가하세요
 import datetime
-from PyQt5 import QtCore, QtWidgets
+from PyQt5 import QtCore, QtWidgets, QtGui
 from PyQt5.QtWidgets import QPlainTextEdit, QTextEdit, QFontComboBox
 try:
     from app.image_movie_docs import normalize_to_v11  # type: ignore
@@ -377,6 +379,385 @@ class ProgressLogDialog(QtWidgets.QDialog):
 
     def set_title(self, text: str):
         self.setWindowTitle(text)
+# ───────────────────────── 제이슨 수정 ─────────────────────────
+
+class ScenePromptEditDialog(QtWidgets.QDialog):
+    """
+    [수정됨 v5] video.json 파일을 읽어, 각 scene의 'direct_prompt'를
+    이미지 썸네일과 함께 편집하고 "업데이트" 버튼으로 저장합니다.
+    - 4개씩 페이지네이션 적용
+    - 썸네일 크기 150px
+    - 썸네일 클릭 시 원본 이미지 팝업
+    - [신규] 이미지 없을 시 '업로드' 버튼 활성화
+    """
+
+    def __init__(self, json_path: Path, parent: Optional[QtWidgets.QWidget] = None):
+        super().__init__(parent)
+        self.json_path = json_path
+        self.full_video_data: dict = {}  # video.json 전체 내용을 담을 변수
+        self.scenes_data: list = []  # scenes 리스트만 담을 변수
+        self.widget_map: list[tuple[str, QtWidgets.QTextEdit]] = []  # (scene_id, 텍스트위젯) 매핑
+
+        self.current_page = 0
+        self.total_pages = 0
+        self.PAGE_SIZE = 4  # 페이지당 4개
+        self.THUMBNAIL_SIZE = 150  # 썸네일 크기 150px
+
+        self.setWindowTitle(f"Scene 프롬프트 편집: {self.json_path.name}")
+        self.setMinimumSize(900, 750)
+        self.setWindowModality(QtCore.Qt.WindowModality.WindowModal)
+
+        # 1. 메인 레이아웃
+        main_layout = QtWidgets.QVBoxLayout(self)
+
+        # 2. 씬 목록을 담을 QStackedWidget (페이지 전환용)
+        self.stacked_widget = QtWidgets.QStackedWidget()
+        main_layout.addWidget(self.stacked_widget)
+
+        # 3. 페이지네이션 컨트롤
+        pagination_layout = QtWidgets.QHBoxLayout()
+        self.btn_prev = QtWidgets.QPushButton("< 이전")
+        self.page_label = QtWidgets.QLabel("Page 0 / 0")
+        self.page_label.setAlignment(QtCore.Qt.AlignmentFlag.AlignCenter)
+        self.btn_next = QtWidgets.QPushButton("다음 >")
+
+        pagination_layout.addWidget(self.btn_prev)
+        pagination_layout.addStretch(1)
+        pagination_layout.addWidget(self.page_label)
+        pagination_layout.addStretch(1)
+        pagination_layout.addWidget(self.btn_next)
+        main_layout.addLayout(pagination_layout)
+
+        # 4. 하단 버튼 레이아웃
+        button_layout = QtWidgets.QHBoxLayout()
+        self.btn_update = QtWidgets.QPushButton("업데이트")
+        self.btn_cancel = QtWidgets.QPushButton("닫기")
+
+        button_layout.addStretch(1)
+        button_layout.addWidget(self.btn_cancel)
+        button_layout.addWidget(self.btn_update)
+        main_layout.addLayout(button_layout)
+
+        # 5. 시그널 연결
+        self.btn_update.clicked.connect(self.on_update_and_close)
+        self.btn_cancel.clicked.connect(self.reject)
+        self.btn_prev.clicked.connect(self.on_prev_page)
+        self.btn_next.clicked.connect(self.on_next_page)
+
+        # 6. JSON 데이터 로드 및 UI 빌드
+        self.load_and_build_ui()
+
+    def show_large_image(self, path_str: str):
+        """썸네일 클릭 시 원본 이미지를 새 다이얼로그에 표시"""
+        if not path_str:
+            QtWidgets.QMessageBox.information(self, "미리보기", "이 씬에는 이미지 경로가 지정되지 않았습니다.")
+            return
+
+        pixmap = QtGui.QPixmap(path_str)
+        if pixmap.isNull():
+            QtWidgets.QMessageBox.warning(self, "미리보기 오류", f"이미지를 불러올 수 없습니다:\n{path_str}")
+            return
+
+        dialog = QtWidgets.QDialog(self)
+        dialog.setWindowTitle(f"이미지 미리보기: {Path(path_str).name}")
+
+        label = QtWidgets.QLabel()
+        label.setPixmap(pixmap)
+
+        scroll_area = QtWidgets.QScrollArea()
+        scroll_area.setWidget(label)
+
+        layout = QtWidgets.QVBoxLayout(dialog)
+        layout.addWidget(scroll_area)
+
+        try:
+            screen_geo = self.screen().availableGeometry()
+        except AttributeError:
+            screen_geo = QtWidgets.QApplication.primaryScreen().availableGeometry()
+
+        max_w = screen_geo.width() * 0.8
+        max_h = screen_geo.height() * 0.8
+        img_w = pixmap.width()
+        img_h = pixmap.height()
+
+        if img_w > max_w or img_h > max_h:
+            scaled_pixmap = pixmap.scaled(int(max_w), int(max_h),
+                                          QtCore.Qt.AspectRatioMode.KeepAspectRatio,
+                                          QtCore.Qt.TransformationMode.SmoothTransformation)
+            label.setPixmap(scaled_pixmap)
+            dialog.resize(scaled_pixmap.width() + 40, scaled_pixmap.height() + 40)
+        else:
+            dialog.resize(img_w + 40, img_h + 40)
+
+        dialog.exec_()
+
+    def on_upload_image(self, scene_id: str, button_widget: QtWidgets.QPushButton, scene_data: Optional[dict] = None):
+        """[신규] '업로드' 버튼 클릭 시, 이미지를 선택받아 imgs/{id}.png로 복사/저장"""
+        if scene_data is None:
+            scene_data = {} # None일 경우 빈 dict로 초기화
+
+        # 1. 대상 폴더 및 파일명 정의 (imgs/{id}.png)
+        imgs_dir = self.json_path.parent / "imgs"
+        try:
+            imgs_dir.mkdir(parents=True, exist_ok=True)
+        except OSError as e:
+            QtWidgets.QMessageBox.warning(self, "업로드 오류", f"이미지 폴더를 생성할 수 없습니다:\n{e}")
+            return
+
+        target_path = imgs_dir / f"{scene_id}.png"
+
+        # 2. 파일 선택 대화상자
+        src_path_str, selected_filter = QtWidgets.QFileDialog.getOpenFileName(
+            self,
+            f"'{scene_id}' 씬 이미지 선택",
+            str(imgs_dir),  # 기본 경로
+            "Images (*.png *.jpg *.jpeg *.webp)"
+        )
+
+        if not src_path_str:
+            return  # 사용자가 취소
+
+        # 3. 파일 복사 (shutil.copy2 사용)
+        try:
+            shutil.copy2(str(src_path_str), str(target_path))
+        except Exception as e:
+            QtWidgets.QMessageBox.warning(self, "업로드 오류", f"파일 복사 중 오류가 발생했습니다:\n{e}")
+            return
+
+        # 4. 복사 성공: 인메모리 데이터 갱신
+        target_path_str = str(target_path)
+        scene_data["img_file"] = target_path_str
+
+        # 5. 버튼 UI 갱신 (썸네일 모드로 변경)
+        self.setup_button_state_for_widget(
+            button_widget,
+            has_image_now=True,
+            path_now_str=target_path_str,
+            scene_id=scene_id,
+            scene_data=scene_data
+        )
+
+    def setup_button_state_for_widget(self,
+                                      img_button: QtWidgets.QPushButton,
+                                      has_image_now: bool,
+                                      path_now_str: str,
+                                      scene_id: str,
+                                      scene_data: Optional[dict] = None):
+        """[신규] 특정 버튼의 상태를 썸네일/업로드 모드로 설정하고 시그널을 다시 연결"""
+        if scene_data is None:
+            scene_data = {} # None일 경우 빈 dict로 초기화
+        img_button.clearFocus()
+
+        # 기존 시그널 모두 연결 해제
+        try:
+            img_button.clicked.disconnect()
+        except TypeError:
+            pass  # 연결된 것이 없으면 통과
+
+        if has_image_now and path_now_str:
+            # --- State 1: 썸네일 표시 ---
+            pixmap = QtGui.QPixmap(path_now_str)
+            if not pixmap.isNull():
+                pixmap_scaled = pixmap.scaled(
+                    self.THUMBNAIL_SIZE, self.THUMBNAIL_SIZE,
+                    QtCore.Qt.AspectRatioMode.KeepAspectRatio,
+                    QtCore.Qt.TransformationMode.SmoothTransformation
+                )
+                img_button.setIcon(QtGui.QIcon(pixmap_scaled))
+                img_button.setText("")
+                img_button.setToolTip(f"경로: {path_now_str}\n(클릭해서 크게 보기)")
+                img_button.setStyleSheet("border: 1px solid #555; background-color: #222; text-align: center;")
+                # '미리보기' 기능 연결
+                img_button.clicked.connect(lambda _, p=path_now_str: self.show_large_image(p))
+            else:
+                # --- State 1b: 경로는 있으나 파일이 깨진 경우 ---
+                img_button.setIcon(QtGui.QIcon())
+                img_button.setText("[파일\n오류]")
+                img_button.setToolTip(f"경로: {path_now_str}\n(파일을 읽을 수 없음. 클릭하여 재업로드)")
+                img_button.setStyleSheet("border: 1px solid red; color: red; text-align: center;")
+                # '업로드' 기능 연결
+                img_button.clicked.connect(
+                    functools.partial(self.on_upload_image, scene_id, img_button, scene_data))
+
+        else:
+            # --- State 2: '업로드' 버튼 표시 ---
+            img_button.setIcon(QtGui.QIcon())  # 아이콘 없음
+            img_button.setText("업로드")
+            img_button.setToolTip(f"Scene ID: {scene_id}\n(클릭하여 이미지 업로드)")
+            img_button.setStyleSheet(
+                "border: 1px dashed gray; color: gray; text-align: center; background-color: #333;")
+            # '업로드' 기능 연결
+            img_button.clicked.connect(
+                functools.partial(self.on_upload_image, scene_id, img_button, scene_data))
+
+    def load_and_build_ui(self):
+        """
+        json_path에서 파일을 읽어 UI를 동적으로 생성합니다.
+        [수정됨] 씬을 4개씩 묶고, 버튼 상태를 동적으로 설정합니다.
+        """
+        from pathlib import Path
+
+        try:
+            data = load_json(self.json_path, None)
+            if not isinstance(data, dict):
+                raise ValueError("video.json 파일의 형식이 올바르지 않습니다.")
+
+            self.full_video_data = data
+            self.scenes_data = self.full_video_data.get("scenes", [])
+
+            if not isinstance(self.scenes_data, list):
+                raise ValueError("video.json에 'scenes' 키가 없거나 리스트가 아닙니다.")
+
+            # 고정폭 폰트
+            font = QtGui.QFont()
+            font.setFamily("Courier" if "Courier" in QtGui.QFontDatabase().families() else "Monospace")
+            font.setPointSize(10)
+
+            # --- 씬 데이터를 페이지 크기(4)로 분할 ---
+            scene_chunks = [self.scenes_data[i:i + self.PAGE_SIZE] for i in
+                            range(0, len(self.scenes_data), self.PAGE_SIZE)]
+            self.total_pages = len(scene_chunks)
+            if self.total_pages == 0:
+                self.total_pages = 1
+                scene_chunks = [[]]  # 씬이 없어도 빈 페이지 1개 생성
+
+            # --- 각 페이지(chunk)별로 UI 생성 ---
+            for chunk in scene_chunks:
+
+                page_scroll_area = QtWidgets.QScrollArea()
+                page_scroll_area.setWidgetResizable(True)
+
+                scroll_content_widget = QtWidgets.QWidget()
+                form_layout_page = QtWidgets.QFormLayout(scroll_content_widget)
+                form_layout_page.setRowWrapPolicy(QtWidgets.QFormLayout.RowWrapPolicy.WrapAllRows)
+                form_layout_page.setLabelAlignment(QtCore.Qt.AlignmentFlag.AlignRight)
+                page_scroll_area.setWidget(scroll_content_widget)
+
+                if not chunk:
+                    form_layout_page.addRow(QtWidgets.QLabel("이 페이지에 씬이 없습니다."))
+
+                # 4개의 씬(또는 그 이하)에 대해 위젯 생성
+                for scene in chunk:
+                    if not isinstance(scene, dict): continue
+
+                    scene_id = scene.get("id", "ID_없음")
+                    direct_prompt = scene.get("direct_prompt", "")
+
+                    # [수정] 이미지 경로 및 존재 여부 확인
+                    img_file_str = scene.get("img_file", "")
+                    img_path = Path(img_file_str) if img_file_str else None
+                    has_image = img_path and img_path.exists()
+
+                    # 폼 왼쪽: ID 라벨
+                    label = QtWidgets.QLabel(f"<b>{scene_id}</b>")
+
+                    # 폼 오른쪽: (이미지 + 텍스트) 컨테이너
+                    row_container = QtWidgets.QWidget()
+                    row_layout = QtWidgets.QHBoxLayout(row_container)
+                    row_layout.setContentsMargins(0, 0, 0, 0)
+                    row_layout.setSpacing(8)
+
+                    # [수정] 썸네일/업로드 버튼 (상태 분기)
+                    img_button = QtWidgets.QPushButton()
+                    img_button.setFixedSize(self.THUMBNAIL_SIZE, self.THUMBNAIL_SIZE)
+                    img_button.setIconSize(QtCore.QSize(self.THUMBNAIL_SIZE, self.THUMBNAIL_SIZE))
+
+                    # 헬퍼 함수를 호출하여 버튼의 초기 상태(썸네일/업로드) 및 시그널 연결
+                    self.setup_button_state_for_widget(
+                        img_button,
+                        has_image_now=has_image,
+                        path_now_str=img_file_str,
+                        scene_id=scene_id,
+                        scene_data=scene  # scene 딕셔너리 자체를 전달
+                    )
+
+                    row_layout.addWidget(img_button)
+
+                    # 텍스트 편집기
+                    text_edit = QtWidgets.QTextEdit()
+                    text_edit.setPlainText(direct_prompt)
+                    text_edit.setFont(font)
+                    text_edit.setMinimumHeight(self.THUMBNAIL_SIZE)
+                    text_edit.setMaximumHeight(self.THUMBNAIL_SIZE + 20)
+                    text_edit.setToolTip(f"Scene ID: {scene_id}\n이 씬의 direct_prompt를 입력하세요.")
+                    text_edit.setSizePolicy(QtWidgets.QSizePolicy.Policy.Expanding,
+                                            QtWidgets.QSizePolicy.Policy.Preferred)
+
+                    row_layout.addWidget(text_edit)
+
+                    form_layout_page.addRow(label, row_container)
+
+                    # 위젯 맵에 추가 (저장 시 사용)
+                    self.widget_map.append((scene_id, text_edit))
+
+                # 완성된 페이지(스크롤 영역)를 QStackedWidget에 추가
+                self.stacked_widget.addWidget(page_scroll_area)
+
+            # --- UI 로드 완료 후 첫 페이지로 설정 ---
+            self.current_page = 0
+            self.update_page_ui()
+
+        except Exception as e:
+            error_label = QtWidgets.QLabel(f"파일 로드 또는 UI 빌드 중 오류 발생:\n{e}")
+            error_label.setWordWrap(True)
+            error_page = QtWidgets.QWidget()
+            error_layout = QtWidgets.QVBoxLayout(error_page)
+            error_layout.addWidget(error_label)
+            self.stacked_widget.addWidget(error_page)
+            self.btn_update.setEnabled(False)
+            self.btn_prev.setEnabled(False)
+            self.btn_next.setEnabled(False)
+
+    def update_page_ui(self):
+        """[신규] 현재 페이지로 스택 위젯을 전환하고 버튼/라벨 상태 업데이트"""
+        self.stacked_widget.setCurrentIndex(self.current_page)
+        self.page_label.setText(f"페이지 {self.current_page + 1} / {self.total_pages}")
+        self.btn_prev.setEnabled(self.current_page > 0)
+        self.btn_next.setEnabled(self.current_page < self.total_pages - 1)
+
+    def on_prev_page(self):
+        """[신규] 이전 페이지 버튼 클릭 핸들러"""
+        if self.current_page > 0:
+            self.current_page -= 1
+            self.update_page_ui()
+
+    def on_next_page(self):
+        """[신규] 다음 페이지 버튼 클릭 핸들러"""
+        if self.current_page < self.total_pages - 1:
+            self.current_page += 1
+            self.update_page_ui()
+
+    def on_update_and_close(self):
+        """
+        '업데이트' 버튼 클릭 시, UI의 모든 텍스트 값을 읽어
+        self.scenes_data에 반영하고, 전체 JSON을 다시 파일에 저장합니다.
+        (이 함수는 페이지네이션과 상관없이 self.widget_map을 순회하므로 수정 불필요)
+        """
+        try:
+            scene_map = {scene.get("id"): scene for scene in self.scenes_data if
+                         isinstance(scene, dict) and "id" in scene}
+
+            updated_count = 0
+            for scene_id, text_edit in self.widget_map:
+                if scene_id in scene_map:
+                    new_prompt = text_edit.toPlainText().strip()
+                    scene = scene_map[scene_id]
+
+                    if scene.get("direct_prompt", "") != new_prompt:
+                        scene["direct_prompt"] = new_prompt
+                        updated_count += 1
+
+            self.full_video_data["scenes"] = self.scenes_data
+            save_json(self.json_path, self.full_video_data)
+
+            QtWidgets.QMessageBox.information(self, "업데이트 완료",
+                                              f"{len(self.widget_map)}개 씬 중 {updated_count}개의 'direct_prompt'가 업데이트되었습니다.\n\n"
+                                              f"파일: {self.json_path}")
+            self.accept()
+
+        except Exception as e:
+            QtWidgets.QMessageBox.critical(self, "저장 오류",
+                                           f"파일을 저장하는 중 오류가 발생했습니다:\n{e}")
 
 
 # ──────────────────────────────── Main UI ─────────────────────────────────────
@@ -4150,6 +4531,7 @@ class MainWindow(QtWidgets.QMainWindow):
         self.btn_analyze = QtWidgets.QPushButton("음악분석")
 
         self.btn_test1_story = QtWidgets.QPushButton("프로젝트분석")
+        self.btn_json_edit = QtWidgets.QPushButton("제이슨수정")  # <-- [신규] 버튼 생성
         self.btn_merging_videos = QtWidgets.QPushButton("영상합치기")
         self.btn_lyrics_in = QtWidgets.QPushButton("가사넣기")
         self.btn_missing_img = QtWidgets.QPushButton("누락 이미지 생성")
@@ -4180,6 +4562,7 @@ class MainWindow(QtWidgets.QMainWindow):
         row_test = QtWidgets.QHBoxLayout()
         row_test.addWidget(self.btn_analyze)
         row_test.addWidget(self.btn_test1_story)
+        row_test.addWidget(self.btn_json_edit)  # <-- [신규] 버튼 레이아웃에 추가
         row_test.addWidget(self.btn_video)
         row_test.addWidget(self.btn_merging_videos)
         row_test.addWidget(self.btn_lyrics_in)
@@ -4895,6 +5278,7 @@ class MainWindow(QtWidgets.QMainWindow):
         self.rb_3m.toggled.connect(lambda on: on and self._on_seconds_changed(180))
 
         # 테스트
+        self.btn_json_edit.clicked.connect(self.on_click_edit_json)  # <-- [신규] 시그널 연결
         self.btn_merging_videos.clicked.connect(self.merging_videos_start)
         self.btn_lyrics_in.clicked.connect(self.lyrics_in_start)
 
@@ -6240,6 +6624,40 @@ class MainWindow(QtWidgets.QMainWindow):
         except Exception:
             pass
 
+    # --- [신규] JSON 편집 버튼 핸들러 ---
+    def on_click_edit_json(self):
+        """
+        '제이슨수정' 버튼 클릭 핸들러.
+        현재 활성화된 프로젝트의 video.json 파일을 찾아 ScenePromptEditDialog에서 엽니다.
+        """
+        from pathlib import Path
+        from PyQt5 import QtWidgets
+
+        proj_dir = None
+        try:
+            # _current_project_dir()는 Path 객체 또는 None을 반환합니다.
+            proj_dir = self._current_project_dir()
+        except Exception as e:
+            print(f"[UI] JSON 편집: 프로젝트 디렉터리를 가져오는 중 오류: {e}")
+
+        if not proj_dir:
+            QtWidgets.QMessageBox.warning(self, "오류", "먼저 프로젝트를 불러오거나 생성해주세요.")
+            return
+
+        video_json_path = Path(proj_dir) / "video.json"
+
+        if not video_json_path.exists():
+            QtWidgets.QMessageBox.warning(self, "오류",
+                                          f"video.json 파일을 찾을 수 없습니다.\n\n"
+                                          f"경로: {video_json_path}")
+            return
+
+        try:
+            # [수정됨] ScenePromptEditDialog를 생성하고 모달로 실행합니다.
+            dialog = ScenePromptEditDialog(video_json_path, self)
+            dialog.exec_()
+        except Exception as e:
+            QtWidgets.QMessageBox.critical(self, "편집기 오류", f"JSON 편집기를 여는 중 오류가 발생했습니다:\n{e}")
     # ────────────── 진행창/로그 ──────────────
 
     def on_show_progress(self) -> None:

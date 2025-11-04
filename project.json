@@ -1,0 +1,14 @@
+{
+  "ui_prefs": {
+    "image_size": [
+      720,
+      1080
+    ],
+    "movie_fps": 30,
+    "resolution_preset": "custom",
+    "t2i_steps": 6,
+    "font_family": "Gulim",
+    "title_font_size": 55,
+    "lyric_font_size": 25
+  }
+}
