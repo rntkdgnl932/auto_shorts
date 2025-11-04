@@ -62,7 +62,7 @@ def _merge_global_context(S: dict, g: dict) -> None:
         GC["palette"] = str(g["palette"]).strip()
 
     # style_guide: 고정 문구 + AI 추가
-    base_sg = "실사, 인물 정면, 일관된 헤어/의상/분위기, 자연스러운 조명"
+    base_sg = "실사, 일관된 헤어/의상/분위기, 자연스러운 조명"
     extra_sg = str(g.get("style_guide") or "").strip()
     GC["style_guide"] = base_sg if not extra_sg else f"{base_sg}, {extra_sg}"
 
@@ -471,7 +471,7 @@ def apply_gpt_to_story_v11(
                 pos_descs.append(f"{pos_name}에 {char_id}")
 
             # 힌트에 장면 배치 프롬프트 주입
-            pos_prompt = f"장면 배치: {', '.join(pos_descs)}. 얼굴 정면."
+            pos_prompt = f"장면 배치: {', '.join(pos_descs)}. 자연스러움."
             hint = f"{pos_prompt} {hint}".strip()
 
         # 최종 저장용 맵에 기록 (예: "t_001" -> ["female_01:0", "male_01:1"])
@@ -742,7 +742,7 @@ def _ensure_positions_with_ids(scene: dict, text: str) -> str:
     for cid, idx in pairs:
         pos = pos_map.get(idx, f"기타{idx}")
         parts.append(f"{pos}에 {cid}")
-    head = "장면 배치: " + ", ".join(parts) + ". 얼굴이 잘 보이도록 정면/반정면 구도."
+    head = "장면 배치: " + ", ".join(parts) # + ". 얼굴이 잘 보이도록 정면/반정면 구도."
     return f"{head} {text}".strip()
 
 

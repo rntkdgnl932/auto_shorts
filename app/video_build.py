@@ -567,9 +567,9 @@ def build_shots_with_i2v(
                 "-r", f"{int(max(1, fps_val))}",
                 "-fps_mode", "cfr",
                 "-vsync", "cfr",
-                "-map_metadata", "-1",  # 메타데이터 제거
-                "-metadata", "title=",  # title 비우기
-                "-sn",  # 자막 스트림 제거
+                "-map_metadata", "-1",
+                "-metadata", "title=",
+                "-sn",
                 "-c:v", "libx264", "-crf", "18",
                 "-pix_fmt", "yuv420p",
                 str(tmp_out_local),
@@ -622,20 +622,38 @@ def build_shots_with_i2v(
         fade 없이 덮어쓰기:
           - A, B, C... 를 순차 병합.
           - 매 단계에서 current(A')의 뒤 overlap만큼을 잘라내고 B 전체를 이어붙임.
-          - 해상도/비율 통일: 1280x720, SAR=1, CFR=fps.
+          - 해상도/비율 통일: (UI가 주면 그 값, 아니면 1280x720), SAR=1, CFR=fps.
           - 모든 단계에서 메타데이터/자막 제거로 '제목 오버레이' 방지.
         """
         if not clip_paths_local:
             return False
 
+        # 여기서 바깥 ui_width / ui_height 를 읽어서 없으면 1280x720으로 간다.
+        if ui_width is not None and ui_width > 0:
+            merge_out_w_local = int(ui_width)
+        else:
+            merge_out_w_local = 1280
+        if ui_height is not None and ui_height > 0:
+            merge_out_h_local = int(ui_height)
+        else:
+            merge_out_h_local = 720
+
         def _norm(src_local: Path, dst_local: Path) -> Tuple[int, bool]:
+            filter_str_local = (
+                "fps={fps},"
+                "scale=w={w}:h={h}:force_original_aspect_ratio=decrease,"
+                "pad={w}:{h}:(ow-iw)/2:(oh-ih)/2,"
+                "setsar=1,format=yuv420p"
+            ).format(
+                fps=int(max(1, fps_local)),
+                w=int(merge_out_w_local),
+                h=int(merge_out_h_local),
+            )
             cmd = [
                 ffmpeg_exe_local, "-y",
                 "-fflags", "+genpts",
                 "-i", str(src_local),
-                "-vf",
-                "fps={fps},scale=w=1280:h=720:force_original_aspect_ratio=decrease,"
-                "pad=1280:720:(ow-iw)/2:(oh-ih)/2,setsar=1,format=yuv420p".format(fps=int(max(1, fps_local))),
+                "-vf", filter_str_local,
                 "-r", f"{int(max(1, fps_local))}",
                 "-vsync", "cfr",
                 "-map_metadata", "-1",
@@ -712,7 +730,9 @@ def build_shots_with_i2v(
             return proc.returncode == 0
 
         print(
-            f"[XC-BEGIN] items={len(clip_paths_local)} fps={fps_local} overlap_frames={overlap_frames_local} out=1280x720")
+            f"[XC-BEGIN] items={len(clip_paths_local)} fps={fps_local} "
+            f"overlap_frames={overlap_frames_local} out={merge_out_w_local}x{merge_out_h_local}"
+        )
 
         # 첫 번째 정규화
         cur_local = work_dir_local / "cur_000.mp4"
@@ -736,7 +756,7 @@ def build_shots_with_i2v(
             fa_local = _probe_nb_frames_ffprobe_local(ffprobe_exe_local, cur_local)
             print(f"[XC-CUR] A(frames)={fa_local}, B(frames)={fb_local}, overlap={overlap_frames_local}")
 
-            keep_a_local = max(0, fa_local - max(0, overlap_frames_local))  # A 뒤 꼬리를 overlap만큼 제거
+            keep_a_local = max(0, fa_local - max(0, overlap_frames_local))
             a_cut_local = work_dir_local / f"_a_cut_{step_idx_local:03d}.mp4"
             ok_cut_local = _trim_tail(cur_local, a_cut_local, keep_a_local)
             if not ok_cut_local:
@@ -756,7 +776,6 @@ def build_shots_with_i2v(
             cur_local = cur_next_local
             step_idx_local += 1
 
-        # 최종 산출 이동
         try:
             if out_path_local.exists():
                 out_path_local.unlink()
@@ -765,7 +784,10 @@ def build_shots_with_i2v(
         shutil.copyfile(str(cur_local), str(out_path_local))
 
         f_out_local = _probe_nb_frames_ffprobe_local(ffprobe_exe_local, out_path_local)
-        print(f"[XC-FINAL] {{'path': '{out_path_local}', 'frames': {f_out_local}, 'fps': {fps_local}}}")
+        print(
+            f"[XC-FINAL] {{'path': '{out_path_local}', 'frames': {f_out_local}, 'fps': {fps_local}, "
+            f"'w': {merge_out_w_local}, 'h': {merge_out_h_local}}}"
+        )
         print(f"[XC-DONE] out_path={out_path_local}")
         return True
 
@@ -937,15 +959,7 @@ def build_shots_with_i2v(
             node_inputs_map[input_key_s] = value
         return True
 
-    # [NEW] 오버레이 제거 패스: 제출 전 그래프의 워터마크/오버레이/자막 관련 입력을 비활성화/비움
     def _clear_overlay_inputs_safe(graph_dict: Dict[str, Any]) -> None:
-        """
-        ComfyUI 노드들의 입력 중 텍스트가 구워질 가능성이 있는 키를 안전하게 무력화.
-        - Boolean류: false로
-        - Text류: 빈 문자열로
-        - 존재할 때만 터치 (없는 함수/키 접근 금지)
-        """
-        # 널리 쓰일 수 있는 키 모음(보수적)
         bool_like_keys = {
             "enable_watermark", "enable_overlay", "enable_subtitle", "enable_caption",
             "draw_text", "show_text", "use_text", "add_text", "overlay_enable",
@@ -965,23 +979,18 @@ def build_shots_with_i2v(
                 if not isinstance(inputs_map, dict):
                     continue
 
-                # boolean류 off
                 for k_bool in list(bool_like_keys):
                     if k_bool in inputs_map:
                         try:
                             inputs_map[k_bool] = False
                         except Exception:
                             pass
-                # text류 비움
                 for k_text in list(text_like_keys):
                     if k_text in inputs_map:
                         try:
-                            # 비움으로써 draw를 유발하지 않게 함
                             inputs_map[k_text] = ""
                         except Exception:
                             pass
-
-                # VHS 계열에서 보이는 'watermark opacity' 류도 0으로
                 for k_dim in ("watermark_opacity", "overlay_opacity", "caption_opacity"):
                     if k_dim in inputs_map:
                         try:
@@ -989,10 +998,8 @@ def build_shots_with_i2v(
                         except Exception:
                             pass
             except Exception:
-                # 과도한 예외 X: 그냥 스킵
                 continue
 
-    # ── 진행중 메시지 릴레이 ───────────────────────────────────
     def _relay(prog: Dict[str, Any]) -> None:
         msg_val = str(prog.get("msg") or "")
         if msg_val and on_progress is not None:
@@ -1030,7 +1037,6 @@ def build_shots_with_i2v(
         except OSError as e_stat_clip:
             _notify(f"[경고] 스킵 확인 중 오류 (씬 {sid}): {e_stat_clip}. 생성 시도.")
 
-        # 입력 이미지
         img_path: Optional[Path] = None
         server_image_name: str = ""
         img_declared = str(scene.get("img_file") or "").strip()
@@ -1065,12 +1071,8 @@ def build_shots_with_i2v(
         try:
             server_image_name = img_path.name
             dest = comfy_input_dir / server_image_name
-
-            # [수정됨] 타임스탬프 검사 없이 항상 덮어쓰도록 강제합니다.
-            # shutil.copy2는 대상 파일이 있어도 덮어씁니다.
             shutil.copy2(str(img_path), str(dest))
             _notify(f"이미지 복사 완료 (덮어쓰기): {server_image_name} -> {comfy_input_dir.name}")
-
         except OSError as e_copy:
             _notify(f"[경고] 이미지 준비 실패({img_path.name}): {e_copy}")
 
@@ -1084,11 +1086,7 @@ def build_shots_with_i2v(
             scene_seed_value = int(time.time() * 1_000_000) % 999_999_999_999_999
         _notify(f"씬 {sid}에 사용할 마스터 시드: {scene_seed_value}")
 
-        # --- ▼▼▼ [수정됨] ReActor 동적 인덱스 파싱 로직 ▼▼▼ ---
-
-        # 1. 씬의 캐릭터 목록 파싱 (video.json 스키마 기준)
-        #    (예: ["female_01:0", "male_01:1"])
-        scene_character_tuples: List[Tuple[str, str]] = []  # (char_id, face_index_str)
+        scene_character_tuples: List[Tuple[str, str]] = []
         try:
             chars_raw = scene.get("characters", [])
             if isinstance(chars_raw, list):
@@ -1100,10 +1098,7 @@ def build_shots_with_i2v(
                         char_id, face_index = c_str.split(":", 1)
                         scene_character_tuples.append((char_id.strip(), face_index.strip()))
                     else:
-                        # 인덱스가 없으면 "0"으로 간주
                         scene_character_tuples.append((c_str, "0"))
-
-                        # 중복 ID 제거 (첫 번째 인덱스 우선)
             seen_ids = set()
             final_tuples = []
             for char_id, face_index in scene_character_tuples:
@@ -1111,30 +1106,22 @@ def build_shots_with_i2v(
                     final_tuples.append((char_id, face_index))
                     seen_ids.add(char_id)
             scene_character_tuples = final_tuples
-
         except Exception as e_char_parse:
             _notify(f"[경고] 씬 {sid} 캐릭터 파싱 실패: {e_char_parse}")
 
         _notify(f"[{sid}] ReActor 대상 캐릭터: {scene_character_tuples}")
 
-        # 2. (guff_movie.json 기준) 캐릭터 ID와 노드 ID 매핑
-        #    "캐릭터ID": ("얼굴LoadImage 노드ID", "ReActor 노드ID")
         CHAR_NODE_MAP = {
-            "male_01": ("32", "29"),  # male_01.png -> LoadImage(32) -> ReActor(29)
-            "female_01": ("31", "28"),  # female_01.png -> LoadImage(31) -> ReActor(28)
-            # "female_02": ("30", "27"), # 3번째 캐릭터(Node 30)
+            "male_01": ("32", "29"),
+            "female_01": ("31", "28"),
         }
 
-        # 3. 이 씬에서 활성화할 ReActor 노드 목록
-        reactor_nodes_to_enable: List[Tuple[str, str]] = []  # (reactor_node_id, input_faces_index)
-        # 이 씬에서 주입할 얼굴 파일 목록 (LoadImage노드ID, 파일명)
+        reactor_nodes_to_enable: List[Tuple[str, str]] = []
         face_files_to_inject: List[Tuple[str, str]] = []
 
-        # 4. 캐릭터별 파일 준비 및 주입 목록 생성
         CHAR_DIR_PATH: Optional[Path] = None
         INPUT_DIR_PATH: Optional[Path] = None
         try:
-            # settings에서 CHARACTER_DIR, COMFY_INPUT_DIR 가져오기
             from settings import CHARACTER_DIR, COMFY_INPUT_DIR  # type: ignore
             CHAR_DIR_PATH = Path(CHARACTER_DIR)
             INPUT_DIR_PATH = Path(COMFY_INPUT_DIR)
@@ -1144,11 +1131,9 @@ def build_shots_with_i2v(
             INPUT_DIR_PATH = None
 
         if CHAR_DIR_PATH and INPUT_DIR_PATH:
-            for char_id, face_index in scene_character_tuples:  # (char_id, face_index) 튜플 사용
+            for char_id, face_index in scene_character_tuples:
                 if char_id in CHAR_NODE_MAP:
                     load_node, reactor_node = CHAR_NODE_MAP[char_id]
-
-                    # 원본 캐릭터 이미지 경로 탐색
                     char_img_path = None
                     for ext in (".png", ".jpg", ".jpeg", ".webp"):
                         p_try = CHAR_DIR_PATH / f"{char_id}{ext}"
@@ -1158,15 +1143,14 @@ def build_shots_with_i2v(
 
                     if char_img_path:
                         try:
-                            # ComfyUI input 폴더로 복사 (덮어쓰기)
                             target_face_file = INPUT_DIR_PATH / char_img_path.name
                             shutil.copy2(str(char_img_path), str(target_face_file))
-
-                            # 주입 목록에 추가
                             face_files_to_inject.append((load_node, char_img_path.name))
-                            reactor_nodes_to_enable.append((reactor_node, face_index))  # (노드ID, 인덱스) 튜플 저장
+                            reactor_nodes_to_enable.append((reactor_node, face_index))
                             _notify(
-                                f"[{sid}] ReActor 준비: {char_id} -> {char_img_path.name} (Node {load_node} -> {reactor_node}, FaceIdx {face_index})")
+                                f"[{sid}] ReActor 준비: {char_id} -> {char_img_path.name} "
+                                f"(Node {load_node} -> {reactor_node}, FaceIdx {face_index})"
+                            )
                         except Exception as e_copy_face:
                             _notify(f"[경고] ReActor 얼굴({char_id}) 복사 실패: {e_copy_face}")
                     else:
@@ -1174,14 +1158,8 @@ def build_shots_with_i2v(
                 else:
                     _notify(f"[{sid}] ReActor 스킵: {char_id}가 CHAR_NODE_MAP에 없음")
 
-        # --- ▼▼▼ [수정됨] ReActor가 사용하는 LoadImage ID 목록 생성 (self 제거) ▼▼▼ ---
-        # (예: {"31", "32", "30"})
-        # 이 노드들은 씬 이미지(t_003.jpg)로 덮어쓰면 안 됨
-        _current_scene_face_loader_ids = set(t[0] for t in face_files_to_inject)  # <--- 'self' 제거
+        _current_scene_face_loader_ids = set(t[0] for t in face_files_to_inject)
         _notify(f"[{sid}] ReActor가 사용할 얼굴 로더 노드: {_current_scene_face_loader_ids}")
-        # --- ▲▲▲ [수정] ID 목록 생성 끝 ▲▲▲ ---
-
-        # --- ▲▲▲ [수정됨] ReActor 로직 끝 ▲▲▲ ---
 
         combine_node_id = "21"
         i2v_node_id = "25"
@@ -1216,7 +1194,6 @@ def build_shots_with_i2v(
 
         print(f"[I2V][SCENE] id={sid} fps={target_fps_val} frame_length={frame_length}")
 
-        # ── 분할(항상 plan_segments 사용, +5 패딩 규칙 내장) ──
         segments_list: List[Tuple[int, int]] = plan_segments(  # type: ignore[name-defined]
             frame_length,
             base_chunk=max_frames_per_chunk,
@@ -1230,7 +1207,6 @@ def build_shots_with_i2v(
         current_input_image_name: str = server_image_name
         temp_frames: List[Path] = []
 
-        # 시퀀스 conditioning 지원 여부 탐지
         has_sequence_loader = False
         sequence_loader_node_id = ""
         for node_key, node_val in graph_origin.items():
@@ -1250,7 +1226,6 @@ def build_shots_with_i2v(
             except (AttributeError, TypeError):
                 continue
 
-        # ── 각 청크 처리 ────────────────────────────────────────
         for c_idx, (start_f, end_f) in enumerate(segments_list):
             if scene_failed:
                 break
@@ -1271,39 +1246,25 @@ def build_shots_with_i2v(
                 scene_failed = True
                 continue
 
-            # [NEW] 오버레이 제거 패스 적용
             _clear_overlay_inputs_safe(graph)
 
-            # --- ▼▼▼ [수정됨] ReActor 동적 인덱스 주입 ▼▼▼ ---
-
-            # 1. (guff_movie.json 기준) 모든 ReActor 노드 ID
             ALL_REACTOR_NODES = ["27", "28", "29"]
 
-            # 2. 씬 기준으로 찾은 '활성화할' 노드 목록 (바깥 루프에서 계산됨)
-            #    (예: { "28": "0", "29": "1" })
             enabled_map: Dict[str, str] = {node_id: face_idx for node_id, face_idx in reactor_nodes_to_enable}
 
             for reactor_id in ALL_REACTOR_NODES:
                 if reactor_id in enabled_map:
-                    # 활성화하고, 동적 인덱스 주입
                     face_index_to_use = enabled_map[reactor_id]
                     _set_input_safe(graph, reactor_id, "enabled", True)
-                    _set_input_safe(graph, reactor_id, "input_faces_index", face_index_to_use)  # <-- 동적 인덱스 주입
+                    _set_input_safe(graph, reactor_id, "input_faces_index", face_index_to_use)
                     _notify(f"ReActor(Node {reactor_id}) 활성화 (FaceIdx {face_index_to_use}) ({chunk_label})")
                 else:
-                    # 비활성화
                     _set_input_safe(graph, reactor_id, "enabled", False)
 
-            # 3. (guff_movie.json 기준) 얼굴 파일 주입
-            #    (예: [("31", "female_01.png")])
             for load_node_id, face_filename in face_files_to_inject:
                 _set_input_safe(graph, load_node_id, "image", face_filename)
                 _notify(f"LoadImage(Node {load_node_id}) 얼굴 주입: {face_filename} ({chunk_label})")
 
-            # --- ▲▲▲ [수정됨] ReActor 로직 끝 ▲▲▲ ---
-
-            # --- ▼▼▼ [수정됨] I2V 소스 이미지만 덮어쓰기 ▼▼▼ ---
-            # 입력 주입 (I2V 소스 이미지)
             load_nodes: List[Tuple[str, Dict[str, Any]]] = []
             for node_key2, node_val2 in graph.items():
                 try:
@@ -1312,20 +1273,14 @@ def build_shots_with_i2v(
                 except (AttributeError, TypeError):
                     continue
 
-            # ReActor가 사용하는 얼굴 로더 ID (바깥 루프에서 계산됨)
-            # (예: {"30", "31", "32"})
-            face_loader_ids_in_loop = _current_scene_face_loader_ids  # <--- [수정됨] self 제거
+            face_loader_ids_in_loop = _current_scene_face_loader_ids
 
             for load_node_id, _node in load_nodes:
                 if load_node_id in face_loader_ids_in_loop:
-                    # 이 노드는 ReActor가 얼굴 소스(female_01.png)로 사용하므로 건너뜀
                     _notify(f"LoadImage({load_node_id}) 스킵 (ReActor 전용 얼굴 소스)")
                     continue
-
-                # ReActor용이 아닌 LoadImage 노드만 씬 이미지(t_003.jpg)로 설정
                 _set_input_safe(graph, load_node_id, "image", current_input_image_name)
                 _notify(f"LoadImage({load_node_id}) I2V 소스 이미지 주입: {current_input_image_name} ({chunk_label})")
-            # --- ▲▲▲ [수정] 로직 끝 ▲▲▲ ---
 
             for sampler_id in ("13", "14"):
                 _set_input_safe(graph, sampler_id, "noise_seed", scene_seed_value)
@@ -1356,28 +1311,19 @@ def build_shots_with_i2v(
             _notify(f"I2V({i2v_node_id}) Length: {chunk_len}f ({chunk_label})")
 
             pos_txt = str(scene.get("prompt_movie") or scene.get("prompt") or "")
-
-            # 1. video.json에서 기존 네거티브 프롬프트를 읽어옵니다.
             base_neg_txt = str(scene.get("prompt_negative") or "")
-
-            # 2. 파일 이름이나 제목이 텍스트로 생성되는 것을 막기 위한 '강제' 네거티브 태그를 정의합니다.
-            #    (AI가 긍정 프롬프트에 t_001 등을 넣더라도 이를 무시하도록 지시)
-            force_neg_tags = "text, watermark, logo, letters, (file name:1.5), (title:1.5), (t_001:1.5), (t_002:1.5), (mp4:1.5), signature, typography, caption, subtitles, text overlay"
-
-            # 3. 두 프롬프트를 쉼표로 합칩니다.
+            force_neg_tags = (
+                "text, watermark, logo, letters, (file name:1.5), (title:1.5), (t_001:1.5), (t_002:1.5), "
+                "(mp4:1.5), signature, typography, caption, subtitles, text overlay"
+            )
             if base_neg_txt:
-                # 쉼표로 구분하여 기존 네거티브와 강제 네거티브를 결합
                 neg_txt = f"{base_neg_txt.rstrip(', ')}, {force_neg_tags}"
             else:
                 neg_txt = force_neg_tags
 
-            # 4. 워크플로우에 주입합니다. (guff_movie.json의 노드 ID 22, 23 사용)
             if pos_txt:
                 _set_input_safe(graph, "22", "text", pos_txt)
-
-            # neg_txt는 이제 항상 값이 있으므로 'if neg_txt:' 검사 없이 바로 주입
             _set_input_safe(graph, "23", "text", neg_txt)
-
             _notify(f"프롬프트(22/23) 설정 완료. (강제 텍스트 금지 네거티브 포함) ({chunk_label})")
 
             try:
@@ -1393,7 +1339,6 @@ def build_shots_with_i2v(
             _set_input_safe(graph, combine_node_id, "filename_prefix", new_prefix)
             _notify(f"Combine({combine_node_id}) Prefix: {new_prefix} ({chunk_label})")
 
-            # conditioning(가능 시)
             use_sequence_conditioning = False
             seq_dir_for_condition: Optional[Path] = None
             seq_pattern_text = ""
@@ -1415,7 +1360,8 @@ def build_shots_with_i2v(
                                 ffmpeg_exe, "-y",
                                 "-i", str(prev_chunk_path),
                                 "-vf",
-                                f"trim=start_frame={start_tail}:end_frame={end_tail},setpts=PTS-STARTPTS,fps={target_fps_val}",
+                                f"trim=start_frame={start_tail}:end_frame={end_tail},"
+                                f"setpts=PTS-STARTPTS,fps={target_fps_val}",
                                 "-frames:v", str(overlap_frames_for_chunk),
                                 str(seq_template_png)
                             ]
@@ -1458,14 +1404,14 @@ def build_shots_with_i2v(
                     _set_input_safe(graph, sequence_loader_node_id, "pattern", seq_pattern_text)
                 _set_input_safe(graph, sequence_loader_node_id, "frame_rate", target_fps_val)
                 _notify(
-                    f"conditioning 시퀀스 사용: node={sequence_loader_node_id}, dir='{seq_dir_for_condition.name}', "
-                    f"pattern='{seq_pattern_text or 'cond_*.png'}', fps={target_fps_val} ({chunk_label})"
+                    f"conditioning 시퀀스 사용: node={sequence_loader_node_id}, "
+                    f"dir='{seq_dir_for_condition.name}', pattern='{seq_pattern_text or 'cond_*.png'}', "
+                    f"fps={target_fps_val} ({chunk_label})"
                 )
             else:
                 if c_idx > 0:
                     _notify(f"conditioning 시퀀스 미사용 → 1프레임 PNG 폴백 ({chunk_label})")
 
-            # 제출/대기
             _notify(f"워크플로우 제출 시작 ({chunk_label})")
             try:
                 result = submit_and_wait_fn(
@@ -1526,7 +1472,6 @@ def build_shots_with_i2v(
 
             _notify(f"결과 파일 선택: filename='{filename_pick}', type='{filetype_pick}'")
 
-            # 청크 파일 저장
             chunk_name = f"_chunk_{sid}_{c_idx:05d}.mp4"
             chunk_path = work_dir / chunk_name
 
@@ -1559,7 +1504,6 @@ def build_shots_with_i2v(
                 scene_failed = True
                 continue
 
-            # 다음 청크 입력용 폴백 PNG 준비
             if c_idx < len(segments_list) - 1:
                 next_frame_name = f"{sid}_temp_frame_{c_idx:05d}.png"
                 next_frame_path = comfy_input_dir / next_frame_name
@@ -1575,12 +1519,14 @@ def build_shots_with_i2v(
                 cond_start = max(0, end_f - overlap_frames_for_chunk)
                 cond_end = max(0, end_f - 1)
                 print(
-                    f"[I2V][COND] {chunk_label} next_cond_range={cond_start}~{cond_end} ({overlap_frames_for_chunk}f, ≈{overlap_sec:.3f}s)")
+                    f"[I2V][COND] {chunk_label} next_cond_range={cond_start}~{cond_end} "
+                    f"({overlap_frames_for_chunk}f, ≈{overlap_sec:.3f}s)"
+                )
 
                 try:
                     subprocess.run(
-                        [ffmpeg_exe, "-y", "-sseof", f"-{overlap_sec:.6f}", "-i", str(chunk_path), "-frames:v", "1",
-                         str(next_frame_path)],
+                        [ffmpeg_exe, "-y", "-sseof", f"-{overlap_sec:.6f}", "-i", str(chunk_path),
+                         "-frames:v", "1", str(next_frame_path)],
                         check=True,
                         stdout=subprocess.DEVNULL,
                         stderr=subprocess.PIPE
@@ -1617,7 +1563,6 @@ def build_shots_with_i2v(
                         except requests_mod.RequestException:
                             current_input_image_name = server_image_name
 
-        # 임시 PNG 정리
         for tmp_png in temp_frames:
             try:
                 tmp_png.unlink(missing_ok=True)
@@ -1637,7 +1582,6 @@ def build_shots_with_i2v(
             _notify(f"[경고] 씬 {sid}에 대해 생성된 청크 파일이 없습니다. 건너뜁니다.")
             continue
 
-        # ── 산출: 단일 or 병합 ─────────────────────────────────
         if len(chunk_paths) == 1:
             _notify(f"씬 {sid} 단일 청크 완료. 최종 파일로 이동합니다.")
             try:
@@ -1647,8 +1591,9 @@ def build_shots_with_i2v(
                 _notify(f"[오류] 단일 청크 파일 이동 실패 ({sid}): {e_mv}")
         else:
             print(
-                f"[I2V][MERGE] id={sid} chunks={len(chunk_paths)} overlap={overlap_frames_for_chunk}f fps={target_fps_val}")
-            # 페이드(xfade) 대신 덮어쓰기(컷) 병합
+                f"[I2V][MERGE] id={sid} chunks={len(chunk_paths)} "
+                f"overlap={overlap_frames_for_chunk}f fps={target_fps_val}"
+            )
             ok_merge = _concat_cut_no_fade(
                 ffmpeg_exe_local=ffmpeg_exe,
                 ffprobe_exe_local=ffprobe_exe,
@@ -1663,17 +1608,16 @@ def build_shots_with_i2v(
             else:
                 _notify(f"[오류] 씬 {sid} 청크 병합(컷) 실패")
 
-        # 임시 mp4 정리
         for tmp_mp4 in chunk_paths:
             try:
                 tmp_mp4.unlink(missing_ok=True)
             except OSError:
                 pass
 
-        # ── 최종 트림: 처음 계산한 frame_length로 정확히 자르기 ──
         _trim_to_frames(ffmpeg_exe, ffprobe_exe, clip_mp4, clip_mp4, frame_length, target_fps_val)
 
     _notify("모든 씬 처리 완료.")
+
 
 
 
@@ -1721,14 +1665,15 @@ def xfade_concat(
     first_clip_path = Path(clip_paths[0])
     base_dir = first_clip_path.parent
 
-    # 작업 폴더(기존 규칙 유지)
     if work_dir is None:
-        work_dir = base_dir if base_dir.name == "xfade_work" else (base_dir / "xfade_work")
+        if base_dir.name == "xfade_work":
+            work_dir = base_dir
+        else:
+            work_dir = base_dir / "xfade_work"
     else:
         work_dir = Path(work_dir)
     work_dir.mkdir(parents=True, exist_ok=True)
 
-    # 출력 경로 기본값 및 정크 미러 폴더 결정
     if out_path is None:
         out_path = base_dir / "final.mp4"
     out_path = Path(out_path)
@@ -1736,7 +1681,7 @@ def xfade_concat(
     mirror_dir.mkdir(parents=True, exist_ok=True)
     print(f"[XC-MIRROR] dir={mirror_dir}")
 
-    # 출력 해상도(없으면 1280x720)
+    # 기본 출력 해상도
     out_w = int(scale_w) if scale_w else 1280
     out_h = int(scale_h) if scale_h else 720
 
@@ -1788,14 +1733,14 @@ def xfade_concat(
                         "time_base": vs0.get("time_base"),
                         "pix_fmt": vs0.get("pix_fmt"),
                     })
-                fmt = parsed.get("format") or {}
-                dur_val = fmt.get("duration")
+                fmt_obj = parsed.get("format") or {}
+                dur_val = fmt_obj.get("duration")
                 if dur_val is not None:
                     try:
                         probe_map["duration_sec"] = float(dur_val)
                     except (TypeError, ValueError):
                         pass
-                bit_val = fmt.get("bit_rate")
+                bit_val = fmt_obj.get("bit_rate")
                 if bit_val is not None:
                     probe_map["bit_rate"] = bit_val
         else:
@@ -1806,23 +1751,41 @@ def xfade_concat(
             pass
         return probe_map
 
+    # 여기서만 보강: 호출자가 scale을 안 줬을 때만 첫 클립 크기를 따른다.
+    if scale_w is None or scale_h is None:
+        first_info = _probe_video_info(first_clip_path)
+        first_w = first_info.get("width")
+        first_h = first_info.get("height")
+        if isinstance(first_w, int) and isinstance(first_h, int) and first_w > 0 and first_h > 0:
+            out_w = first_w
+            out_h = first_h
+
     def _normalize_one(src_path_norm: Path, dst_path_norm: Path) -> None:
         cmd_norm = [
-            ffmpeg_bin, "-y",
-            "-fflags", "+genpts",
-            "-i", str(src_path_norm),
+            ffmpeg_bin,
+            "-y",
+            "-fflags",
+            "+genpts",
+            "-i",
+            str(src_path_norm),
             "-an",
             "-vf",
             (
                 f"fps={target_fps},"
                 f"scale=w={out_w}:h={out_h}:force_original_aspect_ratio=decrease,"
                 f"pad={out_w}:{out_h}:(ow-iw)/2:(oh-ih)/2,"
-                f"setsar=1,format=yuv420p,setpts=PTS-STARTPTS"
+                "setsar=1,format=yuv420p,setpts=PTS-STARTPTS"
             ),
-            "-r", f"{target_fps}",
-            "-vsync", "cfr",
-            "-c:v", "libx264", "-crf", "18",
-            "-pix_fmt", "yuv420p",
+            "-r",
+            f"{target_fps}",
+            "-vsync",
+            "cfr",
+            "-c:v",
+            "libx264",
+            "-crf",
+            "18",
+            "-pix_fmt",
+            "yuv420p",
             str(dst_path_norm),
         ]
         proc_norm = subprocess.run(
@@ -1843,28 +1806,24 @@ def xfade_concat(
         out_path_pair: Path,
         overlap_frames_in: int,
     ) -> None:
-        # 입력 두 영상을 표준화본으로 변환
         norm_a_path = work_dir / "_norm_a.mp4"
         norm_b_path = work_dir / "_norm_b.mp4"
         _normalize_one(cur_path_in, norm_a_path)
         _normalize_one(nxt_path_in, norm_b_path)
 
-        # 길이/오프셋 계산
         info_a = _probe_video_info(norm_a_path)
         info_b = _probe_video_info(norm_b_path)
 
-        # nb_frames가 없을 수도 있으니 duration_sec 기반으로 보강
         def _frames_from_info(info_map: Dict[str, Any]) -> int:
-            nb = info_map.get("nb_frames")
-            if isinstance(nb, str) and nb.isdigit():
+            nb_val = info_map.get("nb_frames")
+            if isinstance(nb_val, str) and nb_val.isdigit():
                 try:
-                    return int(nb)
+                    return int(nb_val)
                 except ValueError:
                     pass
-            dur = info_map.get("duration_sec")
-            if isinstance(dur, (int, float)) and dur > 0:
-                # 반올림보다 바닥으로 깎아 정확도를 확보
-                return max(0, int(dur * target_fps))
+            dur_val_local = info_map.get("duration_sec")
+            if isinstance(dur_val_local, (int, float)) and dur_val_local > 0:
+                return max(0, int(dur_val_local * target_fps))
             return 0
 
         frames_a = _frames_from_info(info_a)
@@ -1873,31 +1832,43 @@ def xfade_concat(
         if frames_a <= 0 or frames_b <= 0:
             raise RuntimeError("정규화본의 프레임 수 계산 실패")
 
-        # 페이드 오프셋: A의 끝에서 fade_frames만큼 앞
-        # (A가 N프레임이면, 오프셋초는 (N - fade)/fps)
         offset_sec = float(max(0, frames_a - fade_frames)) / float(target_fps)
         duration_sec = float(fade_frames) / float(target_fps)
 
-        print(f"[XC-PLAN] fade={fade_frames}f ({duration_sec:.3f}s), offset={offset_sec:.3f}s, expected≥ {(frames_a + frames_b - fade_frames)}f")
+        print(
+            f"[XC-PLAN] fade={fade_frames}f ({duration_sec:.3f}s), "
+            f"offset={offset_sec:.3f}s, expected≥ {(frames_a + frames_b - fade_frames)}f"
+        )
 
         cmd_xf = [
-            ffmpeg_bin, "-y",
-            "-fflags", "+genpts",
-            "-i", str(norm_a_path),
-            "-i", str(norm_b_path),
+            ffmpeg_bin,
+            "-y",
+            "-fflags",
+            "+genpts",
+            "-i",
+            str(norm_a_path),
+            "-i",
+            str(norm_b_path),
             "-filter_complex",
             (
                 "[0:v]format=yuv420p,setsar=1[v0];"
                 "[1:v]format=yuv420p,setsar=1[v1];"
                 f"[v0][v1]xfade=transition=fade:duration={duration_sec:.6f}:offset={offset_sec:.6f}[v]"
             ),
-            "-map", "[v]",
-            "-r", f"{target_fps}",
-            "-fps_mode", "cfr",
-            "-vsync", "cfr",
-            "-c:v", "libx264",
-            "-crf", "18",
-            "-pix_fmt", "yuv420p",
+            "-map",
+            "[v]",
+            "-r",
+            f"{target_fps}",
+            "-fps_mode",
+            "cfr",
+            "-vsync",
+            "cfr",
+            "-c:v",
+            "libx264",
+            "-crf",
+            "18",
+            "-pix_fmt",
+            "yuv420p",
             str(out_path_pair),
         ]
         proc_xf = subprocess.run(
@@ -1913,7 +1884,10 @@ def xfade_concat(
             raise RuntimeError(f"ffmpeg 실패(_xfade_two):\n{proc_xf.stdout}")
 
         out_info = _probe_video_info(out_path_pair)
-        print(f"[XC-OUT] {out_path_pair.name}: sec={out_info.get('duration_sec','?')} frames={out_info.get('nb_frames','?')} @fps={target_fps}")
+        print(
+            f"[XC-OUT] {out_path_pair.name}: sec={out_info.get('duration_sec', '?')} "
+            f"frames={out_info.get('nb_frames', '?')} @fps={target_fps}"
+        )
 
     def _concat_cut_no_fade(
         ffmpeg_exe: str,
@@ -1924,35 +1898,37 @@ def xfade_concat(
         out_path_cut: Path,
         work_dir_cut: Path,
     ) -> bool:
-        """
-        하드컷 병합:
-        - 각 청크를 동일 fps/해상도로 정규화
-        - 첫 청크는 전체 사용
-        - 이후 청크는 overlap_frames_cut 만큼 '앞에서 잘라서' 이어붙임(뒤 청크가 겹침 구간을 덮어씀)
-        """
         import subprocess as _sub
         import shutil as _sh
 
-        # 정규화본 만들기
         norm_list: List[Path] = []
         for idx_norm, src_norm in enumerate(clip_paths_cut):
             dst_norm = work_dir_cut / f"_concat_norm_{idx_norm:03d}.mp4"
             cmd_norm2 = [
-                ffmpeg_exe, "-y",
-                "-fflags", "+genpts",
-                "-i", str(src_norm),
+                ffmpeg_exe,
+                "-y",
+                "-fflags",
+                "+genpts",
+                "-i",
+                str(src_norm),
                 "-an",
                 "-vf",
                 (
                     f"fps={fps_cut},"
                     f"scale=w={out_w}:h={out_h}:force_original_aspect_ratio=decrease,"
                     f"pad={out_w}:{out_h}:(ow-iw)/2:(oh-ih)/2,"
-                    f"setsar=1,format=yuv420p,setpts=PTS-STARTPTS"
+                    "setsar=1,format=yuv420p,setpts=PTS-STARTPTS"
                 ),
-                "-r", f"{fps_cut}",
-                "-vsync", "cfr",
-                "-c:v", "libx264", "-crf", "18",
-                "-pix_fmt", "yuv420p",
+                "-r",
+                f"{fps_cut}",
+                "-vsync",
+                "cfr",
+                "-c:v",
+                "libx264",
+                "-crf",
+                "18",
+                "-pix_fmt",
+                "yuv420p",
                 str(dst_norm),
             ]
             proc_n2 = _sub.run(
@@ -1968,17 +1944,19 @@ def xfade_concat(
                 raise RuntimeError(f"ffmpeg 실패(정규화, no-fade):\n{proc_n2.stdout}")
             norm_list.append(dst_norm)
 
-        # 트리밍 규칙: 첫 청크는 그대로, 두 번째부터는 앞에서 overlap_frames_cut 만큼 제거
         trimmed_list: List[Path] = []
         for idx_trim, src_trim in enumerate(norm_list):
-            # 프레임 수 파악
             cmd_probe2 = [
                 ffprobe_exe,
-                "-v", "error",
-                "-select_streams", "v:0",
+                "-v",
+                "error",
+                "-select_streams",
+                "v:0",
                 "-count_frames",
-                "-show_entries", "stream=nb_read_frames",
-                "-of", "default=nokey=1:noprint_wrappers=1",
+                "-show_entries",
+                "stream=nb_read_frames",
+                "-of",
+                "default=nokey=1:noprint_wrappers=1",
                 str(src_trim),
             ]
             proc_p2 = _sub.run(
@@ -1990,32 +1968,39 @@ def xfade_concat(
                 errors="ignore",
                 check=False,
             )
-            try:
-                nb_frames_str = (proc_p2.stdout or "0").strip()
-                nb_frames_int = int(nb_frames_str) if nb_frames_str.isdigit() else 0
-            except ValueError:
-                nb_frames_int = 0
+            nb_frames_int = 0
+            nb_frames_str = (proc_p2.stdout or "").strip()
+            if nb_frames_str.isdigit():
+                try:
+                    nb_frames_int = int(nb_frames_str)
+                except ValueError:
+                    nb_frames_int = 0
 
             if idx_trim == 0 or overlap_frames_cut <= 0:
-                # 첫 조각은 그대로 사용
                 trimmed_list.append(src_trim)
                 continue
 
             keep_frames = max(0, nb_frames_int - overlap_frames_cut)
             if keep_frames <= 0:
-                # 유지 프레임이 없다면 빈 조각, 스킵
                 continue
 
             trim_out = work_dir_cut / f"_concat_trim_{idx_trim:03d}.mp4"
-            # 앞에서 overlap_frames_cut 만큼 제거: select='gte(n,overlap)'을 사용
             cmd_trim = [
-                ffmpeg_exe, "-y",
-                "-i", str(src_trim),
-                "-vf", f"select='gte(n\\,{overlap_frames_cut})',setpts=N/FRAME_RATE/TB",
-                "-r", f"{fps_cut}",
+                ffmpeg_exe,
+                "-y",
+                "-i",
+                str(src_trim),
+                "-vf",
+                f"select='gte(n\\,{overlap_frames_cut})',setpts=N/FRAME_RATE/TB",
+                "-r",
+                f"{fps_cut}",
                 "-an",
-                "-c:v", "libx264", "-crf", "18",
-                "-pix_fmt", "yuv420p",
+                "-c:v",
+                "libx264",
+                "-crf",
+                "18",
+                "-pix_fmt",
+                "yuv420p",
                 str(trim_out),
             ]
             proc_t = _sub.run(
@@ -2034,31 +2019,28 @@ def xfade_concat(
         if not trimmed_list:
             return False
 
-        # concat
         concat_list_path = work_dir_cut / "_concat_list.txt"
-        try:
-            with open(concat_list_path, "w", encoding="utf-8", newline="\n") as f_list:
-                for p_item in trimmed_list:
-                    p_str = str(p_item).replace("\\", "\\\\").replace("'", "\\'")
-                    f_list.write("file '{}'\n".format(p_str))
-        except OSError as e_osw:
-            raise RuntimeError(f"concat list 작성 실패: {e_osw}") from e_osw
+        with open(concat_list_path, "w", encoding="utf-8", newline="\n") as f_list:
+            for p_item in trimmed_list:
+                p_str = str(p_item).replace("\\", "\\\\").replace("'", "\\'")
+                f_list.write(f"file '{p_str}'\n")
 
         cmd_concat = [
-            ffmpeg_exe, "-y",
-            "-f", "concat",
-            "-safe", "0",
-            "-i", str(concat_list_path),
-            "-c:v", "copy",
-            "-an" if audio_path is None else "-c:a",
+            ffmpeg_exe,
+            "-y",
+            "-f",
+            "concat",
+            "-safe",
+            "0",
+            "-i",
+            str(concat_list_path),
+            "-c:v",
+            "copy",
         ]
         if audio_path is None:
             cmd_concat.append(str(out_path_cut))
         else:
-            # 오디오가 있으면 비디오 copy + 오디오는 별도 멀티플렉스 단계에서 처리되므로 여기선 비디오만 만듦
-            cmd_concat[-1] = "aac"
-            cmd_concat.append("-shortest")
-            cmd_concat.append(str(out_path_cut))
+            cmd_concat.extend(["-c:a", "aac", "-shortest", str(out_path_cut)])
 
         proc_c = _sub.run(
             cmd_concat,
@@ -2072,7 +2054,6 @@ def xfade_concat(
         if proc_c.returncode != 0:
             raise RuntimeError(f"ffmpeg 실패(concat, no-fade):\n{proc_c.stdout}")
 
-        # 미러 보관
         try:
             dst_concat = mirror_dir / out_path_cut.name
             _sh.copyfile(out_path_cut, dst_concat)
@@ -2082,8 +2063,10 @@ def xfade_concat(
 
         return True
 
-    # 입력 요약 및 원본 청크를 미러 폴더에 복사
-    print(f"[XC-BEGIN] items={len(clip_paths)} fps={target_fps} overlap_frames={int(overlap_frames)} out={out_w}x{out_h}")
+    print(
+        f"[XC-BEGIN] items={len(clip_paths)} fps={target_fps} "
+        f"overlap_frames={int(overlap_frames)} out={out_w}x{out_h}"
+    )
     for idx_in, clip_path_item in enumerate(clip_paths):
         clip_path_obj = Path(clip_path_item)
         print(f"[XC-IN-{idx_in:03d}] {_probe_video_info(clip_path_obj)}")
@@ -2096,7 +2079,6 @@ def xfade_concat(
         except OSError:
             pass
 
-    # 페이드 off면 하드컷 병합 경로로 실행
     if not xfade:
         ok_merge = _concat_cut_no_fade(
             ffmpeg_exe=ffmpeg_bin,
@@ -2109,16 +2091,26 @@ def xfade_concat(
         )
         if not ok_merge:
             raise RuntimeError("하드컷 병합 실패")
-        # 필요 시 오디오 멀티플렉스
         if audio_path and Path(audio_path).exists():
             cmd_mux_nf = [
-                ffmpeg_bin, "-y",
-                "-fflags", "+genpts",
-                "-i", str(out_path),
-                "-i", str(audio_path),
-                "-map", "0:v:0", "-map", "1:a:0",
-                "-c:v", "copy",
-                "-c:a", "aac", "-b:a", "192k",
+                ffmpeg_bin,
+                "-y",
+                "-fflags",
+                "+genpts",
+                "-i",
+                str(out_path),
+                "-i",
+                str(audio_path),
+                "-map",
+                "0:v:0",
+                "-map",
+                "1:a:0",
+                "-c:v",
+                "copy",
+                "-c:a",
+                "aac",
+                "-b:a",
+                "192k",
                 "-shortest",
                 str(out_path),
             ]
@@ -2141,26 +2133,32 @@ def xfade_concat(
         print(f"[XC-DONE] out_path={out_path}")
         return out_path
 
-    # ===== 여기부터는 기존 '크로스페이드' 경로 (기존 동작 보존) =====
-
-    # 첫 클립 표준화: cur_000.mp4
     cur_path = work_dir / "cur_000.mp4"
     cmd_first = [
-        ffmpeg_bin, "-y",
-        "-fflags", "+genpts",
-        "-i", str(first_clip_path),
+        ffmpeg_bin,
+        "-y",
+        "-fflags",
+        "+genpts",
+        "-i",
+        str(first_clip_path),
         "-an",
         "-vf",
         (
             f"fps={target_fps},"
             f"scale=w={out_w}:h={out_h}:force_original_aspect_ratio=decrease,"
             f"pad={out_w}:{out_h}:(ow-iw)/2:(oh-ih)/2,"
-            f"setsar=1,format=yuv420p,setpts=PTS-STARTPTS"
+            "setsar=1,format=yuv420p,setpts=PTS-STARTPTS"
         ),
-        "-r", f"{target_fps}",
-        "-vsync", "cfr",
-        "-c:v", "libx264", "-crf", "18",
-        "-pix_fmt", "yuv420p",
+        "-r",
+        f"{target_fps}",
+        "-vsync",
+        "cfr",
+        "-c:v",
+        "libx264",
+        "-crf",
+        "18",
+        "-pix_fmt",
+        "yuv420p",
         str(cur_path),
     ]
     print(f"[XC-CMD-FIRST] {' '.join(cmd_first)}")
@@ -2178,7 +2176,6 @@ def xfade_concat(
         raise RuntimeError(f"ffmpeg 실패(초기 cur_000 인코딩):\n{proc0.stdout}")
     print(f"[XC-CUR-000] {_probe_video_info(cur_path)}")
 
-    # 초기 표준화본 미러 복사
     try:
         dst0 = mirror_dir / cur_path.name
         shutil.copyfile(cur_path, dst0)
@@ -2186,7 +2183,6 @@ def xfade_concat(
     except OSError:
         pass
 
-    # 순차 xfade(기존 흐름 유지)
     for i in range(1, len(clip_paths)):
         next_path = Path(clip_paths[i])
         tmp_out = work_dir / f"cur_{i:03d}.mp4"
@@ -2201,17 +2197,16 @@ def xfade_concat(
         cur_path = tmp_out
         print(f"[XC-CUR-{i:03d}] {_probe_video_info(cur_path)}")
 
-        # _xfade_two가 생성한 정규화본과 현재 결과를 미러 복사
         try:
-            norm_a = work_dir / "_norm_a.mp4"
-            norm_b = work_dir / "_norm_b.mp4"
-            if norm_a.exists():
+            norm_a_path = work_dir / "_norm_a.mp4"
+            norm_b_path = work_dir / "_norm_b.mp4"
+            if norm_a_path.exists():
                 dst_a = mirror_dir / f"_norm_a_{i:03d}.mp4"
-                shutil.copyfile(norm_a, dst_a)
+                shutil.copyfile(norm_a_path, dst_a)
                 print(f"[XC-MIRROR-COPY] norm_a->{dst_a.name}")
-            if norm_b.exists():
+            if norm_b_path.exists():
                 dst_b = mirror_dir / f"_norm_b_{i:03d}.mp4"
-                shutil.copyfile(norm_b, dst_b)
+                shutil.copyfile(norm_b_path, dst_b)
                 print(f"[XC-MIRROR-COPY] norm_b->{dst_b.name}")
             dst_cur = mirror_dir / cur_path.name
             shutil.copyfile(cur_path, dst_cur)
@@ -2219,16 +2214,26 @@ def xfade_concat(
         except OSError:
             pass
 
-    # 오디오 멀티플렉스(선택) - 기존 동작 보존
     if audio_path and Path(audio_path).exists():
         cmd_mux = [
-            ffmpeg_bin, "-y",
-            "-fflags", "+genpts",
-            "-i", str(cur_path),
-            "-i", str(audio_path),
-            "-map", "0:v:0", "-map", "1:a:0",
-            "-c:v", "copy",
-            "-c:a", "aac", "-b:a", "192k",
+            ffmpeg_bin,
+            "-y",
+            "-fflags",
+            "+genpts",
+            "-i",
+            str(cur_path),
+            "-i",
+            str(audio_path),
+            "-map",
+            "0:v:0",
+            "-map",
+            "1:a:0",
+            "-c:v",
+            "copy",
+            "-c:a",
+            "aac",
+            "-b:a",
+            "192k",
             "-shortest",
             str(out_path),
         ]
@@ -2247,10 +2252,14 @@ def xfade_concat(
             raise RuntimeError(f"ffmpeg 실패(오디오 합성):\n{proc_mux.stdout}")
     else:
         cmd_mv = [
-            ffmpeg_bin, "-y",
-            "-fflags", "+genpts",
-            "-i", str(cur_path),
-            "-c:v", "copy",
+            ffmpeg_bin,
+            "-y",
+            "-fflags",
+            "+genpts",
+            "-i",
+            str(cur_path),
+            "-c:v",
+            "copy",
             "-an",
             str(out_path),
         ]
@@ -2270,7 +2279,7 @@ def xfade_concat(
 
     fin_map = _probe_video_info(Path(out_path))
     last_map = _probe_video_info(cur_path)
-    same_size = (fin_map.get("size_bytes") == last_map.get("size_bytes"))
+    same_size = fin_map.get("size_bytes") == last_map.get("size_bytes")
     print(f"[XC-FINAL] {fin_map}")
     print(f"[XC-FINAL==CUR-LAST] same_size={bool(same_size)} out={out_path}")
 
@@ -2284,6 +2293,8 @@ def xfade_concat(
 
     print(f"[XC-DONE] out_path={out_path}")
     return Path(out_path)
+
+
 
 
 
