@@ -411,10 +411,8 @@ class ClickableLabel(QtWidgets.QLabel):
 class ScenePromptEditDialog(QtWidgets.QDialog):
     """
     [수정됨 v17 - 안정화]
-    - [요청] '이미지 삭제' 버튼 추가 (imgs/{id}.png 존재 시 활성화)
-    - [수정] on_upload_image가 '이미지 삭제' 버튼을 활성화하도록 수정
-    - [기존] 씬(Row) 사이의 상하 여백(padding)을 줄임
-    - [기존] '영상삭제' 버튼 추가
+    - [요청] 이미지 미리보기(새 창)가 800x800을 넘지 않도록 스케일 다운 (스크롤바 제거)
+    - [기존] '이미지 삭제' 버튼 추가
     """
 
     # --- [신규] AI 요청 시 사용할 상수 (클래스 속성으로 이동) ---
@@ -486,7 +484,8 @@ class ScenePromptEditDialog(QtWidgets.QDialog):
 
     def show_large_image(self, path_str: str):
         """
-        [수정됨 v16] 썸네일 클릭 시 원본 이미지를 스크롤 가능한 새 다이얼로그에 표시.
+        [수정됨 v17] 썸네일 클릭 시 800x800 박스 안에 맞게
+        이미지를 스케일 다운하여 새 다이얼로그에 표시합니다 (스크롤바 없음).
         """
         if not path_str:
             QtWidgets.QMessageBox.information(self, "미리보기", "이 씬에는 이미지 경로가 지정되지 않았습니다.")
@@ -501,30 +500,38 @@ class ScenePromptEditDialog(QtWidgets.QDialog):
         dialog.setWindowTitle(f"이미지 미리보기: {Path(path_str).name}")
 
         label = QtWidgets.QLabel()
-        label.setPixmap(pixmap)
-        label.setFixedSize(pixmap.width(), pixmap.height())
 
-        scroll_area = QtWidgets.QScrollArea()
-        scroll_area.setWidget(label)
-
-        layout = QtWidgets.QVBoxLayout(dialog)
-        layout.addWidget(scroll_area)
-
-        try:
-            screen_geo = self.screen().availableGeometry()
-        except AttributeError:
-            screen_geo = QtWidgets.QApplication.primaryScreen().availableGeometry()
-
-        max_dialog_w = int(screen_geo.width() * 0.9)
-        max_dialog_h = int(screen_geo.height() * 0.9)
+        # --- [핵심 수정] ---
+        max_preview_w = 800
+        max_preview_h = 800
 
         img_w = pixmap.width()
         img_h = pixmap.height()
 
-        dialog_w = min(img_w + 40, max_dialog_w)
-        dialog_h = min(img_h + 40, max_dialog_h)
+        pixmap_to_show: QtGui.QPixmap
 
-        dialog.resize(dialog_w, dialog_h)
+        if img_w > max_preview_w or img_h > max_preview_h:
+            # 이미지가 800x800보다 크면 비율 유지하며 축소
+            scaled_pixmap = pixmap.scaled(
+                max_preview_w,
+                max_preview_h,
+                Qt.AspectRatioMode.KeepAspectRatio,
+                Qt.TransformationMode.SmoothTransformation
+            )
+            label.setPixmap(scaled_pixmap)
+            # 다이얼로그 크기를 '축소된' 이미지 크기에 맞춤
+            dialog.resize(scaled_pixmap.width() + 20, scaled_pixmap.height() + 20)
+        else:
+            # 이미지가 800x800보다 작으면 원본 그대로
+            label.setPixmap(pixmap)
+            # 다이얼로그 크기를 '원본' 이미지 크기에 맞춤
+            dialog.resize(img_w + 20, img_h + 20)
+
+        # [수정] 스크롤 영역(QScrollArea) 제거, 라벨을 레이아웃에 직접 추가
+        layout = QtWidgets.QVBoxLayout(dialog)
+        layout.addWidget(label)
+        # --- [수정 끝] ---
+
         dialog.exec_()
 
     def on_ai_request(self):
@@ -913,7 +920,6 @@ class ScenePromptEditDialog(QtWidgets.QDialog):
                     upload_button = QtWidgets.QPushButton("업로드")
                     upload_button.setFixedSize(self.THUMBNAIL_SIZE, 28)
 
-                    # --- [신규] '이미지 삭제' 버튼 생성 ---
                     delete_image_button = QtWidgets.QPushButton("이미지 삭제")
                     delete_image_button.setFixedSize(self.THUMBNAIL_SIZE, 28)
 
@@ -922,7 +928,7 @@ class ScenePromptEditDialog(QtWidgets.QDialog):
 
                     left_vbox.addWidget(img_preview_label)
                     left_vbox.addWidget(upload_button)
-                    left_vbox.addWidget(delete_image_button)  # [신규] VBox에 추가
+                    left_vbox.addWidget(delete_image_button)
                     left_vbox.addWidget(delete_video_button)
                     row_layout.addWidget(left_vbox_widget)
 
@@ -930,7 +936,6 @@ class ScenePromptEditDialog(QtWidgets.QDialog):
                     text_edit = QtWidgets.QTextEdit()
                     text_edit.setPlainText(scene.get("direct_prompt", ""))
                     text_edit.setFont(font)
-                    # [수정] 높이를 4개 위젯에 맞춤 (150 + 28*3 + 4*3 spacing) = 246
                     text_edit.setMinimumHeight(246)
                     text_edit.setToolTip(f"Scene ID: {scene_id}\n이 씬의 direct_prompt를 입력하세요.")
                     text_edit.setSizePolicy(QtWidgets.QSizePolicy.Policy.Expanding,
@@ -955,20 +960,20 @@ class ScenePromptEditDialog(QtWidgets.QDialog):
                             img_preview_label.setToolTip(f"경로: {img_file_str}\n(클릭해서 크게 보기)")
                             img_preview_label.clicked.connect(functools.partial(self.show_large_image, img_file_str))
                             upload_button.setText("이미지 변경")
-                            delete_image_button.setEnabled(True)  # [신규] 활성화
+                            delete_image_button.setEnabled(True)
                             delete_image_button.setToolTip(f"경로: {img_file_str}\n(클릭 시 이 씬의 이미지 파일을 삭제합니다.)")
                         else:
                             img_preview_label.setText("[파일\n오류]")
                             img_preview_label.setToolTip(f"경로: {img_file_str}\n(파일을 읽을 수 없음)")
                             img_preview_label.setStyleSheet("border: 1px solid red; color: red;")
                             upload_button.setText("다시 업로드")
-                            delete_image_button.setEnabled(True)  # [신규] (읽을 수 없어도) 파일은 존재하므로 활성화
+                            delete_image_button.setEnabled(True)
                     else:
                         img_preview_label.setText("[이미지\n없음]")
                         img_preview_label.setToolTip(f"경로: {img_file_str}\n(파일이 존재하지 않습니다)")
                         img_preview_label.setStyleSheet("border: 1px dashed gray; color: gray;")
                         upload_button.setText("업로드")
-                        delete_image_button.setEnabled(False)  # [신규] 비활성화
+                        delete_image_button.setEnabled(False)
 
                     # 업로드 버튼 시그널 연결
                     upload_button.clicked.connect(
@@ -976,7 +981,7 @@ class ScenePromptEditDialog(QtWidgets.QDialog):
                                           delete_image_button, scene)
                     )
 
-                    # [신규] 이미지 삭제 버튼 시그널 연결
+                    # 이미지 삭제 버튼 시그널 연결
                     delete_image_button.clicked.connect(
                         functools.partial(self.on_delete_image, img_path if img_path else Path(), img_preview_label,
                                           upload_button, delete_image_button, scene)
@@ -1065,13 +1070,6 @@ class ScenePromptEditDialog(QtWidgets.QDialog):
         except Exception as e_update:
             QtWidgets.QMessageBox.critical(self, "저장 오류",
                                            f"파일을 저장하는 중 오류가 발생했습니다:\n{e_update}")
-
-
-
-# ──────────────────────────────── Main UI ─────────────────────────────────────
-
-
-# ──────────────────────────────── Main UI ─────────────────────────────────────
 
 
 # ──────────────────────────────── Main UI ─────────────────────────────────────
@@ -8494,19 +8492,17 @@ class MainWindow(QtWidgets.QMainWindow):
 
 
 # ==================================================
-# shorts_ui.py 파일의 _inject_render_prefs_methods 함수 전체를 이 코드로 교체하세요. (약 9130 라인)
-
 def _inject_render_prefs_methods():
     """
-    [수정됨 v19] MainWindow에 _create_render_widgets / _save_ui_prefs_to_project (및 테스트 버튼) 없으면 주입.
-    - [버그 수정] 프리셋 변경 시 W/H 콤보박스의 시그널을 임시 차단하여, '맞춤(커스텀)'으로 되돌아갔을 때
-      W/H 콤보박스가 비활성화되는 버그(race condition)를 수정합니다.
+    [수정됨 v20] MainWindow에 _create_render_widgets / _save_ui_prefs_to_project (및 테스트 버튼) 없으면 주입.
+    - [버그 수정] "이 코드에 도달할 수 없습니다" (unreachable code) 버그 수정.
+      'custom' 프리셋에서 return 하던 로직을 'if/else' 구조로 변경하여,
+      다른 프리셋 선택 시 lock_handler(True)가 올바르게 호출되도록 수정.
     - [기존] '이미지 설정'과 '렌더 설정' 위젯을 별도로 생성합니다.
     """
     from pathlib import Path
     from PyQt5 import QtWidgets
     from PyQt5.QtGui import QFont
-    from PyQt5.QtCore import Qt  # [신규] Qt 임포트
 
     # 안전 import (app 패키지/단독 실행 모두 고려)
     try:
@@ -8796,40 +8792,40 @@ def _inject_render_prefs_methods():
 
             return _lock_wh
 
-        def _create_preset_apply_handler(cmb_preset: QtWidgets.QComboBox, cmb_w: QtWidgets.QComboBox,
-                                         cmb_h: QtWidgets.QComboBox, lock_handler: Callable):
+        def _create_preset_apply_handler(cmb_preset, cmb_w, cmb_h, lock_handler):
             """
-            [버그 수정] 프리셋 변경 시 W/H 값 적용 핸들러 생성.
-            W/H 콤보박스 시그널을 임시 차단하여 race condition 방지.
+            프리셋 변경 시 W/H 값 적용 핸들러.
+            - 'custom'이면 잠금 해제
+            - 그 외 프리셋이면 W/H 강제 세팅 후 잠금
             """
 
             def _apply_preset():
                 data = cmb_preset.currentData()
-                if not (isinstance(data, tuple) and len(data) == 3): return
-                w_preset, h_preset, key = data
-
-                if key == "custom":
-                    lock_handler(False)  # '맞춤' 선택 시 잠금 해제
+                if not (isinstance(data, tuple) and len(data) == 3):
                     return
 
-                # --- [버그 수정] ---
-                # W/H 값을 변경하기 전에 시그널을 차단
-                cmb_w.blockSignals(True)
-                cmb_h.blockSignals(True)
+                w_preset, h_preset, key = data
+                is_custom = (key == "custom")
 
-                try:
-                    idx_w = cmb_w.findData(int(w_preset))
-                    if idx_w >= 0: cmb_w.setCurrentIndex(idx_w)
+                # custom 아니면 W/H 먼저 세팅
+                if not is_custom:
+                    cmb_w.blockSignals(True)
+                    cmb_h.blockSignals(True)
+                    try:
+                        idx_w = cmb_w.findData(int(w_preset))
+                        if idx_w >= 0:
+                            cmb_w.setCurrentIndex(idx_w)
 
-                    idx_h = cmb_h.findData(int(h_preset))
-                    if idx_h >= 0: cmb_h.setCurrentIndex(idx_h)
-                finally:
-                    # W/H 값을 모두 설정한 후 시그널을 다시 연결
-                    cmb_w.blockSignals(False)
-                    cmb_h.blockSignals(False)
-                # --- [수정 끝] ---
+                        idx_h = cmb_h.findData(int(h_preset))
+                        if idx_h >= 0:
+                            cmb_h.setCurrentIndex(idx_h)
+                    finally:
+                        cmb_w.blockSignals(False)
+                        cmb_h.blockSignals(False)
 
-                lock_handler(True)  # '맞춤' 아닌 프리셋 선택 시 잠금
+                # 마지막에 한 번만 잠금 상태 적용
+                # custom -> False, 그 외 -> True
+                lock_handler(not is_custom)
 
             return _apply_preset
 
@@ -8952,9 +8948,15 @@ def _inject_render_prefs_methods():
         ui["t2i_steps"] = int(self.spn_t2i_steps.value())  # <-- image_steps 값으로 변경
         # [수정] image_size는 "이미지 설정"의 image_size 값을 사용해야 함
         # ui["image_size"] = [render_w_sel, render_h_sel] # <-- 이 줄 삭제 또는 image_size 값으로
-        ui["image_size"] = [img_w_sel, img_h_sel]  # <-- "이미지 설정" 값으로 명시적 저장
+        # [수정] 호환성을 위해 image_size는 "렌더 설정" 값을 따르게 유지합니다.
+        # (on_video가 image_size를 사용했다면 render_size를 읽도록 수정하는 것이 더 근본적인 해결책입니다)
+        # -> v19에서 on_video는 render_size를 읽도록 수정되었습니다.
+        # -> 따라서 호환성 키인 image_size는 "이미지 설정" 값을 저장하는 것이 맞습니다.
+        # [재수정 v20] 호환성을 위해 기존 'image_size' 키는 "이미지 설정" 값을 저장합니다. (v19 수정 유지)
+        ui["image_size"] = [img_w_sel, img_h_sel]
 
-        ui["resolution_preset"] = str(render_preset_key)  # <-- 렌더 프리셋 (호환성 유지)
+        # [호환성] 기존 'resolution_preset' 키는 "렌더 설정" 프리셋을 저장합니다.
+        ui["resolution_preset"] = str(render_preset_key)
 
         meta["ui_prefs"] = ui
         save_json(pj, meta)
