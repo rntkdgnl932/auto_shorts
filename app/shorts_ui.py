@@ -394,7 +394,6 @@ except (NameError, AttributeError):
     _Button_Left = 1  # Qt.LeftButton의 기본값
 
 
-# [신규] 클릭 가능한 QLabel (이미지 미리보기용)
 class ClickableLabel(QtWidgets.QLabel):
     """클릭 시 'clicked' 시그널을 방출하는 QLabel"""
     clicked = QtCore.pyqtSignal()
@@ -411,11 +410,11 @@ class ClickableLabel(QtWidgets.QLabel):
 
 class ScenePromptEditDialog(QtWidgets.QDialog):
     """
-    [수정됨 v13 - 안정화]
-    - [수정] '함수 내 변수는 소문자여야 합니다' 경고 해결 (상수 -> 클래스 속성으로 이동)
+    [수정됨 v14 - 안정화]
+    - [요청] '영상삭제' 버튼 추가 (clips/{id}.mp4 존재 시 활성화)
     - [수정] 'Qt' 클래스 속성 참조 Linter 경고 해결
-    - [요청 1] 씬 라벨에 {id} : [가사] / 시간 : [start ~ end, duration] 표시
-    - [요청 2] 이미지 미리보기(QLabel)와 '업로드/변경' 버튼(QPushButton) 분리
+    - [요청 1] 씬 라벨 형식 수정
+    - [요청 2] 이미지 미리보기/업로드 버튼 분리
     """
 
     # --- [신규] AI 요청 시 사용할 상수 (클래스 속성으로 이동) ---
@@ -531,8 +530,7 @@ class ScenePromptEditDialog(QtWidgets.QDialog):
 
     def on_ai_request(self):
         """
-        [수정됨 v9] 'AI 요청' 버튼 핸들러.
-        'direct_prompt'를 기반으로 AI를 호출하여 'prompt', 'prompt_img', 'prompt_movie' 3개 필드를 갱신합니다.
+        'AI 요청' 버튼 핸들러. 'prompt', 'prompt_img', 'prompt_movie' 3개 필드를 갱신합니다.
         """
 
         # 1. AI 요청 대상 수집
@@ -572,8 +570,6 @@ class ScenePromptEditDialog(QtWidgets.QDialog):
             )
 
             updated_count = 0
-
-            # [수정] 클래스 속성으로 정의된 상수 사용
             quality_tags = self._AI_QUALITY_TAGS
             default_negative_tags = self._AI_DEFAULT_NEGATIVE_TAGS
 
@@ -613,8 +609,6 @@ class ScenePromptEditDialog(QtWidgets.QDialog):
 
                     if prompt_ko and prompt_img_base:
                         scene_dict["prompt"] = prompt_ko
-
-                        # [수정] 클래스 속성 사용
                         scene_dict["prompt_img"] = f"{prompt_img_base}, {quality_tags}"
 
                         if motion_hint:
@@ -622,7 +616,7 @@ class ScenePromptEditDialog(QtWidgets.QDialog):
                         else:
                             scene_dict["prompt_movie"] = scene_dict["prompt_img"]
 
-                        scene_dict["prompt_negative"] = default_negative_tags  # [수정]
+                        scene_dict["prompt_negative"] = default_negative_tags
                         updated_count += 1
                         _log(f"[{current_scene_id}] 3개 필드 완료: {prompt_ko[:30]}...")
                     else:
@@ -676,7 +670,7 @@ class ScenePromptEditDialog(QtWidgets.QDialog):
                         upload_button: QtWidgets.QPushButton,
                         scene_data: Dict[str, Any]):
         """
-        [수정됨 v10] '업로드' 버튼 클릭 시, 이미지를 선택받아 imgs/{id}.png로 복사/저장.
+        '업로드' 버튼 클릭 시, 이미지를 선택받아 imgs/{id}.png로 복사/저장.
         """
         if scene_data is None:
             scene_data = {}
@@ -731,11 +725,48 @@ class ScenePromptEditDialog(QtWidgets.QDialog):
             preview_label.setToolTip(f"경로: {target_path_str}\n(파일을 읽을 수 없음)")
             upload_button.setText("다시 업로드")
 
+    def on_delete_video(self, video_path: Path, button_widget: QtWidgets.QPushButton):
+        """
+        [신규] '영상삭제' 버튼 클릭 핸들러.
+        사용자 확인 후 {id}.mp4 파일을 삭제하고 버튼을 비활성화합니다.
+        """
+
+        # 1. 경로가 존재하는지 다시 확인 (버튼이 활성화되었더라도)
+        if not video_path.exists():
+            QtWidgets.QMessageBox.warning(self, "오류", "파일이 이미 존재하지 않습니다.")
+            button_widget.setEnabled(False)
+            return
+
+        # 2. 사용자 확인
+        reply = QtWidgets.QMessageBox.question(
+            self,
+            "영상 삭제 확인",
+            f"정말로 이 씬의 비디오 파일을 삭제하시겠습니까?\n\n{video_path.name}",
+            QtWidgets.QMessageBox.Yes | QtWidgets.QMessageBox.No,
+            QtWidgets.QMessageBox.No
+        )
+
+        if reply != QtWidgets.QMessageBox.Yes:
+            return
+
+        # 3. 파일 삭제
+        try:
+            video_path.unlink()
+            QtWidgets.QMessageBox.information(self, "삭제 완료", f"파일을 삭제했습니다:\n{video_path.name}")
+            button_widget.setEnabled(False)  # 삭제 후 비활성화
+
+        except FileNotFoundError:
+            QtWidgets.QMessageBox.warning(self, "오류", "파일이 이미 존재하지 않았습니다.")
+            button_widget.setEnabled(False)
+        except (OSError, Exception) as e_delete:
+            QtWidgets.QMessageBox.critical(self, "삭제 실패", f"파일 삭제 중 오류가 발생했습니다:\n{e_delete}")
+            # 삭제 실패 시 버튼은 활성화된 상태로 둠 (파일이 아직 있으므로)
+
     def load_and_build_ui(self):
         """
         [수정됨 v11]
         - (Request 1) 라벨 형식을 'id : [가사] / 시간'으로 변경
-        - (Request 2) UI 레이아웃을 '미리보기(QLabel)'와 '업로드(QPushButton)'로 분리
+        - (Request 2) UI 레이아웃을 '미리보기(QLabel)'와 '업로드/영상삭제(QPushButton)'로 분리
         """
 
         try:
@@ -779,7 +810,7 @@ class ScenePromptEditDialog(QtWidgets.QDialog):
                     # --- [수정] Request 1: 라벨 정보 수집 ---
                     scene_id = scene.get("id", "ID_없음")
                     lyric = (scene.get("lyric") or "").strip()
-                    if len(lyric) > 20:  # 가사가 너무 길면 자르기
+                    if len(lyric) > 20:
                         lyric = lyric[:20] + "..."
 
                     start_f = scene.get("start", 0.0)
@@ -801,7 +832,7 @@ class ScenePromptEditDialog(QtWidgets.QDialog):
                     row_layout.setContentsMargins(0, 0, 0, 0)
                     row_layout.setSpacing(8)
 
-                    # 2-A: 왼쪽 (이미지 미리보기 + 업로드 버튼)
+                    # 2-A: 왼쪽 (이미지 미리보기 + 버튼 2개)
                     left_vbox_widget = QtWidgets.QWidget()
                     left_vbox = QtWidgets.QVBoxLayout(left_vbox_widget)
                     left_vbox.setContentsMargins(0, 0, 0, 0)
@@ -814,22 +845,28 @@ class ScenePromptEditDialog(QtWidgets.QDialog):
                     upload_button = QtWidgets.QPushButton("업로드")
                     upload_button.setFixedSize(self.THUMBNAIL_SIZE, 28)
 
+                    # --- [신규] Request 2: 영상 삭제 버튼 ---
+                    delete_video_button = QtWidgets.QPushButton("영상삭제")
+                    delete_video_button.setFixedSize(self.THUMBNAIL_SIZE, 28)
+
                     left_vbox.addWidget(img_preview_label)
                     left_vbox.addWidget(upload_button)
+                    left_vbox.addWidget(delete_video_button)  # [신규] VBox에 추가
                     row_layout.addWidget(left_vbox_widget)
 
                     # 2-B: 오른쪽 (Direct Prompt 텍스트 편집기)
                     text_edit = QtWidgets.QTextEdit()
                     text_edit.setPlainText(scene.get("direct_prompt", ""))
                     text_edit.setFont(font)
-                    text_edit.setMinimumHeight(self.THUMBNAIL_SIZE + 32)
+                    # [수정] 높이를 3개 위젯에 맞춤 (150 + 28 + 28 + 8(spacing*2)) = 214
+                    text_edit.setMinimumHeight(214)
                     text_edit.setToolTip(f"Scene ID: {scene_id}\n이 씬의 direct_prompt를 입력하세요.")
                     text_edit.setSizePolicy(QtWidgets.QSizePolicy.Policy.Expanding,
                                             QtWidgets.QSizePolicy.Policy.Preferred)
 
                     row_layout.addWidget(text_edit)
 
-                    # --- [수정] Request 2: 상태 설정 ---
+                    # --- [수정] Request 2: 이미지 상태 설정 ---
                     img_file_str = scene.get("img_file", "")
                     img_path = Path(img_file_str) if img_file_str else None
                     has_image = img_path and img_path.exists()
@@ -860,6 +897,22 @@ class ScenePromptEditDialog(QtWidgets.QDialog):
                     # 업로드 버튼 시그널 연결
                     upload_button.clicked.connect(
                         functools.partial(self.on_upload_image, scene_id, img_preview_label, upload_button, scene)
+                    )
+
+                    # --- [신규] Request 2: 영상삭제 버튼 상태 설정 ---
+                    clips_dir = self.json_path.parent / "clips"
+                    video_file_path = clips_dir / f"{scene_id}.mp4"
+                    video_exists = video_file_path.exists()
+
+                    delete_video_button.setEnabled(video_exists)
+                    if video_exists:
+                        delete_video_button.setToolTip(f"경로: {video_file_path}\n(클릭 시 이 씬의 영상 파일을 삭제합니다.)")
+                    else:
+                        delete_video_button.setToolTip(f"영상 파일 없음:\n{video_file_path}")
+
+                    # 삭제 핸들러 연결
+                    delete_video_button.clicked.connect(
+                        functools.partial(self.on_delete_video, video_file_path, delete_video_button)
                     )
 
                     form_layout_page.addRow(label, row_container)
@@ -932,6 +985,9 @@ class ScenePromptEditDialog(QtWidgets.QDialog):
         except Exception as e_update:
             QtWidgets.QMessageBox.critical(self, "저장 오류",
                                            f"파일을 저장하는 중 오류가 발생했습니다:\n{e_update}")
+
+
+# ──────────────────────────────── Main UI ─────────────────────────────────────
 
 
 # ──────────────────────────────── Main UI ─────────────────────────────────────
