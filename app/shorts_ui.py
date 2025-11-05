@@ -22,7 +22,7 @@ print("GPU_LOCK:", os.getenv("CUDA_VISIBLE_DEVICES"), os.getenv("CT2_FORCE_CPU")
 """
 
 import json
-from typing import Optional, Dict, Set
+from typing import Optional, Dict, Set, Tuple
 import requests
 import math
 import sys
@@ -381,27 +381,31 @@ class ProgressLogDialog(QtWidgets.QDialog):
         self.setWindowTitle(text)
 # ───────────────────────── 제이슨 수정 ─────────────────────────
 
+# ───────────────────────── JSON 편집 다이얼로그 (신규 추가) ─────────────────────────
+
 class ScenePromptEditDialog(QtWidgets.QDialog):
     """
-    [수정됨 v5] video.json 파일을 읽어, 각 scene의 'direct_prompt'를
-    이미지 썸네일과 함께 편집하고 "업데이트" 버튼으로 저장합니다.
-    - 4개씩 페이지네이션 적용
-    - 썸네일 크기 150px
-    - 썸네일 클릭 시 원본 이미지 팝업
-    - [신규] 이미지 없을 시 '업로드' 버튼 활성화
+    [수정됨 v9 - 안정화]
+    - [요청] 'AI 요청' 버튼이 'direct_prompt'를 기반으로 prompt, prompt_img, prompt_movie 3개 필드를 모두 생성하도록 수정
+    - [요청] '업데이트' 버튼 클릭 시 창이 닫히지 않도록 수정
+    - [수정] 'self.' 접두사 오류 및 '가리기(shadowing)' 경고 해결
     """
 
-    def __init__(self, json_path: Path, parent: Optional[QtWidgets.QWidget] = None):
+    def __init__(self, json_path: Path, ai_instance: AI, parent: Optional[QtWidgets.QWidget] = None):
+        """
+        [수정됨 v8] 'self.' 접두사 제거
+        """
         super().__init__(parent)
         self.json_path = json_path
-        self.full_video_data: dict = {}  # video.json 전체 내용을 담을 변수
-        self.scenes_data: list = []  # scenes 리스트만 담을 변수
-        self.widget_map: list[tuple[str, QtWidgets.QTextEdit]] = []  # (scene_id, 텍스트위젯) 매핑
+        self.ai_instance = ai_instance
+        self.full_video_data: dict = {}
+        self.scenes_data: list = []
+        self.widget_map: List[Tuple[str, QtWidgets.QTextEdit]] = []
 
         self.current_page = 0
         self.total_pages = 0
-        self.PAGE_SIZE = 4  # 페이지당 4개
-        self.THUMBNAIL_SIZE = 150  # 썸네일 크기 150px
+        self.PAGE_SIZE = 4
+        self.THUMBNAIL_SIZE = 150
 
         self.setWindowTitle(f"Scene 프롬프트 편집: {self.json_path.name}")
         self.setMinimumSize(900, 750)
@@ -430,19 +434,26 @@ class ScenePromptEditDialog(QtWidgets.QDialog):
 
         # 4. 하단 버튼 레이아웃
         button_layout = QtWidgets.QHBoxLayout()
+        self.btn_ai_request = QtWidgets.QPushButton("AI 요청")
         self.btn_update = QtWidgets.QPushButton("업데이트")
         self.btn_cancel = QtWidgets.QPushButton("닫기")
 
+        # [수정] 툴팁 변경: 3개 필드 모두 생성함을 명시
+        self.btn_ai_request.setToolTip(
+            "현재 페이지의 'direct_prompt' 내용을 기반으로\nAI에게 'prompt'(한국어), 'prompt_img', 'prompt_movie' 3개 필드를 새로 요청합니다.")
+
         button_layout.addStretch(1)
         button_layout.addWidget(self.btn_cancel)
+        button_layout.addWidget(self.btn_ai_request)
         button_layout.addWidget(self.btn_update)
         main_layout.addLayout(button_layout)
 
         # 5. 시그널 연결
         self.btn_update.clicked.connect(self.on_update_and_close)
-        self.btn_cancel.clicked.connect(self.reject)
+        self.btn_cancel.clicked.connect(self.reject)  # 닫기 버튼은 reject (창 닫음)
         self.btn_prev.clicked.connect(self.on_prev_page)
         self.btn_next.clicked.connect(self.on_next_page)
+        self.btn_ai_request.clicked.connect(self.on_ai_request)
 
         # 6. JSON 데이터 로드 및 UI 빌드
         self.load_and_build_ui()
@@ -491,44 +502,192 @@ class ScenePromptEditDialog(QtWidgets.QDialog):
 
         dialog.exec_()
 
-    def on_upload_image(self, scene_id: str, button_widget: QtWidgets.QPushButton, scene_data: Optional[dict] = None):
+    def on_ai_request(self):
+        """
+        [수정됨 v9] 'AI 요청' 버튼 핸들러.
+        'direct_prompt'를 기반으로 AI를 호출하여 'prompt', 'prompt_img', 'prompt_movie' 3개 필드를 갱신합니다.
+        """
+
+        # 1. AI 요청 대상 수집 (현재 UI의 direct_prompt 값 기준)
+        scenes_to_process: List[Tuple[Dict[str, Any], str]] = []
+        scenes_map = {scene.get("id"): scene for scene in self.scenes_data if isinstance(scene, dict) and "id" in scene}
+
+        for scene_id, text_edit_widget in self.widget_map:
+            if scene_id in scenes_map:
+                direct_prompt_text = text_edit_widget.toPlainText().strip()
+                if direct_prompt_text:
+                    scenes_to_process.append((scenes_map[scene_id], direct_prompt_text))
+
+        if not scenes_to_process:
+            QtWidgets.QMessageBox.information(self, "알림",
+                                              "AI로 요청할 'direct_prompt' 내용이 없습니다.\n먼저 'direct_prompt' 텍스트창에 내용을 입력하세요.")
+            return
+
+        # 2. 버튼 비활성화
+        self.btn_ai_request.setEnabled(False)
+        self.btn_update.setEnabled(False)
+        self.btn_cancel.setEnabled(False)
+
+        # 3. 백그라운드 작업(job) 정의
+        def job(progress_callback: Callable[[dict], None]):
+            _log = lambda msg: progress_callback({"msg": msg})
+
+            _log(f"총 {len(scenes_to_process)}개의 씬에 대해 3개 필드(prompt, prompt_img, prompt_movie) 생성을 요청합니다...")
+
+            # [수정] AI가 3개 필드를 포함한 JSON을 반환하도록 시스템 프롬프트 변경
+            system_prompt = (
+                "You are an AI assistant for video prompt generation. "
+                "The user will provide core keywords. "
+                "Return a JSON object with 3 keys: "
+                "1. `prompt_ko`: A single, vivid scene description in Korean based on the keywords. "
+                "2. `prompt_img_base`: A comma-separated list of English keywords (5-10 tags) for the scene's background, mood, and subject. "
+                "3. `motion_hint`: A single, short English motion tag (e.g., 'slow zoom in', 'camera pan left', 'subtle eye blink'). If no motion, return an empty string \"\". "
+                "Respond ONLY with the JSON object."
+            )
+
+            updated_count = 0
+            # [신규] 프롬프트 조립에 필요한 공통 태그
+            QUALITY_TAGS = "photorealistic, cinematic lighting, high detail, 8k, masterpiece"
+            DEFAULT_NEGATIVE_TAGS = "lowres, bad anatomy, bad proportions, extra limbs, extra fingers, missing fingers, jpeg artifacts, signature, logo, nsfw, text, letters, typography, watermark"
+
+            for scene_dict, dp_text in scenes_to_process:
+                current_scene_id = scene_dict.get("id", "Unknown")
+                _log(f"[{current_scene_id}] 요청 중... (Keywords: {dp_text[:30]}...)")
+
+                user_prompt = f"Keywords: {dp_text}\n\nJSON Response:"
+
+                try:
+                    # AI 호출 (Gemini 우선 사용)
+                    ai_response_str = self.ai_instance.ask_smart(
+                        system_prompt,
+                        user_prompt,
+                        prefer="gemini",
+                        allow_fallback=True
+                    )
+
+                    # AI 응답 (JSON) 파싱
+                    # [수정] 텍스트에서 JSON 블록만 안전하게 추출
+                    json_start = ai_response_str.find("{")
+                    json_end = ai_response_str.rfind("}") + 1
+
+                    if 0 <= json_start < json_end:
+                        json_str = ai_response_str[json_start:json_end]
+                        try:
+                            ai_json_data = json.loads(json_str)
+                            if not isinstance(ai_json_data, dict):
+                                raise json.JSONDecodeError("AI response is not a JSON object", json_str, 0)
+                        except json.JSONDecodeError as e_json:
+                            _log(f"[{current_scene_id}] AI 응답 JSON 파싱 실패: {e_json}\n응답: {ai_response_str[:50]}...")
+                            continue
+                    else:
+                        _log(f"[{current_scene_id}] AI가 JSON 응답을 반환하지 않았습니다.")
+                        continue
+
+                    # [수정] 3개 필드 추출
+                    prompt_ko = (ai_json_data.get("prompt_ko") or "").strip().replace('"', '').replace("'", "")
+                    prompt_img_base = (ai_json_data.get("prompt_img_base") or "").strip()
+                    motion_hint = (ai_json_data.get("motion_hint") or "").strip()
+
+                    if prompt_ko and prompt_img_base:
+                        # [핵심] 3개 필드를 모두 덮어씀
+                        scene_dict["prompt"] = prompt_ko
+
+                        # [신규] prompt_img 조립 (기존 캐릭터 태그 등은 보존하지 않고, AI가 생성한 태그 기반으로 덮어씀)
+                        # (참고: 이 방식은 캐릭터 태그를 자동으로 주입하지 않습니다.
+                        #  'direct_prompt'에 'female_01' 같은 ID를 포함시켜야 AI가 인식할 수 있습니다.)
+                        scene_dict["prompt_img"] = f"{prompt_img_base}, {QUALITY_TAGS}"
+
+                        # [신규] prompt_movie 조립
+                        if motion_hint:
+                            scene_dict["prompt_movie"] = f"{prompt_img_base}, {QUALITY_TAGS}, motion: {motion_hint}"
+                        else:
+                            scene_dict["prompt_movie"] = scene_dict["prompt_img"]  # 모션 없으면 img와 동일하게
+
+                        # [신규] 네거티브 프롬프트도 기본값으로 설정 (기존 값 덮어쓰기)
+                        scene_dict["prompt_negative"] = DEFAULT_NEGATIVE_TAGS
+
+                        updated_count += 1
+                        _log(f"[{current_scene_id}] 3개 필드 완료: {prompt_ko[:30]}...")
+                    else:
+                        _log(f"[{current_scene_id}] AI가 필수 필드(prompt_ko, prompt_img_base)를 반환하지 않았습니다.")
+
+                except Exception as e_ai_call:
+                    _log(f"[{current_scene_id}] AI 요청 실패 ({type(e_ai_call).__name__}): {e_ai_call}")
+
+            # 4. 모든 작업 완료 후 파일 저장
+            if updated_count > 0:
+                _log(f"총 {updated_count}개 씬의 프롬프트를 갱신했습니다. video.json 파일에 저장합니다...")
+                self.full_video_data["scenes"] = self.scenes_data
+                try:
+                    save_json(self.json_path, self.full_video_data)
+                except (IOError, OSError, Exception) as save_e:
+                    _log(f"[ERROR] video.json 저장 실패: {save_e}")
+                    pass
+
+            return {"updated_count": updated_count}
+
+        # 5. 작업 완료 콜백 정의
+        def done(ok: bool, payload: Optional[dict], err: Optional[Exception]):
+            # 버튼 활성화
+            self.btn_ai_request.setEnabled(True)
+            self.btn_update.setEnabled(True)
+            self.btn_cancel.setEnabled(True)
+
+            if not ok:
+                QtWidgets.QMessageBox.critical(self, "AI 요청 실패", f"작업 중 오류가 발생했습니다:\n{err}")
+                return
+
+            if payload:
+                count = payload.get("updated_count", 0)
+                if count > 0:
+                    QtWidgets.QMessageBox.information(self, "AI 요청 완료",
+                                                      f"총 {count}개 씬의 'prompt', 'prompt_img', 'prompt_movie' 필드를 갱신하고 저장했습니다.\n\n"
+                                                      f"(이제 '업데이트' 버튼을 눌러 direct_prompt도 저장하거나, 창을 닫으세요.)")
+                else:
+                    QtWidgets.QMessageBox.warning(self, "AI 요청", "AI가 갱신한 내용이 없거나 저장에 실패했습니다.")
+
+        # 6. 비동기 작업 실행
+        run_job_with_progress_async(
+            owner=self,
+            title=f"AI 프롬프트 생성 중 ({self.json_path.name})",
+            job=job,
+            on_done=done
+        )
+
+    def on_upload_image(self, scene_id: str, button_widget: QtWidgets.QPushButton,
+                        scene_data: Optional[Dict[str, Any]] = None):
         """[신규] '업로드' 버튼 클릭 시, 이미지를 선택받아 imgs/{id}.png로 복사/저장"""
         if scene_data is None:
-            scene_data = {} # None일 경우 빈 dict로 초기화
+            scene_data = {}
 
-        # 1. 대상 폴더 및 파일명 정의 (imgs/{id}.png)
         imgs_dir = self.json_path.parent / "imgs"
         try:
             imgs_dir.mkdir(parents=True, exist_ok=True)
-        except OSError as e:
-            QtWidgets.QMessageBox.warning(self, "업로드 오류", f"이미지 폴더를 생성할 수 없습니다:\n{e}")
+        except os.error as e_mkdir:
+            QtWidgets.QMessageBox.warning(self, "업로드 오류", f"이미지 폴더를 생성할 수 없습니다:\n{e_mkdir}")
             return
 
         target_path = imgs_dir / f"{scene_id}.png"
 
-        # 2. 파일 선택 대화상자
         src_path_str, selected_filter = QtWidgets.QFileDialog.getOpenFileName(
             self,
             f"'{scene_id}' 씬 이미지 선택",
-            str(imgs_dir),  # 기본 경로
+            str(imgs_dir),
             "Images (*.png *.jpg *.jpeg *.webp)"
         )
 
         if not src_path_str:
-            return  # 사용자가 취소
-
-        # 3. 파일 복사 (shutil.copy2 사용)
-        try:
-            shutil.copy2(str(src_path_str), str(target_path))
-        except Exception as e:
-            QtWidgets.QMessageBox.warning(self, "업로드 오류", f"파일 복사 중 오류가 발생했습니다:\n{e}")
             return
 
-        # 4. 복사 성공: 인메모리 데이터 갱신
+        try:
+            shutil.copy2(str(src_path_str), str(target_path))
+        except Exception as e_copy:
+            QtWidgets.QMessageBox.warning(self, "업로드 오류", f"파일 복사 중 오류가 발생했습니다:\n{e_copy}")
+            return
+
         target_path_str = str(target_path)
         scene_data["img_file"] = target_path_str
 
-        # 5. 버튼 UI 갱신 (썸네일 모드로 변경)
         self.setup_button_state_for_widget(
             button_widget,
             has_image_now=True,
@@ -542,20 +701,18 @@ class ScenePromptEditDialog(QtWidgets.QDialog):
                                       has_image_now: bool,
                                       path_now_str: str,
                                       scene_id: str,
-                                      scene_data: Optional[dict] = None):
+                                      scene_data: Optional[Dict[str, Any]] = None):
         """[신규] 특정 버튼의 상태를 썸네일/업로드 모드로 설정하고 시그널을 다시 연결"""
         if scene_data is None:
-            scene_data = {} # None일 경우 빈 dict로 초기화
+            scene_data = {}
         img_button.clearFocus()
 
-        # 기존 시그널 모두 연결 해제
         try:
             img_button.clicked.disconnect()
         except TypeError:
-            pass  # 연결된 것이 없으면 통과
+            pass
 
         if has_image_now and path_now_str:
-            # --- State 1: 썸네일 표시 ---
             pixmap = QtGui.QPixmap(path_now_str)
             if not pixmap.isNull():
                 pixmap_scaled = pixmap.scaled(
@@ -567,26 +724,22 @@ class ScenePromptEditDialog(QtWidgets.QDialog):
                 img_button.setText("")
                 img_button.setToolTip(f"경로: {path_now_str}\n(클릭해서 크게 보기)")
                 img_button.setStyleSheet("border: 1px solid #555; background-color: #222; text-align: center;")
-                # '미리보기' 기능 연결
-                img_button.clicked.connect(lambda _, p=path_now_str: self.show_large_image(p))
+
+                img_button.clicked.connect(lambda _, path_val=path_now_str: self.show_large_image(path_val))
             else:
-                # --- State 1b: 경로는 있으나 파일이 깨진 경우 ---
                 img_button.setIcon(QtGui.QIcon())
                 img_button.setText("[파일\n오류]")
                 img_button.setToolTip(f"경로: {path_now_str}\n(파일을 읽을 수 없음. 클릭하여 재업로드)")
                 img_button.setStyleSheet("border: 1px solid red; color: red; text-align: center;")
-                # '업로드' 기능 연결
                 img_button.clicked.connect(
                     functools.partial(self.on_upload_image, scene_id, img_button, scene_data))
 
         else:
-            # --- State 2: '업로드' 버튼 표시 ---
-            img_button.setIcon(QtGui.QIcon())  # 아이콘 없음
+            img_button.setIcon(QtGui.QIcon())
             img_button.setText("업로드")
             img_button.setToolTip(f"Scene ID: {scene_id}\n(클릭하여 이미지 업로드)")
             img_button.setStyleSheet(
                 "border: 1px dashed gray; color: gray; text-align: center; background-color: #333;")
-            # '업로드' 기능 연결
             img_button.clicked.connect(
                 functools.partial(self.on_upload_image, scene_id, img_button, scene_data))
 
@@ -595,7 +748,6 @@ class ScenePromptEditDialog(QtWidgets.QDialog):
         json_path에서 파일을 읽어 UI를 동적으로 생성합니다.
         [수정됨] 씬을 4개씩 묶고, 버튼 상태를 동적으로 설정합니다.
         """
-        from pathlib import Path
 
         try:
             data = load_json(self.json_path, None)
@@ -608,22 +760,18 @@ class ScenePromptEditDialog(QtWidgets.QDialog):
             if not isinstance(self.scenes_data, list):
                 raise ValueError("video.json에 'scenes' 키가 없거나 리스트가 아닙니다.")
 
-            # 고정폭 폰트
             font = QtGui.QFont()
             font.setFamily("Courier" if "Courier" in QtGui.QFontDatabase().families() else "Monospace")
             font.setPointSize(10)
 
-            # --- 씬 데이터를 페이지 크기(4)로 분할 ---
             scene_chunks = [self.scenes_data[i:i + self.PAGE_SIZE] for i in
                             range(0, len(self.scenes_data), self.PAGE_SIZE)]
             self.total_pages = len(scene_chunks)
             if self.total_pages == 0:
                 self.total_pages = 1
-                scene_chunks = [[]]  # 씬이 없어도 빈 페이지 1개 생성
+                scene_chunks = [[]]
 
-            # --- 각 페이지(chunk)별로 UI 생성 ---
             for chunk in scene_chunks:
-
                 page_scroll_area = QtWidgets.QScrollArea()
                 page_scroll_area.setWidgetResizable(True)
 
@@ -636,44 +784,37 @@ class ScenePromptEditDialog(QtWidgets.QDialog):
                 if not chunk:
                     form_layout_page.addRow(QtWidgets.QLabel("이 페이지에 씬이 없습니다."))
 
-                # 4개의 씬(또는 그 이하)에 대해 위젯 생성
                 for scene in chunk:
                     if not isinstance(scene, dict): continue
 
                     scene_id = scene.get("id", "ID_없음")
                     direct_prompt = scene.get("direct_prompt", "")
 
-                    # [수정] 이미지 경로 및 존재 여부 확인
                     img_file_str = scene.get("img_file", "")
                     img_path = Path(img_file_str) if img_file_str else None
                     has_image = img_path and img_path.exists()
 
-                    # 폼 왼쪽: ID 라벨
                     label = QtWidgets.QLabel(f"<b>{scene_id}</b>")
 
-                    # 폼 오른쪽: (이미지 + 텍스트) 컨테이너
                     row_container = QtWidgets.QWidget()
                     row_layout = QtWidgets.QHBoxLayout(row_container)
                     row_layout.setContentsMargins(0, 0, 0, 0)
                     row_layout.setSpacing(8)
 
-                    # [수정] 썸네일/업로드 버튼 (상태 분기)
                     img_button = QtWidgets.QPushButton()
                     img_button.setFixedSize(self.THUMBNAIL_SIZE, self.THUMBNAIL_SIZE)
                     img_button.setIconSize(QtCore.QSize(self.THUMBNAIL_SIZE, self.THUMBNAIL_SIZE))
 
-                    # 헬퍼 함수를 호출하여 버튼의 초기 상태(썸네일/업로드) 및 시그널 연결
                     self.setup_button_state_for_widget(
                         img_button,
                         has_image_now=has_image,
                         path_now_str=img_file_str,
                         scene_id=scene_id,
-                        scene_data=scene  # scene 딕셔너리 자체를 전달
+                        scene_data=scene
                     )
 
                     row_layout.addWidget(img_button)
 
-                    # 텍스트 편집기
                     text_edit = QtWidgets.QTextEdit()
                     text_edit.setPlainText(direct_prompt)
                     text_edit.setFont(font)
@@ -684,21 +825,16 @@ class ScenePromptEditDialog(QtWidgets.QDialog):
                                             QtWidgets.QSizePolicy.Policy.Preferred)
 
                     row_layout.addWidget(text_edit)
-
                     form_layout_page.addRow(label, row_container)
-
-                    # 위젯 맵에 추가 (저장 시 사용)
                     self.widget_map.append((scene_id, text_edit))
 
-                # 완성된 페이지(스크롤 영역)를 QStackedWidget에 추가
                 self.stacked_widget.addWidget(page_scroll_area)
 
-            # --- UI 로드 완료 후 첫 페이지로 설정 ---
             self.current_page = 0
             self.update_page_ui()
 
-        except Exception as e:
-            error_label = QtWidgets.QLabel(f"파일 로드 또는 UI 빌드 중 오류 발생:\n{e}")
+        except Exception as e_load_ui:
+            error_label = QtWidgets.QLabel(f"파일 로드 또는 UI 빌드 중 오류 발생:\n{e_load_ui}")
             error_label.setWordWrap(True)
             error_page = QtWidgets.QWidget()
             error_layout = QtWidgets.QVBoxLayout(error_page)
@@ -729,9 +865,10 @@ class ScenePromptEditDialog(QtWidgets.QDialog):
 
     def on_update_and_close(self):
         """
-        '업데이트' 버튼 클릭 시, UI의 모든 텍스트 값을 읽어
+        [수정됨 v9] '업데이트' 버튼 클릭 시, UI의 모든 텍스트 값을 읽어
         self.scenes_data에 반영하고, 전체 JSON을 다시 파일에 저장합니다.
-        (이 함수는 페이지네이션과 상관없이 self.widget_map을 순회하므로 수정 불필요)
+
+        [요청] 완료 후 창을 닫는 self.accept()를 제거합니다.
         """
         try:
             scene_map = {scene.get("id"): scene for scene in self.scenes_data if
@@ -743,6 +880,8 @@ class ScenePromptEditDialog(QtWidgets.QDialog):
                     new_prompt = text_edit.toPlainText().strip()
                     scene = scene_map[scene_id]
 
+                    # [수정] direct_prompt가 덮어씌워지지 않도록 보호
+                    # (AI 요청은 'prompt' 필드를 수정하고, 업데이트는 'direct_prompt' 필드를 수정)
                     if scene.get("direct_prompt", "") != new_prompt:
                         scene["direct_prompt"] = new_prompt
                         updated_count += 1
@@ -753,11 +892,13 @@ class ScenePromptEditDialog(QtWidgets.QDialog):
             QtWidgets.QMessageBox.information(self, "업데이트 완료",
                                               f"{len(self.widget_map)}개 씬 중 {updated_count}개의 'direct_prompt'가 업데이트되었습니다.\n\n"
                                               f"파일: {self.json_path}")
-            self.accept()
 
-        except Exception as e:
+            # [요청] self.accept() 제거됨. 창이 닫히지 않습니다.
+            # self.accept()
+
+        except Exception as e_update:
             QtWidgets.QMessageBox.critical(self, "저장 오류",
-                                           f"파일을 저장하는 중 오류가 발생했습니다:\n{e}")
+                                           f"파일을 저장하는 중 오류가 발생했습니다:\n{e_update}")
 
 
 # ──────────────────────────────── Main UI ─────────────────────────────────────
@@ -4108,7 +4249,7 @@ class MainWindow(QtWidgets.QMainWindow):
 
     from pathlib import Path
     from typing import Optional
-    # @staticmethod
+    @staticmethod
     def _build_clip_from_image(
             self,
             img: "str | Path",
@@ -6624,6 +6765,7 @@ class MainWindow(QtWidgets.QMainWindow):
         except Exception:
             pass
 
+
     # --- [신규] JSON 편집 버튼 핸들러 ---
     def on_click_edit_json(self):
         """
@@ -6653,8 +6795,8 @@ class MainWindow(QtWidgets.QMainWindow):
             return
 
         try:
-            # [수정됨] ScenePromptEditDialog를 생성하고 모달로 실행합니다.
-            dialog = ScenePromptEditDialog(video_json_path, self)
+            # [수정됨] ScenePromptEditDialog 생성 시 self._ai 인스턴스를 전달합니다.
+            dialog = ScenePromptEditDialog(video_json_path, self._ai, self)
             dialog.exec_()
         except Exception as e:
             QtWidgets.QMessageBox.critical(self, "편집기 오류", f"JSON 편집기를 여는 중 오류가 발생했습니다:\n{e}")
