@@ -1,14 +1,22 @@
 {
   "ui_prefs": {
     "image_size": [
-      720,
-      1080
+      832,
+      1472
     ],
     "movie_fps": 30,
     "resolution_preset": "custom",
     "t2i_steps": 6,
-    "font_family": "Gulim",
+    "font_family": "굴림",
     "title_font_size": 55,
-    "lyric_font_size": 25
+    "lyric_font_size": 25,
+    "image_preset": "custom",
+    "image_steps": 6,
+    "render_size": [
+      1920,
+      1080
+    ],
+    "render_preset": "custom",
+    "render_steps": 6
   }
 }

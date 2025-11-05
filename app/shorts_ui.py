@@ -4816,12 +4816,6 @@ class MainWindow(QtWidgets.QMainWindow):
 
 
 
-        # 옵션(영상 관련)
-        self.sb_total   = self._spin(60, 120000, 1200,              " frames")
-        self.sb_chunk   = self._spin(60,   5000,   DEFAULT_CHUNK,   " /chunk")
-        self.sb_overlap = self._spin(1,     120,   DEFAULT_OVERLAP, " overlap")
-        self.sb_infps   = self._spin(1,     240,   DEFAULT_INPUT_FPS,  " inFPS")
-        self.sb_outfps  = self._spin(1,     240,   DEFAULT_TARGET_FPS, " outFPS")
 
         # --- ▼▼▼ [신규] "huge" 체크박스 생성 (그룹박스 제거) ▼▼▼ ---
         self.chk_huge_breasts = QtWidgets.QCheckBox("huge breasts")
@@ -4830,8 +4824,6 @@ class MainWindow(QtWidgets.QMainWindow):
         # --- ▲▲▲ [신규] 생성 끝 ▲▲▲ ---
 
         opts = QtWidgets.QHBoxLayout()
-        for w in (self.sb_total, self.sb_chunk, self.sb_overlap, self.sb_infps, self.sb_outfps):
-            opts.addWidget(w)
         opts.addStretch(1)
         opts.addWidget(self.chk_huge_breasts)
         opts.addStretch(1)
@@ -4903,9 +4895,69 @@ class MainWindow(QtWidgets.QMainWindow):
         main_layout.addWidget(self.grp_vocal)
         main_layout.addWidget(self.grp_basic_vocal)
         main_layout.addWidget(self.grp_manual_tags)
-        main_layout.addLayout(opts)
-        main_layout.addWidget(self.btn_ai_toggle)
-        self._add_render_prefs_controls(main_layout)
+        #
+        # --- [신규] 렌더/이미지/기타 설정 재배치 ---
+
+        # 1. 모든 렌더/이미지 관련 위젯을 생성 (self.cmb_img_w, self.cmb_render_w 등을 생성)
+        self._create_render_widgets()  # [수정] _add_render_prefs_controls -> _create_render_widgets
+
+        # 2. 새로운 상단 가로줄 (이미지 설정 + 기타 설정)
+        top_settings_row = QtWidgets.QHBoxLayout()
+
+        # 2a. (왼쪽) "이미지 설정" 그룹 [요청 사항]
+        grp_image = QtWidgets.QGroupBox("이미지 설정")
+        layout_image = QtWidgets.QHBoxLayout(grp_image)
+        layout_image.addWidget(QtWidgets.QLabel("W"))
+        layout_image.addWidget(self.cmb_img_w)  # "이미지"용 W
+        layout_image.addWidget(QtWidgets.QLabel("H"))
+        layout_image.addWidget(self.cmb_img_h)  # "이미지"용 H
+        layout_image.addSpacing(12)
+        layout_image.addWidget(QtWidgets.QLabel("프리셋"))
+        layout_image.addWidget(self.cmb_res_preset)  # "이미지"용 프리셋
+        layout_image.addSpacing(12)
+        layout_image.addWidget(QtWidgets.QLabel("스텝"))
+        layout_image.addWidget(self.spn_t2i_steps)  # "이미지"용 스텝
+        layout_image.addStretch(1)
+        top_settings_row.addWidget(grp_image, 1)  # 1 stretch
+
+        # 2b. (오른쪽) "기타 설정" 그룹 [요청 사항]
+        grp_other = QtWidgets.QGroupBox("기타 설정")
+        layout_other = QtWidgets.QHBoxLayout(grp_other)
+        layout_other.addWidget(self.btn_ai_toggle)  # (기존 위치에서 이동)
+        layout_other.addWidget(self.chk_huge_breasts)  # (기존 위치(opts)에서 이동)
+        layout_other.addStretch(1)
+        top_settings_row.addWidget(grp_other, 1)  # 1 stretch
+
+        main_layout.addLayout(top_settings_row)  # [신규] 상단 줄 추가
+
+        # 3. (아래쪽) "렌더 설정" 그룹 (기존 위젯 + 신규 복제 위젯)
+        grp_render = QtWidgets.QGroupBox("렌더 설정")
+        layout_render = QtWidgets.QHBoxLayout(grp_render)
+        layout_render.addWidget(QtWidgets.QLabel("W"))
+        layout_render.addWidget(self.cmb_render_w)  # "렌더"용 W
+        layout_render.addWidget(QtWidgets.QLabel("H"))
+        layout_render.addWidget(self.cmb_render_h)  # "렌더"용 H
+        layout_render.addSpacing(12)
+        layout_render.addWidget(QtWidgets.QLabel("FPS"))
+        layout_render.addWidget(self.cmb_movie_fps)  # "렌더"용 FPS (공통)
+        layout_render.addSpacing(12)
+        layout_render.addWidget(QtWidgets.QLabel("프리셋"))
+        layout_render.addWidget(self.cmb_render_preset)  # "렌더"용 프리셋
+        layout_render.addSpacing(12)
+        layout_render.addWidget(QtWidgets.QLabel("스텝"))
+        layout_render.addWidget(self.spn_render_steps)  # "렌더"용 스텝
+        layout_render.addSpacing(12)
+        layout_render.addWidget(self.cmb_font)  # "렌더"용 폰트 (공통)
+        layout_render.addSpacing(10)
+        layout_render.addWidget(QtWidgets.QLabel("제목크기:"))
+        layout_render.addWidget(self.spn_title_font_size)  # (공통)
+        layout_render.addWidget(QtWidgets.QLabel("가사크기:"))
+        layout_render.addWidget(self.spn_lyric_font_size)  # (공통)
+        layout_render.addStretch(1)
+
+        main_layout.addWidget(grp_render)  # [신규] 렌더 설정 그룹 추가
+        # --- [신규] 재배치 끝 ---
+        #
         main_layout.addLayout(row)
 
 
@@ -7894,14 +7946,16 @@ class MainWindow(QtWidgets.QMainWindow):
         return moved
 
     # ────────────── 영상 빌드(선택) ──────────────
+    # shorts_ui.py 파일의 on_video 함수 전체를 이 코드로 교체하세요. (약 7076 라인)
+
     def on_video(self, *, on_done_override: Optional[Callable] = None) -> None:  # <-- 시그니처 수정
         try:
             self._save_ui_prefs_to_project()
         except Exception as e_save_prefs:
             print(f"[UI] on_video: UI 설정 저장 실패: {e_save_prefs}")
         """
-        영상 생성:
-          - UI에서 W/H/FPS/스텝 값을 읽어 build_shots_with_i2v로 전달.
+        [수정됨] 영상 생성:
+          - [요청 수정] UI에서 '렌더 설정' 그룹의 W/H/FPS/스텝 값을 읽어 build_shots_with_i2v로 전달.
           - run_job_with_progress_async를 사용하여 비동기 실행 및 실시간 로그 창 표시.
           - video_build.build_shots_with_i2v 기존 동작 100% 보존.
         """
@@ -7957,10 +8011,12 @@ class MainWindow(QtWidgets.QMainWindow):
                         print(f"[경고] UI 값 읽기 중 예상치 못한 오류 ({widget_name}): {e_get_val_unexpected}")
                 return default_val
 
-            ui_w = _get_ui_int_value("cmb_img_w", "currentData")
-            ui_h = _get_ui_int_value("cmb_img_h", "currentData")
-            ui_fps = _get_ui_int_value("cmb_movie_fps", "currentData")
-            ui_steps = _get_ui_int_value("spn_t2i_steps", "value")
+            # --- ▼▼▼ [핵심 수정] "렌더 설정" 그룹의 위젯 이름으로 변경 ▼▼▼ ---
+            ui_w = _get_ui_int_value("cmb_render_w", "currentData")
+            ui_h = _get_ui_int_value("cmb_render_h", "currentData")
+            ui_fps = _get_ui_int_value("cmb_movie_fps", "currentData")  # (이름 동일, 렌더 그룹 소속)
+            ui_steps = _get_ui_int_value("spn_render_steps", "value")  # spn_t2i_steps -> spn_render_steps
+            # --- ▲▲▲ [핵심 수정] 끝 ▲▲▲ ---
 
             # --- 프로젝트 경로 확인 ---
             proj_dir_val: Optional[str] = None
@@ -8038,7 +8094,8 @@ class MainWindow(QtWidgets.QMainWindow):
                         raise RuntimeError(
                             f"build_shots_with_i2v 최종 호출 실패: {e_fallback_call_inner}") from e_fallback_call_inner
                 except Exception as e_build_other_inner:
-                    raise RuntimeError(f"build_shots_with_i2v 실행 오류: {e_build_other_inner}") from e_build_other_inner
+                    raise RuntimeError(
+                        f"build_shots_with_i2v 실행 오류: {e_build_other_inner}") from e_build_other_inner
 
             # --- 작업 완료 콜백 ---
             def _done(ok: bool, payload: Any, err: Optional[Exception]) -> None:  # <-- payload 타입 Any로
@@ -8095,26 +8152,21 @@ class MainWindow(QtWidgets.QMainWindow):
                 return  # 동기 실행 후 종료
 
             # --- run_async 호출 준비 ---
-            # run_job_with_progress_async 함수 시그니처 확인 (utils.py 기준)
-            # def run_job_with_progress_async(owner, title, job, *, tail_file=None, on_done=None)
             kw_run_async: Dict[str, Any] = {}
             try:
                 sig_run_async_check = inspect.signature(run_async_local)
                 if "tail_file" in sig_run_async_check.parameters:
-                    kw_run_async["tail_file"] = None  # 영상 생성은 tail 불필요
+                    kw_run_async["tail_file"] = None
                 if "on_done" in sig_run_async_check.parameters:
                     kw_run_async["on_done"] = _done
             except (TypeError, ValueError) as e_sig_check:
                 print(f"[경고] run_async 시그니처 분석 실패 (호출은 시도): {e_sig_check}")
-                # 기본 키워드 인자 설정 (on_done은 중요하므로 포함 시도)
                 kw_run_async = {"tail_file": None, "on_done": _done}
 
             # --- run_async 실행 (정확한 인자 전달) ---
             try:
-                # utils.py 시그니처에 맞춰 owner, title, job을 위치 인자로 전달
-                run_async_local(self, "영상 생성", _job, **kw_run_async)  # <-- 호출 방식 수정
+                run_async_local(self, "영상 생성", _job, **kw_run_async)
             except Exception as e_run_call_final:
-                # 호출 실패 시 오류 로깅 및 동기 실행
                 print(f"[오류] run_job_with_progress_async 호출 실패: {e_run_call_final}")
                 print("[경고] 동기 실행으로 전환합니다.")
 
@@ -8128,21 +8180,17 @@ class MainWindow(QtWidgets.QMainWindow):
                     _done(False, None, e_sync_job_fallback_inner)
 
         except Exception as e_outer_inner:
-            # on_video 함수 자체의 최상위 예외 처리
             print(f"[오류] on_video 실행 중 오류 발생: {type(e_outer_inner).__name__}: {e_outer_inner}")
             print(traceback.format_exc())
             QtWidgets.QMessageBox.critical(self, "오류", f"영상 생성 시작 중 오류 발생:\n{e_outer_inner}")
 
         finally:
-            # 버튼 활성화 (항상 실행)
-            # --- ▼▼▼ 수정 (매크로가 아닐 때만 버튼 활성화) ▼▼▼ ---
             if on_done_override is None:
                 if btn_video_widget:
                     try:
                         btn_video_widget.setEnabled(True)
-                    except RuntimeError:  # 위젯 소멸 등 예외
+                    except RuntimeError:
                         pass
-            # --- ▲▲▲ 수정 끝 ▲▲▲ ---
     # ────────────── 기타 ──────────────
     def _set_total_frames_from_audio(self, audio_path: Path) -> None:
         dur = audio_duration_sec(audio_path)
@@ -8446,10 +8494,19 @@ class MainWindow(QtWidgets.QMainWindow):
 
 
 # ==================================================
+# shorts_ui.py 파일의 _inject_render_prefs_methods 함수 전체를 이 코드로 교체하세요. (약 9130 라인)
+
 def _inject_render_prefs_methods():
-    """MainWindow에 _add_render_prefs_controls / _save_ui_prefs_to_project (및 테스트 버튼) 없으면 주입."""
+    """
+    [수정됨 v19] MainWindow에 _create_render_widgets / _save_ui_prefs_to_project (및 테스트 버튼) 없으면 주입.
+    - [버그 수정] 프리셋 변경 시 W/H 콤보박스의 시그널을 임시 차단하여, '맞춤(커스텀)'으로 되돌아갔을 때
+      W/H 콤보박스가 비활성화되는 버그(race condition)를 수정합니다.
+    - [기존] '이미지 설정'과 '렌더 설정' 위젯을 별도로 생성합니다.
+    """
     from pathlib import Path
     from PyQt5 import QtWidgets
+    from PyQt5.QtGui import QFont
+    from PyQt5.QtCore import Qt  # [신규] Qt 임포트
 
     # 안전 import (app 패키지/단독 실행 모두 고려)
     try:
@@ -8464,8 +8521,8 @@ def _inject_render_prefs_methods():
 
     # 이미 있으면 건너뜀
     if (
-        hasattr(MainWindow, "_add_render_prefs_controls")
-        and hasattr(MainWindow, "_save_ui_prefs_to_project")
+            hasattr(MainWindow, "_create_render_widgets")
+            and hasattr(MainWindow, "_save_ui_prefs_to_project")
     ):
         return
 
@@ -8515,111 +8572,123 @@ def _inject_render_prefs_methods():
         return _p(base_dir_val) / title_val
 
     # ==== 메서드 정의: 드롭다운 UI 추가 ====
-    def _add_render_prefs_controls(self, parent_layout: QtWidgets.QBoxLayout) -> None:
-        """렌더 설정(W, H, FPS, 프리셋, 스텝) UI를 생성하고 부모 레이아웃에 추가합니다."""
+    def _create_render_widgets(self) -> None:
+        """
+        [수정됨] '이미지 설정'과 '렌더 설정' 그룹에 필요한 모든 위젯을 생성하고 시그널을 연결합니다.
+        """
         # settings 모듈을 안전하게 참조 (s_mod_prefs 별칭 사용)
         try:
-            from app import settings as s_mod_prefs # type: ignore
+            from app import settings as s_mod_prefs  # type: ignore
         except ImportError:
             try:
-                import settings as s_mod_prefs # type: ignore
+                import settings as s_mod_prefs  # type: ignore
             except ImportError:
-                print("[경고] _add_render_prefs_controls: settings 모듈 로드 실패, 기본값 사용")
+                print("[경고] _create_render_widgets: settings 모듈 로드 실패, 기본값 사용")
+
                 class SettingsFallbackPrefs:
                     IMAGE_SIZE_CHOICES = [240, 480, 512, 720, 832, 960, 1024, 1080, 1280, 1440, 1920, 2560]
-                    DEFAULT_IMG_SIZE = (1080, 1920)
+                    DEFAULT_IMG_SIZE = (720, 1080)
                     MOVIE_FPS_CHOICES = [24, 30, 60]
                     DEFAULT_MOVIE_FPS = 30
+                    DEFAULT_T2I_STEPS = 6
+
                 s_mod_prefs = SettingsFallbackPrefs()
 
-        #--- 내부 유틸 함수 (load_json) ---
-        _load_json_local_prefs: Callable # 타입 명시
+        # --- 내부 유틸 함수 (load_json) ---
+        _load_json_local_prefs: Callable  # 타입 명시
         try:
-            from app.utils import load_json as _load_json_local_prefs # type: ignore
+            from app.utils import load_json as _load_json_local_prefs  # type: ignore
         except ImportError:
             try:
-                from utils import load_json as _load_json_local_prefs # type: ignore
+                from utils import load_json as _load_json_local_prefs  # type: ignore
             except ImportError:
-                print("[오류] _add_render_prefs_controls: load_json 함수 로드 실패")
+                print("[오류] _create_render_widgets: load_json 함수 로드 실패")
+
                 def _load_json_fb_prefs(p, default=None):
-                    try: return json.loads(Path(p).read_text(encoding="utf-8"))
-                    except Exception: return default
+                    try:
+                        return json.loads(Path(p).read_text(encoding="utf-8"))
+                    except Exception:
+                        return default
+
                 _load_json_local_prefs = _load_json_fb_prefs
 
-        #--- 내부 유틸 함수 (_guess_project_dir) ---
-        _guess_project_dir_local: Callable[[], Path] # 타입 명시
+        # --- 내부 유틸 함수 (_guess_project_dir) ---
+        _guess_project_dir_local: Callable[[], Path]  # 타입 명시
         try:
             _guess_project_dir_local = getattr(self, "_guess_project_dir")
             if not callable(_guess_project_dir_local):
-                 raise AttributeError("_guess_project_dir 메서드를 찾을 수 없습니다.")
-        except AttributeError as e_guess_dir_local: # 변수명 변경
-             print(f"[오류] _add_render_prefs_controls: {e_guess_dir_local}")
-             def _guess_project_dir_fb() -> Path: return Path(".")
-             _guess_project_dir_local = _guess_project_dir_fb
+                raise AttributeError("_guess_project_dir 메서드를 찾을 수 없습니다.")
+        except AttributeError as e_guess_dir_local:  # 변수명 변경
+            print(f"[오류] _create_render_widgets: {e_guess_dir_local}")
 
+            def _guess_project_dir_fb() -> Path:
+                return Path(".")
 
-        grp = QtWidgets.QGroupBox("렌더 설정")
-        row = QtWidgets.QHBoxLayout(grp)
+            _guess_project_dir_local = _guess_project_dir_fb
 
-        # 기본 컨트롤
+        # --- [신규] 헬퍼 함수: Linter 경고를 피하기 위한 안전 연결 ---
+        def _safe_connect(signal_object, slot_function):
+            """Linter 경고를 피하기 위해 getattr로 안전하게 connect 호출"""
+            try:
+                connect_method = getattr(signal_object, "connect", None)
+                if callable(connect_method) and callable(slot_function):
+                    connect_method(slot_function)
+            except Exception as e_connect:
+                print(f"[경고] _create_render_widgets: 시그널 연결 실패: {e_connect}")
+
+        # --- [수정] 위젯 생성 (두 그룹용으로 분리) ---
+
+        # [신규] 1. "이미지 설정" 그룹용 위젯 생성
         self.cmb_img_w = QtWidgets.QComboBox()
         self.cmb_img_h = QtWidgets.QComboBox()
-        self.cmb_movie_fps = QtWidgets.QComboBox()
+        self.cmb_res_preset = QtWidgets.QComboBox()
+        self.spn_t2i_steps = QtWidgets.QSpinBox()
 
         self.cmb_img_w.setToolTip("이미지 가로 (width)")
         self.cmb_img_h.setToolTip("이미지 세로 (height)")
+        self.cmb_res_preset.setToolTip("이미지 해상도 프리셋")
+        self.spn_t2i_steps.setToolTip("이미지 생성 샘플링 스텝 수")
+
+        # [신규] 2. "렌더 설정" 그룹용 위젯 생성
+        self.cmb_render_w = QtWidgets.QComboBox()
+        self.cmb_render_h = QtWidgets.QComboBox()
+        self.cmb_render_preset = QtWidgets.QComboBox()
+        self.spn_render_steps = QtWidgets.QSpinBox()
+        self.cmb_movie_fps = QtWidgets.QComboBox()
+
+        self.cmb_render_w.setToolTip("최종 렌더링 가로 (width)")
+        self.cmb_render_h.setToolTip("최종 렌더링 세로 (height)")
+        self.cmb_render_preset.setToolTip("렌더링 해상도 프리셋")
+        self.spn_render_steps.setToolTip("렌더링 샘플링 스텝 수 (i2v 등)")
         self.cmb_movie_fps.setToolTip("타깃 FPS (i2v/렌더)")
 
-        # --- ▼▼▼ 프리셋 값들(832, 1024 등)이 포함되도록 수정 ▼▼▼ ---
-        default_w_val, default_h_val = getattr(s_mod_prefs, "DEFAULT_IMG_SIZE", (1080, 1920))
-        # 프리셋에 사용된 모든 W 값을 size_choices_val에 포함시킴
+        # 3. 공통: 폰트 관련 위젯
+        self.cmb_font = QFontComboBox()
+        self.cmb_font.setToolTip("자막에 사용할 폰트를 선택합니다.")
+        self.cmb_font.setMinimumWidth(150)
+        self.spn_title_font_size = self._spin(10, 200, 55, " px")
+        self.spn_lyric_font_size = self._spin(10, 200, 25, " px")
+        self.spn_title_font_size.setToolTip("제목 폰트 크기 (기본값 55)")
+        self.spn_lyric_font_size.setToolTip("가사 폰트 크기 (기본값 25)")
+
+        # --- [수정] 데이터 목록 준비 ---
+        default_w_val, default_h_val = getattr(s_mod_prefs, "DEFAULT_IMG_SIZE", (720, 1080))
         preset_widths = {720, 832, 1080, 1280, 1920, 512, 1024}
         preset_heights = {1280, 1472, 1920, 720, 1080, 512, 1024}
-
         size_choices_conf = getattr(s_mod_prefs, "IMAGE_SIZE_CHOICES", [240, 480, 520, 720, 960, 1080, 1280, 1440])
         size_choices_set = set(int(w) for w in size_choices_conf if str(w).isdigit())
-        size_choices_set.update(preset_widths) # 프리셋 W 값 추가
-        size_choices_set.add(int(default_w_val)) # 기본 W 값 추가
-        size_choices_val = sorted(list(size_choices_set)) # 정렬된 리스트
-
-        # H 값 목록 생성
-        h_candidates_set = {int(round(w * 16 / 9)) for w in size_choices_val} # 16:9 비율
-        h_candidates_set.update({int(round(w * 9 / 16)) for w in size_choices_val}) # 9:16 비율
-        h_candidates_set.update(preset_heights) # 프리셋 H 값 추가
-        h_candidates_set.add(int(default_h_val)) # 기본 H 값 추가
-        h_candidates_val = sorted(list(h_candidates_set)) # 정렬된 리스트
-        # --- ▲▲▲ 목록 수정 끝 ▲▲▲ ---
+        size_choices_set.update(preset_widths)
+        size_choices_set.add(int(default_w_val))
+        size_choices_val = sorted(list(size_choices_set))
+        h_candidates_set = {int(round(w * 16 / 9)) for w in size_choices_val}
+        h_candidates_set.update({int(round(w * 9 / 16)) for w in size_choices_val})
+        h_candidates_set.update(preset_heights)
+        h_candidates_set.add(int(default_h_val))
+        h_candidates_val = sorted(list(h_candidates_set))
 
         fps_choices_val = getattr(s_mod_prefs, "MOVIE_FPS_CHOICES", [24, 30, 60])
         default_fps_val = int(getattr(s_mod_prefs, "DEFAULT_MOVIE_FPS", 30))
-
-        # W/H 콤보박스 채우기
-        try:
-            for w_val_item in size_choices_val:
-                self.cmb_img_w.addItem(str(w_val_item), int(w_val_item))
-            for h_val_item in h_candidates_val:
-                self.cmb_img_h.addItem(str(h_val_item), int(h_val_item))
-        except (ValueError, TypeError) as e_size_fill_local: # 변수명 변경
-             print(f"[경고] W/H 콤보박스 채우기 오류: {e_size_fill_local}")
-             if self.cmb_img_w.count() == 0: self.cmb_img_w.addItem(str(default_w_val), int(default_w_val))
-             if self.cmb_img_h.count() == 0: self.cmb_img_h.addItem(str(default_h_val), int(default_h_val))
-
-        # FPS 콤보박스 채우기
-        try:
-            valid_fps_choices = [int(f) for f in fps_choices_val if str(f).isdigit()]
-            if default_fps_val not in valid_fps_choices: # 기본값이 목록에 없으면 추가
-                 valid_fps_choices.append(default_fps_val)
-                 valid_fps_choices.sort()
-            for fps_val_item in valid_fps_choices:
-                self.cmb_movie_fps.addItem(str(fps_val_item), int(fps_val_item))
-        except (ValueError, TypeError) as e_fps_fill_local: # 변수명 변경
-             print(f"[경고] FPS 콤보박스 채우기 오류: {e_fps_fill_local}")
-             if self.cmb_movie_fps.count() == 0: self.cmb_movie_fps.addItem(str(default_fps_val), int(default_fps_val))
-
-
-        # 해상도 프리셋 + 스텝
-        self.cmb_res_preset = QtWidgets.QComboBox()
-        self.cmb_res_preset.setToolTip("해상도 프리셋(선택 시 W/H 자동 설정)")
+        default_steps_val = int(getattr(s_mod_prefs, "DEFAULT_T2I_STEPS", 6))
 
         presets_data = [
             ("Shorts 9:16 · 720×1280", 720, 1280, "shorts_720x1280"),
@@ -8629,33 +8698,47 @@ def _inject_render_prefs_methods():
             ("Landscape 16:9 · 1920×1080", 1920, 1080, "land_1920x1080"),
             ("Square 1:1 · 512×512", 512, 512, "square_512"),
             ("Square 1:1 · 1024×1024", 1024, 1024, "square_1024"),
-            ("맞춤(커스텀)", -1, -1, "custom"), # '맞춤'이 항상 마지막
+            ("맞춤(커스텀)", -1, -1, "custom"),
         ]
-        for label_text, w_preset, h_preset, key_preset in presets_data:
-            self.cmb_res_preset.addItem(label_text, (w_preset, h_preset, key_preset))
 
-        self.spn_t2i_steps = QtWidgets.QSpinBox()
-        self.spn_t2i_steps.setRange(1, 200)
-        self.spn_t2i_steps.setValue(6) # 기본값 12
-        self.spn_t2i_steps.setToolTip("샘플링 스텝 수(확산 단계 수)")
+        # --- [수정] 콤보박스 채우기 (두 그룹 모두) ---
+        for combo_w, combo_h, combo_preset, spin_step in [
+            (self.cmb_img_w, self.cmb_img_h, self.cmb_res_preset, self.spn_t2i_steps),
+            (self.cmb_render_w, self.cmb_render_h, self.cmb_render_preset, self.spn_render_steps)
+        ]:
+            try:
+                for w_val_item in size_choices_val:
+                    combo_w.addItem(str(w_val_item), int(w_val_item))
+                for h_val_item in h_candidates_val:
+                    combo_h.addItem(str(h_val_item), int(h_val_item))
+                for label_text, w_preset, h_preset, key_preset in presets_data:
+                    combo_preset.addItem(label_text, (w_preset, h_preset, key_preset))
+                spin_step.setRange(1, 200)
+                spin_step.setValue(default_steps_val)
+            except (ValueError, TypeError) as e_fill:
+                print(f"[경고] W/H/Preset 콤보박스 채우기 오류: {e_fill}")
+                if combo_w.count() == 0: combo_w.addItem(str(default_w_val), int(default_w_val))
+                if combo_h.count() == 0: combo_h.addItem(str(default_h_val), int(default_h_val))
 
-        self.cmb_font = QFontComboBox()
-        self.cmb_font.setToolTip("자막에 사용할 폰트를 선택합니다.")
-        self.cmb_font.setMinimumWidth(150)  # 폰트 이름이 잘 보이도록 최소 너비 지정
+        # FPS 콤보박스 채우기 (렌더 설정에만)
+        try:
+            valid_fps_choices = [int(f) for f in fps_choices_val if str(f).isdigit()]
+            if default_fps_val not in valid_fps_choices:
+                valid_fps_choices.append(default_fps_val)
+                valid_fps_choices.sort()
+            for fps_val_item in valid_fps_choices:
+                self.cmb_movie_fps.addItem(str(fps_val_item), int(fps_val_item))
+        except (ValueError, TypeError) as e_fps_fill_local:
+            print(f"[경고] FPS 콤보박스 채우기 오류: {e_fps_fill_local}")
+            if self.cmb_movie_fps.count() == 0: self.cmb_movie_fps.addItem(str(default_fps_val), int(default_fps_val))
 
-        self.spn_title_font_size = self._spin(10, 200, 55, " px")
-        self.spn_lyric_font_size = self._spin(10, 200, 25, " px")
-        self.spn_title_font_size.setToolTip("제목 폰트 크기 (기본값 70)")
-        self.spn_lyric_font_size.setToolTip("가사 폰트 크기 (기본값 48)")
-
-        # project.json 초기값 반영
+        # --- [수정] project.json 초기값 반영 (두 그룹 모두) ---
         proj_dir_current = _guess_project_dir_local()
         pj_current = proj_dir_current / "project.json"
         meta_current = _load_json_local_prefs(pj_current, {}) if pj_current.exists() else {}
         ui_prefs_current = meta_current.get("ui_prefs") or {}
 
         def _set_combo_safe(combo: QtWidgets.QComboBox, val_to_set: int, fallback_val: int):
-            """콤보박스 값을 안전하게 설정 (데이터 값 기준)."""
             try:
                 val_int = int(val_to_set)
                 idx_found = combo.findData(val_int)
@@ -8665,114 +8748,197 @@ def _inject_render_prefs_methods():
             except (ValueError, TypeError):
                 combo.setCurrentIndex(0)
 
-        ui_w_val = (ui_prefs_current.get("image_size") or [default_w_val, default_h_val])[0]
-        ui_h_val = (ui_prefs_current.get("image_size") or [default_w_val, default_h_val])[1]
-        ui_fps_val = ui_prefs_current.get("movie_fps") or default_fps_val
+        # [신규] "이미지 설정" 값 로드
+        img_size = ui_prefs_current.get("image_size", [default_w_val, default_h_val])
+        img_preset_key = str(ui_prefs_current.get("image_preset", "custom"))
+        img_steps = int(ui_prefs_current.get("image_steps", default_steps_val))
 
-        _set_combo_safe(self.cmb_img_w, ui_w_val, default_w_val)
-        _set_combo_safe(self.cmb_img_h, ui_h_val, default_h_val)
+        _set_combo_safe(self.cmb_img_w, img_size[0], default_w_val)
+        _set_combo_safe(self.cmb_img_h, img_size[1], default_h_val)
+        self.spn_t2i_steps.setValue(img_steps)
+
+        # [신규] "렌더 설정" 값 로드 (기존 키 사용)
+        render_size = ui_prefs_current.get("render_size",
+                                           ui_prefs_current.get("image_size", [default_w_val, default_h_val]))  # 호환성
+        render_preset_key = str(
+            ui_prefs_current.get("render_preset", ui_prefs_current.get("resolution_preset", "custom")))  # 호환성
+        render_steps = int(
+            ui_prefs_current.get("render_steps", ui_prefs_current.get("t2i_steps", default_steps_val)))  # 호환성
+        ui_fps_val = ui_prefs_current.get("movie_fps", default_fps_val)
+
+        _set_combo_safe(self.cmb_render_w, render_size[0], default_w_val)
+        _set_combo_safe(self.cmb_render_h, render_size[1], default_h_val)
         _set_combo_safe(self.cmb_movie_fps, ui_fps_val, default_fps_val)
+        self.spn_render_steps.setValue(render_steps)
 
-        preset_key_from_json = str((ui_prefs_current.get("resolution_preset") or "custom"))
-        steps_from_json = int(ui_prefs_current.get("t2i_steps") or 6)
-        self.spn_t2i_steps.setValue(steps_from_json)
+        # 폰트 설정 불러오기
+        try:
+            font_family = ui_prefs_current.get("font_family", "굴림")
+            self.cmb_font.setCurrentFont(QFont(font_family))
+            title_size = ui_prefs_current.get("title_font_size", 55)
+            lyric_size = ui_prefs_current.get("lyric_font_size", 25)
+            self.spn_title_font_size.setValue(int(title_size))
+            self.spn_lyric_font_size.setValue(int(lyric_size))
+        except Exception as e_font_load:
+            print(f"[경고] 폰트 설정 불러오기 실패: {e_font_load}")
 
-        def _lock_wh_inputs(lock: bool) -> None:
-            """W/H 콤보박스 활성화/비활성화 및 툴팁 설정."""
-            self.cmb_img_w.setEnabled(not lock)
-            self.cmb_img_h.setEnabled(not lock)
-            tip_text = (
-                "프리셋을 '맞춤(커스텀)'으로 바꾸면 해상도를 수정할 수 있습니다."
-                if lock else "W/H를 직접 선택하세요."
-            )
-            self.cmb_img_w.setToolTip(tip_text)
-            self.cmb_img_h.setToolTip(tip_text)
+        # --- [신규] 시그널 연결 (두 그룹 모두) ---
 
-        def _apply_preset_to_wh_inputs() -> None:
-            """프리셋 콤보박스 변경 시 W/H 콤보박스 값 업데이트 및 잠금 처리."""
-            current_data = self.cmb_res_preset.currentData()
-            if not (isinstance(current_data, tuple) and len(current_data) == 3):
-                 return
+        def _create_wh_lock_handler(cmb_w: QtWidgets.QComboBox, cmb_h: QtWidgets.QComboBox):
+            """W/H 콤보박스 잠금/해제 핸들러 생성"""
 
-            w_sel_preset, h_sel_preset, preset_key_sel = current_data
-            if preset_key_sel == "custom":
-                _lock_wh_inputs(False)
-                return
+            def _lock_wh(lock: bool):
+                cmb_w.setEnabled(not lock)
+                cmb_h.setEnabled(not lock)
+                tip = "프리셋을 '맞춤(커스텀)'으로 바꾸면 수정 가능" if lock else "W/H를 직접 선택"
+                cmb_w.setToolTip(tip)
+                cmb_h.setToolTip(tip)
 
-            idx_w_preset = self.cmb_img_w.findData(int(w_sel_preset))
-            if idx_w_preset >= 0:
-                self.cmb_img_w.setCurrentIndex(idx_w_preset)
-            else:
-                # 목록에 없으면 경고 (하지만 목록 생성 로직이 수정되어 이 경우는 드물 것)
-                print(f"[경고] 프리셋 W 값({w_sel_preset})이 콤보박스 목록에 없습니다.")
+            return _lock_wh
 
-            idx_h_preset = self.cmb_img_h.findData(int(h_sel_preset))
-            if idx_h_preset >= 0:
-                self.cmb_img_h.setCurrentIndex(idx_h_preset)
-            else:
-                print(f"[경고] 프리셋 H 값({h_sel_preset})이 콤보박스 목록에 없습니다.")
-            _lock_wh_inputs(True)
+        def _create_preset_apply_handler(cmb_preset: QtWidgets.QComboBox, cmb_w: QtWidgets.QComboBox,
+                                         cmb_h: QtWidgets.QComboBox, lock_handler: Callable):
+            """
+            [버그 수정] 프리셋 변경 시 W/H 값 적용 핸들러 생성.
+            W/H 콤보박스 시그널을 임시 차단하여 race condition 방지.
+            """
 
-        # 프리셋 초기값 설정
-        kidx_preset_init = 0
-        for idx_preset_loop in range(self.cmb_res_preset.count()):
-            item_data = self.cmb_res_preset.itemData(idx_preset_loop)
-            if isinstance(item_data, tuple) and len(item_data) == 3:
-                _, _, key_val_loop = item_data
-                if key_val_loop == preset_key_from_json:
-                    kidx_preset_init = idx_preset_loop
+            def _apply_preset():
+                data = cmb_preset.currentData()
+                if not (isinstance(data, tuple) and len(data) == 3): return
+                w_preset, h_preset, key = data
+
+                if key == "custom":
+                    lock_handler(False)  # '맞춤' 선택 시 잠금 해제
+                    return
+
+                # --- [버그 수정] ---
+                # W/H 값을 변경하기 전에 시그널을 차단
+                cmb_w.blockSignals(True)
+                cmb_h.blockSignals(True)
+
+                try:
+                    idx_w = cmb_w.findData(int(w_preset))
+                    if idx_w >= 0: cmb_w.setCurrentIndex(idx_w)
+
+                    idx_h = cmb_h.findData(int(h_preset))
+                    if idx_h >= 0: cmb_h.setCurrentIndex(idx_h)
+                finally:
+                    # W/H 값을 모두 설정한 후 시그널을 다시 연결
+                    cmb_w.blockSignals(False)
+                    cmb_h.blockSignals(False)
+                # --- [수정 끝] ---
+
+                lock_handler(True)  # '맞춤' 아닌 프리셋 선택 시 잠금
+
+            return _apply_preset
+
+        def _create_wh_changed_handler(cmb_preset: QtWidgets.QComboBox, lock_handler: Callable):
+            """W/H 변경 시 프리셋을 '맞춤'으로 변경하는 핸들러 생성"""
+
+            def _on_changed():
+                custom_idx = -1
+                for i in range(cmb_preset.count()):
+                    data = cmb_preset.itemData(i)
+                    if isinstance(data, tuple) and len(data) == 3 and data[2] == "custom":
+                        custom_idx = i
+                        break
+
+                # 현재 프리셋이 '맞춤'이 아닌 경우에만 '맞춤'으로 변경
+                if custom_idx >= 0 and cmb_preset.currentIndex() != custom_idx:
+                    cmb_preset.blockSignals(True)
+                    cmb_preset.setCurrentIndex(custom_idx)
+                    cmb_preset.blockSignals(False)
+                    lock_handler(False)
+
+            return _on_changed
+
+        # 1. "이미지 설정" 그룹 시그널 연결
+        img_lock_handler = _create_wh_lock_handler(self.cmb_img_w, self.cmb_img_h)
+        img_preset_handler = _create_preset_apply_handler(self.cmb_res_preset, self.cmb_img_w, self.cmb_img_h,
+                                                          img_lock_handler)
+        img_wh_changed_handler = _create_wh_changed_handler(self.cmb_res_preset, img_lock_handler)
+
+        _safe_connect(self.cmb_res_preset.currentIndexChanged, img_preset_handler)
+        _safe_connect(self.cmb_img_w.currentIndexChanged, img_wh_changed_handler)
+        _safe_connect(self.cmb_img_h.currentIndexChanged, img_wh_changed_handler)
+
+        # 2. "렌더 설정" 그룹 시그널 연결
+        render_lock_handler = _create_wh_lock_handler(self.cmb_render_w, self.cmb_render_h)
+        render_preset_handler = _create_preset_apply_handler(self.cmb_render_preset, self.cmb_render_w,
+                                                             self.cmb_render_h, render_lock_handler)
+        render_wh_changed_handler = _create_wh_changed_handler(self.cmb_render_preset, render_lock_handler)
+
+        _safe_connect(self.cmb_render_preset.currentIndexChanged, render_preset_handler)
+        _safe_connect(self.cmb_render_w.currentIndexChanged, render_wh_changed_handler)
+        _safe_connect(self.cmb_render_h.currentIndexChanged, render_wh_changed_handler)
+
+        # 3. 프리셋 초기값 설정 (두 그룹 모두)
+        def _set_initial_preset(cmb_preset: QtWidgets.QComboBox, key: str, apply_handler: Callable):
+            init_idx = 0
+            for i in range(cmb_preset.count()):
+                data = cmb_preset.itemData(i)
+                if isinstance(data, tuple) and len(data) == 3 and data[2] == key:
+                    init_idx = i
                     break
-        self.cmb_res_preset.setCurrentIndex(kidx_preset_init)
-        # 시그널 연결 (프리셋 변경 -> W/H 업데이트)
-        self.cmb_res_preset.currentIndexChanged.connect(_apply_preset_to_wh_inputs)
-        # 초기 잠금 상태 적용
-        _apply_preset_to_wh_inputs()
+            cmb_preset.setCurrentIndex(init_idx)
+            apply_handler()  # 초기 잠금 상태 적용
 
-        # 레이아웃
-        row.addWidget(QtWidgets.QLabel("W")); row.addWidget(self.cmb_img_w)
-        row.addWidget(QtWidgets.QLabel("H")); row.addWidget(self.cmb_img_h)
-        row.addSpacing(12)
-        row.addWidget(QtWidgets.QLabel("FPS")); row.addWidget(self.cmb_movie_fps)
-        row.addSpacing(12)
-        row.addWidget(QtWidgets.QLabel("프리셋")); row.addWidget(self.cmb_res_preset)
-        row.addWidget(QtWidgets.QLabel("스텝")); row.addWidget(self.spn_t2i_steps)
-        row.addWidget(self.cmb_font)
-        row.addSpacing(10)
-        row.addWidget(QtWidgets.QLabel("제목크기:"))
-        row.addWidget(self.spn_title_font_size)
-        row.addWidget(QtWidgets.QLabel("가사크기:"))
-        row.addWidget(self.spn_lyric_font_size)
-        row.addStretch(1)
-        parent_layout.addWidget(grp)
+        _set_initial_preset(self.cmb_res_preset, img_preset_key, img_preset_handler)
+        _set_initial_preset(self.cmb_render_preset, render_preset_key, render_preset_handler)
 
-        # 변경 시 저장 시그널 연결
-        self.cmb_img_w.currentIndexChanged.connect(self._save_ui_prefs_to_project)
-        self.cmb_img_h.currentIndexChanged.connect(self._save_ui_prefs_to_project)
-        self.cmb_movie_fps.currentIndexChanged.connect(self._save_ui_prefs_to_project)
-        # self.cmb_res_preset.currentIndexChanged.connect(self._save_ui_prefs_to_project) # <-- 이 라인 제거됨 (유지)
-        self.spn_t2i_steps.valueChanged.connect(self._save_ui_prefs_to_project)
+        # 4. 저장 시그널 연결 (모든 위젯)
+        all_widgets_to_save = [
+            self.cmb_img_w, self.cmb_img_h, self.cmb_res_preset, self.spn_t2i_steps,
+            self.cmb_render_w, self.cmb_render_h, self.cmb_render_preset, self.spn_render_steps,
+            self.cmb_movie_fps, self.cmb_font, self.spn_title_font_size, self.spn_lyric_font_size
+        ]
+
+        for widget in all_widgets_to_save:
+            if hasattr(widget, "currentIndexChanged"):  # QComboBox
+                _safe_connect(widget.currentIndexChanged, self._save_ui_prefs_to_project)
+            elif hasattr(widget, "valueChanged"):  # QSpinBox
+                _safe_connect(widget.valueChanged, self._save_ui_prefs_to_project)
+            elif hasattr(widget, "currentFontChanged"):  # QFontComboBox
+                _safe_connect(widget.currentFontChanged, self._save_ui_prefs_to_project)
 
     # ==== 메서드 정의: project.json 저장 ====
     def _save_ui_prefs_to_project(self) -> None:
+        """[수정됨] '이미지 설정'과 '렌더 설정' 값을 별도 키로 저장합니다."""
         proj_dir = _guess_project_dir(self)
         pj = proj_dir / "project.json"
+
         meta = load_json(pj, {}) if pj.exists() else {}
+        if not isinstance(meta, dict): meta = {}
+
         ui = meta.get("ui_prefs") or {}
 
-        w_sel = int(self.cmb_img_w.currentData())
-        h_sel = int(self.cmb_img_h.currentData())
-        fps_sel = int(self.cmb_movie_fps.currentData())
+        # 1. "이미지 설정" 그룹 저장
+        img_w_sel = int(self.cmb_img_w.currentData())
+        img_h_sel = int(self.cmb_img_h.currentData())
+        img_preset_key = "custom"
+        img_data_val = self.cmb_res_preset.currentData()
+        if isinstance(img_data_val, tuple) and len(img_data_val) == 3:
+            _, _, img_preset_key = img_data_val
 
-        preset_key_sel = "custom"
-        data_val = self.cmb_res_preset.currentData()
-        if isinstance(data_val, tuple) and len(data_val) == 3:
-            _, _, preset_key_sel = data_val  # (w, h, key)
+        ui["image_size"] = [img_w_sel, img_h_sel]
+        ui["image_preset"] = str(img_preset_key)
+        ui["image_steps"] = int(self.spn_t2i_steps.value())
 
-        ui["image_size"] = [w_sel, h_sel]
-        ui["movie_fps"] = fps_sel
-        ui["resolution_preset"] = str(preset_key_sel)
-        ui["t2i_steps"] = int(self.spn_t2i_steps.value())
+        # 2. "렌더 설정" 그룹 저장
+        render_w_sel = int(self.cmb_render_w.currentData())
+        render_h_sel = int(self.cmb_render_h.currentData())
+        render_preset_key = "custom"
+        render_data_val = self.cmb_render_preset.currentData()
+        if isinstance(render_data_val, tuple) and len(render_data_val) == 3:
+            _, _, render_preset_key = render_data_val
 
+        ui["render_size"] = [render_w_sel, render_h_sel]
+        ui["render_preset"] = str(render_preset_key)
+        ui["render_steps"] = int(self.spn_render_steps.value())
+
+        # 3. 공통 설정 (FPS, 폰트) 저장
+        ui["movie_fps"] = int(self.cmb_movie_fps.currentData())
         try:
             ui["font_family"] = self.cmb_font.currentFont().family()
             ui["title_font_size"] = self.spn_title_font_size.value()
@@ -8780,11 +8946,22 @@ def _inject_render_prefs_methods():
         except Exception as e:
             print(f"[UI] 폰트/크기 저장 실패: {e}")
 
+        # [호환성] 기존 키도 '렌더 설정' 값으로 저장
+        # (기존 '누락 이미지 생성'이 t2i_steps를 사용했었으므로, render_steps 값으로 채워줌)
+        # [수정] t2i_steps는 "이미지 설정"의 image_steps 값을 사용해야 함 (on_click_test2... 수정과 일치)
+        ui["t2i_steps"] = int(self.spn_t2i_steps.value())  # <-- image_steps 값으로 변경
+        # [수정] image_size는 "이미지 설정"의 image_size 값을 사용해야 함
+        # ui["image_size"] = [render_w_sel, render_h_sel] # <-- 이 줄 삭제 또는 image_size 값으로
+        ui["image_size"] = [img_w_sel, img_h_sel]  # <-- "이미지 설정" 값으로 명시적 저장
+
+        ui["resolution_preset"] = str(render_preset_key)  # <-- 렌더 프리셋 (호환성 유지)
+
         meta["ui_prefs"] = ui
         save_json(pj, meta)
 
     # === 옵션: 누락 이미지 생성 버튼 핸들러도 주입 ===
     def on_click_test2_1_generate_missing_images(self) -> None:
+        """[수정됨] '이미지 설정' 그룹의 W/H/Step 값을 사용합니다."""
         from pathlib import Path
         from utils import run_job_with_progress_async
         try:
@@ -8792,7 +8969,6 @@ def _inject_render_prefs_methods():
         except Exception:
             from video_build import build_missing_images_from_story  # type: ignore
 
-        # 상수 직접 import 대신 getattr로 안전 접근
         try:
             import settings as _settings_local  # type: ignore
         except Exception:
@@ -8800,6 +8976,8 @@ def _inject_render_prefs_methods():
         comfy_log_file = getattr(_settings_local, "COMFY_LOG_FILE", None)
 
         story_path = Path(self.txt_story_path.text()).resolve()
+
+        # [수정] '이미지 설정' (self.cmb_img_w) 그룹의 값을 읽음
         ui_w = int(self.cmb_img_w.currentData())
         ui_h = int(self.cmb_img_h.currentData())
         steps_val = int(self.spn_t2i_steps.value())
@@ -8812,7 +8990,7 @@ def _inject_render_prefs_methods():
                 steps=steps_val,
                 timeout_sec=300,
                 poll_sec=1.5,
-                workflow_path=None,  # JSONS_DIR/nunchaku_qwen_image_swap.json 자동
+                workflow_path=None,
                 on_progress=on_progress,
             )
 
@@ -8827,11 +9005,10 @@ def _inject_render_prefs_methods():
         run_job_with_progress_async(self, "테스트2_1: 누락 이미지 생성", _job, tail_file=comfy_log_file, on_done=_done)
 
     # 클래스에 바인딩
-    setattr(MainWindow, "_add_render_prefs_controls", _add_render_prefs_controls)
+    setattr(MainWindow, "_guess_project_dir", _guess_project_dir)
+    setattr(MainWindow, "_create_render_widgets", _create_render_widgets)
     setattr(MainWindow, "_save_ui_prefs_to_project", _save_ui_prefs_to_project)
     setattr(MainWindow, "on_click_test2_1_generate_missing_images", on_click_test2_1_generate_missing_images)
-
-
 
 
 # === 주입을 즉시 실행 (MainWindow 인스턴스 생성 전에!) ===
