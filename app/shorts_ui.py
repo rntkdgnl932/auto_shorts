@@ -1311,6 +1311,7 @@ class MainWindow(QtWidgets.QMainWindow):
         if not isinstance(tag_boxes, dict) or not tag_boxes:
             return
 
+        # 이 함수 안에서만 쓰는 기본 7개 태그 집합
         basic_defaults_all = {
             "clean vocals",
             "clear diction",
@@ -1320,6 +1321,7 @@ class MainWindow(QtWidgets.QMainWindow):
             "balanced mixing",
             "studio reverb light",
         }
+        # 실제 UI에 있는 것만 걸러낸 리스트
         basic_defaults = [label for label in tag_boxes.keys() if label in basic_defaults_all]
 
         def _apply_defaults(auto_enabled: bool = True) -> None:
@@ -1367,7 +1369,7 @@ class MainWindow(QtWidgets.QMainWindow):
             except Exception:
                 return
 
-        # --- proj_dir 안전 획득(정적 타입 체커 만족) ---
+        # --- proj_dir 안전 획득 ---
         proj_dir_obj = getattr(self, "_current_project_dir", None)
         if callable(proj_dir_obj):
             try:
@@ -1387,6 +1389,7 @@ class MainWindow(QtWidgets.QMainWindow):
 
         meta = load_json(meta_path, {}) or {}
 
+        # 저장된 태그 우선순위: checked_tags > tags_effective > 기본 7개
         if isinstance(meta.get("checked_tags"), list):
             selected = [str(x) for x in meta["checked_tags"]]
             should_persist = False
@@ -1396,6 +1399,12 @@ class MainWindow(QtWidgets.QMainWindow):
         else:
             selected = list(basic_defaults)
             should_persist = True
+
+        # 🔴 여기서 예전에는 BASIC_VOCAL_TAGS 를 썼는데,
+        # 이 함수 안에서 만든 basic_defaults 를 써야 참조 오류가 안 난다.
+        for basic_tag_name in basic_defaults:
+            if basic_tag_name not in selected:
+                selected.append(basic_tag_name)
 
         auto_on_state = False
         auto_checkbox = getattr(self, "chk_auto_tags", None)
@@ -1542,101 +1551,102 @@ class MainWindow(QtWidgets.QMainWindow):
     ######### ######### ######### #########
     ######### ######### ######### #########
     ######### ######### ######### #########
-    def _generate_and_save_ai_tags(self, project_path: Path, meta: dict, progress_callback: Callable) -> list[str]:
+
+    def _generate_and_save_ai_tags(self, project_path: Path, meta: dict, progress_callback: Callable) -> List[str]:
         """
         '긍정 프롬프트 (+)' 박스 내용을 AI로 보내 태그로 변환하고 project.json에 저장합니다.
         박스가 비어있으면 빈 목록을 저장합니다.
+        (주의) progress_callback 은 문자열만 받는 기존 코드에 맞춥니다.
         """
-        # utils.py의 save_json을 사용
+        # utils.py의 save_json을 사용합니다.
         try:
-            from app.utils import save_json
+            from app.utils import save_json  # type: ignore
         except ImportError:
             from utils import save_json  # type: ignore
 
-        # 1) UI에서 프롬프트 읽기
-        prompt_text = ""
+        prompt_text_src = ""
         try:
             if hasattr(self, "te_prompt_pos") and hasattr(self.te_prompt_pos, "toPlainText"):
-                prompt_text = (self.te_prompt_pos.toPlainText() or "").strip()
+                prompt_text_src = self.te_prompt_pos.toPlainText().strip()
 
-            # 기본 문구 들어있으면 비운다
-            if prompt_text == "ace-step tag 추천해줘 :":
-                prompt_text = ""
-        except Exception as e:
-            # 여기서는 문자열로!
-            progress_callback(f"[AI Tags] 긍정 프롬프트 UI 읽기 실패: {e}")
-            prompt_text = ""
+            # 사용자가 수동으로 제거할 기본 텍스트 (안전장치)
+            if prompt_text_src == "ace-step tag 추천해줘 :":
+                prompt_text_src = ""
+        except Exception as read_exc:
+            # 콜백은 문자열만
+            progress_callback(f"[AI Tags] 긍정 프롬프트 UI 읽기 실패: {read_exc}")
+            prompt_text_src = ""
 
-        ai_tags_list: list[str] = []
+        ai_tags_result: List[str] = []
 
-        # 2) 프롬프트 없으면 그냥 저장만
-        if not prompt_text:
+        if not prompt_text_src:
             progress_callback("[AI Tags] 긍정 프롬프트가 비어있어 AI 태그 생성을 건너뜁니다.")
         else:
-            progress_callback(f"[AI Tags] 긍정 프롬프트 AI 태그 변환 시작... (내용: {prompt_text[:30]}...)")
+            progress_callback(f"[AI Tags] 긍정 프롬프트 AI 태그 변환 시작... (내용: {prompt_text_src[:30]}...)")
 
             system_prompt = (
                 "You are an expert tag generator for music AI. "
                 "Based on the user's text, extract key themes, moods, genres, instruments, and styles. "
-                "Return only a simple, comma-separated list of 5-10 relevant English tags. "
-                "No explanation."
+                "Return *only* a simple, comma-separated list of 5-10 relevant English tags. "
+                "Do not add any other text, explanation, or markdown. Just the tags."
+                "Example: lyrical, calm, pop, piano, female vocal, night, urban"
             )
-            user_prompt = f'Text: "{prompt_text}"\n\nTags (comma-separated):'
+            user_prompt = f'Text: "{prompt_text_src}"\n\nTags (comma-separated):'
 
             try:
                 if not hasattr(self, "_ai"):
                     raise RuntimeError("AI instance (self._ai) not found.")
 
-                # gemini 우선 호출
-                raw = self._ai.ask_smart(
+                # gemini 우선
+                raw_response = self._ai.ask_smart(
                     system_prompt,
                     user_prompt,
                     prefer="gemini",
                     allow_fallback=True,
                 )
 
-                # 3) 응답 정규화 (dict / list / str 전부 처리)
+                # dict / list 등 올 수 있으니 문자열로 정규화
                 import json
 
-                if isinstance(raw, dict):
-                    text = (
-                            raw.get("tags")
-                            or raw.get("text")
-                            or raw.get("content")
-                            or raw.get("output")
-                            or json.dumps(raw, ensure_ascii=False)
+                if isinstance(raw_response, dict):
+                    # 모델이 줄 법한 키 우선
+                    text_body = (
+                            raw_response.get("tags")
+                            or raw_response.get("text")
+                            or raw_response.get("content")
+                            or raw_response.get("output")
+                            or json.dumps(raw_response, ensure_ascii=False)
                     )
-                elif isinstance(raw, (list, tuple)):
-                    text = ", ".join(str(x) for x in raw)
+                elif isinstance(raw_response, (list, tuple)):
+                    # ["pop", "jazz"] 이런 식이면 콤마로 합치기
+                    text_body = ", ".join(str(item) for item in raw_response)
                 else:
-                    text = str(raw or "")
+                    text_body = str(raw_response or "")
 
-                text = text.strip()
+                text_body = text_body.strip()
 
-                # 4) 콤마 기준으로 태그 나누기
-                ai_tags_list = [t.strip().lower() for t in text.split(",") if t.strip()]
+                # 기본: 콤마로 나눈 태그
+                ai_tags_result = [item.strip().lower() for item in text_body.split(",") if item.strip()]
 
-                # "tags: pop, jazz" 이런 식이면 콜론 뒤만 다시 파싱
-                if not ai_tags_list and ":" in text:
-                    body = text.split(":", 1)[-1]
-                    ai_tags_list = [t.strip().lower() for t in body.split(",") if t.strip()]
+                # "tags: ..." 형식이면 콜론 뒤만 다시 파싱
+                if not ai_tags_result and ":" in text_body:
+                    tail_text = text_body.split(":", 1)[-1]
+                    ai_tags_result = [item.strip().lower() for item in tail_text.split(",") if item.strip()]
 
-                progress_callback(f"[AI Tags] AI 태그 생성 완료: {ai_tags_list}")
+                progress_callback(f"[AI Tags] AI 태그 생성 완료: {ai_tags_result}")
+            except Exception as ai_exc:
+                progress_callback(f"[AI Tags] AI 태그 생성 실패: {ai_exc}. 빈 목록을 사용합니다.")
+                ai_tags_result = []
 
-            except Exception as e:
-                # 여기서도 문자열로만!
-                progress_callback(f"[AI Tags] AI 태그 생성 실패: {e}. 빈 목록을 사용합니다.")
-                ai_tags_list = []
-
-        # 5) project.json에 저장
+        # project.json에 'prompt_user_ai_tags' 키로 저장
         try:
-            meta["prompt_user_ai_tags"] = ai_tags_list
+            meta["prompt_user_ai_tags"] = ai_tags_result
             save_json(project_path, meta)
-            progress_callback(f"[AI Tags] {len(ai_tags_list)}개의 AI 태그를 project.json에 저장했습니다.")
-        except Exception as e:
-            progress_callback(f"[AI Tags] project.json 저장 실패: {e}")
+            progress_callback(f"[AI Tags] {len(ai_tags_result)}개의 AI 태그를 project.json에 저장했습니다.")
+        except Exception as save_exc:
+            progress_callback(f"[AI Tags] project.json 저장 실패: {save_exc}")
 
-        return ai_tags_list
+        return ai_tags_result
 
     def _bind_actions(self) -> None:
         if getattr(self, "_actions_bound", False):
