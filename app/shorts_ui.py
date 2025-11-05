@@ -1542,72 +1542,102 @@ class MainWindow(QtWidgets.QMainWindow):
     ######### ######### ######### #########
     ######### ######### ######### #########
     ######### ######### ######### #########
-    def _generate_and_save_ai_tags(self, project_path: Path, meta: dict, progress_callback: Callable) -> List[str]:
+    def _generate_and_save_ai_tags(self, project_path: Path, meta: dict, progress_callback: Callable) -> list[str]:
         """
         '긍정 프롬프트 (+)' 박스 내용을 AI로 보내 태그로 변환하고 project.json에 저장합니다.
         박스가 비어있으면 빈 목록을 저장합니다.
         """
-        # utils.py의 save_json을 사용합니다.
+        # utils.py의 save_json을 사용
         try:
             from app.utils import save_json
         except ImportError:
             from utils import save_json  # type: ignore
 
+        # 1) UI에서 프롬프트 읽기
         prompt_text = ""
         try:
             if hasattr(self, "te_prompt_pos") and hasattr(self.te_prompt_pos, "toPlainText"):
-                prompt_text = self.te_prompt_pos.toPlainText().strip()
+                prompt_text = (self.te_prompt_pos.toPlainText() or "").strip()
 
-            # 사용자가 수동으로 제거할 기본 텍스트 (안전장치)
+            # 기본 문구 들어있으면 비운다
             if prompt_text == "ace-step tag 추천해줘 :":
                 prompt_text = ""
-
         except Exception as e:
-            progress_callback({"msg": f"[AI Tags] 긍정 프롬프트 UI 읽기 실패: {e}"})
+            # 여기서는 문자열로!
+            progress_callback(f"[AI Tags] 긍정 프롬프트 UI 읽기 실패: {e}")
             prompt_text = ""
 
-        ai_tags_list = []
+        ai_tags_list: list[str] = []
+
+        # 2) 프롬프트 없으면 그냥 저장만
         if not prompt_text:
-            progress_callback({"msg": "[AI Tags] 긍정 프롬프트가 비어있어 AI 태그 생성을 건너뜁니다."})
+            progress_callback("[AI Tags] 긍정 프롬프트가 비어있어 AI 태그 생성을 건너뜁니다.")
         else:
-            progress_callback({"msg": f"[AI Tags] 긍정 프롬프트 AI 태그 변환 시작... (내용: {prompt_text[:30]}...)"})
+            progress_callback(f"[AI Tags] 긍정 프롬프트 AI 태그 변환 시작... (내용: {prompt_text[:30]}...)")
 
             system_prompt = (
                 "You are an expert tag generator for music AI. "
                 "Based on the user's text, extract key themes, moods, genres, instruments, and styles. "
-                "Return *only* a simple, comma-separated list of 5-10 relevant English tags. "
-                "Do not add any other text, explanation, or markdown. Just the tags."
-                "Example: lyrical, calm, pop, piano, female vocal, night, urban"
+                "Return only a simple, comma-separated list of 5-10 relevant English tags. "
+                "No explanation."
             )
-            user_prompt = f"Text: \"{prompt_text}\"\n\nTags (comma-separated):"
+            user_prompt = f'Text: "{prompt_text}"\n\nTags (comma-separated):'
 
             try:
                 if not hasattr(self, "_ai"):
                     raise RuntimeError("AI instance (self._ai) not found.")
 
-                # ask_smart를 사용하여 'gemini' 우선 호출 (빠른 응답)
-                raw_tags = self._ai.ask_smart(system_prompt, user_prompt, prefer="gemini", allow_fallback=True)
+                # gemini 우선 호출
+                raw = self._ai.ask_smart(
+                    system_prompt,
+                    user_prompt,
+                    prefer="gemini",
+                    allow_fallback=True,
+                )
 
-                ai_tags_list = [t.strip().lower() for t in raw_tags.split(',') if t.strip()]
+                # 3) 응답 정규화 (dict / list / str 전부 처리)
+                import json
 
-                if not ai_tags_list and ":" in raw_tags:
-                    raw_tags = raw_tags.split(":", 1)[-1]
-                    ai_tags_list = [t.strip().lower() for t in raw_tags.split(',') if t.strip()]
+                if isinstance(raw, dict):
+                    text = (
+                            raw.get("tags")
+                            or raw.get("text")
+                            or raw.get("content")
+                            or raw.get("output")
+                            or json.dumps(raw, ensure_ascii=False)
+                    )
+                elif isinstance(raw, (list, tuple)):
+                    text = ", ".join(str(x) for x in raw)
+                else:
+                    text = str(raw or "")
 
-                progress_callback({"msg": f"[AI Tags] AI 태그 생성 완료: {ai_tags_list}"})
+                text = text.strip()
+
+                # 4) 콤마 기준으로 태그 나누기
+                ai_tags_list = [t.strip().lower() for t in text.split(",") if t.strip()]
+
+                # "tags: pop, jazz" 이런 식이면 콜론 뒤만 다시 파싱
+                if not ai_tags_list and ":" in text:
+                    body = text.split(":", 1)[-1]
+                    ai_tags_list = [t.strip().lower() for t in body.split(",") if t.strip()]
+
+                progress_callback(f"[AI Tags] AI 태그 생성 완료: {ai_tags_list}")
+
             except Exception as e:
-                progress_callback({"msg": f"[AI Tags] AI 태G Tags] AI 태그 생성 실패: {e}. 빈 목록을 사용합니다."})
+                # 여기서도 문자열로만!
+                progress_callback(f"[AI Tags] AI 태그 생성 실패: {e}. 빈 목록을 사용합니다.")
                 ai_tags_list = []
 
-        # project.json에 'prompt_user_ai_tags' 키로 저장
+        # 5) project.json에 저장
         try:
-            meta['prompt_user_ai_tags'] = ai_tags_list
+            meta["prompt_user_ai_tags"] = ai_tags_list
             save_json(project_path, meta)
-            progress_callback({"msg": f"[AI Tags] {len(ai_tags_list)}개의 AI 태그를 project.json에 저장했습니다."})
+            progress_callback(f"[AI Tags] {len(ai_tags_list)}개의 AI 태그를 project.json에 저장했습니다.")
         except Exception as e:
-            progress_callback({"msg": f"[AI Tags] project.json 저장 실패: {e}"})
+            progress_callback(f"[AI Tags] project.json 저장 실패: {e}")
 
         return ai_tags_list
+
     def _bind_actions(self) -> None:
         if getattr(self, "_actions_bound", False):
             return
@@ -2115,7 +2145,10 @@ class MainWindow(QtWidgets.QMainWindow):
 
             base_dir_path = _get_base_dir()
 
-            temp_title = title_in_pre or (prompt_text_pre[:20] if prompt_text_pre else "untitled")
+            temp_title = (title_in_pre or "").strip()
+            if not temp_title:
+                temp_title = "untitled"  # 제목 없으면 그냥 untitled 로
+
             temp_safe_title = sanitize_title(temp_title)
 
             # _normalize_maked_title_root 함수 필요 (utils.py에서 제공되어야 함)

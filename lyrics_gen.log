@@ -16,3 +16,33 @@
 [parse] text_len=864
 [parse] ok
 [normalize] lyrics generated without language tags
+[ui] 가사 생성 시작
+[AI Tags] 태그 생성 중 예외 발생: 'dict' object has no attribute 'rstrip'
+[ai] prefer=gemini, secs=30
+[ai] prefer=gemini, allow_fallback=False, sec=30, lines=6-8
+[gemini] model=gemini-2.5-pro
+[gemini] len=414
+[provider] gemini model=gemini-2.5-pro
+[parse] text_len=414
+[parse] ok
+[normalize] lyrics generated without language tags
+[ui] 가사 생성 시작
+[AI Tags] 태그 생성 중 예외 발생: 'dict' object has no attribute 'rstrip'
+[ai] prefer=gemini, secs=30
+[ai] prefer=gemini, allow_fallback=False, sec=30, lines=6-8
+[gemini] model=gemini-2.5-pro
+[gemini] len=482
+[provider] gemini model=gemini-2.5-pro
+[parse] text_len=482
+[parse] ok
+[normalize] lyrics generated without language tags
+[ui] 가사 생성 시작
+[AI Tags] 태그 생성 중 예외 발생: 'dict' object has no attribute 'rstrip'
+[ai] prefer=gemini, secs=30
+[ai] prefer=gemini, allow_fallback=False, sec=30, lines=6-8
+[gemini] model=gemini-2.5-pro
+[gemini] len=438
+[provider] gemini model=gemini-2.5-pro
+[parse] text_len=438
+[parse] ok
+[normalize] lyrics generated without language tags
