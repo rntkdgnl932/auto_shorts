@@ -410,11 +410,11 @@ class ClickableLabel(QtWidgets.QLabel):
 
 class ScenePromptEditDialog(QtWidgets.QDialog):
     """
-    [수정됨 v14 - 안정화]
-    - [요청] '영상삭제' 버튼 추가 (clips/{id}.mp4 존재 시 활성화)
-    - [수정] 'Qt' 클래스 속성 참조 Linter 경고 해결
-    - [요청 1] 씬 라벨 형식 수정
-    - [요청 2] 이미지 미리보기/업로드 버튼 분리
+    [수정됨 v17 - 안정화]
+    - [요청] '이미지 삭제' 버튼 추가 (imgs/{id}.png 존재 시 활성화)
+    - [수정] on_upload_image가 '이미지 삭제' 버튼을 활성화하도록 수정
+    - [기존] 씬(Row) 사이의 상하 여백(padding)을 줄임
+    - [기존] '영상삭제' 버튼 추가
     """
 
     # --- [신규] AI 요청 시 사용할 상수 (클래스 속성으로 이동) ---
@@ -485,7 +485,9 @@ class ScenePromptEditDialog(QtWidgets.QDialog):
         self.load_and_build_ui()
 
     def show_large_image(self, path_str: str):
-        """썸네일 클릭 시 원본 이미지를 새 다이얼로그에 표시"""
+        """
+        [수정됨 v16] 썸네일 클릭 시 원본 이미지를 스크롤 가능한 새 다이얼로그에 표시.
+        """
         if not path_str:
             QtWidgets.QMessageBox.information(self, "미리보기", "이 씬에는 이미지 경로가 지정되지 않았습니다.")
             return
@@ -500,6 +502,7 @@ class ScenePromptEditDialog(QtWidgets.QDialog):
 
         label = QtWidgets.QLabel()
         label.setPixmap(pixmap)
+        label.setFixedSize(pixmap.width(), pixmap.height())
 
         scroll_area = QtWidgets.QScrollArea()
         scroll_area.setWidget(label)
@@ -512,25 +515,22 @@ class ScenePromptEditDialog(QtWidgets.QDialog):
         except AttributeError:
             screen_geo = QtWidgets.QApplication.primaryScreen().availableGeometry()
 
-        max_w = screen_geo.width() * 0.8
-        max_h = screen_geo.height() * 0.8
+        max_dialog_w = int(screen_geo.width() * 0.9)
+        max_dialog_h = int(screen_geo.height() * 0.9)
+
         img_w = pixmap.width()
         img_h = pixmap.height()
 
-        if img_w > max_w or img_h > max_h:
-            scaled_pixmap = pixmap.scaled(int(max_w), int(max_h),
-                                          Qt.AspectRatioMode.KeepAspectRatio,
-                                          Qt.TransformationMode.SmoothTransformation)
-            label.setPixmap(scaled_pixmap)
-            dialog.resize(scaled_pixmap.width() + 40, scaled_pixmap.height() + 40)
-        else:
-            dialog.resize(img_w + 40, img_h + 40)
+        dialog_w = min(img_w + 40, max_dialog_w)
+        dialog_h = min(img_h + 40, max_dialog_h)
 
+        dialog.resize(dialog_w, dialog_h)
         dialog.exec_()
 
     def on_ai_request(self):
         """
-        'AI 요청' 버튼 핸들러. 'prompt', 'prompt_img', 'prompt_movie' 3개 필드를 갱신합니다.
+        [수정됨 v9] 'AI 요청' 버튼 핸들러.
+        'direct_prompt'를 기반으로 AI를 호출하여 'prompt', 'prompt_img', 'prompt_movie' 3개 필드를 갱신합니다.
         """
 
         # 1. AI 요청 대상 수집
@@ -668,9 +668,10 @@ class ScenePromptEditDialog(QtWidgets.QDialog):
                         scene_id: str,
                         preview_label: QtWidgets.QLabel,
                         upload_button: QtWidgets.QPushButton,
+                        delete_image_button: QtWidgets.QPushButton,  # [신규] '이미지 삭제' 버튼 추가
                         scene_data: Dict[str, Any]):
         """
-        '업로드' 버튼 클릭 시, 이미지를 선택받아 imgs/{id}.png로 복사/저장.
+        [수정됨 v17] '업로드' 버튼 클릭 시, '이미지 삭제' 버튼을 활성화합니다.
         """
         if scene_data is None:
             scene_data = {}
@@ -701,7 +702,7 @@ class ScenePromptEditDialog(QtWidgets.QDialog):
             return
 
         target_path_str = str(target_path)
-        scene_data["img_file"] = target_path_str
+        scene_data["img_file"] = target_path_str  # [신규] 씬 데이터에도 경로 업데이트
 
         pixmap = QtGui.QPixmap(target_path_str)
         if not pixmap.isNull():
@@ -715,29 +716,41 @@ class ScenePromptEditDialog(QtWidgets.QDialog):
             preview_label.setToolTip(f"경로: {target_path_str}\n(클릭해서 크게 보기)")
             upload_button.setText("이미지 변경")
 
+            # [신규] 업로드 성공 시 '이미지 삭제' 버튼 활성화
+            delete_image_button.setEnabled(True)
+            delete_image_button.setToolTip(f"경로: {target_path_str}\n(클릭 시 이 씬의 이미지 파일을 삭제합니다.)")
+
             try:
                 preview_label.clicked.disconnect()
             except (TypeError, RuntimeError):
                 pass
             preview_label.clicked.connect(lambda: self.show_large_image(target_path_str))
+
+            # [신규] '이미지 삭제' 버튼의 핸들러도 새 경로로 다시 연결
+            try:
+                delete_image_button.clicked.disconnect()
+            except (TypeError, RuntimeError):
+                pass
+            delete_image_button.clicked.connect(
+                functools.partial(self.on_delete_image, Path(target_path_str), preview_label, upload_button,
+                                  delete_image_button, scene_data)
+            )
         else:
             preview_label.setText("[파일\n오류]")
             preview_label.setToolTip(f"경로: {target_path_str}\n(파일을 읽을 수 없음)")
             upload_button.setText("다시 업로드")
+            delete_image_button.setEnabled(False)  # [신규] 읽기 실패 시 비활성화
 
     def on_delete_video(self, video_path: Path, button_widget: QtWidgets.QPushButton):
         """
-        [신규] '영상삭제' 버튼 클릭 핸들러.
-        사용자 확인 후 {id}.mp4 파일을 삭제하고 버튼을 비활성화합니다.
+        '영상삭제' 버튼 클릭 핸들러.
         """
 
-        # 1. 경로가 존재하는지 다시 확인 (버튼이 활성화되었더라도)
         if not video_path.exists():
             QtWidgets.QMessageBox.warning(self, "오류", "파일이 이미 존재하지 않습니다.")
             button_widget.setEnabled(False)
             return
 
-        # 2. 사용자 확인
         reply = QtWidgets.QMessageBox.question(
             self,
             "영상 삭제 확인",
@@ -749,24 +762,75 @@ class ScenePromptEditDialog(QtWidgets.QDialog):
         if reply != QtWidgets.QMessageBox.Yes:
             return
 
-        # 3. 파일 삭제
         try:
             video_path.unlink()
             QtWidgets.QMessageBox.information(self, "삭제 완료", f"파일을 삭제했습니다:\n{video_path.name}")
-            button_widget.setEnabled(False)  # 삭제 후 비활성화
+            button_widget.setEnabled(False)
 
         except FileNotFoundError:
             QtWidgets.QMessageBox.warning(self, "오류", "파일이 이미 존재하지 않았습니다.")
             button_widget.setEnabled(False)
         except (OSError, Exception) as e_delete:
             QtWidgets.QMessageBox.critical(self, "삭제 실패", f"파일 삭제 중 오류가 발생했습니다:\n{e_delete}")
-            # 삭제 실패 시 버튼은 활성화된 상태로 둠 (파일이 아직 있으므로)
+
+    def on_delete_image(self,
+                        image_path: Path,
+                        preview_label: QtWidgets.QLabel,
+                        upload_button: QtWidgets.QPushButton,
+                        delete_image_button: QtWidgets.QPushButton,
+                        scene_data: Dict[str, Any]):
+        """
+        [신규] '이미지 삭제' 버튼 클릭 핸들러.
+        사용자 확인 후 {id}.png 파일을 삭제하고 UI를 초기 상태로 되돌립니다.
+        """
+
+        # 1. 경로가 존재하는지 다시 확인
+        if not image_path.exists():
+            QtWidgets.QMessageBox.warning(self, "오류", "파일이 이미 존재하지 않습니다.")
+
+        # 2. 사용자 확인
+        reply = QtWidgets.QMessageBox.question(
+            self,
+            "이미지 삭제 확인",
+            f"정말로 이 씬의 이미지 파일을 삭제하시겠습니까?\n\n{image_path.name}",
+            QtWidgets.QMessageBox.Yes | QtWidgets.QMessageBox.No,
+            QtWidgets.QMessageBox.No
+        )
+
+        if reply != QtWidgets.QMessageBox.Yes:
+            return
+
+        # 3. 파일 삭제
+        try:
+            if image_path.exists():  # 한 번 더 확인
+                image_path.unlink()
+            QtWidgets.QMessageBox.information(self, "삭제 완료", f"파일을 삭제했습니다:\n{image_path.name}")
+
+            # 4. 씬 데이터(인메모리) 갱신
+            scene_data["img_file"] = ""
+
+            # 5. UI 상태 되돌리기 (미리보기, 업로드 버튼, 삭제 버튼)
+            preview_label.setPixmap(QtGui.QPixmap())  # pixmap 제거
+            preview_label.setText("[이미지\n없음]")
+            preview_label.setToolTip(f"파일이 삭제되었습니다. (경로: {image_path})")
+            preview_label.setStyleSheet("border: 1px dashed gray; color: gray;")
+            try:
+                preview_label.clicked.disconnect()  # 클릭 시도 비활성화
+            except (TypeError, RuntimeError):
+                pass
+
+            upload_button.setText("업로드")
+            delete_image_button.setEnabled(False)  # 자신(삭제 버튼) 비활성화
+
+        except FileNotFoundError:
+            QtWidgets.QMessageBox.warning(self, "오류", "파일이 이미 존재하지 않았습니다.")
+            delete_image_button.setEnabled(False)
+        except (OSError, Exception) as e_delete:
+            QtWidgets.QMessageBox.critical(self, "삭제 실패", f"파일 삭제 중 오류가 발생했습니다:\n{e_delete}")
 
     def load_and_build_ui(self):
         """
-        [수정됨 v11]
-        - (Request 1) 라벨 형식을 'id : [가사] / 시간'으로 변경
-        - (Request 2) UI 레이아웃을 '미리보기(QLabel)'와 '업로드/영상삭제(QPushButton)'로 분리
+        [수정됨 v17] '이미지 삭제' 버튼 추가 및 VBox/텍스트 에디터 높이 조절
         """
 
         try:
@@ -799,6 +863,10 @@ class ScenePromptEditDialog(QtWidgets.QDialog):
                 form_layout_page = QtWidgets.QFormLayout(scroll_content_widget)
                 form_layout_page.setRowWrapPolicy(QtWidgets.QFormLayout.RowWrapPolicy.WrapAllRows)
                 form_layout_page.setLabelAlignment(Qt.AlignmentFlag.AlignRight)
+
+                # [기존] 씬(Row) 간의 상하 여백(verticalSpacing)을 줄입니다
+                form_layout_page.setVerticalSpacing(8)
+
                 page_scroll_area.setWidget(scroll_content_widget)
 
                 if not chunk:
@@ -807,7 +875,7 @@ class ScenePromptEditDialog(QtWidgets.QDialog):
                 for scene in chunk:
                     if not isinstance(scene, dict): continue
 
-                    # --- [수정] Request 1: 라벨 정보 수집 ---
+                    # --- [기존] Request 1: 라벨 정보 수집 ---
                     scene_id = scene.get("id", "ID_없음")
                     lyric = (scene.get("lyric") or "").strip()
                     if len(lyric) > 20:
@@ -832,7 +900,7 @@ class ScenePromptEditDialog(QtWidgets.QDialog):
                     row_layout.setContentsMargins(0, 0, 0, 0)
                     row_layout.setSpacing(8)
 
-                    # 2-A: 왼쪽 (이미지 미리보기 + 버튼 2개)
+                    # 2-A: 왼쪽 (이미지 미리보기 + 버튼 3개)
                     left_vbox_widget = QtWidgets.QWidget()
                     left_vbox = QtWidgets.QVBoxLayout(left_vbox_widget)
                     left_vbox.setContentsMargins(0, 0, 0, 0)
@@ -845,21 +913,25 @@ class ScenePromptEditDialog(QtWidgets.QDialog):
                     upload_button = QtWidgets.QPushButton("업로드")
                     upload_button.setFixedSize(self.THUMBNAIL_SIZE, 28)
 
-                    # --- [신규] Request 2: 영상 삭제 버튼 ---
+                    # --- [신규] '이미지 삭제' 버튼 생성 ---
+                    delete_image_button = QtWidgets.QPushButton("이미지 삭제")
+                    delete_image_button.setFixedSize(self.THUMBNAIL_SIZE, 28)
+
                     delete_video_button = QtWidgets.QPushButton("영상삭제")
                     delete_video_button.setFixedSize(self.THUMBNAIL_SIZE, 28)
 
                     left_vbox.addWidget(img_preview_label)
                     left_vbox.addWidget(upload_button)
-                    left_vbox.addWidget(delete_video_button)  # [신규] VBox에 추가
+                    left_vbox.addWidget(delete_image_button)  # [신규] VBox에 추가
+                    left_vbox.addWidget(delete_video_button)
                     row_layout.addWidget(left_vbox_widget)
 
                     # 2-B: 오른쪽 (Direct Prompt 텍스트 편집기)
                     text_edit = QtWidgets.QTextEdit()
                     text_edit.setPlainText(scene.get("direct_prompt", ""))
                     text_edit.setFont(font)
-                    # [수정] 높이를 3개 위젯에 맞춤 (150 + 28 + 28 + 8(spacing*2)) = 214
-                    text_edit.setMinimumHeight(214)
+                    # [수정] 높이를 4개 위젯에 맞춤 (150 + 28*3 + 4*3 spacing) = 246
+                    text_edit.setMinimumHeight(246)
                     text_edit.setToolTip(f"Scene ID: {scene_id}\n이 씬의 direct_prompt를 입력하세요.")
                     text_edit.setSizePolicy(QtWidgets.QSizePolicy.Policy.Expanding,
                                             QtWidgets.QSizePolicy.Policy.Preferred)
@@ -883,23 +955,34 @@ class ScenePromptEditDialog(QtWidgets.QDialog):
                             img_preview_label.setToolTip(f"경로: {img_file_str}\n(클릭해서 크게 보기)")
                             img_preview_label.clicked.connect(functools.partial(self.show_large_image, img_file_str))
                             upload_button.setText("이미지 변경")
+                            delete_image_button.setEnabled(True)  # [신규] 활성화
+                            delete_image_button.setToolTip(f"경로: {img_file_str}\n(클릭 시 이 씬의 이미지 파일을 삭제합니다.)")
                         else:
                             img_preview_label.setText("[파일\n오류]")
                             img_preview_label.setToolTip(f"경로: {img_file_str}\n(파일을 읽을 수 없음)")
                             img_preview_label.setStyleSheet("border: 1px solid red; color: red;")
                             upload_button.setText("다시 업로드")
+                            delete_image_button.setEnabled(True)  # [신규] (읽을 수 없어도) 파일은 존재하므로 활성화
                     else:
                         img_preview_label.setText("[이미지\n없음]")
                         img_preview_label.setToolTip(f"경로: {img_file_str}\n(파일이 존재하지 않습니다)")
                         img_preview_label.setStyleSheet("border: 1px dashed gray; color: gray;")
                         upload_button.setText("업로드")
+                        delete_image_button.setEnabled(False)  # [신규] 비활성화
 
                     # 업로드 버튼 시그널 연결
                     upload_button.clicked.connect(
-                        functools.partial(self.on_upload_image, scene_id, img_preview_label, upload_button, scene)
+                        functools.partial(self.on_upload_image, scene_id, img_preview_label, upload_button,
+                                          delete_image_button, scene)
                     )
 
-                    # --- [신규] Request 2: 영상삭제 버튼 상태 설정 ---
+                    # [신규] 이미지 삭제 버튼 시그널 연결
+                    delete_image_button.clicked.connect(
+                        functools.partial(self.on_delete_image, img_path if img_path else Path(), img_preview_label,
+                                          upload_button, delete_image_button, scene)
+                    )
+
+                    # --- [기존] 영상삭제 버튼 상태 설정 ---
                     clips_dir = self.json_path.parent / "clips"
                     video_file_path = clips_dir / f"{scene_id}.mp4"
                     video_exists = video_file_path.exists()
@@ -979,15 +1062,10 @@ class ScenePromptEditDialog(QtWidgets.QDialog):
                                               f"{len(self.widget_map)}개 씬 중 {updated_count}개의 'direct_prompt'가 업데이트되었습니다.\n\n"
                                               f"파일: {self.json_path}")
 
-            # [요청] self.accept() 제거됨. 창이 닫히지 않습니다.
-            # self.accept()
-
         except Exception as e_update:
             QtWidgets.QMessageBox.critical(self, "저장 오류",
                                            f"파일을 저장하는 중 오류가 발생했습니다:\n{e_update}")
 
-
-# ──────────────────────────────── Main UI ─────────────────────────────────────
 
 
 # ──────────────────────────────── Main UI ─────────────────────────────────────
