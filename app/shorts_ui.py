@@ -534,6 +534,47 @@ class ScenePromptEditDialog(QtWidgets.QDialog):
 
         dialog.exec_()
 
+    def _build_character_styles_group(self) -> QtWidgets.QGroupBox:
+        """
+        [신규] video.json의 character_styles를 편집하기 위한
+        "전체 등장 캐릭터 스타일" 그룹박스를 생성합니다.
+        (사용자 요청: 한 줄 QLineEdit 사용)
+        """
+        group = QtWidgets.QGroupBox("전체 등장 캐릭터 스타일")
+        layout = QtWidgets.QFormLayout(group)
+        layout.setRowWrapPolicy(QtWidgets.QFormLayout.RowWrapPolicy.WrapAllRows)
+        layout.setLabelAlignment(Qt.AlignmentFlag.AlignRight)
+
+        # self.style_widget_map 초기화 (char_id -> QLineEdit)
+        self.style_widget_map: Dict[str, QtWidgets.QLineEdit] = {}
+
+        # self.full_video_data는 load_and_build_ui에서 먼저 로드됩니다.
+        styles_data = self.full_video_data.get("character_styles", {})
+
+        if not styles_data:
+            layout.addRow(QtWidgets.QLabel("프로젝트에 character_styles 정보가 없습니다."))
+            return group
+
+        # 폰트 설정 (가독성)
+        font = QtGui.QFont()
+        font.setFamily("Courier" if "Courier" in QtGui.QFontDatabase().families() else "Monospace")
+        font.setPointSize(10)
+
+        for char_id, style_text in styles_data.items():
+            label = QtWidgets.QLabel(f"<b>{char_id}</b>")
+            label.setToolTip(f"캐릭터 ID: {char_id}")
+
+            # [요청] 한 줄 입력창(QLineEdit) 사용
+            edit = QtWidgets.QLineEdit(style_text)
+            edit.setFont(font)
+            edit.setToolTip(f"ID: {char_id}\n스타일: {style_text}")
+            edit.setMinimumWidth(600)  # 긴 텍스트를 볼 수 있도록 최소 너비 확보
+
+            layout.addRow(label, edit)
+            self.style_widget_map[char_id] = edit
+
+        return group
+
     def on_ai_request(self):
         """
         [수정됨 v9] 'AI 요청' 버튼 핸들러.
@@ -838,19 +879,30 @@ class ScenePromptEditDialog(QtWidgets.QDialog):
     def load_and_build_ui(self):
         """
         [수정됨 v17] '이미지 삭제' 버튼 추가 및 VBox/텍스트 에디터 높이 조절
+        [수정됨 v18] (사용자 요청 반영)
+        1. 상단에 "전체 캐릭터 스타일" 편집기(_build_character_styles_group) 삽입
+        2. 씬 라벨(가사/캐릭터/시간)을 '...' 없이 한 줄로 길게 표시 (setWordWrap(False))
+        3. direct_prompt 텍스트 상자 최소 높이를 150px로 축소
         """
-
         try:
             data = load_json(self.json_path, None)
             if not isinstance(data, dict):
                 raise ValueError("video.json 파일의 형식이 올바르지 않습니다.")
 
+            # [수정] 데이터를 먼저 self에 저장
             self.full_video_data = data
             self.scenes_data = self.full_video_data.get("scenes", [])
 
             if not isinstance(self.scenes_data, list):
                 raise ValueError("video.json에 'scenes' 키가 없거나 리스트가 아닙니다.")
 
+            # [신규] 캐릭터 스타일 그룹 빌드 및 메인 레이아웃 상단에 삽입
+            self.character_styles_group = self._build_character_styles_group()
+            main_layout = self.layout()  # __init__에서 생성된 QVBoxLayout
+            if main_layout and hasattr(main_layout, "insertWidget"):
+                main_layout.insertWidget(0, self.character_styles_group)
+
+            # --- 기존 UI 빌드 로직 (수정됨) ---
             font = QtGui.QFont()
             font.setFamily("Courier" if "Courier" in QtGui.QFontDatabase().families() else "Monospace")
             font.setPointSize(10)
@@ -870,8 +922,6 @@ class ScenePromptEditDialog(QtWidgets.QDialog):
                 form_layout_page = QtWidgets.QFormLayout(scroll_content_widget)
                 form_layout_page.setRowWrapPolicy(QtWidgets.QFormLayout.RowWrapPolicy.WrapAllRows)
                 form_layout_page.setLabelAlignment(Qt.AlignmentFlag.AlignRight)
-
-                # [기존] 씬(Row) 간의 상하 여백(verticalSpacing)을 줄입니다
                 form_layout_page.setVerticalSpacing(8)
 
                 page_scroll_area.setWidget(scroll_content_widget)
@@ -882,11 +932,10 @@ class ScenePromptEditDialog(QtWidgets.QDialog):
                 for scene in chunk:
                     if not isinstance(scene, dict): continue
 
-                    # --- [기존] Request 1: 라벨 정보 수집 ---
+                    # --- [수정] Request 1: 씬 라벨 정보 (한 줄로 길게) ---
                     scene_id = scene.get("id", "ID_없음")
                     lyric = (scene.get("lyric") or "").strip()
-                    if len(lyric) > 20:
-                        lyric = lyric[:20] + "..."
+                    # (제거) if len(lyric) > 20: ...
 
                     start_f = scene.get("start", 0.0)
                     end_f = scene.get("end", 0.0)
@@ -894,14 +943,21 @@ class ScenePromptEditDialog(QtWidgets.QDialog):
                     if duration_f == 0.0 and end_f > start_f:
                         duration_f = end_f - start_f
 
+                    # [신규] 캐릭터 정보 추가
+                    chars_list = scene.get("characters", [])
+                    chars_str = ", ".join(chars_list) if chars_list else "없음"
+
+                    # [수정] 한 줄로 표시 (줄바꿈 <br> 제거)
                     label_text = (
-                        f"<b>{scene_id}</b> : [{lyric or '가사 없음'}]<br>"
-                        f"시간 : [{start_f:.2f} ~ {end_f:.2f}, ({duration_f:.2f}s)]"
+                        f"<b>{scene_id}</b> [{lyric or '가사 없음'}] | "
+                        f"<b>캐릭터:</b> [{chars_str}] | "
+                        f"<b>시간:</b> [{start_f:.2f} ~ {end_f:.2f}, ({duration_f:.2f}s)]"
                     )
                     label = QtWidgets.QLabel(label_text)
-                    label.setWordWrap(True)
+                    label.setWordWrap(False)  # [수정] True -> False (가로 스크롤 허용)
+                    # --- [수정] 씬 라벨 끝 ---
 
-                    # --- [수정] Request 2: UI 레이아웃 변경 ---
+                    # --- [수정] Request 2: UI 레이아웃 (기존과 동일) ---
                     row_container = QtWidgets.QWidget()
                     row_layout = QtWidgets.QHBoxLayout(row_container)
                     row_layout.setContentsMargins(0, 0, 0, 0)
@@ -936,14 +992,15 @@ class ScenePromptEditDialog(QtWidgets.QDialog):
                     text_edit = QtWidgets.QTextEdit()
                     text_edit.setPlainText(scene.get("direct_prompt", ""))
                     text_edit.setFont(font)
-                    text_edit.setMinimumHeight(246)
+                    # [수정] 최소 높이 246 -> 150
+                    text_edit.setMinimumHeight(150)
                     text_edit.setToolTip(f"Scene ID: {scene_id}\n이 씬의 direct_prompt를 입력하세요.")
                     text_edit.setSizePolicy(QtWidgets.QSizePolicy.Policy.Expanding,
                                             QtWidgets.QSizePolicy.Policy.Preferred)
 
                     row_layout.addWidget(text_edit)
 
-                    # --- [수정] Request 2: 이미지 상태 설정 ---
+                    # --- 이미지 상태 설정 (기존과 동일) ---
                     img_file_str = scene.get("img_file", "")
                     img_path = Path(img_file_str) if img_file_str else None
                     has_image = img_path and img_path.exists()
@@ -975,19 +1032,19 @@ class ScenePromptEditDialog(QtWidgets.QDialog):
                         upload_button.setText("업로드")
                         delete_image_button.setEnabled(False)
 
-                    # 업로드 버튼 시그널 연결
+                    # 업로드 버튼 시그널 연결 (기존과 동일)
                     upload_button.clicked.connect(
                         functools.partial(self.on_upload_image, scene_id, img_preview_label, upload_button,
                                           delete_image_button, scene)
                     )
 
-                    # 이미지 삭제 버튼 시그널 연결
+                    # 이미지 삭제 버튼 시그널 연결 (기존과 동일)
                     delete_image_button.clicked.connect(
                         functools.partial(self.on_delete_image, img_path if img_path else Path(), img_preview_label,
                                           upload_button, delete_image_button, scene)
                     )
 
-                    # --- [기존] 영상삭제 버튼 상태 설정 ---
+                    # 영상삭제 버튼 상태 설정 (기존과 동일)
                     clips_dir = self.json_path.parent / "clips"
                     video_file_path = clips_dir / f"{scene_id}.mp4"
                     video_exists = video_file_path.exists()
@@ -998,7 +1055,7 @@ class ScenePromptEditDialog(QtWidgets.QDialog):
                     else:
                         delete_video_button.setToolTip(f"영상 파일 없음:\n{video_file_path}")
 
-                    # 삭제 핸들러 연결
+                    # 삭제 핸들러 연결 (기존과 동일)
                     delete_video_button.clicked.connect(
                         functools.partial(self.on_delete_video, video_file_path, delete_video_button)
                     )
@@ -1012,6 +1069,7 @@ class ScenePromptEditDialog(QtWidgets.QDialog):
             self.update_page_ui()
 
         except Exception as e_load_ui:
+            # (예외 처리 기존과 동일)
             error_label = QtWidgets.QLabel(f"파일 로드 또는 UI 빌드 중 오류 발생:\n{e_load_ui}")
             error_label.setWordWrap(True)
             error_page = QtWidgets.QWidget()
@@ -1045,12 +1103,29 @@ class ScenePromptEditDialog(QtWidgets.QDialog):
         """
         [수정됨 v10] '업데이트' 버튼 클릭 시 'direct_prompt'만 저장합니다.
         [요청] 완료 후 창을 닫지 않습니다.
+        [수정됨 v18] (사용자 요청 반영)
+        1. 'direct_prompt' (씬별) 저장
+        2. 'character_styles' (전체) 저장
         """
         try:
+            # 1. [신규] 캐릭터 스타일 업데이트
+            updated_styles_count = 0
+            if hasattr(self, "style_widget_map") and self.style_widget_map:
+                updated_styles = {}
+                # QLineEdit 위젯 맵에서 최신 텍스트를 읽어옴
+                for char_id, edit_widget in self.style_widget_map.items():
+                    updated_styles[char_id] = edit_widget.text().strip()
+
+                # self.full_video_data에 덮어쓰기
+                if self.full_video_data.get("character_styles") != updated_styles:
+                    self.full_video_data["character_styles"] = updated_styles
+                    updated_styles_count = len(updated_styles)
+
+            # 2. [기존] 씬별 'direct_prompt' 업데이트
             scene_map = {scene.get("id"): scene for scene in self.scenes_data if
                          isinstance(scene, dict) and "id" in scene}
 
-            updated_count = 0
+            updated_prompts_count = 0
             for scene_id, text_edit in self.widget_map:
                 if scene_id in scene_map:
                     new_prompt = text_edit.toPlainText().strip()
@@ -1058,14 +1133,17 @@ class ScenePromptEditDialog(QtWidgets.QDialog):
 
                     if scene.get("direct_prompt", "") != new_prompt:
                         scene["direct_prompt"] = new_prompt
-                        updated_count += 1
+                        updated_prompts_count += 1
 
+            # 3. [기존] 파일 저장 (수정된 full_video_data 통째로)
             self.full_video_data["scenes"] = self.scenes_data
             save_json(self.json_path, self.full_video_data)
 
+            # 4. 완료 메시지 (수정됨)
             QtWidgets.QMessageBox.information(self, "업데이트 완료",
-                                              f"{len(self.widget_map)}개 씬 중 {updated_count}개의 'direct_prompt'가 업데이트되었습니다.\n\n"
-                                              f"파일: {self.json_path}")
+                                              f"파일에 저장되었습니다: {self.json_path.name}\n\n"
+                                              f"- 캐릭터 스타일 {updated_styles_count}개 항목 업데이트됨\n"
+                                              f"- 씬 'direct_prompt' {updated_prompts_count}개 항목 업데이트됨")
 
         except Exception as e_update:
             QtWidgets.QMessageBox.critical(self, "저장 오류",
