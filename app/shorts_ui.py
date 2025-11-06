@@ -3115,84 +3115,87 @@ class MainWindow(QtWidgets.QMainWindow):
                 return
 
             # seg 원문 가사 재주입 함수 (내부 함수로 정의)
-            def _reinject_lyrics_from_seg(target_json_path: Path, seg_file_path: Path,
+            def _reinject_lyrics_from_seg(target_json_path: Path, source_story_path: Path,
                                           log_fn: Callable[[str], None]) -> None:
-                try:
-                    target_doc = load_json(target_json_path, None)
-                    if not isinstance(target_doc, dict):
-                        log_fn("[WARN] 가사 재주입 실패: 대상 JSON 형식이 dict가 아닙니다.")
-                        return
+                    """
+                    [수정됨]
+                    - 원본 seg.json 대신, 1단계에서 생성된 story.json (source_story_path)을 읽는다.
+                    - 'start' 시간 대신 'id'를 키로 매칭하여 가사를 재주입한다.
+                    """
+                    try:
+                        target_doc = load_json(target_json_path, None)
+                        if not isinstance(target_doc, dict):
+                            log_fn("[WARN] 가사 재주입 실패: 대상 JSON(video.json) 형식이 dict가 아닙니다.")
+                            return
 
-                    seg_data_raw = load_json(seg_file_path, None)
-                    seg_data: List[Dict[str, Any]]
-                    if not isinstance(seg_data_raw, list):
-                        log_fn("[WARN] 가사 재주입 실패: seg.json 형식이 리스트가 아닙니다.")
-                        seg_data = []
-                    else:
-                        seg_data = seg_data_raw
+                        source_doc = load_json(source_story_path, None)
+                        if not isinstance(source_doc, dict):
+                            log_fn(f"[WARN] 가사 재주입 실패: 원본 JSON(story.json) 형식이 dict가 아닙니다. 경로: {source_story_path}")
+                            return
 
-                    scenes_raw = target_doc.get("scenes")
-                    if not isinstance(scenes_raw, list):
-                        log_fn("[WARN] 가사 재주입 실패: 대상 JSON에 'scenes' 리스트가 없습니다.")
-                        return
-                    scenes: List[Dict[str, Any]] = scenes_raw
+                        scenes_raw = target_doc.get("scenes")
+                        if not isinstance(scenes_raw, list):
+                            log_fn("[WARN] 가사 재주입 실패: 대상 JSON(video.json)에 'scenes' 리스트가 없습니다.")
+                            return
+                        scenes: List[Dict[str, Any]] = scenes_raw
 
-                    seg_map: Dict[str, str] = {}
-                    for seg_item in seg_data:
-                        if isinstance(seg_item, dict) and "start" in seg_item:
+                        # --- ▼▼▼ [핵심 수정] ▼▼▼ ---
+                        # 'start' 시간 대신 'id'를 키로 하는 가사 맵 생성 (story.json 기준)
+                        source_scenes = source_doc.get("scenes", [])
+                        if not isinstance(source_scenes, list):
+                            log_fn(f"[WARN] 원본 JSON(story.json)에 'scenes' 리스트가 없습니다.")
+                            return
+
+                        lyric_map: Dict[str, str] = {}
+                        for src_scene in source_scenes:
+                            if isinstance(src_scene, dict):
+                                scene_id_key = str(src_scene.get("id", "")).strip()
+                                # [주의] story.json의 lyric을 사용 (사용자 의도)
+                                text_val = str(src_scene.get("lyric", "")).strip()
+                                if scene_id_key and text_val:
+                                    lyric_map[scene_id_key] = text_val
+                        # --- ▲▲▲ [핵심 수정] ▲▲▲ ---
+
+                        reinjected_count = 0
+                        cleared_gap_count = 0
+
+                        for sc_item in scenes:
+                            if not isinstance(sc_item, dict):
+                                continue
+                            sc_id_str = str(sc_item.get("id") or "")
+                            sc_origin_str = str(sc_item.get("origin") or "")
+                            is_gap_scene = sc_id_str.startswith("gap_") or sc_origin_str == "gap-fill"
+
+                            if is_gap_scene:
+                                if sc_item.get("lyric"):
+                                    sc_item["lyric"] = ""
+                                    cleared_gap_count += 1
+                                continue
+
+                            # --- ▼▼▼ [핵심 수정] ▼▼▼ ---
+                            # 'start' 시간(sc_key) 대신 'id'(sc_id_str)로 맵에서 검색
+                            if sc_id_str in lyric_map:
+                                original_text = lyric_map[sc_id_str]
+                                if original_text and sc_item.get("lyric", "") != original_text:
+                                    sc_item["lyric"] = original_text
+                                    reinjected_count += 1
+                            # --- ▲▲▲ [핵심 수정] ▲▲▲ ---
+
+                        if reinjected_count > 0 or cleared_gap_count > 0:
+                            target_doc["scenes"] = scenes
                             try:
-                                start_val = float(seg_item.get("start", 0.0))
-                            except (TypeError, ValueError):
-                                start_val = 0.0
-                            start_key = f"{start_val:.3f}"
-                            text_val = str(seg_item.get("text", "")).strip()
-                            if text_val:
-                                seg_map[start_key] = text_val
+                                save_json(target_json_path, target_doc)
+                                log_fn(
+                                    f"[INFO] 가사 재주입 완료 (ID 매칭): 정상 씬 복원 {reinjected_count}개, 갭 씬 정리 {cleared_gap_count}개")
+                            except (OSError, TypeError) as e_save_reinject:
+                                log_fn(f"[ERROR] 가사 재주입 저장 오류: {type(e_save_reinject).__name__}: {e_save_reinject}")
                         else:
-                            log_fn("[WARN] seg.json 내 항목 형식이 잘못되었습니다 (dict 아니거나 'start' 없음).")
+                            log_fn("[INFO] 가사 재주입 (ID 매칭): 변경 없음")
 
-                    reinjected_count = 0
-                    cleared_gap_count = 0
-
-                    for sc_item in scenes:
-                        if not isinstance(sc_item, dict):
-                            continue
-                        sc_id_str = str(sc_item.get("id") or "")
-                        sc_origin_str = str(sc_item.get("origin") or "")
-                        is_gap_scene = sc_id_str.startswith("gap_") or sc_origin_str == "gap-fill"
-
-                        if is_gap_scene:
-                            if sc_item.get("lyric"):
-                                sc_item["lyric"] = ""
-                                cleared_gap_count += 1
-                            continue
-
-                        try:
-                            sc_start_val = float(sc_item.get("start", 0.0))
-                        except (TypeError, ValueError):
-                            sc_start_val = 0.0
-                        sc_key = f"{sc_start_val:.3f}"
-
-                        if sc_key in seg_map:
-                            original_text = seg_map[sc_key]
-                            if original_text and sc_item.get("lyric", "") != original_text:
-                                sc_item["lyric"] = original_text
-                                reinjected_count += 1
-
-                    if reinjected_count > 0 or cleared_gap_count > 0:
-                        target_doc["scenes"] = scenes
-                        try:
-                            save_json(target_json_path, target_doc)
-                            log_fn(f"[INFO] 가사 재주입 완료: 정상 씬 복원 {reinjected_count}개, 갭 씬 정리 {cleared_gap_count}개")
-                        except (OSError, TypeError) as e_save_reinject:
-                            log_fn(f"[ERROR] 가사 재주입 저장 오류: {type(e_save_reinject).__name__}: {e_save_reinject}")
-                    else:
-                        log_fn("[INFO] 가사 재주입: 변경 없음")
-
-                except (FileNotFoundError, json.JSONDecodeError, OSError, TypeError, ValueError) as e_reinject:
-                    log_fn(f"[ERROR] 가사 재주입 오류: {type(e_reinject).__name__}: {e_reinject}")
-                except Exception as e_unknown_reinject:
-                    log_fn(f"[ERROR] 가사 재주입 중 예상치 못한 오류: {type(e_unknown_reinject).__name__}: {e_unknown_reinject}")
+                    except (FileNotFoundError, json.JSONDecodeError, OSError, TypeError, ValueError) as e_reinject:
+                        log_fn(f"[ERROR] 가사 재주입 오류: {type(e_reinject).__name__}: {e_reinject}")
+                    except Exception as e_unknown_reinject:
+                        log_fn(f"[ERROR] 가사 재주입 중 예상치 못한 오류: {type(e_unknown_reinject).__name__}: {e_unknown_reinject}")
 
             # ----- job 함수 정의 -----
             def job(on_progress_callback: Callable[[dict], None]) -> Dict[str, str]:
@@ -3467,7 +3470,7 @@ class MainWindow(QtWidgets.QMainWindow):
 
                     prefer_final = prefer or prefer_detected_provider or getattr(ai_client_instance, "default_prefer",
                                                                                  "openai")
-                    allow_fallback_final = True if allow_fallback is None else bool(allow_fallback)
+                    allow_fallback_final = False if allow_fallback is None else bool(allow_fallback)
 
                     ask_smart = getattr(ai_client_instance, "ask_smart", None)
                     if not callable(ask_smart):
@@ -3612,10 +3615,12 @@ class MainWindow(QtWidgets.QMainWindow):
                     _log_progress("[WARN] video.json 경로가 없어 프롬프트 주입 생략")
 
                 if video_path_str and Path(video_path_str).is_file():
-                    _log_progress("[5/5] video.json 가사 재주입...")
+                    _log_progress("[5/5] video.json 가사 재주입 (ID 매칭)...")
                     try:
-                        _reinject_lyrics_from_seg(Path(video_path_str), seg_json_path, _log_progress)
-                        on_progress_callback({"stage": "lyric_reinject_done_video", "msg": "video.json 가사 재주입 시도 완료"})
+                        # [수정] seg_json_path 대신 story_path (뼈대)를 원본으로 사용
+                        _reinject_lyrics_from_seg(Path(video_path_str), story_path, _log_progress)
+                        on_progress_callback(
+                            {"stage": "lyric_reinject_done_video", "msg": "video.json 가사 재주입 시도 완료 (ID 매칭)"})
                     except (FileNotFoundError, OSError, TypeError, ValueError) as e_reinject_call:
                         _log_progress(
                             f"[ERROR] video.json 가사 재주입 오류: {type(e_reinject_call).__name__}: {e_reinject_call}")

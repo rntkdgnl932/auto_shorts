@@ -38,44 +38,44 @@ def _equal_chunks_by_words(text: str, n: int) -> List[str]:
     return out
 
 
-def _merge_global_context(S: dict, g: dict) -> None:
+def _merge_global_context(s: dict, g: dict) -> None:
     """AI가 준 전역 컨텍스트를 story에 병합한다."""
     if not isinstance(g, dict):
         g = {}
 
     # 기본값 준비
-    S.setdefault("global_context", {})
-    GC = S["global_context"]
+    s.setdefault("global_context", {})
+    gc = s["global_context"]
 
     # 1) 요약
     if g.get("global_summary"):
-        GC["global_summary"] = str(g["global_summary"]).strip()
+        gc["global_summary"] = str(g["global_summary"]).strip()
 
     # 2) themes
     th = g.get("themes") or []
     if isinstance(th, str):
         th = [x.strip() for x in re.split(r"[,|/]+", th) if x.strip()]
-    GC["themes"] = th
+    gc["themes"] = th
 
     # 3) palette / style_guide / negative_bank / section_moods / effect
     if g.get("palette"):
-        GC["palette"] = str(g["palette"]).strip()
+        gc["palette"] = str(g["palette"]).strip()
 
     # style_guide: 고정 문구 + AI 추가
     base_sg = "실사, 일관된 헤어/의상/분위기, 자연스러운 조명"
     extra_sg = str(g.get("style_guide") or "").strip()
-    GC["style_guide"] = base_sg if not extra_sg else f"{base_sg}, {extra_sg}"
+    gc["style_guide"] = base_sg if not extra_sg else f"{base_sg}, {extra_sg}"
 
     base_neg = "손가락 왜곡, 눈 왜곡, 과도한 보정, 노이즈, 흐릿함, 텍스트 워터마크"
     extra_neg = str(g.get("negative_bank") or "").strip()
-    GC["negative_bank"] = base_neg if not extra_neg else f"{base_neg}, {extra_neg}"
+    gc["negative_bank"] = base_neg if not extra_neg else f"{base_neg}, {extra_neg}"
 
     # section_moods: 기본 문구 + AI 추가
     def _sm(name: str, base: str) -> str:
         add = str((g.get("section_moods") or {}).get(name, "")).strip()
         return base if not add else f"{base}/{add}"
 
-    GC["section_moods"] = {
+    gc["section_moods"] = {
         "intro":  _sm("intro",  "도입/암시/미니멀"),
         "verse":  _sm("verse",  "잔잔함/근접/친밀감"),
         "chorus": _sm("chorus", "개방감/광각/확장"),
@@ -87,17 +87,17 @@ def _merge_global_context(S: dict, g: dict) -> None:
     eff = g.get("effect") or []
     if isinstance(eff, str):
         eff = [x.strip() for x in re.split(r"[,|/]+", eff) if x.strip()]
-    GC["effect"] = eff
+    gc["effect"] = eff
 
     # 4) defaults.image (렌더 W/H 반영 + negative="@global")
-    S.setdefault("defaults", {})
-    S["defaults"].setdefault("image", {})
-    di = S["defaults"]["image"]
+    s.setdefault("defaults", {})
+    s["defaults"].setdefault("image", {})
+    di = s["defaults"]["image"]
     # 기존 값 우선, 없으면 g의 width/height 사용
-    W = int(di.get("width") or g.get("image_width") or 832)
-    H = int(di.get("height") or g.get("image_height") or 1472)
-    di["width"] = W
-    di["height"] = H
+    width = int(di.get("width") or g.get("image_width") or 832)
+    height = int(di.get("height") or g.get("image_height") or 1472)
+    di["width"] = width
+    di["height"] = height
     di["negative"] = "@global"
 
 def _fallback_scene_bg(section: str, themes: list[str]) -> str:
@@ -160,12 +160,12 @@ def _equal_chunks_by_chars(text: str, n: int) -> List[str]:
         return []
     if not text:
         return [''] * n
-    L = len(text)
-    step = max(1, L // n)
+    lan = len(text)
+    step = max(1, lan // n)
     out = []
     i = 0
     for k in range(n - 1):
-        j = min(L, i + step)
+        j = min(lan, i + step)
         # 경계 보정: 공백/구두점에서 끊기 시도
         m = re.search(r'[\s,.!?…]+', text[j:j+12])
         if m:
@@ -175,7 +175,9 @@ def _equal_chunks_by_chars(text: str, n: int) -> List[str]:
     out.append(text[i:].strip())
     return out
 
-def _segment_lyrics_for_scenes(record: dict, audio_info: dict=None, ai=None, lang='ko'):
+
+
+def _segment_lyrics_for_scenes(record: dict, audio_info: dict = None, ai=None, lang: str = "ko"):
     """
     record: story.json dict
     audio_info = {"duration": float, "onsets": [초, ...]}  # onsets는 있어도 되고 없어도 됨
@@ -183,79 +185,116 @@ def _segment_lyrics_for_scenes(record: dict, audio_info: dict=None, ai=None, lan
       - record["lyrics_sections"] = [{id, start, end, text}...]
       - record["scenes"][i]["lyric"] = 해당 구간과 겹치는 첫 가사 또는 ""
     """
-    ######
-    rec = deepcopy(record)
-    # 1) 한 줄 가사 확보
-    lyrics_text = " ".join((rec.get("lyrics") or "").split())
+    from copy import deepcopy
+    import re
 
-    # 2) 의미 단위(하드코딩 문구 금지, AI 호출)
-    units = split_lyrics_into_semantic_units(lyrics_text, ai=ai)
-    if not units:
-        rec["lyrics_sections"] = []
-        return rec
-    print(f"[debug] split_lyrics_into_semantic_units -> {units}")
+    # 원본 보존용 복사
+    record_local = deepcopy(record)
+
+    # 원래 가사 줄바꿈 보존
+    lyrics_text_local = (record_local.get("lyrics") or "").strip()
+
+    # 의미 단위로 분리 (이 함수는 외부에 있다고 가정)
+    units_data_local = split_lyrics_into_semantic_units(lyrics_text_local, ai=ai)
+    if not units_data_local:
+        record_local["lyrics_sections"] = []
+        return record_local
+
+    # 여기서 dict → str 리스트로 정규화해서 이후 로직이 항상 list[str]을 보게 한다
+    units_text_list: list[str] = []
+    if isinstance(units_data_local, list):
+        # case 1: 새 포맷 - dict 안에 text가 있는 경우
+        if all(isinstance(u_item, dict) for u_item in units_data_local):
+            for unit_item in units_data_local:
+                unit_text = str(unit_item.get("text", "") or "")
+                units_text_list.append(unit_text)
+        # case 2: 예전 포맷 - 애초에 문자열 리스트로 오는 경우
+        elif all(isinstance(u_item, str) for u_item in units_data_local):
+            units_text_list = [str(u_item) for u_item in units_data_local]
+        else:
+            # 이상한 포맷이면 빈 결과 반환(기존 동작과 동일한 방어)
+            record_local["lyrics_sections"] = []
+            return record_local
+    else:
+        record_local["lyrics_sections"] = []
+        return record_local
+
+    # 여기까지 오면 units_text_list는 무조건 list[str]
     # 3) 시간 범위
-    total_offset = float(rec.get("offset", 0.0))
-    total_duration = float(rec.get("duration", 0.0))
-    total_start = total_offset
-    total_end = total_offset + total_duration
+    total_offset_val = float(record_local.get("offset", 0.0))
+    total_duration_val = float(record_local.get("duration", 0.0))
+    total_start_val = total_offset_val
+    total_end_val = total_offset_val + total_duration_val
 
-    # 4) 오디오 정보(있으면 교정)
+    # 4) 오디오 정보 있으면 duration 보정
     if audio_info:
-        dur = float(audio_info.get("duration") or 0)
-        if dur > 0 and abs(dur - total_duration) > 0.25:
-            total_end = total_start + dur
-            rec["duration"] = round(dur, 3)
+        audio_duration_val = float(audio_info.get("duration") or 0.0)
+        if audio_duration_val > 0.0 and abs(audio_duration_val - total_duration_val) > 0.25:
+            total_end_val = total_start_val + audio_duration_val
+            record_local["duration"] = round(audio_duration_val, 3)
 
-    # 5) 가중치(한글 음절 수)로 시간 분배 (온셋 있으면 온셋 우선)
-    def _syllable_w(t):
-        ks = re.findall(r"[가-힣]", t or "")
-        return len(ks) if ks else max(1, len((t or "").replace(" ", "")))
+    # 5) 한글 음절 수 기반 가중치
+    def _syllable_w(text_input_local: str) -> int:
+        korean_chars = re.findall(r"[가-힣]", text_input_local or "")
+        if korean_chars:
+            return len(korean_chars)
+        # 한글이 없을 때는 공백 제거한 길이로라도 1 이상 주기
+        no_space_len = len((text_input_local or "").replace(" ", ""))
+        return no_space_len if no_space_len > 0 else 1
 
-    weights = [_syllable_w(t) for t in units]
-    s = sum(weights)
-    if s <= 0: weights = [1]*len(units); s = len(units)
-    ratios = [w/s for w in weights]
+    weight_list = [_syllable_w(text_item) for text_item in units_text_list]
+    weight_sum = sum(weight_list)
+    if weight_sum <= 0:
+        weight_list = [1] * len(units_text_list)
+        weight_sum = len(units_text_list)
+    ratio_list = [weight_val / weight_sum for weight_val in weight_list]
 
-    # 온셋 보정(선택): audio_info.get("onsets")
-    boundaries = [total_start]
-    acc = total_start
-    for r in ratios:
-        acc += (total_end-total_start)*r
-        boundaries.append(acc)
-    boundaries[-1] = total_end
-    # (온셋 기반 스냅은 필요하면 여기서 보정 가능)
+    # 6) 구간 경계 만들기
+    boundaries_list = [total_start_val]
+    acc_val = total_start_val
+    for ratio_val in ratio_list:
+        acc_val += (total_end_val - total_start_val) * ratio_val
+        boundaries_list.append(acc_val)
+    # 마지막 값은 총 길이에 스냅
+    boundaries_list[-1] = total_end_val
 
-    # 6) lyrics_sections 생성
-    new_lyrics = []
-    for i, text in enumerate(units):
-        s0, s1 = boundaries[i], boundaries[i+1]
-        new_lyrics.append({
-            "id": f"L{i+1:02d}",
-            "start": round(s0, 3),
-            "end": round(s1, 3),
-            "text": text
-        })
-    rec["lyrics_sections"] = new_lyrics
+    # 7) lyrics_sections 생성
+    new_lyrics_list: list[dict] = []
+    for idx, text_item in enumerate(units_text_list):
+        seg_start_val = boundaries_list[idx]
+        seg_end_val = boundaries_list[idx + 1]
+        new_lyrics_list.append(
+            {
+                "id": f"L{idx + 1:02d}",
+                "start": round(seg_start_val, 3),
+                "end": round(seg_end_val, 3),
+                "text": text_item,
+            }
+        )
+    record_local["lyrics_sections"] = new_lyrics_list
 
-    # 7) 씬에 1:1 매핑(겹치는 첫 가사 텍스트를 lyric에 기입)
-    scenes = rec.get("scenes", [])
-    j = 0
-    for sc in scenes:
-        s0, s1 = float(sc.get("start", 0)), float(sc.get("end", 0))
-        chosen = ""
-        while j < len(new_lyrics) and new_lyrics[j]["end"] <= s0:
-            j += 1
-        if j < len(new_lyrics):
-            l0, l1 = new_lyrics[j]["start"], new_lyrics[j]["end"]
-            if not (l1 <= s0 or l0 >= s1):
-                chosen = new_lyrics[j]["text"]
-        sc["lyric"] = chosen
-    rec["scenes"] = scenes
-    return rec
+    # 8) 씬에 첫 번째로 겹치는 가사 꽂아주기
+    scenes_list_local = record_local.get("scenes", [])
+    lyric_index = 0
+    for scene_item_local in scenes_list_local:
+        scene_start_val = float(scene_item_local.get("start", 0.0))
+        scene_end_val = float(scene_item_local.get("end", 0.0))
+        chosen_text = ""
+        # lyrics가 씬 시작 이전에 끝난 건 건너뛰기
+        while lyric_index < len(new_lyrics_list) and new_lyrics_list[lyric_index]["end"] <= scene_start_val:
+            lyric_index += 1
+        if lyric_index < len(new_lyrics_list):
+            lyr_start_val = new_lyrics_list[lyric_index]["start"]
+            lyr_end_val = new_lyrics_list[lyric_index]["end"]
+            # 겹치는지 확인
+            if not (lyr_end_val <= scene_start_val or lyr_start_val >= scene_end_val):
+                chosen_text = new_lyrics_list[lyric_index]["text"]
+        scene_item_local["lyric"] = chosen_text
+
+    record_local["scenes"] = scenes_list_local
+    return record_local
 
 
-# story_enrich.py 파일의 _enforce_character_style_rules 함수 전체를 교체하세요.
 
 def _enforce_character_style_rules(styles: Dict[str, str]) -> Dict[str, str]:
     """[수정됨] 여성: 'huge breasts, slim legs'를 UI 체크 시(환경변수) 강제 포함."""
@@ -434,7 +473,7 @@ def apply_gpt_to_story_v11(
     payload_scenes: List[dict] = []
 
     # [기존] ReActor 탐지 순서(왼쪽->오른쪽)에 맞춘 위치 맵
-    POSITION_MAP = {
+    position_map = {
         0: "왼쪽",
         1: "오른쪽",
         2: "가운데",
@@ -471,7 +510,7 @@ def apply_gpt_to_story_v11(
             pos_descs_list = []
             for i, char_id_loop in enumerate(original_char_ids):
                 indexed_chars_for_ai.append(f"{char_id_loop}:{i}")
-                pos_name_str = POSITION_MAP.get(i, f"{i}번 위치")
+                pos_name_str = position_map.get(i, f"{i}번 위치")
                 pos_descs_list.append(f"{pos_name_str}에 {char_id_loop}")
 
             # [수정] 힌트에 바로 주입하지 않고, pos_prompt 변수에 저장
@@ -620,8 +659,8 @@ def apply_gpt_to_story_v11(
 
     prompts_from_ai = {d["id"]: d for d in (ai_data.get("prompts") or []) if isinstance(d, dict) and d.get("id")}
 
-    QUALITY_TAGS = "photorealistic, cinematic lighting, high detail, 8k, masterpiece"
-    DEFAULT_NEGATIVE_TAGS = "lowres, bad anatomy, bad proportions, extra limbs, extra fingers, missing fingers, jpeg artifacts, signature, logo, nsfw, text, letters, typography, watermark"
+    quality_tags = "photorealistic, cinematic lighting, high detail, 8k, masterpiece"
+    default_negative_tags = "lowres, bad anatomy, bad proportions, extra limbs, extra fingers, missing fingers, jpeg artifacts, signature, logo, nsfw, text, letters, typography, watermark"
 
     # 각 씬 순회하며 최종 프롬프트 조합
     for scene_obj in scenes:
@@ -653,7 +692,7 @@ def apply_gpt_to_story_v11(
             prompt_img_base_from_ai,  # AI 제안 핵심 태그
             char_tags_final_list,  # 캐릭터 태그 (영어)
             current_scene_effects_list,  # 효과 태그
-            QUALITY_TAGS  # 품질 태그
+            quality_tags  # 품질 태그
         )
 
         # 4. 최종 prompt_movie: 이미지 프롬프트 + AI 제안 모션 힌트
@@ -665,7 +704,7 @@ def apply_gpt_to_story_v11(
         # 5. 최종 prompt_negative
         global_ctx_data = story_data.get("global_context", {})  # 변수명 변경
         final_prompt_negative_str = _combine_unique_tags(global_ctx_data.get("negative_bank", ""),
-                                                         DEFAULT_NEGATIVE_TAGS)  # 변수명 변경
+                                                         default_negative_tags)  # 변수명 변경
 
         # 6. scene 객체에 최종 결과 저장
         scene_obj["prompt"] = prompt_ko_from_ai or scene_obj.get("prompt", "")  # 한국어 설명
