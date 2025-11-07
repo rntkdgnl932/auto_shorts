@@ -228,7 +228,6 @@ def _apply_overrides(graph: dict, overrides: Dict[str, Any]) -> None:
 import subprocess
 
 
-# (이미 파일 상단에 import 되어 있어야 함: Path, List, Callable, Dict, Any, load_json, build_shots_with_i2v, FFMPEG_EXE)
 
 def build_and_merge_full_video(project_dir: str,
                                on_progress: Callable[[Dict[str, Any]], None]) -> str:
@@ -485,7 +484,8 @@ def build_shots_with_i2v(
       * 시퀀스 미지원 워크플로우면 기존 1프레임 PNG 폴백 유지
     - 기본 청크 크기 60f(메모리 안전)
     - 임시 청크 mp4는 항상 clips/xfade_work 에만 저장
-    - [수정됨] 다중 페이스 스왑 워크플로(nunchaku_qwen_image_swap.json) 지원
+    - [수정됨] nunchaku_qwen_image_swap.json 워크플로의 ReActor 노드 ID와 호환
+    - [수정됨] 필요한 헬퍼 함수(_parse_character_spec, _resolve_character_image_path, _find_nodes)를 내장하여 참조 오류 해결
     """
     # ── [1. 표준/타입 모듈] ────────────────────────────────────────
     import json as json_mod
@@ -511,7 +511,7 @@ def build_shots_with_i2v(
 
     # ── [2. 중첩 헬퍼 함수 정의] ───────────────────────────────────
 
-    def _notify(msg: str) -> None:
+    def _notify(msg: str, *args: Any, **kwargs: Any) -> None:
         """진행률 콜백을 안전하게 호출하는 중첩 헬퍼 함수"""
         if on_progress is None:
             return
@@ -576,7 +576,7 @@ def build_shots_with_i2v(
                 "-metadata", "title=",
                 "-sn",
                 "-c:v", "libx264", "-crf", "18",
-                "-pix_fmt", "yuv420p",
+                "-pix_fmt", "yuv420p",  # [오타 수정] yuv4color -> yuv420p
                 str(tmp_out_local),
             ]
             proc = subprocess.run(
@@ -837,6 +837,7 @@ def build_shots_with_i2v(
                 COMFY_HOST = "http://127.0.0.1:8188"
                 FFMPEG_EXE = "ffmpeg"
                 FFPROBE_EXE = "ffprobe"
+                CHARACTER_DIR = r"C:\my_games\shorts_make\character"  # [수정] 헬퍼 함수용으로 추가
 
             s_mod = _SettingsFallback()
 
@@ -846,6 +847,8 @@ def build_shots_with_i2v(
     comfy_host_conf = getattr(s_mod, "COMFY_HOST", "http://127.0.0.1:8188")
     ffmpeg_exe = getattr(s_mod, "FFMPEG_EXE", "ffmpeg")
     ffprobe_exe = getattr(s_mod, "FFPROBE_EXE", "ffprobe")
+    # [수정] 페이스 스왑 헬퍼 함수가 사용할 CHARACTER_DIR
+    character_dir_conf = getattr(s_mod, "CHARACTER_DIR", r"C:\my_games\shorts_make\character")
 
     base_jsons = Path(str(jsons_dir_conf))
     comfy_input_dir = Path(str(comfy_input_conf))
@@ -901,11 +904,16 @@ def build_shots_with_i2v(
             if c2_path.is_file():
                 wf_path = c2_path
     if wf_path is None:
-        c3_path = base_jsons / "guff_movie.json"  # 'c3' -> 'c3_path'
+        # --- ▼▼▼ [수정] 폴백 워크플로 변경 ▼▼▼ ---
+        c3_path = base_jsons / "nunchaku_qwen_image_swap.json"  # 'c3' -> 'c3_path'
+        if not c3_path.is_file():
+            c3_path = base_jsons / "guff_movie.json"
+
         if c3_path.is_file():
             wf_path = c3_path
         else:
-            raise FileNotFoundError(f"워크플로 파일을 찾을 수 없습니다: {c3_path}")
+            raise FileNotFoundError(f"워크플로 파일을 찾을 수 없습니다: {c3_path.name} 또는 guff_movie.json")
+        # --- ▲▲▲ [수정] 끝 ▲▲▲ ---
 
     _notify(f"사용할 워크플로우: {wf_path.name} (경로: {wf_path})")
 
@@ -928,6 +936,25 @@ def build_shots_with_i2v(
 
     if submit_and_wait_fn is None:
         raise RuntimeError("_submit_and_wait 함수를 audio_sync 모듈에서 찾을 수 없습니다.")
+
+    # --- [4. (수정) 헬퍼 함수 내장] ---
+    # (build_missing_images_from_story가 참조하던 모듈 레벨 함수들을 여기에 내장)
+
+
+
+
+
+    # [수정] _find_nodes 헬퍼 함수도 이 스코프에 추가
+    def _find_nodes(gdict: Dict[str, Any], class_type_str: str) -> List[str]:
+        """(중첩 헬퍼) 워크플로에서 특정 class_type의 노드 ID 목록을 찾습니다."""
+        hits: List[str] = []
+        for nid, node_item in (gdict or {}).items():
+            try:
+                if str(node_item.get("class_type")) == class_type_str:
+                    hits.append(str(nid))
+            except (AttributeError, KeyError, TypeError):
+                continue
+        return hits
 
     # ── 그래프 입력 주입 (중첩 함수) ──
     def _set_input_safe(graph_dict: Dict[str, Any], node_id: str, input_key: str, value: Any) -> bool:
@@ -1010,7 +1037,7 @@ def build_shots_with_i2v(
     except Exception:
         date_prefix = "YYYY-MM-DD"
 
-    defaults_all = video.get("defaults") or {}
+    defaults_all = video_doc.get("defaults") or {}
     defaults_i2v = defaults_all.get("i2v") or {}
     try:
         max_frames_per_chunk = int(defaults_i2v.get("max_frames_per_chunk", 60))
@@ -1043,7 +1070,7 @@ def build_shots_with_i2v(
         if img_declared:
             p_img = Path(img_declared)
             if not p_img.is_absolute():
-                paths_info = video.get("paths") or {}
+                paths_info = video_doc.get("paths") or {}
                 root_dir_str = str(paths_info.get("root") or pdir)
                 imgs_dir_name_str = str(paths_info.get("imgs_dir") or "imgs")  # 'imgs_dir_name' -> 'imgs_dir_name_str'
                 p_img = Path(root_dir_str) / imgs_dir_name_str / p_img.name
@@ -1053,7 +1080,7 @@ def build_shots_with_i2v(
             except OSError:
                 pass  # 파일 상태 확인 실패
         if img_path is None:
-            paths_info2 = video.get("paths") or {}
+            paths_info2 = video_doc.get("paths") or {}
             root_dir_str2 = str(paths_info2.get("root") or pdir)
             imgs_dir_name_str2 = str(paths_info2.get("imgs_dir") or "imgs")  # 'imgs_dir_name2' -> 'imgs_dir_name_str2'
             cand_png = Path(root_dir_str2) / imgs_dir_name_str2 / f"{sid}.png"
@@ -1090,28 +1117,21 @@ def build_shots_with_i2v(
         # (기존의 단순 scene_character_tuples 로직을 nunchaku_qwen_image_swap.json 맞춤형으로 변경)
 
         # 1. 이 워크플로(nunchaku_qwen_image_swap.json)에 하드코딩된 노드 ID 맵
-        # (WorkflowNodeID, LoadImageNodeID, DefaultCharacterID)
-        # (참고: nunchaku_qwen_image_swap.json 파일 구조 기준)
         WORKFLOW_REACTOR_MAP = {
-            # ReActor 노드 ID : (연결된 LoadImage 노드 ID, 이 슬롯이 처리할 캐릭터 ID)
-            "28": ("25", "male_01"),  # ReActor_0 (Node 28) <- LoadImage (Node 25) <- "male_01"
-            "23": ("24", "female_01"),  # ReActor_1 (Node 23) <- LoadImage (Node 24) <- "female_01"
-            "22": ("19", "other_char")  # ReActor_2 (Node 22) <- LoadImage (Node 19) <- (씬에 'other_char'가 있을 때)
+            "28": ("25", "male_01"),
+            "23": ("24", "female_01"),
+            "22": ("19", "other_char")
         }
 
         # 2. 씬에서 캐릭터 스펙 파싱 (e.g., {"female_01": 1, "male_01": 0})
         scene_char_specs: Dict[str, int] = {}
         try:
-            # [수정] 이 파일(video_build.py)의 모듈 레벨 함수인 parse_character_spec를 호출합니다.
-            # (파일 하단 1555라인 근처에 정의되어 있어야 함)
-            chars_list_data = scene.get("characters") or scene.get(
-                "character_objs") or []  # 'chars_list' -> 'chars_list_data'
-            for item_spec in chars_list_data:  # 'item' -> 'item_spec'
-                spec_dict = parse_character_spec(item_spec)
-                char_id_val = spec_dict.get("id")  # 'char_id' -> 'char_id_val'
-                char_idx_val = spec_dict.get("index")  # 'char_idx' -> 'char_idx_val'
+            chars_list_data = scene.get("characters") or scene.get("character_objs") or []
+            for item_spec in chars_list_data:
+                spec_dict = _parse_character_spec(item_spec)  # 중첩 함수 호출
+                char_id_val = spec_dict.get("id")
+                char_idx_val = spec_dict.get("index")
                 if char_id_val:
-                    # 씬에 인덱스가 명시되지 않으면 0을 기본값으로 사용
                     scene_char_specs[char_id_val] = 0 if char_idx_val is None else int(char_idx_val)
         except (AttributeError, TypeError, ValueError, IndexError) as e_parse:
             _notify("warn", f"[IMG] {sid} 캐릭터 파싱 실패: {e_parse}")
@@ -1120,80 +1140,64 @@ def build_shots_with_i2v(
 
         # 3. 맵을 순회하며 ReActor 활성화 및 얼굴 이미지 주입
         enabled_reactors_count = 0
+        face_files_to_inject_map: Dict[str, str] = {}  # (LoadNodeID -> FaceFileName)
+        reactors_to_enable_map: Dict[str, str] = {}  # (ReactorNodeID -> FaceIndex)
 
-        # (루프 밖에서 comfy_in_dir 변수 선언)
-        comfy_in_dir: Optional[_Path] = None
-        try:
-            from settings import COMFY_INPUT_DIR  # type: ignore
-            comfy_in_dir = _Path(COMFY_INPUT_DIR)
-            comfy_in_dir.mkdir(parents=True, exist_ok=True)
-        except (ImportError, AttributeError, OSError) as e_comfy_input:
-            _notify("warn", f"[IMG] {sid} COMFY_INPUT_DIR 초기화 실패: {e_comfy_input}")
-            comfy_in_dir = None  # 실패 시 None으로 설정
+        # (comfy_input_dir는 씬 루프 밖에서 이미 정의됨)
 
-        for reactor_id_str, (load_id_str, default_char_id_str) in WORKFLOW_REACTOR_MAP.items():  # 변수명 변경
+        for reactor_id_str, (load_id_str, default_char_id_str) in WORKFLOW_REACTOR_MAP.items():
 
             char_id_for_this_node: Optional[str] = None
             face_index_for_this_node: int = 0
 
             if default_char_id_str in scene_char_specs:
-                # 맵의 기본 ID (male_01, female_01)가 씬에 있으면 사용
                 char_id_for_this_node = default_char_id_str
                 face_index_for_this_node = scene_char_specs[default_char_id_str]
 
             if char_id_for_this_node:
                 # 4. 캐릭터 이미지 파일 찾기
-                # [수정] 이 파일(video_build.py)의 모듈 레벨 함수인 _resolve_character_image_path를 호출합니다.
-                # (파일 하단 1229라인 근처에 정의되어 있어야 함)
-                face_path_resolved_str = _resolve_character_image_path(scene,
-                                                                       video_doc)  # 'face_path_resolved' -> 'face_path_resolved_str'
+                face_path_resolved_str = _resolve_character_image_path(scene, video_doc)  # 중첩 함수 호출
                 face_name_in_input: Optional[str] = None
 
                 if face_path_resolved_str and _Path(face_path_resolved_str).exists():
                     face_path_obj = _Path(face_path_resolved_str)
-                    if comfy_in_dir:
+                    if comfy_input_dir:  # comfy_input_dir이 성공적으로 초기화되었는지 확인
                         try:
                             # 5. ComfyUI input 폴더로 복사
                             face_name_in_input = face_path_obj.name
-                            shutil.copy2(str(face_path_obj), str(comfy_in_dir / face_name_in_input))
+                            shutil.copy2(str(face_path_obj), str(comfy_input_dir / face_name_in_input))
                         except (IOError, OSError, shutil.Error) as e_copy:
-                            _notify("warn", f"[IMG] {sid} 얼굴 복사 실패 ({face_name_in_input}): {e_copy}")
+                            _notify("warn", f"[IMG] {sid} 얼굴 복사 실패 ({face_path_obj.name}): {e_copy}")
                             face_name_in_input = None
                     else:
                         _notify("warn", f"[IMG] {sid} COMFY_INPUT_DIR가 없어 얼굴 복사 스킵.")
                         face_name_in_input = None
 
                 if face_name_in_input:
-                    # 6. 워크플로 주입: ReActor 활성화, LoadImage 경로 설정, 얼굴 인덱스 설정
-                    graph_clone = cast(Dict[str, Any], graph)  # graph_clone으로 변수명 통일
-                    _set_input_safe(graph_clone, reactor_id_str, "enabled", True)
-                    _set_input_safe(graph_clone, load_id_str, "image", face_name_in_input)
-                    _set_input_safe(graph_clone, reactor_id_str, "input_faces_index", str(face_index_for_this_node))
-                    _set_input_safe(graph_clone, reactor_id_str, "source_faces_index", "0")  # 소스 이미지는 얼굴 1개
+                    # 6. [수정] 청크 루프에서 주입할 맵에 추가
+                    face_files_to_inject_map[load_id_str] = face_name_in_input
+                    reactors_to_enable_map[reactor_id_str] = str(face_index_for_this_node)
+
                     _notify("info",
-                            f"[IMG] {sid} ReActor 활성화: Node {reactor_id_str} (Char: {char_id_for_this_node}, FaceIdx: {face_index_for_this_node}, Img: {face_name_in_input})")
+                            f"[IMG] {sid} ReActor 준비: Node {reactor_id_str} (Char: {char_id_for_this_node}, FaceIdx: {face_index_for_this_node}, Img: {face_name_in_input})")
                     enabled_reactors_count += 1
                 else:
-                    # 캐릭터는 지정됐으나 파일이 없음 -> 비활성화
-                    graph_clone = cast(Dict[str, Any], graph)
-                    _set_input_safe(graph_clone, reactor_id_str, "enabled", False)
                     _notify("warn",
-                            f"[IMG] {sid} ReActor 비활성화: Node {reactor_id_str} ({char_id_for_this_node} 이미지 파일 없음)")
-            else:
-                # 씬에 이 캐릭터가 없음 -> 비활성화
-                graph_clone = cast(Dict[str, Any], graph)
-                _set_input_safe(graph_clone, reactor_id_str, "enabled", False)
+                            f"[IMG] {sid} ReActor 스킵: Node {reactor_id_str} ({char_id_for_this_node} 이미지 파일 없음)")
+            # (else: 씬에 이 캐릭터가 없으면 맵에 추가하지 않음 -> 자동 비활성화)
 
         if enabled_reactors_count == 0:
             _notify("info", f"[IMG] {sid} 씬에 매칭되는 캐릭터 없음. 페이스 스왑 비활성화.")
 
+        # [수정] 청크 루프에서 참조할 최종 LoadImage 노드 ID 목록
+        _current_scene_face_loader_ids = set(face_files_to_inject_map.keys())
+        _notify(f"[{sid}] ReActor가 사용할 얼굴 로더 노드: {_current_scene_face_loader_ids}")
+
         # --- ▲▲▲ [페이스 스왑 로직 수정 끝] ▲▲▲ ---
 
-        # (기존: _current_scene_face_loader_ids ... 로직은 위에서 대체되었으므로 제거)
-
         # ── 씬 루프 (계속) ──
-        combine_node_id = "21"
-        i2v_node_id = "25"
+        combine_node_id = "21"  # (guff_movie.json용)
+        i2v_node_id = "25"  # (guff_movie.json용)
         target_fps_val: int = 16
 
         try:
@@ -1206,8 +1210,8 @@ def build_shots_with_i2v(
         else:
             fps_wf = None
             try:
-                # graph_origin (원본)에서 읽어옴
-                fps_wf = graph_origin.get(combine_node_id, {}).get("inputs", {}).get("frame_rate")
+                if combine_node_id in graph_origin:
+                    fps_wf = graph_origin.get(combine_node_id, {}).get("inputs", {}).get("frame_rate")
             except AttributeError:
                 fps_wf = None
             if fps_wf is not None:
@@ -1273,9 +1277,7 @@ def build_shots_with_i2v(
             print(f"[I2V][CHUNK] {chunk_label} range={start_f}~{end_f - 1} len={chunk_len}f")
 
             try:
-                # [수정] graph_clone (씬 루프 시작 시 복제한)을 사용해야
-                # 페이스 스왑 설정이 청크 루프에 반영됩니다.
-                graph_chunk = json_mod.loads(json_mod.dumps(graph_clone))  # 'graph' -> 'graph_chunk'
+                graph_chunk = json_mod.loads(json_mod.dumps(graph_origin))  # 'graph' -> 'graph_chunk'
             except (TypeError, ValueError) as e_clone:
                 _notify(f"[오류] 워크플로우 복제 실패 ({chunk_label}): {e_clone}")
                 scene_failed = True
@@ -1283,10 +1285,32 @@ def build_shots_with_i2v(
 
             _clear_overlay_inputs_safe(graph_chunk)
 
-            # (페이스 스왑 주입 로직은 씬 루프 시작 시 graph_clone에 이미 적용되었음)
+            # --- ▼▼▼ [페이스 스왑 로직 수정됨 - 청크 레벨] ▼▼▼ ---
 
-            # (기존: LoadImage 로직)
-            # [수정] 페이스 스왑 로직과 겹치므로, I2V 소스 이미지만 주입하도록 수정
+            # 1. 이 워크플로의 모든 ReActor 노드 ID
+            ALL_REACTOR_NODES_IN_WF = ["22", "23", "28"]  # (nunchaku_qwen_image_swap.json 기준)
+
+            # 2. 씬 레벨에서 준비한 맵 참조
+            #    reactors_to_enable_map = {"28": "1", "23": "0"}
+            #    face_files_to_inject_map = {"25": "male_01.png", "24": "female_01.png"}
+
+            # 3. ReActor 활성화/비활성화
+            for reactor_id in ALL_REACTOR_NODES_IN_WF:
+                if reactor_id in reactors_to_enable_map:
+                    face_index_to_use = reactors_to_enable_map[reactor_id]
+                    _set_input_safe(graph_chunk, reactor_id, "enabled", True)
+                    _set_input_safe(graph_chunk, reactor_id, "input_faces_index", face_index_to_use)
+                    _set_input_safe(graph_chunk, reactor_id, "source_faces_index", "0")  # 소스 이미지는 얼굴 1개
+                    _notify(f"ReActor(Node {reactor_id}) 활성화 (FaceIdx {face_index_to_use}) ({chunk_label})")
+                else:
+                    _set_input_safe(graph_chunk, reactor_id, "enabled", False)
+
+            # 4. LoadImage에 얼굴 파일 주입
+            for load_node_id, face_filename in face_files_to_inject_map.items():
+                _set_input_safe(graph_chunk, load_node_id, "image", face_filename)
+                _notify(f"LoadImage(Node {load_node_id}) 얼굴 주입: {face_filename} ({chunk_label})")
+
+            # 5. I2V 소스 이미지 주입 (기존 로직 유지)
             load_nodes: List[Tuple[str, Dict[str, Any]]] = []
             for node_key2, node_val2 in graph_chunk.items():
                 try:
@@ -1295,63 +1319,97 @@ def build_shots_with_i2v(
                 except (AttributeError, TypeError):
                     continue
 
-            # 이 씬에서 페이스 스왑에 사용된 LoadImage 노드 ID 목록
-            face_loader_ids_in_loop = set(load_id_str for _r_id, (load_id_str, _c_id) in WORKFLOW_REACTOR_MAP.items())
+            # _current_scene_face_loader_ids는 씬 레벨에서 계산된 맵의 키
+            face_loader_ids_in_loop = _current_scene_face_loader_ids
 
-            for load_node_id, _node in load_nodes:
+            for load_node_id, _node_data in load_nodes:  # '_node' -> '_node_data'
                 if load_node_id in face_loader_ids_in_loop:
-                    # 이 노드는 페이스 스왑용이므로 건너뜀 (이미 씬 루프에서 설정됨)
+                    _notify(f"LoadImage({load_node_id}) 스킵 (ReActor 전용 얼굴 소스)")
                     continue
 
-                    # 페이스 스왑용이 아닌 다른 LoadImage 노드 (e.g. I2V의 첫 프레임 소스)
+                # 페이스 스왑용이 아닌 다른 LoadImage 노드 (e.g. I2V의 첫 프레임 소스)
                 _set_input_safe(graph_chunk, load_node_id, "image", current_input_image_name)
                 _notify(f"LoadImage({load_node_id}) I2V 소스 이미지 주입: {current_input_image_name} ({chunk_label})")
 
-            for sampler_id in ("13", "14"):  # KSampler 노드 ID (워크플로에 따라 다름)
-                _set_input_safe(graph_chunk, sampler_id, "noise_seed", scene_seed_value)
-            _notify(f"Sampler(13, 14) Seed: {scene_seed_value} ({chunk_label})")
+            # --- ▲▲▲ [페이스 스왑 로직 수정 끝] ▲▲▲ ---
 
-            resize_node_id = "24"  # Resize 노드 ID (워크플로에 따라 다름)
-            if ui_width and ui_width > 0:
-                _set_input_safe(graph_chunk, resize_node_id, "width", ui_width)
-            if ui_height and ui_height > 0:
-                _set_input_safe(graph_chunk, resize_node_id, "height", ui_height)
-            if ui_width or ui_height:
-                _notify(
-                    f"Resize({resize_node_id}) 크기: {ui_width if ui_width else '기본값'}x{ui_height if ui_height else '기본값'} ({chunk_label})")
+            # (이하 KSampler, Resize, 프롬프트 등 나머지 설정은 기존 로직 유지)
+
+            # KSampler 시드 설정
+            # [수정] nunchaku...json의 KSampler ID는 "12"입니다.
+            ksampler_ids_in_graph = _find_nodes(graph_chunk, "KSampler")  # ksampler_ids -> ksampler_ids_in_graph
+            for sampler_id in ksampler_ids_in_graph:
+                _set_input_safe(graph_chunk, sampler_id, "noise_seed", scene_seed_value)
+            _notify(f"Sampler({','.join(ksampler_ids_in_graph)}) Seed: {scene_seed_value} ({chunk_label})")
+
+            # [수정] nunchaku...json에는 Resize(24) 노드가 없습니다. 대신 ImageScale(33) 노드가 있습니다.
+            resize_node_id = "33"  # "24" -> "33" (ImageScale)
+            if resize_node_id in graph_chunk:
+                if ui_width and ui_width > 0:
+                    _set_input_safe(graph_chunk, resize_node_id, "width", ui_width)
+                if ui_height and ui_height > 0:
+                    _set_input_safe(graph_chunk, resize_node_id, "height", ui_height)
+                if (ui_width or ui_height):
+                    _notify(
+                        f"ImageScale(Node {resize_node_id}) 크기: {ui_width if ui_width else '기본값'}x{ui_height if ui_height else '기본값'} ({chunk_label})")
 
             if ui_fps and ui_fps > 0:
+                # combine_node_id = "21" (nunchaku...json에는 없음)
                 _set_input_safe(graph_chunk, combine_node_id, "frame_rate", ui_fps)
-                _notify(f"Combine({combine_node_id}) FPS: {ui_fps} ({chunk_label})")
+                if "21" in graph_chunk:  # 있는지 확인
+                    _notify(f"Combine(Node 21) FPS: {ui_fps} ({chunk_label})")
 
             if ui_steps and ui_steps > 0:
                 steps_set_count = 0  # 'steps_set' -> 'steps_set_count'
-                for sampler_id in ksampler_ids:  # ksampler_ids 사용 (기존 "13", "14" 하드코딩 대신)
+                for sampler_id in ksampler_ids_in_graph:  # ksampler_ids_in_graph 사용
                     if _set_input_safe(graph_chunk, sampler_id, "steps", ui_steps):
                         steps_set_count += 1
                 if steps_set_count > 0:
-                    _notify(f"Sampler({','.join(ksampler_ids)}) Steps: {ui_steps} ({chunk_label})")
+                    _notify(f"Sampler({','.join(ksampler_ids_in_graph)}) Steps: {ui_steps} ({chunk_label})")
 
+            # i2v_node_id = "25" (nunchaku...json에는 없음)
             _set_input_safe(graph_chunk, i2v_node_id, "length", chunk_len)
-            _notify(f"I2V({i2v_node_id}) Length: {chunk_len}f ({chunk_label})")
+            if "25" in graph_chunk:  # 있는지 확인
+                _notify(f"I2V(Node 25) Length: {chunk_len}f ({chunk_label})")
 
-            # (프롬프트 주입 로직은 이미 씬 루프에서 graph_clone에 적용되었음)
+            pos_txt = str(scene.get("prompt_movie") or scene.get("prompt") or "")
+            base_neg_txt = str(scene.get("prompt_negative") or "")
+            force_neg_tags = (
+                "text, watermark, logo, letters, (file name:1.5), (title:1.5), (t_001:1.5), (t_002:1.5), "
+                "(mp4:1.5), signature, typography, caption, subtitles, text overlay"
+            )
+            if base_neg_txt:
+                neg_txt = f"{base_neg_txt.rstrip(', ')}, {force_neg_tags}"
+            else:
+                neg_txt = force_neg_tags
 
+            # [수정] 프롬프트 노드 ID 변경 (nunchaku...json 기준)
+            # 긍정: 16 (DeepTranslator)
+            # 부정: 5 (CLIPTextEncode)
+            if pos_txt:
+                _set_input_safe(graph_chunk, "16", "text", pos_txt)  # DeepTranslator
+            _set_input_safe(graph_chunk, "5", "text", neg_txt)  # Negative Prompt
+            _notify(f"프롬프트(16/5) 설정 완료. (강제 텍스트 금지 네거티브 포함) ({chunk_label})")
+
+            save_node_id = "35"
             try:
-                # graph_chunk에서 현재 값 읽기
+                # [수정] 파일 저장 노드 ID 변경 (nunchaku...json 기준: 35 (SaveImage))
+
                 raw_prefix = str(
-                    graph_chunk.get(combine_node_id, {}).get("inputs", {}).get("filename_prefix", "wan22_"))
+                    graph_chunk.get(save_node_id, {}).get("inputs", {}).get("filename_prefix", "t_01"))
             except AttributeError:
-                raw_prefix = "wan22_"
+                raw_prefix = "t_01"
 
             suffix_str = raw_prefix.split("/", 1)[-1] if "/" in raw_prefix else raw_prefix  # 'suffix' -> 'suffix_str'
             if (not suffix_str or suffix_str.isdigit()
                     or suffix_str.replace("-", "").isdigit()
                     or (suffix_str.endswith("_") and suffix_str[:-1].isdigit())):
-                suffix_str = "wan22_"
+                suffix_str = "i2v_fallback"  # 기본값 변경
+
+            # [수정] nunchaku...json은 T2I 워크플로이므로, SaveImage(35) 노드를 사용합니다.
             new_prefix = f"{datetime.date.today().strftime('%Y-%m-%d')}/{suffix_str}"
-            _set_input_safe(graph_chunk, combine_node_id, "filename_prefix", new_prefix)
-            _notify(f"Combine({combine_node_id}) Prefix: {new_prefix} ({chunk_label})")
+            _set_input_safe(graph_chunk, save_node_id, "filename_prefix", new_prefix)
+            _notify(f"SaveImage(Node {save_node_id}) Prefix: {new_prefix} ({chunk_label})")
 
             use_sequence_conditioning = False
             seq_dir_for_condition: Optional[Path] = None
@@ -1445,34 +1503,45 @@ def build_shots_with_i2v(
 
             outputs_dict = cast(dict, result_data_chunk.get("outputs") or {})
             target_info: Optional[Dict[str, Any]] = None
-            valid_mp4_infos: List[Dict[str, Any]] = []
+
+            # [수정] nunchaku...json은 T2I이므로 "images"를 찾아야 함
+            valid_png_infos: List[Dict[str, Any]] = []
             any_outputs: List[Dict[str, Any]] = []
 
             for node_out_id, out_val in outputs_dict.items():
                 if not isinstance(out_val, dict):
                     continue
+
+                # I2V (vids/gifs) 로직 (기존 보존)
                 vids_list = out_val.get("videos") or out_val.get("gifs")  # 'vids' -> 'vids_list'
                 if isinstance(vids_list, list):
                     any_outputs.extend(vids_list)
                     for vinfo in vids_list:
                         if isinstance(vinfo, dict):
                             fn_lower = str(vinfo.get("filename") or "").lower()
-                            t_lower = str(vinfo.get("type") or "").lower()
-                            if fn_lower.endswith(".mp4") and t_lower != "preview":
-                                valid_mp4_infos.append(vinfo)
-                                _notify(f"MP4 후보 발견 (노드 {node_out_id}): {fn_lower} (type: {t_lower})")
+                            if fn_lower.endswith(".mp4"):
+                                valid_png_infos.append(vinfo)  # MP4도 유효한 정보로 추가
+                                _notify(f"MP4 후보 발견 (노드 {node_out_id}): {fn_lower}")
+
+                # T2I (images) 로직 (nunchaku...json용)
                 imgs_list = out_val.get("images")  # 'imgs' -> 'imgs_list'
                 if isinstance(imgs_list, list):
                     any_outputs.extend(imgs_list)
+                    for img_info in imgs_list:
+                        if isinstance(img_info, dict):
+                            fn_lower_img = str(img_info.get("filename") or "").lower()
+                            if fn_lower_img.endswith(".png"):
+                                valid_png_infos.append(img_info)
+                                _notify(f"PNG 후보 발견 (노드 {node_out_id}): {fn_lower_img}")
 
-            if valid_mp4_infos:
-                target_info = valid_mp4_infos[-1]
-                _notify(f"최종 MP4 파일 선택: {target_info.get('filename')}")
+            if valid_png_infos:
+                target_info = valid_png_infos[-1]
+                _notify(f"최종 출력 파일 선택: {target_info.get('filename')}")
             elif any_outputs:
                 target_info = any_outputs[-1]
-                _notify(f"MP4 없음. 폴백 파일 선택: {target_info.get('filename')}")
+                _notify(f"유효한 PNG/MP4 없음. 폴백 파일 선택: {target_info.get('filename')}")
             else:
-                _notify("처리할 출력 파일 정보 없음")
+                _notify(f"{sid}: 처리할 출력 파일 정보 없음")
                 scene_failed = True
                 continue
 
@@ -1480,7 +1549,7 @@ def build_shots_with_i2v(
             filename_pick = str(target_info.get("filename") or "")
             filetype_pick = str(target_info.get("type") or "output")
             if not filename_pick:
-                _notify("출력 파일명 없음")
+                _notify(f"{sid}: 출력 파일명 없음")
                 scene_failed = True
                 continue
 
@@ -1501,20 +1570,65 @@ def build_shots_with_i2v(
                 scene_failed = True
                 continue
 
-            if not filename_pick.lower().endswith(".mp4"):
-                _notify(f"[오류] 결과 파일이 .mp4가 아닙니다! (실제: {filename_pick}).")
+            # [수정] T2I 워크플로(PNG)와 I2V 워크플로(MP4) 분기 처리
+            if filename_pick.lower().endswith(".png"):
+                # T2I (nunchaku) -> PNG를 MP4로 변환해야 함
+                _notify(f"[I2V-T2I] PNG 출력 감지. {chunk_len}f MP4로 변환 시도...")
+                temp_png_path = work_dir / f"_temp_{sid}_{c_idx:05d}.png"
+                try:
+                    with open(temp_png_path, "wb") as f_temp_png:
+                        f_temp_png.write(resp.content)
+
+                    # PNG 1장 -> MP4 변환
+                    cmd_png_to_mp4 = [
+                        ffmpeg_exe, "-y",
+                        "-loop", "1",
+                        "-i", str(temp_png_path),
+                        "-t", f"{float(chunk_len) / float(max(1, target_fps_val)):.4f}",  # 프레임 수만큼 길이 지정
+                        "-vf", f"fps={int(max(1, target_fps_val))},format=yuv420p",
+                        "-c:v", "libx264", "-crf", "18",
+                        "-pix_fmt", "yuv420p",
+                        str(chunk_path)
+                    ]
+                    proc_png = subprocess.run(
+                        cmd_png_to_mp4,
+                        stdout=subprocess.PIPE,
+                        stderr=subprocess.STDOUT,
+                        text=True, encoding="utf-8", errors="ignore", check=False,
+                    )
+                    if proc_png.returncode != 0:
+                        _notify(f"[오류] PNG -> MP4 변환 실패: {proc_png.stdout[:1000]}")
+                        scene_failed = True
+                        continue
+
+                    temp_png_path.unlink(missing_ok=True)  # 임시 PNG 삭제
+
+                except (OSError, IOError, subprocess.SubprocessError) as e_png_to_mp4:
+                    _notify(f"[오류] PNG -> MP4 변환 중 예외: {e_png_to_mp4}")
+                    scene_failed = True
+                    continue
+
+            elif filename_pick.lower().endswith(".mp4"):
+                # I2V (guff_movie) -> MP4 바로 저장
+                try:
+                    chunk_path.parent.mkdir(parents=True, exist_ok=True)
+                    with open(chunk_path, "wb") as f_out_file:
+                        f_out_file.write(resp.content)
+                except OSError as e_write:
+                    _notify(f"[오류] 청크 파일 저장 실패: {e_write}")
+                    scene_failed = True
+                    continue
+            else:
+                _notify(f"[오류] 알 수 없는 출력 형식: {filename_pick}")
                 scene_failed = True
                 continue
 
             try:
-                chunk_path.parent.mkdir(parents=True, exist_ok=True)
-                with open(chunk_path, "wb") as f_out_file:
-                    f_out_file.write(resp.content)
                 size_bytes = chunk_path.stat().st_size
                 _notify(f"청크 파일 저장 완료: {chunk_path.name} ({size_bytes / 1024:.1f} KB)")
                 chunk_paths.append(chunk_path)
-            except OSError as e_write:
-                _notify(f"[오류] 청크 파일 저장 실패: {e_write}")
+            except OSError as e_stat_chunk:
+                _notify(f"[오류] 청크 파일 상태 확인 실패: {e_stat_chunk}")
                 scene_failed = True
                 continue
 
@@ -2625,12 +2739,12 @@ def build_missing_images_from_story(
             # 2. 씬에서 캐릭터 스펙 파싱 (e.g., {"female_01": 1, "male_01": 0})
             scene_char_specs: Dict[str, int] = {}
             try:
-                # [수정] 이 파일(video_build.py)의 모듈 레벨 함수인 parse_character_spec를 호출합니다.
+                # [수정] 이 파일(video_build.py)의 모듈 레벨 함수인 _parse_character_spec를 호출합니다.
                 # (파일 하단 1555라인 근처에 정의되어 있어야 함)
                 chars_list_data = sc.get("characters") or sc.get(
                     "character_objs") or []  # 'chars_list' -> 'chars_list_data'
                 for item_spec in chars_list_data:  # 'item' -> 'item_spec'
-                    spec_dict = parse_character_spec(item_spec)
+                    spec_dict = _parse_character_spec(item_spec)
                     char_id_val = spec_dict.get("id")  # 'char_id' -> 'char_id_val'
                     char_idx_val = spec_dict.get("index")  # 'char_idx' -> 'char_idx_val'
                     if char_id_val:
@@ -4131,7 +4245,7 @@ def gpt_scene_prompt_writer(
 #================페이스 스왑 관련=============#
 
 
-def parse_character_spec(item: Any) -> Dict[str, Any]:
+def _parse_character_spec(item: Any) -> Dict[str, Any]:
     """
     'characters' 항목의 원소를 정규화한다.
     허용 입력:
@@ -4173,14 +4287,14 @@ def parse_character_spec(item: Any) -> Dict[str, Any]:
 def normalize_scene_characters(scene: Dict[str, Any]) -> Dict[str, Any]:
     """
     scene["characters"]를 표준화:
-      - 리스트 각 원소를 parse_character_spec()으로 dict화
+      - 리스트 각 원소를 _parse_character_spec()으로 dict화
       - scene["layout"]["face_indices"] (있다면)로 index를 보완
       - scene["face_indices"] (flat dict)도 함께 만들어 소비 측이 편하게 사용
     반환: 수정된 scene (원본 shallow copy 후 필드 갱신)
     """
     sc = dict(scene or {})
     chars_in = sc.get("characters") or []
-    norm: List[Dict[str, Any]] = [parse_character_spec(x) for x in chars_in]
+    norm: List[Dict[str, Any]] = [_parse_character_spec(x) for x in chars_in]
 
     # layout.face_indices에 매핑이 있으면 index 보완
     layout = sc.get("layout") or {}

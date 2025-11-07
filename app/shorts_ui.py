@@ -8696,47 +8696,67 @@ class MainWindow(QtWidgets.QMainWindow):
         # shorts_ui.py
 
     def on_click_macro_build_video(self) -> None:
-            """매크로: 1. 영상생성(i2v) -> 2. 영상합치기 -> 3. 가사넣기"""
+        """매크로: 1. 영상생성(i2v) -> 2. 영상합치기 -> 3. 가사넣기"""
+        # (Callback 시그니처를 위해 typing 임포트)
+        from typing import Any, Optional
+        from PyQt5 import QtWidgets  # [수정] 버튼 참조를 위해 임포트
 
-            # --- 3단계 (가사넣기) ---
-            def _on_merge_done(ok: bool, payload: Any, err: Optional[Exception]):
-                """2단계(영상합치기) 완료 콜백"""
-                if not ok:
-                    print(f"[MACRO-BUILD] 2단계 (영상합치기) 실패: {err}")
-                    QtWidgets.QMessageBox.critical(self, "영상만들기 2단계 실패", f"영상 병합 중 오류:\n{err}")
-                    return
+        # --- 3단계 (가사넣기) ---
+        def _on_merge_done(ok: bool, payload: Any, err: Optional[Exception]):
+            """2단계(영상합치기) 완료 콜백"""
+            if not ok:
+                print(f"[MACRO-BUILD] 2단계 (영상합치기) 실패: {err}")
+                QtWidgets.QMessageBox.critical(self, "영상만들기 2단계 실패", f"영상 병합 중 오류:\n{err}")
+                return
 
-                print("[MACRO-BUILD] 2단계 (영상합치기) 완료. 3단계 (가사넣기) 시작...")
-                try:
-                    # 3단계(가사넣기) 호출. 이게 마지막이므로 override 불필요.
-                    # (lyrics_in_start는 작업 완료 시 자체적으로 팝업을 띄웁니다)
-                    self.lyrics_in_start()
-                except Exception as ee:
-                    QtWidgets.QMessageBox.critical(self, "영상만들기 3단계 오류", f"가사 삽입 시작 중 오류:\n{ee}")
-
-            # --- 2단계 (영상합치기) ---
-            def _on_video_gen_done(ok: bool, payload: Any, err: Optional[Exception]):
-                """1단계(영상생성) 완료 콜백"""
-                if not ok:
-                    print(f"[MACRO-BUILD] 1단계 (영상생성) 실패: {err}")
-                    QtWidgets.QMessageBox.critical(self, "영상만들기 1단계 실패", f"영상 생성(i2v) 중 오류:\n{err}")
-                    return
-
-                print("[MACRO-BUILD] 1단계 (영상생성) 완료. 2단계 (영상합치기) 시작...")
-                try:
-                    # 2단계(영상합치기) 호출, 3단계를 콜백으로 전달
-                    self.merging_videos_start(on_done_override=_on_merge_done)
-                except Exception as ae:
-                    QtWidgets.QMessageBox.critical(self, "영상만들기 2단계 오류", f"영상 합치기 시작 중 오류:\n{ae}")
-
-            # --- 1단계 (영상생성) ---
-            print("[MACRO-BUILD] 1단계 (영상생성) 시작...")
+            print("[MACRO-BUILD] 2단계 (영상합치기) 완료. 3단계 (가사넣기) 시작...")
             try:
-                # 1단계(영상생성) 호출, 2단계를 콜백으로 전달
-                # 이 on_video 함수는 UI의 W/H/FPS/스텝 설정을 읽어옵니다.
-                self.on_video(on_done_override=_on_video_gen_done)
-            except Exception as e:
-                QtWidgets.QMessageBox.critical(self, "영상만들기 1단계 오류", f"영상 생성 시작 중 오류:\n{e}")
+                # 3단계(가사넣기) 호출. 이게 마지막이므로 override 불필요.
+                # (lyrics_in_start는 작업 완료 시 자체적으로 팝업을 띄웁니다)
+                self.lyrics_in_start()
+            except Exception as e_lyrics_start:  # 'ee' -> 'e_lyrics_start'
+                QtWidgets.QMessageBox.critical(self, "영상만들기 3단계 오류", f"가사 삽입 시작 중 오류:\n{e_lyrics_start}")
+
+        # --- 2단계 (영상합치기) ---
+        def _on_video_gen_done(ok: bool, payload: Any, err: Optional[Exception]):
+            """1단계(영상생성) 완료 콜백"""
+
+            # --- ▼▼▼ [수정] 1단계(on_video)가 끝났으므로 "영상생성" 버튼을 여기서 복구 ▼▼▼ ---
+            try:
+                btn_video_widget: Optional[QtWidgets.QAbstractButton] = None
+                # "영상생성" 버튼(btn_video)을 찾습니다.
+                for btn_name in ("btn_video", "btn_build_video"):
+                    widget_candidate = getattr(self, btn_name, None) or \
+                                       getattr(getattr(self, "ui", None), btn_name, None)
+                    if isinstance(widget_candidate, QtWidgets.QAbstractButton):
+                        btn_video_widget = widget_candidate
+                        break
+                if btn_video_widget:
+                    btn_video_widget.setEnabled(True)  # 버튼을 다시 활성화합니다.
+            except (AttributeError, RuntimeError) as e_btn_enable:
+                print(f"[WARN] 매크로: 영상생성 버튼 복구 실패: {e_btn_enable}")
+            # --- ▲▲▲ [수정] 끝 ▲▲▲ ---
+
+            if not ok:
+                print(f"[MACRO-BUILD] 1단계 (영상생성) 실패: {err}")
+                QtWidgets.QMessageBox.critical(self, "영상만들기 1단계 실패", f"영상 생성(i2v) 중 오류:\n{err}")
+                return  # (실패 시 2단계 진입 안 함)
+
+            print("[MACRO-BUILD] 1단계 (영상생성) 완료. 2단계 (영상합치기) 시작...")
+            try:
+                # 2단계(영상합치기) 호출, 3단계를 콜백으로 전달
+                self.merging_videos_start(on_done_override=_on_merge_done)
+            except Exception as e_merge_start:  # 'ae' -> 'e_merge_start'
+                QtWidgets.QMessageBox.critical(self, "영상만들기 2단계 오류", f"영상 합치기 시작 중 오류:\n{e_merge_start}")
+
+        # --- 1단계 (영상생성) ---
+        print("[MACRO-BUILD] 1단계 (영상생성) 시작...")
+        try:
+            # 1단계(영상생성) 호출, 2단계를 콜백으로 전달
+            # 이 on_video 함수는 UI의 W/H/FPS/스텝 설정을 읽어옵니다.
+            self.on_video(on_done_override=_on_video_gen_done)
+        except Exception as e_video_start:  # 'e' -> 'e_video_start'
+            QtWidgets.QMessageBox.critical(self, "영상만들기 1단계 오류", f"영상 생성 시작 중 오류:\n{e_video_start}")
 
 
 # ───────── 워크플로 저장 노드(class_type) 영구 수정 도우미 ─────────
