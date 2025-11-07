@@ -2295,19 +2295,16 @@ def xfade_concat(
     return Path(out_path)
 
 
-
-
-
 def build_missing_images_from_story(
-    story_path: str | _Path,
-    *,
-    ui_width: int,
-    ui_height: int,
-    steps: int = 28,
-    timeout_sec: int = 300,
-    poll_sec: float = 1.5,
-    workflow_path: str | _Path | None = None,
-    on_progress: Optional[Dict[str, Any] | Callable[[Dict[str, Any]], None]] = None,
+        story_path: str | _Path,
+        *,
+        ui_width: int,
+        ui_height: int,
+        steps: int = 28,
+        timeout_sec: int = 300,
+        poll_sec: float = 1.5,
+        workflow_path: str | _Path | None = None,
+        on_progress: Optional[Dict[str, Any] | Callable[[Dict[str, Any]], None]] = None,
 ) -> List[_Path]:
     """
     누락 이미지 생성:
@@ -2316,9 +2313,18 @@ def build_missing_images_from_story(
     - 워크플로: settings.JSONS_DIR / nunchaku_qwen_image_swap.json (또는 인자 workflow_path)
     - 프롬프트: scene.prompt_movie > (scene.prompt + '\\n' + scene.prompt_img)
     - 네거티브: scene.prompt_negative or defaults.image.negative
+    - [수정됨] 다중 페이스 스왑 워크플로(nunchaku_qwen_image_swap.json) 지원
     """
+    # --- [1. 모듈 임포트] ---
+    # (json은 _json_loader 별칭으로 사용, 전역 'json'과 충돌 방지)
+    import json as _json_loader
+    import shutil
+    import requests
+    from typing import Any, Dict, List, Optional, Callable
 
+    # --- [2. 알림 콜백 함수 (중첩)] ---
     def _notify(stage: str, msg: str = "", **extra: Any) -> None:
+        """진행률 콜백을 안전하게 호출하는 중첩 헬퍼 함수"""
         if not on_progress:
             return
         data: Dict[str, Any] = {"stage": stage, "msg": msg}
@@ -2328,25 +2334,33 @@ def build_missing_images_from_story(
             if callable(on_progress):
                 on_progress(data)
             elif isinstance(on_progress, dict):
-                cb = on_progress.get("callback")
-                if callable(cb):
-                    cb(data)
-        except (RuntimeError, ValueError, TypeError):
-            pass
+                cb_func = on_progress.get("callback")  # 'cb' -> 'cb_func' (가리기 방지)
+                if callable(cb_func):
+                    cb_func(data)
+        except (RuntimeError, ValueError, TypeError) as e_notify_callback:
+            print(f"[WARN] build_missing_images_from_story._notify callback failed: {e_notify_callback}", flush=True)
 
-    p_story = _Path(story_path).resolve()
-    story_dir = p_story.parent if p_story.is_file() else _Path(story_path).resolve()
-    if not story_dir.exists():
-        raise FileNotFoundError(f"경로 없음: {story_dir}")
+    # --- [3. 경로 및 문서 로드 (메인 함수 로직)] ---
+    try:
+        p_story = _Path(story_path).resolve()
+        story_dir = p_story.parent if p_story.is_file() else _Path(story_path).resolve()
+        if not story_dir.exists():
+            raise FileNotFoundError(f"경로 없음: {story_dir}")
 
-    p_video = story_dir / "video.json"
-    video = load_json(p_video, {}) or {}
-    p_story_json = story_dir / "story.json"
-    story = load_json(p_story_json, {}) or {}
+        p_video = story_dir / "video.json"
+        video_doc = load_json(p_video, {}) or {}  # 'video' -> 'video_doc' (가리기 방지)
+        p_story_json = story_dir / "story.json"
+        story_doc = load_json(p_story_json, {}) or {}  # 'story' -> 'story_doc' (가리기 방지)
 
-    paths_v = video.get("paths") or {}
-    root_dir = _Path(paths_v.get("root") or story.get("paths", {}).get("root") or story_dir)
-    imgs_dir_name = str(paths_v.get("imgs_dir") or story.get("paths", {}).get("imgs_dir") or "imgs")
+    except FileNotFoundError as e_story_path:
+        # 이 예외는 호출 측에서 처리해야 할 수 있으므로 다시 발생시킴
+        raise e_story_path
+    except (IOError, OSError) as e_story_io:
+        raise IOError(f"스토리 경로 접근 오류: {e_story_io}") from e_story_io
+
+    paths_v = video_doc.get("paths") or {}
+    root_dir = _Path(paths_v.get("root") or story_doc.get("paths", {}).get("root") or story_dir)
+    imgs_dir_name = str(paths_v.get("imgs_dir") or story_doc.get("paths", {}).get("imgs_dir") or "imgs")
     img_root = ensure_dir(root_dir / imgs_dir_name)
 
     try:
@@ -2355,95 +2369,114 @@ def build_missing_images_from_story(
     except (ImportError, AttributeError):
         base_jsons = _Path(r"C:\my_games\shorts_make\app\jsons")
 
-    wf_path = _Path(workflow_path) if workflow_path else (base_jsons / "nunchaku_qwen_image_swap.json")
-    if not wf_path.exists():
-        raise FileNotFoundError(f"필수 워크플로 없음: {wf_path}")
+    wf_path_resolved = _Path(workflow_path) if workflow_path else (base_jsons / "nunchaku_qwen_image_swap.json")
+    if not wf_path_resolved.exists():
+        raise FileNotFoundError(f"필수 워크플로 없음: {wf_path_resolved}")
 
-    with open(wf_path, "r", encoding="utf-8") as f:
-        graph_origin: Dict[str, Any] = _json.load(f)
+    try:
+        with open(wf_path_resolved, "r", encoding="utf-8") as f_graph:
+            graph_origin: Dict[str, Any] = _json_loader.load(f_graph)
+    except (IOError, OSError, _json_loader.JSONDecodeError) as e_load_wf:
+        raise RuntimeError(f"워크플로 로드 실패: {wf_path_resolved}") from e_load_wf
 
-    def _find_nodes(gdict: Dict[str, Any], class_type: str) -> List[str]:
+    # --- [4. 워크플로/Comfy 헬퍼 (중첩)] ---
+    # (기존 중첩 함수들 100% 보존)
+    def _find_nodes(gdict: Dict[str, Any], class_type_str: str) -> List[str]:  # 'class_type' -> 'class_type_str'
+        """워크플로에서 특정 class_type의 노드 ID 목록을 찾습니다."""
         hits: List[str] = []
-        for nid, node in (gdict or {}).items():
+        for nid, node_item in (gdict or {}).items():  # 'node' -> 'node_item'
             try:
-                if str(node.get("class_type")) == class_type:
+                if str(node_item.get("class_type")) == class_type_str:
                     hits.append(str(nid))
             except (AttributeError, KeyError, TypeError):
                 continue
         return hits
 
     def _set_input(gdict: Dict[str, Any], nid: str, key: str, val: Any) -> None:
+        """워크플로 딕셔너리에 입력 값을 안전하게 주입합니다."""
         try:
             gdict[str(nid)].setdefault("inputs", {})[key] = val
-        except (KeyError, TypeError):
+        except (KeyError, TypeError, AttributeError):
+            _notify("warn", f"[IMG] 워크플로 주입 실패: Node {nid}, Key {key}")
             pass
 
     latent_ids = _find_nodes(graph_origin, "EmptySD3LatentImage") + _find_nodes(graph_origin, "EmptyLatentImage")
     latent_ids = list(dict.fromkeys(latent_ids))
     ksampler_ids = _find_nodes(graph_origin, "KSampler")
-    reactor_ids = [nid for nid, node in graph_origin.items() if str(node.get("class_type")) == "ReActorFaceSwap"]
+
+    # (reactor_ids는 아래의 새 로직에서 `WORKFLOW_REACTOR_MAP`으로 대체)
 
     def _resolve_face_image_by_name(name: str) -> _Path | None:
+        """(기존 중첩 함수) 캐릭터 이름으로 이미지 파일을 찾습니다."""
         try:
             from settings import CHARACTER_DIR  # type: ignore
-            base_dir = _Path(CHARACTER_DIR)
+            base_dir_char = _Path(CHARACTER_DIR)  # 'base_dir' -> 'base_dir_char'
         except (ImportError, AttributeError):
-            base_dir = _Path(r"C:\my_games\shorts_make\character")
+            base_dir_char = _Path(r"C:\my_games\shorts_make\character")
         exts = (".png", ".jpg", ".jpeg", ".webp")
-        for ext in exts:
-            p = base_dir / f"{name}{ext}"
-            if p.exists():
-                return p
+        for ext_item in exts:  # 'ext' -> 'ext_item'
+            p_path = base_dir_char / f"{name}{ext_item}"  # 'p' -> 'p_path'
+            if p_path.exists():
+                return p_path
         return None
 
     def _pick_scene_character_name(scene: Dict[str, Any]) -> str | None:
-        chars = scene.get("characters") or []
-        if isinstance(chars, list) and chars:
-            cc0 = chars[0]
+        """(기존 중첩 함수) 씬에서 첫 번째 캐릭터 이름을 가져옵니다. (수정된 로직에서는 사용되지 않음)"""
+        chars_list = scene.get("characters") or []  # 'chars' -> 'chars_list'
+        if isinstance(chars_list, list) and chars_list:
+            cc0 = chars_list[0]
             if isinstance(cc0, str):
-                name = cc0.strip()
-                return name or None
+                name_str = cc0.strip()  # 'name' -> 'name_str'
+                return name_str or None
             if isinstance(cc0, dict):
-                cand = (str(cc0.get("id") or "") or str(cc0.get("name") or "")).strip()
-                return cand or None
-        cobjs = scene.get("character_objs") or []
-        if isinstance(cobjs, list) and cobjs:
-            o0 = cobjs[0]
-            if isinstance(o0, dict):
-                cand = (str(o0.get("id") or "") or str(o0.get("name") or "")).strip()
-                return cand or None
+                cand_str = (str(cc0.get("id") or "") or str(cc0.get("name") or "")).strip()  # 'cand' -> 'cand_str'
+                return cand_str or None
+        cobjs_list = scene.get("character_objs") or []  # 'cobjs' -> 'cobjs_list'
+        if isinstance(cobjs_list, list) and cobjs_list:
+            o0_obj = cobjs_list[0]  # 'o0' -> 'o0_obj'
+            if isinstance(o0_obj, dict):
+                cand_str_obj = (str(o0_obj.get("id") or "") or str(
+                    o0_obj.get("name") or "")).strip()  # 'cand' -> 'cand_str_obj'
+                return cand_str_obj or None
         return None
 
     def _inject_face_to_reactors(gdict: Dict[str, Any], file_name: str) -> List[str]:
+        """(기존 중첩 함수) (수정된 로직에서는 사용되지 않음)"""
         applied_ids: List[str] = []
-        for ridt in reactor_ids:
+        # 'reactor_ids'는 이 함수의 로컬 스코프에서 정의되지 않았으므로,
+        # 이 함수를 호출하는 상위 스코프의 'reactor_ids'를 참조해야 합니다.
+        # (단, 수정된 로직은 이 함수를 호출하지 않습니다.)
+        local_reactor_ids = [nid for nid, node in gdict.items() if str(node.get("class_type")) == "ReActorFaceSwap"]
+        for ridt in local_reactor_ids:
             try:
-                ins = gdict[ridt].setdefault("inputs", {})
-                if "source_image" in ins:
-                    ins["source_image"] = file_name
+                ins_map = gdict[ridt].setdefault("inputs", {})  # 'ins' -> 'ins_map'
+                if "source_image" in ins_map:
+                    ins_map["source_image"] = file_name
                     applied_ids.append(ridt)
-                elif "input_image" in ins:
-                    ins["input_image"] = file_name
+                elif "input_image" in ins_map:
+                    ins_map["input_image"] = file_name
                     applied_ids.append(ridt)
             except (KeyError, TypeError):
                 continue
         return applied_ids
 
     def _inject_face_image_loaders(_gdict: Dict[str, Any], _file_name: str) -> List[str]:
+        """(기존 중첩 함수) (수정된 로직에서는 사용되지 않음)"""
         return []
 
     def _parse_first_char_index(scene: Dict[str, Any]) -> int:
-        specs = scene.get("characters") or scene.get("character_objs") or []
-        if not specs:
+        """(기존 중첩 함수) (수정된 로직에서는 사용되지 않음)"""
+        specs_list = scene.get("characters") or scene.get("character_objs") or []  # 'specs' -> 'specs_list'
+        if not specs_list:
             return 0
-        if isinstance(specs[0], str) and ":" in specs[0]:
+        if isinstance(specs_list[0], str) and ":" in specs_list[0]:
             try:
-                return int(specs[0].split(":")[1])
+                return int(specs_list[0].split(":")[1])
             except (ValueError, IndexError):
                 return 0
-        if isinstance(specs[0], dict):
+        if isinstance(specs_list[0], dict):
             try:
-                return int(specs[0].get("index", 0))
+                return int(specs_list[0].get("index", 0))
             except (ValueError, TypeError):
                 return 0
         return 0
@@ -2451,276 +2484,284 @@ def build_missing_images_from_story(
     try:
         from audio_sync import _submit_and_wait as _wait_core  # type: ignore
     except (ImportError, AttributeError):
-        from app.audio_sync import _submit_and_wait as _wait_core  # type: ignore
+        try:
+            from app.audio_sync import _submit_and_wait as _wait_core  # type: ignore
+        except (ImportError, AttributeError) as e_import_wait:
+            raise ImportError("필수 함수 _submit_and_wait를 audio_sync 모듈에서 찾을 수 없습니다.") from e_import_wait
 
-    # ====== 여기만 변경(대기 로그 50번에 1번씩만 전달) ======
-    def _wait_img(url: str, gdict: Dict[str, Any], *, timeout: int, poll: float, progress_cb: Callable[[Dict[str, Any]], None]) -> Dict[str, Any]:
-        wait_i = 0  # throttling counter inside one request
+    def _wait_img(url: str, gdict: Dict[str, Any], *, timeout: int, poll: float,
+                  progress_cb: Callable[[Dict[str, Any]], None]) -> Dict[str, Any]:
+        """(기존 중첩 함수) ComfyUI 작업 제출 및 대기 (로그 스로틀링 적용)"""
+        wait_i_counter = 0  # 'wait_i' -> 'wait_i_counter' (가리기 방지)
 
-        def _relay(prog: Dict[str, Any]) -> None:
-            nonlocal wait_i
-            raw = str(prog.get("msg") or "")
-            if raw.startswith("[MUSIC]"):
-                patched = "[IMG]" + raw[len("[MUSIC]"):]
+        def _relay_progress(prog: Dict[str, Any]) -> None:
+            nonlocal wait_i_counter
+            raw_msg = str(prog.get("msg") or "")  # 'raw' -> 'raw_msg'
+            if raw_msg.startswith("[MUSIC]"):
+                patched_msg = "[IMG]" + raw_msg[len("[MUSIC]"):]  # 'patched' -> 'patched_msg'
             else:
-                patched = "[IMG] " + raw if raw else "[IMG]"
+                patched_msg = "[IMG] " + raw_msg if raw_msg else "[IMG]"
 
-            # throttle: forward only every 50th wait message
-            wait_i += 1
-            if wait_i % 50 != 0:
+            # 스로틀링: 50번째 대기 메시지마다 한 번만 로그 전송
+            wait_i_counter += 1
+            if wait_i_counter % 50 != 0:
                 return
 
             try:
-                progress_cb({"stage": "wait", "msg": patched})
-            except (RuntimeError, ValueError, TypeError):
-                pass
+                progress_cb({"stage": "wait", "msg": patched_msg})
+            except (RuntimeError, ValueError, TypeError) as e_relay_callback:
+                print(f"[WARN] _relay_progress callback failed: {e_relay_callback}", flush=True)
 
-        return _wait_core(url, gdict, timeout=timeout, poll=poll, on_progress=_relay)
-    # ================================================
+        return _wait_core(url, gdict, timeout=timeout, poll=poll, on_progress=_relay_progress)
 
+    # --- [5. 씬(Scene) 루프 시작 (메인 함수 로직)] ---
     created: List[_Path] = []
-    base_url = str(video.get("comfy_host") or story.get("comfy_host") or "http://127.0.0.1:8188").rstrip("/")
-    _notify("begin", f"[IMG] 대상 scenes={(len(video.get('scenes') or story.get('scenes') or []))} wf={wf_path.name}")
+    base_url = str(video_doc.get("comfy_host") or story_doc.get("comfy_host") or "http://127.0.0.1:8188").rstrip("/")
+    _notify("begin",
+            f"[IMG] 대상 scenes={(len(video_doc.get('scenes') or story_doc.get('scenes') or []))} wf={wf_path_resolved.name}")
 
-    defaults_v = video.get("defaults") or {}
-    defaults_img = defaults_v.get("image") or (story.get("defaults", {}).get("image") if story else {}) or {}
+    defaults_v = video_doc.get("defaults") or {}
+    defaults_img = defaults_v.get("image") or (story_doc.get("defaults", {}).get("image") if story_doc else {}) or {}
     default_neg = str(defaults_img.get("negative") or "")
 
-    scenes: List[Dict[str, Any]] = list(video.get("scenes") or story.get("scenes") or [])
+    scenes_list: List[Dict[str, Any]] = list(
+        video_doc.get("scenes") or story_doc.get("scenes") or [])  # 'scenes' -> 'scenes_list'
     req_count = 0
 
-    for idx, sc in enumerate(scenes):
+    for idx, sc in enumerate(scenes_list):
         try:
-            # ★ 변경: 기본 SID 패딩 3→5 (기능 동일, 명명 규칙만 조정)
             sid = str(sc.get("id") or f"scene_{idx:05d}")
-            img_path = img_root / f"{sid}.png"
+            img_path_target = img_root / f"{sid}.png"  # 'img_path' -> 'img_path_target'
 
-            scene_img = str(sc.get("img_file") or "")
-            if scene_img:
-                p_scene_img = _Path(scene_img)
+            # 이미지 존재 여부 확인
+            scene_img_file = str(sc.get("img_file") or "")  # 'scene_img' -> 'scene_img_file'
+            if scene_img_file:
+                p_scene_img = _Path(scene_img_file)
                 if not p_scene_img.is_absolute():
                     p_scene_img = img_root / p_scene_img.name
                 if p_scene_img.exists():
-                    _notify("skip", f"[IMG] {sid} → 존재 {p_scene_img.name}")
+                    _notify("skip", f"[IMG] {sid} → 존재 (img_file) {p_scene_img.name}")
                     continue
-            if img_path.exists():
-                _notify("skip", f"[IMG] {sid} → 존재 {img_path.name}")
+            if img_path_target.exists():
+                _notify("skip", f"[IMG] {sid} → 존재 (id) {img_path_target.name}")
                 continue
 
-            graph = _json.loads(_json.dumps(graph_origin))
+            # 워크플로 복제
+            graph_clone = _json_loader.loads(_json_loader.dumps(graph_origin))  # 'graph' -> 'graph_clone'
 
-            for nid in latent_ids:
-                _set_input(graph, nid, "width", int(ui_width))
-                _set_input(graph, nid, "height", int(ui_height))
+            # W/H 설정
+            for nid_latent in latent_ids:  # 'nid' -> 'nid_latent'
+                _set_input(graph_clone, nid_latent, "width", int(ui_width))
+                _set_input(graph_clone, nid_latent, "height", int(ui_height))
 
-            pos_text = str(sc.get("prompt_movie") or "").strip()
-            if not pos_text:
+            # 프롬프트 설정
+            pos_text_raw = str(sc.get("prompt_movie") or "").strip()  # 'pos_text' -> 'pos_text_raw'
+            if not pos_text_raw:
                 p_main = str(sc.get("prompt") or "").strip()
                 p_img = str(sc.get("prompt_img") or "").strip()
-                pos_text = f"{p_main}\n{p_img}" if p_main and p_img else (p_main or p_img)
+                pos_text_raw = f"{p_main}\n{p_img}" if p_main and p_img else (p_main or p_img)
             neg_text = str(sc.get("prompt_negative") or "") or default_neg
 
             def _apply_prompts(gdict: Dict[str, Any], pos: str, neg: str) -> None:
-                fields = ("text", "text_g", "text_l")
-                for nid2, node2 in gdict.items():
+                """(중첩 함수) 긍정/부정 프롬프트를 관련 노드에 주입"""
+                fields_list = ("text", "text_g", "text_l")  # 'fields' -> 'fields_list'
+                for nid_prompt, node_prompt in gdict.items():  # 'nid2', 'node2' -> 'nid_prompt', 'node_prompt'
                     try:
-                        if not isinstance(node2, dict):
+                        if not isinstance(node_prompt, dict):
                             continue
-                        if not any(k in node2.get("inputs", {}) for k in fields):
+                        node_inputs = node_prompt.get("inputs", {})  # 'inp' -> 'node_inputs'
+                        if not any(f_key in node_inputs for f_key in fields_list):  # 'fk' -> 'f_key'
                             continue
-                        hint = str(node2.get("label") or "") + " " + str(node2.get("_meta", {}).get("title") or "")
-                        is_neg = ("neg" in hint.lower()) or ("negative" in hint.lower()) or ("Negative" in hint)
-                        val = neg if is_neg else pos
-                        inp = node2.setdefault("inputs", {})
-                        for fk in fields:
-                            inp[fk] = val
-                    except (AttributeError, KeyError, TypeError):
+
+                        hint_str = str(node_prompt.get("label") or "") + " " + str(
+                            node_prompt.get("_meta", {}).get("title") or "")
+                        is_neg_prompt = ("neg" in hint_str.lower()) or ("negative" in hint_str.lower()) or (
+                                    "Negative" in hint_str)
+                        val_to_set = neg if is_neg_prompt else pos  # 'val' -> 'val_to_set'
+
+                        if not isinstance(node_inputs, dict):
+                            node_inputs = node_prompt.setdefault("inputs", {})
+
+                        for f_key in fields_list:
+                            if f_key in node_inputs:  # 값 존재 여부만 확인 후 덮어쓰기
+                                node_inputs[f_key] = val_to_set
+                    except (AttributeError, KeyError, TypeError) as e_apply_prompt:
+                        _notify("warn", f"[IMG] 프롬프트 적용 중 경고: {e_apply_prompt}")
                         continue
 
-            _apply_prompts(graph, pos_text, neg_text)
+            _apply_prompts(graph_clone, pos_text_raw, neg_text)
 
-            face_path: _Path | None = None
-            char_name = _pick_scene_character_name(sc)
-            if isinstance(char_name, str):
-                face_path = _resolve_face_image_by_name(char_name)
+            # --- ▼▼▼ [페이스 스왑 로직 수정됨] ▼▼▼ ---
+            # (기존의 단순 face_path 탐색 로직을 nunchaku_qwen_image_swap.json 맞춤형으로 변경)
 
-            if face_path is None:
-                char_objs = sc.get("character_objs") or []
-                if isinstance(char_objs, list) and char_objs:
-                    obj0 = char_objs[0]
-                    if isinstance(obj0, dict):
-                        fi = obj0.get("img_file") or obj0.get("image") or ""
-                        if fi:
-                            fp = _Path(fi)
-                            face_path = fp if fp.exists() else None
+            # 1. 이 워크플로(nunchaku_qwen_image_swap.json)에 하드코딩된 노드 ID 맵
+            # (WorkflowNodeID, LoadImageNodeID, DefaultCharacterID)
+            # (참고: nunchaku_qwen_image_swap.json 파일 구조 기준)
+            WORKFLOW_REACTOR_MAP = {
+                # ReActor 노드 ID : (연결된 LoadImage 노드 ID, 이 슬롯이 처리할 캐릭터 ID)
+                "28": ("25", "male_01"),  # ReActor_0 (Node 28) <- LoadImage (Node 25) <- "male_01"
+                "23": ("24", "female_01"),  # ReActor_1 (Node 23) <- LoadImage (Node 24) <- "female_01"
+                "22": ("19", "other_char")  # ReActor_2 (Node 22) <- LoadImage (Node 19) <- (씬에 'other_char'가 있을 때)
+            }
 
-            if face_path is None:
-                chars2 = sc.get("characters") or []
-                if isinstance(chars2, list) and chars2:
-                    c0 = chars2[0]
-                    if isinstance(c0, dict):
-                        fi2 = c0.get("img_file") or c0.get("image") or ""
-                        if fi2:
-                            fp2 = _Path(fi2)
-                            face_path = fp2 if fp2.exists() else None
-
-            face_name: str | None = None
-            if face_path and face_path.exists():
-                try:
-                    from settings import COMFY_INPUT_DIR  # type: ignore
-                    comfy_in = _Path(COMFY_INPUT_DIR)
-                except (ImportError, AttributeError):
-                    comfy_in = _Path(r"C:\my_games\shorts_make\app\comfy_inputs")
-                comfy_in.mkdir(parents=True, exist_ok=True)
-                face_name = face_path.name
-                try:
-                    shutil.copy2(str(face_path), str(comfy_in / face_name))
-                except (OSError, shutil.Error):
-                    pass
-
-            applied_reactors: List[str] = []
-            if face_name:
-                target_rid = reactor_ids[0] if reactor_ids else None
-                for rnid in reactor_ids:
-                    try:
-                        graph[rnid].setdefault("inputs", {})["enabled"] = (rnid == target_rid)
-                    except (KeyError, TypeError):
-                        continue
-                if target_rid:
-                    try:
-                        rinp = graph[target_rid].setdefault("inputs", {})
-                        link = rinp.get("source_image")
-                        if isinstance(link, list) and len(link) == 2:
-                            link_id = str(link[0])
-                            if link_id in graph and str(graph[link_id].get("class_type")) == "LoadImage":
-                                graph[link_id].setdefault("inputs", {})["image"] = face_name
-                                applied_reactors.append(target_rid)
-                        else:
-                            if "source_image" in rinp:
-                                rinp["source_image"] = face_name
-                                applied_reactors.append(target_rid)
-                            elif "input_image" in rinp:
-                                rinp["input_image"] = face_name
-                                applied_reactors.append(target_rid)
-                    except (KeyError, TypeError):
-                        pass
-
-                face_idx = _parse_first_char_index(sc)
-                for rnid in reactor_ids:
-                    try:
-                        inp_map = graph[rnid].setdefault("inputs", {})
-                        if "source_faces_index" in inp_map:
-                            inp_map["source_faces_index"] = int(face_idx)
-                        if "input_faces_index" in inp_map:
-                            inp_map["input_faces_index"] = int(face_idx)
-                    except (KeyError, TypeError, ValueError):
-                        continue
-            else:
-                for rnid in reactor_ids:
-                    try:
-                        graph[rnid].setdefault("inputs", {})["enabled"] = False
-                    except (KeyError, TypeError):
-                        continue
-
+            # 2. 씬에서 캐릭터 스펙 파싱 (e.g., {"female_01": 1, "male_01": 0})
+            scene_char_specs: Dict[str, int] = {}
             try:
-                load_ids = _find_nodes(graph, "LoadImage")
-                for lid in load_ids:
-                    try:
-                        li = graph[lid].get("inputs", {})  # type: ignore
-                        _notify("debug-loadimage", f"[IMG][DBG] LoadImage nid={lid} image={str(li.get('image') or '')}")
-                    except (AttributeError, KeyError, TypeError):
-                        continue
+                # [수정] 이 파일(video_build.py)의 모듈 레벨 함수인 parse_character_spec를 호출합니다.
+                # (파일 하단 1555라인 근처에 정의되어 있어야 함)
+                chars_list_data = sc.get("characters") or sc.get(
+                    "character_objs") or []  # 'chars_list' -> 'chars_list_data'
+                for item_spec in chars_list_data:  # 'item' -> 'item_spec'
+                    spec_dict = parse_character_spec(item_spec)
+                    char_id_val = spec_dict.get("id")  # 'char_id' -> 'char_id_val'
+                    char_idx_val = spec_dict.get("index")  # 'char_idx' -> 'char_idx_val'
+                    if char_id_val:
+                        # 씬에 인덱스가 명시되지 않으면 0을 기본값으로 사용
+                        scene_char_specs[char_id_val] = 0 if char_idx_val is None else int(char_idx_val)
+            except (AttributeError, TypeError, ValueError, IndexError) as e_parse:
+                _notify("warn", f"[IMG] {sid} 캐릭터 파싱 실패: {e_parse}")
 
-                for rid in reactor_ids:
-                    try:
-                        rin = graph[rid].get("inputs", {})  # type: ignore
-                        _notify(
-                            "debug-reactor",
-                            "[IMG][DBG] ReActor nid="
-                            + str(rid)
-                            + " enabled="
-                            + str(rin.get("enabled"))
-                            + " src_img="
-                            + str(rin.get("source_image") or rin.get("input_image") or "")
-                            + " src_idx="
-                            + str(rin.get("source_faces_index"))
-                            + " in_idx="
-                            + str(rin.get("input_faces_index"))
-                        )
-                    except (AttributeError, KeyError, TypeError):
-                        continue
+            _notify("debug", f"[IMG] {sid} 씬 캐릭터 스펙: {scene_char_specs}")
 
-                if face_name and not applied_reactors:
-                    _notify("debug-warn", "[IMG][DBG] face image 있음에도 ReActor에 연결된 입력이 감지되지 않음")
-            except (RuntimeError, ValueError, TypeError):
-                pass
+            # 3. 맵을 순회하며 ReActor 활성화 및 얼굴 이미지 주입
+            enabled_reactors_count = 0
+            for reactor_id_str, (load_id_str, default_char_id_str) in WORKFLOW_REACTOR_MAP.items():  # 변수명 변경
 
-            for nid in ksampler_ids:
-                _set_input(graph, nid, "steps", int(steps))
+                char_id_for_this_node: Optional[str] = None
+                face_index_for_this_node: int = 0
 
+                if default_char_id_str in scene_char_specs:
+                    # 맵의 기본 ID (male_01, female_01)가 씬에 있으면 사용
+                    char_id_for_this_node = default_char_id_str
+                    face_index_for_this_node = scene_char_specs[default_char_id_str]
+
+                if char_id_for_this_node:
+                    # 4. 캐릭터 이미지 파일 찾기
+                    # [수정] 이 함수의 중첩 헬퍼인 _resolve_face_image_by_name를 호출합니다.
+                    face_path_resolved = _resolve_face_image_by_name(
+                        char_id_for_this_node)  # 'face_path' -> 'face_path_resolved'
+                    face_name_in_input: Optional[str] = None
+
+                    if face_path_resolved and face_path_resolved.exists():
+                        try:
+                            # 5. ComfyUI input 폴더로 복사
+                            from settings import COMFY_INPUT_DIR  # type: ignore
+                            comfy_in_dir = _Path(COMFY_INPUT_DIR)  # 'comfy_in' -> 'comfy_in_dir'
+                            comfy_in_dir.mkdir(parents=True, exist_ok=True)
+                            face_name_in_input = face_path_resolved.name
+                            shutil.copy2(str(face_path_resolved), str(comfy_in_dir / face_name_in_input))
+                        except (ImportError, AttributeError) as e_import_settings:
+                            _notify("warn", f"[IMG] {sid} settings.COMFY_INPUT_DIR 임포트 실패: {e_import_settings}")
+                            face_name_in_input = None
+                        except (IOError, OSError, shutil.Error) as e_copy:
+                            _notify("warn", f"[IMG] {sid} 얼굴 복사 실패 ({face_name_in_input}): {e_copy}")
+                            face_name_in_input = None
+
+                    if face_name_in_input:
+                        # 6. 워크플로 주입: ReActor 활성화, LoadImage 경로 설정, 얼굴 인덱스 설정
+                        _set_input(graph_clone, reactor_id_str, "enabled", True)
+                        _set_input(graph_clone, load_id_str, "image", face_name_in_input)
+                        # ReActor는 인덱스를 str으로도 받을 수 있음
+                        _set_input(graph_clone, reactor_id_str, "input_faces_index", str(face_index_for_this_node))
+                        _set_input(graph_clone, reactor_id_str, "source_faces_index", "0")  # 소스 이미지는 얼굴 1개
+                        _notify("info",
+                                f"[IMG] {sid} ReActor 활성화: Node {reactor_id_str} (Char: {char_id_for_this_node}, FaceIdx: {face_index_for_this_node}, Img: {face_name_in_input})")
+                        enabled_reactors_count += 1
+                    else:
+                        # 캐릭터는 지정됐으나 파일이 없음 -> 비활성화
+                        _set_input(graph_clone, reactor_id_str, "enabled", False)
+                        _notify("warn",
+                                f"[IMG] {sid} ReActor 비활성화: Node {reactor_id_str} ({char_id_for_this_node} 이미지 파일 없음)")
+                else:
+                    # 씬에 이 캐릭터가 없음 -> 비활성화
+                    _set_input(graph_clone, reactor_id_str, "enabled", False)
+
+            if enabled_reactors_count == 0:
+                _notify("info", f"[IMG] {sid} 씬에 매칭되는 캐릭터 없음. 페이스 스왑 비활성화.")
+
+            # --- ▲▲▲ [페이스 스왑 로직 수정 끝] ▲▲▲ ---
+
+            # KSampler 스텝 설정
+            for nid_sampler in ksampler_ids:  # 'nid' -> 'nid_sampler'
+                _set_input(graph_clone, nid_sampler, "steps", int(steps))
+
+            # --- [6. 작업 제출 및 결과 처리 (메인 함수 로직)] ---
             req_count += 1
             _notify("submit", f"[IMG] /prompt {sid}")
-            result = _wait_img(
+            result_data = _wait_img(  # 'result' -> 'result_data'
                 base_url,
-                graph,
+                graph_clone,
                 timeout=timeout_sec,
                 poll=poll_sec,
                 progress_cb=lambda d: _notify("wait", str(d.get("msg") or "")),
             )
 
-            files: List[Dict[str, Any]] = []
-            for _, out in (result.get("outputs") or {}).items():
-                if isinstance(out, dict):
-                    files.extend(out.get("images", []) or [])
-            if not files:
-                raise RuntimeError("출력 이미지 없음")
+            files_list: List[Dict[str, Any]] = []  # 'files' -> 'files_list'
+            for out_val in (result_data.get("outputs") or {}).values():  # 'out' -> 'out_val'
+                if isinstance(out_val, dict):
+                    files_list.extend(out_val.get("images", []) or [])
+            if not files_list:
+                raise RuntimeError(f"{sid}: 출력 이미지 없음")
 
-            last = files[-1]
-            subfolder = str(last.get("subfolder") or "")
-            fname = str(last.get("filename") or "")
-            if not fname:
-                raise RuntimeError("출력 파일명 없음")
+            last_file_info = files_list[-1]  # 'last' -> 'last_file_info'
+            subfolder_str = str(last_file_info.get("subfolder") or "")  # 'subfolder' -> 'subfolder_str'
+            fname_str = str(last_file_info.get("filename") or "")  # 'fname' -> 'fname_str'
+            if not fname_str:
+                raise RuntimeError(f"{sid}: 출력 파일명 없음")
 
-            rimg = requests.get(
-                base_url.rstrip("/") + "/view",
-                params={"filename": fname, "subfolder": subfolder},
-                timeout=30,
-            )
-            if not rimg.ok:
-                raise RuntimeError(f"/view 실패: {rimg.status_code}")
+            try:
+                r_image = requests.get(  # 'rimg' -> 'r_image'
+                    base_url.rstrip("/") + "/view",
+                    params={"filename": fname_str, "subfolder": subfolder_str},
+                    timeout=30,
+                )
+                r_image.raise_for_status()  # HTTP 오류 체크
+            except requests.RequestException as e_requests:
+                raise RuntimeError(f"{sid}: /view 실패: {e_requests}") from e_requests
 
-            img_path.parent.mkdir(parents=True, exist_ok=True)
-            with open(img_path, "wb") as fpw:
-                fpw.write(rimg.content)
+            img_path_target.parent.mkdir(parents=True, exist_ok=True)
+            try:
+                with open(img_path_target, "wb") as fpw:
+                    fpw.write(r_image.content)
+            except (IOError, OSError) as e_write_img:
+                raise IOError(f"{sid}: 이미지 파일 저장 실패: {e_write_img}") from e_write_img
 
-            for s in scenes:
-                if str(s.get("id")) == sid:
-                    s["img_file"] = str(img_path)
+            # video.json에 경로 저장
+            for scene_item in scenes_list:  # 's' -> 'scene_item'
+                if str(scene_item.get("id")) == sid:
+                    scene_item["img_file"] = str(img_path_target)
                     break
             try:
-                save_json(p_video, video)
+                save_json(p_video, video_doc)
                 _notify("save", f"[IMG] video.json 갱신: {sid}")
-            except (OSError, ValueError, TypeError):
-                pass
+            except (OSError, ValueError, TypeError) as e_save_video:
+                _notify("warn", f"[IMG] {sid} video.json 저장 실패: {e_save_video}")
 
-            if story:
+            # story.json에도 경로 저장
+            if story_doc:
                 try:
-                    scs = story.get("scenes") or []
-                    for s in scs:
-                        if str(s.get("id")) == sid:
-                            s["img_file"] = str(img_path)
+                    scs_list = story_doc.get("scenes") or []  # 'scs' -> 'scs_list'
+                    for scene_item_story in scs_list:  # 's' -> 'scene_item_story'
+                        if str(scene_item_story.get("id")) == sid:
+                            scene_item_story["img_file"] = str(img_path_target)
                             break
-                    save_json(p_story_json, story)
-                except (OSError, ValueError, TypeError):
-                    pass
+                    save_json(p_story_json, story_doc)
+                except (OSError, ValueError, TypeError) as e_save_story:
+                    _notify("warn", f"[IMG] {sid} story.json 저장 실패: {e_save_story}")
 
-            created.append(img_path)
-            _notify("done", f"[IMG] 저장 {img_path.name}")
+            created.append(img_path_target)
+            _notify("done", f"[IMG] 저장 {img_path_target.name}")
 
-        except (OSError, ValueError, TypeError, KeyError, RuntimeError, requests.RequestException) as err:
-            _notify("scene-error", f"[IMG] {sc.get('id')}: {err}")
+        except (OSError, ValueError, TypeError, KeyError, RuntimeError, requests.RequestException) as err_scene:
+            _notify("scene-error", f"[IMG] {sc.get('id')}: {type(err_scene).__name__}: {err_scene}")
+            continue
+        except Exception as e_scene_unknown:
+            # 예상치 못한 모든 예외 처리
+            _notify("scene-error",
+                    f"[IMG] {sc.get('id')} 예상치 못한 오류: {type(e_scene_unknown).__name__}: {e_scene_unknown}")
             continue
 
+    # --- [7. 루프 종료 및 요약] ---
     _notify("summary", f"[IMG] 생성={len(created)} / 요청={req_count}")
     return created
 
