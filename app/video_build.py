@@ -6,7 +6,6 @@ from typing import List, Tuple, Optional, Dict, Any
 import re
 from pathlib import Path
 from pathlib import Path as _Path
-import json as _json
 import time, requests, shutil
 import os
 try:
@@ -486,7 +485,6 @@ def build_shots_with_i2v(
     - 기본 청크 크기 60f, 겹침 12f
     - 임시 청크 mp4는 clips/xfade_work 에 저장
     - guff_movie.json 의 ReActor/LoadImage 노드 ID와 호환 (27/28/29 + 30/31/32)
-    - 없는 헬퍼(_parse_character_spec, _resolve_character_image_path) 는 함수 안에서 채워서 NameError 안 나게 함
     """
     # ── 표준 모듈 ─────────────────────────────────────────────
     import json as json_mod
@@ -761,7 +759,7 @@ def build_shots_with_i2v(
         return True
 
     # ── 없는 헬퍼: 캐릭터 스펙 파싱 ─────────────────────────────
-    def _parse_character_spec(raw_obj: Any) -> Dict[str, Any]:
+    def _parse_character_spec_i2v(raw_obj: Any) -> Dict[str, Any]:
         if isinstance(raw_obj, dict):
             cid_val = str(raw_obj.get("id") or raw_obj.get("name") or "").strip()
             cidx_val = raw_obj.get("index")
@@ -785,20 +783,26 @@ def build_shots_with_i2v(
         return {"id": "", "index": None}
 
     # ── 없는 헬퍼: 캐릭터 얼굴 경로 ─────────────────────────────
-    def _resolve_character_image_path(scene_obj: Dict[str, Any],
-                                      video_doc_local: Dict[str, Any],
-                                      char_id: str,
-                                      character_dir_conf: str) -> str:
+    # ── 없는 헬퍼: 캐릭터 얼굴 경로 ─────────────────────────────
+    def _resolve_character_image_path_i2v(
+            scene_obj: Dict[str, Any],
+            video_doc_local: Dict[str, Any],
+            char_id: str,
+            character_dir_path_str: str,  # ← 여기 이름만 바꿨다 (원래 character_dir_conf 였음)
+    ) -> str:
         char_id_str = str(char_id or "").strip()
         if not char_id_str:
             return ""
-        char_dir_path = Path(character_dir_conf)
-        cand_png = char_dir_path / "{0}.png".format(char_id_str)
+
+        char_dir_path = Path(character_dir_path_str)
+        cand_png = char_dir_path / f"{char_id_str}.png"
         if cand_png.exists():
             return str(cand_png)
-        cand_jpg = char_dir_path / "{0}.jpg".format(char_id_str)
+
+        cand_jpg = char_dir_path / f"{char_id_str}.jpg"
         if cand_jpg.exists():
             return str(cand_jpg)
+
         return ""
 
     # ── 시작 로그 ─────────────────────────────────────────────
@@ -1018,7 +1022,7 @@ def build_shots_with_i2v(
         try:
             scene_chars_list = scene_item.get("characters") or scene_item.get("character_objs") or []
             for scene_char_raw in scene_chars_list:
-                parsed = _parse_character_spec(scene_char_raw)
+                parsed = _parse_character_spec_i2v(scene_char_raw)
                 parsed_id_val = parsed.get("id")
                 parsed_idx_val = parsed.get("index")
                 if parsed_id_val:
@@ -1035,8 +1039,11 @@ def build_shots_with_i2v(
             load_node_id_str, default_character_id_str = reactor_meta
             if default_character_id_str in scene_character_specs:
                 face_idx_for_node = scene_character_specs[default_character_id_str]
-                face_path_resolved = _resolve_character_image_path(
-                    scene_item, video_doc, default_character_id_str, character_dir_conf
+                face_path_resolved = _resolve_character_image_path_i2v(
+                    scene_item,
+                    video_doc,
+                    default_character_id_str,
+                    character_dir_conf,  # ← 바깥에서 settings에서 가져온 이 이름은 그대로 둔다
                 )
                 if face_path_resolved:
                     face_name_input = Path(face_path_resolved).name
@@ -1540,6 +1547,12 @@ def build_shots_with_i2v(
 
 
 
+from pathlib import Path
+from typing import Any, Callable, Dict, List, Optional
+
+import json as _json  # 위에서 _probe_video_info가 _json을 써서 여기 둠
+
+
 def xfade_concat(
     clip_paths: List[Path],
     overlap_frames: int,
@@ -1617,8 +1630,10 @@ def xfade_concat(
             return probe_map
         cmd_probe = [
             ffprobe_bin,
-            "-v", "error",
-            "-print_format", "json",
+            "-v",
+            "error",
+            "-print_format",
+            "json",
             "-show_streams",
             "-show_format",
             str(path_for_probe),
@@ -2114,16 +2129,17 @@ def xfade_concat(
         cur_path = tmp_out
         print(f"[XC-CUR-{i:03d}] {_probe_video_info(cur_path)}")
 
+        # ← 여기 이름만 바꿨다
         try:
-            norm_a_path = work_dir / "_norm_a.mp4"
-            norm_b_path = work_dir / "_norm_b.mp4"
-            if norm_a_path.exists():
+            norm_a_copy_path = work_dir / "_norm_a.mp4"
+            norm_b_copy_path = work_dir / "_norm_b.mp4"
+            if norm_a_copy_path.exists():
                 dst_a = mirror_dir / f"_norm_a_{i:03d}.mp4"
-                shutil.copyfile(norm_a_path, dst_a)
+                shutil.copyfile(norm_a_copy_path, dst_a)
                 print(f"[XC-MIRROR-COPY] norm_a->{dst_a.name}")
-            if norm_b_path.exists():
+            if norm_b_copy_path.exists():
                 dst_b = mirror_dir / f"_norm_b_{i:03d}.mp4"
-                shutil.copyfile(norm_b_path, dst_b)
+                shutil.copyfile(norm_b_copy_path, dst_b)
                 print(f"[XC-MIRROR-COPY] norm_b->{dst_b.name}")
             dst_cur = mirror_dir / cur_path.name
             shutil.copyfile(cur_path, dst_cur)
@@ -2210,6 +2226,7 @@ def xfade_concat(
 
     print(f"[XC-DONE] out_path={out_path}")
     return Path(out_path)
+
 
 
 def build_missing_images_from_story(
@@ -2524,12 +2541,11 @@ def build_missing_images_from_story(
             # 2. 씬에서 캐릭터 스펙 파싱 (e.g., {"female_01": 1, "male_01": 0})
             scene_char_specs: Dict[str, int] = {}
             try:
-                # [수정] 이 파일(video_build.py)의 모듈 레벨 함수인 _parse_character_spec를 호출합니다.
                 # (파일 하단 1555라인 근처에 정의되어 있어야 함)
                 chars_list_data = sc.get("characters") or sc.get(
                     "character_objs") or []  # 'chars_list' -> 'chars_list_data'
                 for item_spec in chars_list_data:  # 'item' -> 'item_spec'
-                    spec_dict = _parse_character_spec(item_spec)
+                    spec_dict = _parse_character_spec_img(item_spec)
                     char_id_val = spec_dict.get("id")  # 'char_id' -> 'char_id_val'
                     char_idx_val = spec_dict.get("index")  # 'char_idx' -> 'char_idx_val'
                     if char_id_val:
@@ -4030,7 +4046,7 @@ def gpt_scene_prompt_writer(
 #================페이스 스왑 관련=============#
 
 
-def _parse_character_spec(item: Any) -> Dict[str, Any]:
+def _parse_character_spec_img(item: Any) -> Dict[str, Any]:
     """
     'characters' 항목의 원소를 정규화한다.
     허용 입력:
@@ -4072,14 +4088,13 @@ def _parse_character_spec(item: Any) -> Dict[str, Any]:
 def normalize_scene_characters(scene: Dict[str, Any]) -> Dict[str, Any]:
     """
     scene["characters"]를 표준화:
-      - 리스트 각 원소를 _parse_character_spec()으로 dict화
       - scene["layout"]["face_indices"] (있다면)로 index를 보완
       - scene["face_indices"] (flat dict)도 함께 만들어 소비 측이 편하게 사용
     반환: 수정된 scene (원본 shallow copy 후 필드 갱신)
     """
     sc = dict(scene or {})
     chars_in = sc.get("characters") or []
-    norm: List[Dict[str, Any]] = [_parse_character_spec(x) for x in chars_in]
+    norm: List[Dict[str, Any]] = [_parse_character_spec_img(x) for x in chars_in]
 
     # layout.face_indices에 매핑이 있으면 index 보완
     layout = sc.get("layout") or {}

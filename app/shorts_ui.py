@@ -430,6 +430,7 @@ class ScenePromptEditDialog(QtWidgets.QDialog):
         self.scenes_data: list = []
         self.widget_map: List[Tuple[str, QtWidgets.QTextEdit]] = []
         self.style_widget_map: Dict[str, Tuple[QtWidgets.QLabel, QtWidgets.QWidget]] = {}
+        self.character_styles_group: QtWidgets.QWidget | None = None
 
         self.current_page = 0
         self.total_pages = 0
@@ -492,7 +493,8 @@ class ScenePromptEditDialog(QtWidgets.QDialog):
         # 7. JSON 데이터 로드 및 UI 빌드 (이 함수가 5~7초 소요)
         self.load_and_build_ui()
 
-    def _reindex_char_list(self, list_widget: QtWidgets.QListWidget):
+    @staticmethod
+    def _reindex_char_list(list_widget: QtWidgets.QListWidget) -> None:
         """
         [신규] QListWidget의 항목을 읽어 인덱스를 0부터 순차적으로 다시 매깁니다.
         (예: ["f:0", "m:2"] -> ["f:0", "m:1"])
@@ -630,8 +632,8 @@ class ScenePromptEditDialog(QtWidgets.QDialog):
         """(v19 추가) "추가" 버튼 핸들러. CHARACTER_DIR에서 캐릭터 파일을 선택."""
         start_dir = r"C:\my_games\shorts_make\character"
         try:
-            from app import settings as S
-            start_dir = getattr(S, "CHARACTER_DIR", start_dir)
+            from app import settings as sex
+            start_dir = getattr(sex, "CHARACTER_DIR", start_dir)
         except (ImportError, AttributeError):
             pass
 
@@ -941,27 +943,30 @@ class ScenePromptEditDialog(QtWidgets.QDialog):
         try:
             # --- (v37) settings 임포트 (버그 수정) ---
             try:
-                from app import settings as S
+                from app import settings as s_conf
             except ImportError:
-                import settings as S  # type: ignore
+                import settings as s_conf  # type: ignore
             # --- (v37) 수정 끝 ---
 
             data = load_json(self.json_path, None)
-            if not isinstance(data, dict): raise ValueError("video.json 파일의 형식이 올바르지 않습니다.")
+            if not isinstance(data, dict):
+                raise ValueError("video.json 파일의 형식이 올바르지 않습니다.")
 
             self.full_video_data = data
             self.scenes_data = self.full_video_data.get("scenes", [])
-            if not isinstance(self.scenes_data, list): raise ValueError("video.json에 'scenes' 키가 없거나 리스트가 아닙니다.")
+            if not isinstance(self.scenes_data, list):
+                raise ValueError("video.json에 'scenes' 키가 없거나 리스트가 아닙니다.")
 
             # --- [v29] 캐릭터 스타일 그룹 + 추가 버튼 가로 배치 ---
             top_char_layout = QtWidgets.QHBoxLayout()
             self.character_styles_group = self._build_character_styles_group()
             top_char_layout.addWidget(self.character_styles_group, 1)
             add_button = QtWidgets.QPushButton("캐릭터\n추가")
-            add_button.setToolTip(f"폴더[{getattr(S, 'CHARACTER_DIR', 'C:/.../character')}]에서 캐릭터 파일을 선택해 목록에 추가합니다.")
+            add_button.setToolTip(
+                f"폴더[{getattr(s_conf, 'CHARACTER_DIR', 'C:/.../character')}]에서 캐릭터 파일을 선택해 목록에 추가합니다."
+            )
             add_button.clicked.connect(self.on_add_character_style)
             add_button.setSizePolicy(QtWidgets.QSizePolicy.Policy.Fixed, QtWidgets.QSizePolicy.Policy.Fixed)
-            top_char_layout.addWidget(add_button, 0)
             main_layout = self.layout()
             if main_layout and hasattr(main_layout, "insertLayout"):
                 main_layout.insertLayout(0, top_char_layout)
@@ -3152,6 +3157,57 @@ class MainWindow(QtWidgets.QMainWindow):
         return max(uniq, key=_mtime_safe)
 
     # shos_ui.py 파일의 on_click_build_story_from_seg_async 함수 전체를 교체하세요.
+    def fps_to_partion(self, video_json_path: Path) -> int:
+        """
+        UI에서 렌더 FPS 값을 읽어 video.json의 defaults.movie.target_fps 및
+        defaults.image.fps에 저장하고, 해당 FPS 값을 반환합니다.
+        (함수 이름은 'fps_to_partion'으로 명명되었으나, 실제로는 FPS 값 저장 및 반환 역할을 수행)
+        """
+        try:
+            from app.utils import load_json, save_json
+        except ImportError:
+            from utils import load_json, save_json  # type: ignore
+
+        # 1. UI에서 현재 FPS 값 읽기
+        ui_fps_widget = getattr(self, "cmb_movie_fps", None)
+        try:
+            # currentData는 정수(int) 값을 반환해야 함
+            target_fps_val = int(ui_fps_widget.currentData()) if ui_fps_widget and hasattr(ui_fps_widget,
+                                                                                           "currentData") else 30
+        except Exception:
+            target_fps_val = 30
+            print("[WARN] UI에서 FPS 값 읽기 실패, 기본값 30 사용.")
+
+        # 2. video.json 로드
+        video_doc = load_json(video_json_path, {}) or {}
+        if not isinstance(video_doc, dict):
+            video_doc = {}
+
+        # 3. defaults 섹션에 FPS 값 주입
+        video_doc.setdefault("defaults", {})
+
+        # [신규] FPS 값을 movie/image 양쪽에 저장 (target_fps, input_fps 역할을 겸함)
+        movie_defaults = video_doc["defaults"].setdefault("movie", {})
+        image_defaults = video_doc["defaults"].setdefault("image", {})
+
+        # movie defaults (렌더 설정)
+        movie_defaults["target_fps"] = target_fps_val
+        movie_defaults["input_fps"] = target_fps_val  # input/target 동일하게 설정
+        movie_defaults["fps"] = target_fps_val  # 레거시 호환
+
+        # image defaults (프레임 계산에 사용될 수 있음)
+        # video.json의 기존 image defaults를 그대로 사용하거나, fps 필드만 업데이트
+        image_defaults["fps"] = target_fps_val
+
+        # 4. video.json 저장
+        try:
+            save_json(video_json_path, video_doc)
+            print(f"[FPS-PARTITION] {target_fps_val} FPS 저장 완료: {video_json_path.name}")
+        except Exception as e_save_fps:
+            print(f"[ERROR] video.json에 FPS 값 저장 실패: {e_save_fps}")
+
+        return target_fps_val
+
 
     def on_click_build_story_from_seg_async(self) -> None:
             """
@@ -3380,6 +3436,23 @@ class MainWindow(QtWidgets.QMainWindow):
                         log_fn(f"[ERROR] 가사 재주입 오류: {type(e_reinject).__name__}: {e_reinject}")
                     except Exception as e_unknown_reinject:
                         log_fn(f"[ERROR] 가사 재주입 중 예상치 못한 오류: {type(e_unknown_reinject).__name__}: {e_unknown_reinject}")
+
+            video_json_path = proj_dir_path / "video.json"
+
+            try:
+                # self.fps_to_partion 함수를 호출하여 UI FPS 값을 video.json에 저장합니다.
+                current_fps = self.fps_to_partion(video_json_path)
+                # job 내의 _log_progress 대신, 임시로 print를 사용하여 로그를 남깁니다.
+                print(f"[INFO] UI FPS ({current_fps} FPS)를 video.json에 반영했습니다.", flush=True)
+            except Exception as e_fps_to_partion:
+                # 여기서 오류가 나면 버튼을 복구하고 job 실행을 막습니다.
+                print(f"[ERROR] FPS 값 저장 실패, 기본값 사용: {e_fps_to_partion}", flush=True)
+                self._seg_story_busy = False
+                btn_build_story = getattr(self, "btn_test1_story", None)
+                if btn_build_story is not None: btn_build_story.setEnabled(True)
+                return  # job 정의 및 실행을 막습니다.
+
+
 
             # ----- job 함수 정의 -----
             def job(on_progress_callback: Callable[[dict], None]) -> Dict[str, str]:
@@ -9080,27 +9153,26 @@ def _inject_render_prefs_methods():
                 if not (isinstance(data, tuple) and len(data) == 3):
                     return
 
-                w_preset, h_preset, key = data
+                # 바깥 for문의 w_preset/h_preset이랑 이름 안 겹치게 바꿨다
+                w_val, h_val, key = data
                 is_custom = (key == "custom")
 
-                # custom 아니면 W/H 먼저 세팅
                 if not is_custom:
                     cmb_w.blockSignals(True)
                     cmb_h.blockSignals(True)
                     try:
-                        idx_w = cmb_w.findData(int(w_preset))
+                        idx_w = cmb_w.findData(int(w_val))
                         if idx_w >= 0:
                             cmb_w.setCurrentIndex(idx_w)
 
-                        idx_h = cmb_h.findData(int(h_preset))
+                        idx_h = cmb_h.findData(int(h_val))
                         if idx_h >= 0:
                             cmb_h.setCurrentIndex(idx_h)
                     finally:
                         cmb_w.blockSignals(False)
                         cmb_h.blockSignals(False)
 
-                # 마지막에 한 번만 잠금 상태 적용
-                # custom -> False, 그 외 -> True
+                # custom → 잠금 해제 / 프리셋 → 잠금
                 lock_handler(not is_custom)
 
             return _apply_preset
