@@ -105,10 +105,10 @@
   "52": {
     "inputs": {
       "seed": 1075430197111118,
-      "steps": 60,
-      "cfg": 5,
-      "sampler_name": "euler",
-      "scheduler": "simple",
+      "steps": 40,
+      "cfg": 6,
+      "sampler_name": "dpmpp_2m_sde",
+      "scheduler": "karras",
       "denoise": 1,
       "model": [
         "49",
