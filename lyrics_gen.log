@@ -86,3 +86,16 @@ Please retry in 41.907013033s. [links {
 [parse] text_len=484
 [parse] ok
 [normalize] lyrics generated without language tags
+[ui] 가사 생성 시작
+[AI Tags] 긍정 프롬프트 AI 태그 변환 시작... (내용: 분위기 있는 노래...)
+[AI Tags] AI 태그 생성 완료: ['atmospheric', 'moody', 'chill', 'relaxing', 'late night', 'downtempo', 'lofi', 'ambient']
+[AI Tags] 8개의 AI 태그를 project.json에 저장했습니다.
+[ai] prefer=gemini, secs=30
+[ai] prefer=gemini, allow_fallback=False, sec=30, lines=6-8
+[gemini] model=gemini-2.5-pro
+[gemini] len=486
+[provider] gemini model=gemini-2.5-pro
+[parse] text_len=486
+[parse] ok
+[normalize] lyrics generated without language tags
+[AI Tags] 수동 태그(31개)로 필터링 -> []

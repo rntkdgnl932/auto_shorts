@@ -1744,9 +1744,23 @@ class MainWindow(QtWidgets.QMainWindow):
     def _generate_and_save_ai_tags(self, project_path: Path, meta: dict, progress_callback: Callable) -> List[str]:
         """
         '긍정 프롬프트 (+)' 박스 내용을 AI로 보내 태그로 변환하고 project.json에 저장합니다.
-        박스가 비어있으면 빈 목록을 저장합니다.
-        (주의) progress_callback 은 문자열만 받는 기존 코드에 맞춥니다.
+        (수정됨: progress_callback을 항상 dict 형태로 변환하여 호출하도록 수정)
         """
+
+        # 헬퍼 함수: progress_callback을 항상 dict 형태로 호출
+        def _log_progress(message: str) -> None:
+            """progress_callback을 항상 dict 형태로 호출하는 래퍼."""
+            try:
+                # 상위 run_job_with_progress_async의 progress 콜백은 dict를 받습니다.
+                progress_callback({"msg": message, "stage": "AI Tags"})
+            except Exception as e:
+                # 만약 상위 콜백이 문자열을 인자로 받는 형태의 Fallback이라면:
+                try:
+                    progress_callback(f"[AI Tags] {message}")
+                except Exception:
+                    # 최후의 수단: 아무것도 하지 않음
+                    pass
+
         # utils.py의 save_json을 사용합니다.
         try:
             from app.utils import save_json  # type: ignore
@@ -1763,15 +1777,15 @@ class MainWindow(QtWidgets.QMainWindow):
                 prompt_text_src = ""
         except Exception as read_exc:
             # 콜백은 문자열만
-            progress_callback(f"[AI Tags] 긍정 프롬프트 UI 읽기 실패: {read_exc}")
+            _log_progress(f"긍정 프롬프트 UI 읽기 실패: {read_exc}")
             prompt_text_src = ""
 
         ai_tags_result: List[str] = []
 
         if not prompt_text_src:
-            progress_callback("[AI Tags] 긍정 프롬프트가 비어있어 AI 태그 생성을 건너뜁니다.")
+            _log_progress("긍정 프롬프트가 비어있어 AI 태그 생성을 건너뜁니다.")
         else:
-            progress_callback(f"[AI Tags] 긍정 프롬프트 AI 태그 변환 시작... (내용: {prompt_text_src[:30]}...)")
+            _log_progress(f"긍정 프롬프트 AI 태그 변환 시작... (내용: {prompt_text_src[:30]}...)")
 
             system_prompt = (
                 "You are an expert tag generator for music AI. "
@@ -1822,18 +1836,18 @@ class MainWindow(QtWidgets.QMainWindow):
                     tail_text = text_body.split(":", 1)[-1]
                     ai_tags_result = [item.strip().lower() for item in tail_text.split(",") if item.strip()]
 
-                progress_callback(f"[AI Tags] AI 태그 생성 완료: {ai_tags_result}")
+                _log_progress(f"AI 태그 생성 완료: {ai_tags_result}")
             except Exception as ai_exc:
-                progress_callback(f"[AI Tags] AI 태그 생성 실패: {ai_exc}. 빈 목록을 사용합니다.")
+                _log_progress(f"AI 태그 생성 실패: {ai_exc}. 빈 목록을 사용합니다.")
                 ai_tags_result = []
 
         # project.json에 'prompt_user_ai_tags' 키로 저장
         try:
             meta["prompt_user_ai_tags"] = ai_tags_result
             save_json(project_path, meta)
-            progress_callback(f"[AI Tags] {len(ai_tags_result)}개의 AI 태그를 project.json에 저장했습니다.")
+            _log_progress(f"{len(ai_tags_result)}개의 AI 태그를 project.json에 저장했습니다.")
         except Exception as save_exc:
-            progress_callback(f"[AI Tags] project.json 저장 실패: {save_exc}")
+            _log_progress(f"project.json 저장 실패: {save_exc}")
 
         return ai_tags_result
 
