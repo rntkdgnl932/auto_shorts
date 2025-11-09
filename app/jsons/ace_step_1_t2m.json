@@ -105,7 +105,7 @@
   "52": {
     "inputs": {
       "seed": 1075430197111118,
-      "steps": 40,
+      "steps": 100,
       "cfg": 6,
       "sampler_name": "dpmpp_2m_sde",
       "scheduler": "karras",
