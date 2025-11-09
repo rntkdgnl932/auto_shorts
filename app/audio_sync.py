@@ -3672,7 +3672,8 @@ def _create_final_segments_from_ready(
     [헤더 제거 최종 수정 v5.1 + 안전한 시간표현 통일 주입 + 이웃기반 영단어 복원(내부 로컬) + 참조 bigram 문맥 가중치]
     - Boundary detection uses lyric lines *without* headers.
     - Word correction reference(`ref_all_words`)는 헤더 제거본 사용.
-    - [수정] 환각 가사 제거를 위해 원본 가사 줄 수(N)를 초과하는 세그먼트를 강제 절단합니다.
+    - [수정] 환각 가사 제거를 위해 원본 가사 줄 수(N)를 초과하는 세그먼트를 강제 절단하며,
+             시간 조정 후 '원본 단어 검증' 클린업 로직을 추가합니다.
     """
     import difflib
     from pathlib import Path
@@ -3680,10 +3681,10 @@ def _create_final_segments_from_ready(
     import re
 
     # ---- 시간표현 통일 헬퍼 바인딩(있으면만 사용, 임포트 시도 안 함) ----
-    build_time_variant_map_local = globals().get("build_time_variant_map")  # 변수명 변경 (가리기 방지)
-    normalize_times_in_text_local = globals().get("normalize_times_in_text")  # 변수명 변경
+    build_time_variant_map_local = globals().get("build_time_variant_map")
+    normalize_times_in_text_local = globals().get("normalize_times_in_text")
 
-    time_map_local = None  # 변수명 변경
+    time_map_local = None
     if build_time_variant_map_local:
         try:
             time_map_local = build_time_variant_map_local(clean_lyrics_lines)
@@ -3722,15 +3723,15 @@ def _create_final_segments_from_ready(
         return difflib.SequenceMatcher(None, a, b).ratio()
 
     # kroman 처리 (ImportError 시 None 할당 및 except 블록에서도 정의)
-    kroman_local: Optional[Any]  # 변수명 변경
+    kroman_local: Optional[Any]
     try:
         import kroman  # type: ignore
-        kroman_local = kroman  # 할당
+        kroman_local = kroman
     except ImportError:
         kroman_local = None
         print("[WARN] kroman library not found. Romanization comparison will be limited.")
 
-    _korean_pattern_local: Pattern[str] = re.compile(r'[\uac00-\ud7a3]')  # 변수명 변경 (가리기 방지)
+    _korean_pattern_local: Pattern[str] = re.compile(r'[\uac00-\ud7a3]')
 
     def _is_korean(word: str) -> bool:
         return bool(_korean_pattern_local.search(str(word or "")))
@@ -3860,7 +3861,7 @@ def _create_final_segments_from_ready(
 
     # ---- 2 & 3. Word Correction 준비 (헤더 제거본 + 시간통일 적용) ----
     ref_source_lines = boundary_ref_lines_no_headers
-    ref_source_lines = [_maybe_norm_time(x) for x in ref_source_lines]
+    ref_source_lines = [_maybe_norm_time(x) for x in boundary_ref_lines_no_headers]
 
     # === 앵커 기반 영단어 복원용 맵 ===
     anchor_map: Dict[str, str] = {}
@@ -4156,9 +4157,50 @@ def _create_final_segments_from_ready(
             if curr_end_adjust < prev_end_adjust + 0.1:
                 final_segments[i_adjust]["end"] = prev_end_adjust + 0.1
 
-    print(f"\n[SYNC-PRO] Returning {len(final_segments)} final segments.")
+    # -----------------------------------------------------
+    # 💡 [핵심 추가 로직] 최종 가사 후처리: 원본 가사에 없는 단어 제거
+    # -----------------------------------------------------
+    final_segments_clean: List[Dict] = []
+
+    # 원본 가사에서 사용된 모든 단어(헤더 제외)를 찾기 위한 set 생성
+    # ref_all_words는 이미 위에서 계산됨
+    source_words_set = set(w.lower() for w in ref_all_words)
+
+    for seg in final_segments:
+        current_text = str(seg.get("text", "")).strip()
+
+        # current_text를 단어 단위로 분해 (공백 및 쉼표 기준)
+        current_words = [w for w in re.split(r"[\s,]+", current_text) if w]
+
+        # 원본에 포함된 단어만 남깁니다.
+        corrected_words_list = []
+        for word in current_words:
+            # 원본 가사 단어 집합에 포함되는 경우에만 추가
+            if word.lower() in source_words_set:
+                corrected_words_list.append(word)
+            # 그렇지 않은 경우, 즉 "볼"과 같은 환각 단어는 무시
+
+        new_text = " ".join(corrected_words_list).strip()
+
+        if new_text and new_text != current_text:
+            # 텍스트가 변경되었고 (예: "볼 복잡했던" -> "복잡했던") 새 텍스트가 비어있지 않은 경우 업데이트
+            seg["text"] = new_text
+            seg["line_ko"] = new_text  # line_ko도 함께 업데이트
+            print(f"[CLEANUP] Corrected line: '{current_text}' -> '{new_text}'")
+            final_segments_clean.append(seg)
+        elif not new_text and current_text:
+            # 모든 단어가 제거되었다면 (빈 줄)
+            print(f"[CLEANUP] Line completely removed: '{current_text}'")
+            continue  # 최종 목록에 추가하지 않음
+        else:
+            # 변경 없음 (new_text == current_text) 또는 new_text가 비어있지 않은 경우
+            final_segments_clean.append(seg)
+
+    # -----------------------------------------------------
+
+    print(f"\n[SYNC-PRO] Returning {len(final_segments_clean)} final segments after cleanup.")
     print("------------------------------------\n")
-    return final_segments
+    return final_segments_clean
 
 
 
