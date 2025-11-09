@@ -3660,6 +3660,8 @@ JUNGSUNG = ['ㅏ', 'ㅐ', 'ㅑ', 'ㅒ', 'ㅓ', 'ㅔ', 'ㅕ', 'ㅖ', 'ㅗ', 'ㅘ'
 JONGSUNG = ['', 'ㄱ', 'ㄲ', 'ㄳ', 'ㄴ', 'ㄵ', 'ㄶ', 'ㄷ', 'ㄹ', 'ㄺ', 'ㄻ', 'ㄼ', 'ㄽ', 'ㄾ', 'ㄿ', 'ㅀ', 'ㅁ', 'ㅂ', 'ㅄ', 'ㅅ', 'ㅆ', 'ㅇ', 'ㅈ', 'ㅊ', 'ㅋ', 'ㅌ', 'ㅍ', 'ㅎ']
 
 
+# 파일: audio_sync.py
+
 def _create_final_segments_from_ready(
         seg_ready_payload: list,
         clean_lyrics_lines: list,  # 헤더 포함된 원본 가사 (입력)
@@ -3670,14 +3672,7 @@ def _create_final_segments_from_ready(
     [헤더 제거 최종 수정 v5.1 + 안전한 시간표현 통일 주입 + 이웃기반 영단어 복원(내부 로컬) + 참조 bigram 문맥 가중치]
     - Boundary detection uses lyric lines *without* headers.
     - Word correction reference(`ref_all_words`)는 헤더 제거본 사용.
-    - 필요 시 시간표현(3시/세 시/15:05:00 등) 통일(헬퍼 있으면만).
-    - 마지막 줄 탐색은 역방향(원본 유지).
-    - 기존 상수/로직/임계값 그대로.
-    - 추가1: 참조 가사에서 [앵커(한글 등)] 뒤에 [영단어 1~2개]가 오는 패턴을 학습해,
-             세그먼트 텍스트에서 앵커 다음의 한글 오인식 토큰을 해당 영단어로 보수적으로 치환.
-             (예: '푸른 스크린라이트' → 참조 '푸른 screen light'를 근거로 'screen light' 복원)
-    - 추가2: 참조 가사에서 인접 단어 bigram을 수집하여, 교정 시 '직전 확정 단어의 다음으로 자주 오는 단어'에
-             미세 가중치를 부여(동점/근소차 해소). (예: 'a perfect' 다음 'heal' 우선)
+    - [수정] 환각 가사 제거를 위해 원본 가사 줄 수(N)를 초과하는 세그먼트를 강제 절단합니다.
     """
     import difflib
     from pathlib import Path
@@ -3685,28 +3680,28 @@ def _create_final_segments_from_ready(
     import re
 
     # ---- 시간표현 통일 헬퍼 바인딩(있으면만 사용, 임포트 시도 안 함) ----
-    build_time_variant_map = globals().get("build_time_variant_map")
-    normalize_times_in_text = globals().get("normalize_times_in_text")
+    build_time_variant_map_local = globals().get("build_time_variant_map")  # 변수명 변경 (가리기 방지)
+    normalize_times_in_text_local = globals().get("normalize_times_in_text")  # 변수명 변경
 
-    time_map = None
-    if build_time_variant_map:
+    time_map_local = None  # 변수명 변경
+    if build_time_variant_map_local:
         try:
-            time_map = build_time_variant_map(clean_lyrics_lines)
+            time_map_local = build_time_variant_map_local(clean_lyrics_lines)
         except Exception:
-            time_map = None
+            time_map_local = None
 
     def _maybe_norm_time(s: str) -> str:
-        if time_map and normalize_times_in_text:
+        if time_map_local and normalize_times_in_text_local:
             try:
-                return normalize_times_in_text(s, time_map)
+                return normalize_times_in_text_local(s, time_map_local)
             except Exception:
                 return s
         return s
 
-    # --- constants and local utils ---
-    _match_type_kept = "KEPT"
-    _match_type_authenticated = "AUTHENTICATED"
-    _match_type_corrected = "CORRECTED"
+    # --- constants and local utils (확인되지 않은 참조 해결) ---
+    _match_type_kept_local = "KEPT"
+    _match_type_authenticated_local = "AUTHENTICATED"
+    _match_type_corrected_local = "CORRECTED"
     _filter_short_words = {'a', 'ah', 'oh', 'uh', 'hm', 'hmm', 'um', 'o', 'eh', '음', 'nan', 'neo'}
 
     def _safe_float(val: Any) -> float:
@@ -3727,27 +3722,28 @@ def _create_final_segments_from_ready(
         return difflib.SequenceMatcher(None, a, b).ratio()
 
     # kroman 처리 (ImportError 시 None 할당 및 except 블록에서도 정의)
-    kroman: Optional[Any]
+    kroman_local: Optional[Any]  # 변수명 변경
     try:
         import kroman  # type: ignore
+        kroman_local = kroman  # 할당
     except ImportError:
-        kroman = None
+        kroman_local = None
         print("[WARN] kroman library not found. Romanization comparison will be limited.")
 
-    _korean_pattern: Pattern[str] = re.compile(r'[\uac00-\ud7a3]')
+    _korean_pattern_local: Pattern[str] = re.compile(r'[\uac00-\ud7a3]')  # 변수명 변경 (가리기 방지)
 
     def _is_korean(word: str) -> bool:
-        return bool(_korean_pattern.search(str(word or "")))
+        return bool(_korean_pattern_local.search(str(word or "")))
 
     def _romanize(text: str) -> str:
         text_norm = _norm_for_compare(text)
         if not text_norm:
             return ""
-        korean_parts = _korean_pattern.findall(text)
-        if korean_parts and kroman:
+        korean_parts = _korean_pattern_local.findall(text)
+        if korean_parts and kroman_local:
             try:
                 korean_text_only = "".join(korean_parts)
-                parsed: Optional[str] = kroman.parse(korean_text_only)  # type: ignore[attr-defined]
+                parsed: Optional[str] = kroman_local.parse(korean_text_only)  # type: ignore[attr-defined]
                 return parsed.replace("-", "").lower() if parsed else text_norm
             except Exception as e_kroman_parse:
                 print(f"[WARN] kroman parsing failed for '{text}': {type(e_kroman_parse).__name__}")
@@ -3799,7 +3795,8 @@ def _create_final_segments_from_ready(
                 seg_text_raw = _maybe_norm_time(str(seg_item.get("text", "")))
                 seg_text_norm = _norm_for_compare(seg_text_raw)
                 score_val = _match_score(seg_text_norm, first_line_norm)
-                print(f"  [DEBUG] Comparing seg[{i}] ('{seg_text_norm}') vs First ('{first_line_norm}') -> Score: {score_val:.4f}")
+                print(
+                    f"  [DEBUG] Comparing seg[{i}] ('{seg_text_norm}') vs First ('{first_line_norm}') -> Score: {score_val:.4f}")
                 if score_val > score_threshold_boundary:
                     first_idx = i
                     print(f"    => Match found! Setting first_idx = {i}")
@@ -3817,7 +3814,8 @@ def _create_final_segments_from_ready(
             if isinstance(current_seg_item, dict) and "text" in current_seg_item:
                 seg_text_norm_rev = _norm_for_compare(_maybe_norm_time(current_seg_item.get("text", "")))
                 score_val_rev = _match_score(seg_text_norm_rev, last_line_norm)
-                print(f"  [DEBUG] Comparing seg[{i_rev}] ('{seg_text_norm_rev}') vs Last ('{last_line_norm}') -> Score: {score_val_rev:.4f}")
+                print(
+                    f"  [DEBUG] Comparing seg[{i_rev}] ('{seg_text_norm_rev}') vs Last ('{last_line_norm}') -> Score: {score_val_rev:.4f}")
                 if score_val_rev > score_threshold_boundary:
                     last_idx = i_rev
                     print(f"    => Match found! Setting last_idx = {i_rev}")
@@ -3900,10 +3898,13 @@ def _create_final_segments_from_ready(
         if not text or not anchors:
             return text
         out = str(text)
-        for anchor_key, eng_phrase in anchors.items():
+        for anchor_key in anchors.keys():
+            eng_phrase = anchors.get(anchor_key)
             pat = re.compile(r"(?:(?<=^)|(?<=\s))" + re.escape(anchor_key) + r"\s+([가-힣]{2,15})(?=\s|$)")
+
             def _repl(m: re.Match) -> str:
                 return f"{anchor_key} {eng_phrase}"
+
             out_new = pat.sub(_repl, out)
             out = out_new
         return out
@@ -3914,24 +3915,24 @@ def _create_final_segments_from_ready(
         toks = rx_token.findall(line_ref or "")
         toks_l = [t.lower() for t in toks if t]
         for i_b in range(len(toks_l) - 1):
-            a = toks_l[i_b]
-            b = toks_l[i_b + 1]
-            if a not in bigram_counts:
-                bigram_counts[a] = {}
-            if b not in bigram_counts[a]:
-                bigram_counts[a][b] = 0
-            bigram_counts[a][b] += 1
+            a_token = toks_l[i_b]
+            b_token = toks_l[i_b + 1]
+            if a_token not in bigram_counts:
+                bigram_counts[a_token] = {}
+            if b_token not in bigram_counts[a_token]:
+                bigram_counts[a_token][b_token] = 0
+            bigram_counts[a_token][b_token] += 1
 
     top_next_map: Dict[str, str] = {}
-    for k_prev, nxts in bigram_counts.items():
-        best_next = ""
+    for k_prev_token, nxts in bigram_counts.items():
+        best_next_token = ""
         best_cnt = -1
         for cand_nxt, cnt in nxts.items():
             if cnt > best_cnt:
                 best_cnt = cnt
-                best_next = cand_nxt
-        if best_next:
-            top_next_map[k_prev] = best_next
+                best_next_token = cand_nxt
+        if best_next_token:
+            top_next_map[k_prev_token] = best_next_token
 
     ref_all_words_raw = " ".join(ref_source_lines).replace(",", "").replace("'", "")
     ref_all_words = ref_all_words_raw.split()
@@ -3974,7 +3975,7 @@ def _create_final_segments_from_ready(
             best_match: Dict[str, Any] = {
                 "score": -1.0,
                 "word": candidate_whisper,
-                "type": _match_type_kept,
+                "type": _match_type_kept_local,
                 "ref_origin": ""
             }
 
@@ -4003,7 +4004,7 @@ def _create_final_segments_from_ready(
                 context_bonus = 0.0
                 loop_ref_lower = loop_ref_word.lower()
                 if prev_out_lower and prev_out_lower in bigram_counts:
-                    if loop_ref_lower in bigram_counts[prev_out_lower]:
+                    if loop_ref_lower in bigram_counts.get(prev_out_lower, {}):
                         context_bonus += 0.18
                         if top_next_map.get(prev_out_lower) == loop_ref_lower:
                             context_bonus += 0.05
@@ -4016,7 +4017,7 @@ def _create_final_segments_from_ready(
                     best_match.update({
                         "score": auth_score,
                         "word": candidate_whisper,
-                        "type": _match_type_authenticated,
+                        "type": _match_type_authenticated_local,
                         "ref_origin": loop_ref_word
                     })
                 elif correction_score > current_best_score:
@@ -4026,7 +4027,7 @@ def _create_final_segments_from_ready(
                         best_match.update({
                             "score": correction_score,
                             "word": loop_ref_word,
-                            "type": _match_type_corrected,
+                            "type": _match_type_corrected_local,
                             "ref_origin": loop_ref_word
                         })
 
@@ -4038,7 +4039,7 @@ def _create_final_segments_from_ready(
             word_to_append: Optional[str] = None
             leftover_whisper_part = ""
 
-            if match_type == _match_type_kept:
+            if match_type == _match_type_kept_local:
                 if candidate_whisper.lower() not in _filter_short_words:
                     word_to_append = candidate_whisper
             else:
@@ -4046,9 +4047,11 @@ def _create_final_segments_from_ready(
                     word_to_append = word_to_process
                     ref_matched_norm = _norm_for_compare(ref_origin)
                     candidate_actual_norm = _norm_for_compare(candidate_whisper)
-                    if len(candidate_actual_norm) > len(ref_matched_norm) and candidate_actual_norm.startswith(ref_matched_norm):
+                    if len(candidate_actual_norm) > len(ref_matched_norm) and candidate_actual_norm.startswith(
+                            ref_matched_norm):
                         try:
-                            match_obj = re.match(re.escape(ref_matched_norm), candidate_whisper, flags=re.IGNORECASE | re.UNICODE)
+                            match_obj = re.match(re.escape(ref_matched_norm), candidate_whisper,
+                                                 flags=re.IGNORECASE | re.UNICODE)
                             if match_obj:
                                 leftover_whisper_part = candidate_whisper[match_obj.end():].strip()
                         except re.error:
@@ -4119,13 +4122,27 @@ def _create_final_segments_from_ready(
     final_segments: List[Dict] = []
     if final_start_idx != -1 and final_end_idx != -1 and final_end_idx >= final_start_idx:
         final_segments = intermediate_segments[final_start_idx: final_end_idx + 1]
-        print(f"[SYNC-PRO] Final check: Kept segments {final_start_idx} to {final_end_idx} (Total: {len(final_segments)}).")
+        print(
+            f"[SYNC-PRO] Final check: Kept segments {final_start_idx} to {final_end_idx} (Total: {len(final_segments)}).")
     elif intermediate_segments:
         final_segments = intermediate_segments
         print("[WARN] Final check failed, using all intermediate.")
     else:
         print("[ERROR] Final check failed, no intermediate segments.")
         return []
+
+    # -----------------------------------------------------
+    # 💡 [핵심 추가 로직] 원본 가사 줄 수(N) 초과 강제 절단
+    # -----------------------------------------------------
+    # boundary_ref_lines_no_headers는 헤더가 제거된 원본 가사입니다.
+    N_SOURCE_LINES = len(boundary_ref_lines_no_headers)
+
+    if len(final_segments) > N_SOURCE_LINES:
+        # 세그먼트가 원본 줄 수보다 많으면, 앞에서부터 N개만 남기고 잘라냅니다.
+        print(
+            f"[INFO] Segment count ({len(final_segments)}) exceeds source line count ({N_SOURCE_LINES}). Trimming to {N_SOURCE_LINES} segments.")
+        final_segments = final_segments[:N_SOURCE_LINES]
+    # -----------------------------------------------------
 
     # Time Adjustment
     final_segments.sort(key=lambda x: _safe_float(x.get("start", 0.0)))
