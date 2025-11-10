@@ -1543,9 +1543,6 @@ class AI:
             return {"segments": [{"text": r, "reason": "fallback"} for r in refined]}
 
 
-# === [MERGED FROM progress.py] ===
-# app/progress.py
-# -*- coding: utf-8 -*-
 from pathlib import Path
 import io, traceback
 import os
