@@ -2247,13 +2247,13 @@ def build_missing_images_from_story(
     - 워크플로: settings.JSONS_DIR / nunchaku_qwen_image_swap.json (또는 인자 workflow_path)
     - 프롬프트: scene.prompt_movie > (scene.prompt + '\\n' + scene.prompt_img)
     - 네거티브: scene.prompt_negative or defaults.image.negative
-    - [수정됨] 다중 페이스 스왑 워크플로(nunchaku_qwen_image_swap.json) 지원
+    - 다중 페이스 스왑 워크플로(nunchaku_qwen_image_swap.json) 지원
     """
     # --- [1. 모듈 임포트] ---
-    # (json은 _json_loader 별칭으로 사용, 전역 'json'과 충돌 방지)
     import json as _json_loader
     import shutil
     import requests
+    import random as _img_seed_random  # 시드용
     from typing import Any, Dict, List, Optional, Callable
 
     # --- [2. 알림 콜백 함수 (중첩)] ---
@@ -2268,7 +2268,7 @@ def build_missing_images_from_story(
             if callable(on_progress):
                 on_progress(data)
             elif isinstance(on_progress, dict):
-                cb_func = on_progress.get("callback")  # 'cb' -> 'cb_func' (가리기 방지)
+                cb_func = on_progress.get("callback")
                 if callable(cb_func):
                     cb_func(data)
         except (RuntimeError, ValueError, TypeError) as e_notify_callback:
@@ -2282,12 +2282,11 @@ def build_missing_images_from_story(
             raise FileNotFoundError(f"경로 없음: {story_dir}")
 
         p_video = story_dir / "video.json"
-        video_doc = load_json(p_video, {}) or {}  # 'video' -> 'video_doc' (가리기 방지)
+        video_doc = load_json(p_video, {}) or {}
         p_story_json = story_dir / "story.json"
-        story_doc = load_json(p_story_json, {}) or {}  # 'story' -> 'story_doc' (가리기 방지)
+        story_doc = load_json(p_story_json, {}) or {}
 
     except FileNotFoundError as e_story_path:
-        # 이 예외는 호출 측에서 처리해야 할 수 있으므로 다시 발생시킴
         raise e_story_path
     except (IOError, OSError) as e_story_io:
         raise IOError(f"스토리 경로 접근 오류: {e_story_io}") from e_story_io
@@ -2314,11 +2313,9 @@ def build_missing_images_from_story(
         raise RuntimeError(f"워크플로 로드 실패: {wf_path_resolved}") from e_load_wf
 
     # --- [4. 워크플로/Comfy 헬퍼 (중첩)] ---
-    # (기존 중첩 함수들 100% 보존)
-    def _find_nodes(gdict: Dict[str, Any], class_type_str: str) -> List[str]:  # 'class_type' -> 'class_type_str'
-        """워크플로에서 특정 class_type의 노드 ID 목록을 찾습니다."""
+    def _find_nodes(gdict: Dict[str, Any], class_type_str: str) -> List[str]:
         hits: List[str] = []
-        for nid, node_item in (gdict or {}).items():  # 'node' -> 'node_item'
+        for nid, node_item in (gdict or {}).items():
             try:
                 if str(node_item.get("class_type")) == class_type_str:
                     hits.append(str(nid))
@@ -2327,63 +2324,78 @@ def build_missing_images_from_story(
         return hits
 
     def _set_input(gdict: Dict[str, Any], nid: str, key: str, val: Any) -> None:
-        """워크플로 딕셔너리에 입력 값을 안전하게 주입합니다."""
         try:
             gdict[str(nid)].setdefault("inputs", {})[key] = val
         except (KeyError, TypeError, AttributeError):
             _notify("warn", f"[IMG] 워크플로 주입 실패: Node {nid}, Key {key}")
-            pass
 
+    # 워크플로 안에서 쓸 노드들 찾기
     latent_ids = _find_nodes(graph_origin, "EmptySD3LatentImage") + _find_nodes(graph_origin, "EmptyLatentImage")
     latent_ids = list(dict.fromkeys(latent_ids))
     ksampler_ids = _find_nodes(graph_origin, "KSampler")
 
-    # (reactor_ids는 아래의 새 로직에서 `WORKFLOW_REACTOR_MAP`으로 대체)
+    # ★ seed inject start -------------------------------------------------
+    # video.json 에 들어있는 시드가 있으면 그걸 쓰고, 없으면 여기서만 1번 랜덤으로 뽑아서
+    # 원본 워크플로(graph_origin)의 KSampler에 꽂는다.
+    img_seed_from_video = None
+    root_seed_val = video_doc.get("t2i_seed_for_workflow")
+    if isinstance(root_seed_val, int) and root_seed_val > 0:
+        img_seed_from_video = root_seed_val
+    else:
+        defaults_doc_img = video_doc.get("defaults") or {}
+        image_defaults_doc = defaults_doc_img.get("image") or {}
+        seed_in_defaults = image_defaults_doc.get("t2i_seed")
+        if isinstance(seed_in_defaults, int) and seed_in_defaults > 0:
+            img_seed_from_video = seed_in_defaults
 
+    if img_seed_from_video is None:
+        img_seed_from_video = _img_seed_random.randint(1, 2_147_483_646)
+
+    for k_id in ksampler_ids:
+        try:
+            graph_origin[str(k_id)].setdefault("inputs", {})["seed"] = int(img_seed_from_video)
+        except (KeyError, TypeError, ValueError, AttributeError):
+            _notify("warn", f"[IMG] 시드 주입 실패: KSampler {k_id}")
+    # ★ seed inject end ---------------------------------------------------
+
+    # (reactor용 헬퍼들)
     def _resolve_face_image_by_name(name: str) -> _Path | None:
-        """(기존 중첩 함수) 캐릭터 이름으로 이미지 파일을 찾습니다."""
         try:
             from settings import CHARACTER_DIR  # type: ignore
-            base_dir_char = _Path(CHARACTER_DIR)  # 'base_dir' -> 'base_dir_char'
+            base_dir_char = _Path(CHARACTER_DIR)
         except (ImportError, AttributeError):
             base_dir_char = _Path(r"C:\my_games\shorts_make\character")
         exts = (".png", ".jpg", ".jpeg", ".webp")
-        for ext_item in exts:  # 'ext' -> 'ext_item'
-            p_path = base_dir_char / f"{name}{ext_item}"  # 'p' -> 'p_path'
+        for ext_item in exts:
+            p_path = base_dir_char / f"{name}{ext_item}"
             if p_path.exists():
                 return p_path
         return None
 
     def _pick_scene_character_name(scene: Dict[str, Any]) -> str | None:
-        """(기존 중첩 함수) 씬에서 첫 번째 캐릭터 이름을 가져옵니다. (수정된 로직에서는 사용되지 않음)"""
-        chars_list = scene.get("characters") or []  # 'chars' -> 'chars_list'
+        chars_list = scene.get("characters") or []
         if isinstance(chars_list, list) and chars_list:
             cc0 = chars_list[0]
             if isinstance(cc0, str):
-                name_str = cc0.strip()  # 'name' -> 'name_str'
+                name_str = cc0.strip()
                 return name_str or None
             if isinstance(cc0, dict):
-                cand_str = (str(cc0.get("id") or "") or str(cc0.get("name") or "")).strip()  # 'cand' -> 'cand_str'
+                cand_str = (str(cc0.get("id") or "") or str(cc0.get("name") or "")).strip()
                 return cand_str or None
-        cobjs_list = scene.get("character_objs") or []  # 'cobjs' -> 'cobjs_list'
+        cobjs_list = scene.get("character_objs") or []
         if isinstance(cobjs_list, list) and cobjs_list:
-            o0_obj = cobjs_list[0]  # 'o0' -> 'o0_obj'
+            o0_obj = cobjs_list[0]
             if isinstance(o0_obj, dict):
-                cand_str_obj = (str(o0_obj.get("id") or "") or str(
-                    o0_obj.get("name") or "")).strip()  # 'cand' -> 'cand_str_obj'
+                cand_str_obj = (str(o0_obj.get("id") or "") or str(o0_obj.get("name") or "")).strip()
                 return cand_str_obj or None
         return None
 
     def _inject_face_to_reactors(gdict: Dict[str, Any], file_name: str) -> List[str]:
-        """(기존 중첩 함수) (수정된 로직에서는 사용되지 않음)"""
         applied_ids: List[str] = []
-        # 'reactor_ids'는 이 함수의 로컬 스코프에서 정의되지 않았으므로,
-        # 이 함수를 호출하는 상위 스코프의 'reactor_ids'를 참조해야 합니다.
-        # (단, 수정된 로직은 이 함수를 호출하지 않습니다.)
         local_reactor_ids = [nid for nid, node in gdict.items() if str(node.get("class_type")) == "ReActorFaceSwap"]
         for ridt in local_reactor_ids:
             try:
-                ins_map = gdict[ridt].setdefault("inputs", {})  # 'ins' -> 'ins_map'
+                ins_map = gdict[ridt].setdefault("inputs", {})
                 if "source_image" in ins_map:
                     ins_map["source_image"] = file_name
                     applied_ids.append(ridt)
@@ -2395,12 +2407,10 @@ def build_missing_images_from_story(
         return applied_ids
 
     def _inject_face_image_loaders(_gdict: Dict[str, Any], _file_name: str) -> List[str]:
-        """(기존 중첩 함수) (수정된 로직에서는 사용되지 않음)"""
         return []
 
     def _parse_first_char_index(scene: Dict[str, Any]) -> int:
-        """(기존 중첩 함수) (수정된 로직에서는 사용되지 않음)"""
-        specs_list = scene.get("characters") or scene.get("character_objs") or []  # 'specs' -> 'specs_list'
+        specs_list = scene.get("characters") or scene.get("character_objs") or []
         if not specs_list:
             return 0
         if isinstance(specs_list[0], str) and ":" in specs_list[0]:
@@ -2418,29 +2428,22 @@ def build_missing_images_from_story(
     try:
         from audio_sync import _submit_and_wait as _wait_core  # type: ignore
     except (ImportError, AttributeError):
-        try:
-            from app.audio_sync import _submit_and_wait as _wait_core  # type: ignore
-        except (ImportError, AttributeError) as e_import_wait:
-            raise ImportError("필수 함수 _submit_and_wait를 audio_sync 모듈에서 찾을 수 없습니다.") from e_import_wait
+        from app.audio_sync import _submit_and_wait as _wait_core  # type: ignore
 
     def _wait_img(url: str, gdict: Dict[str, Any], *, timeout: int, poll: float,
                   progress_cb: Callable[[Dict[str, Any]], None]) -> Dict[str, Any]:
-        """(기존 중첩 함수) ComfyUI 작업 제출 및 대기 (로그 스로틀링 적용)"""
-        wait_i_counter = 0  # 'wait_i' -> 'wait_i_counter' (가리기 방지)
+        wait_i_counter = 0
 
         def _relay_progress(prog: Dict[str, Any]) -> None:
             nonlocal wait_i_counter
-            raw_msg = str(prog.get("msg") or "")  # 'raw' -> 'raw_msg'
+            raw_msg = str(prog.get("msg") or "")
             if raw_msg.startswith("[MUSIC]"):
-                patched_msg = "[IMG]" + raw_msg[len("[MUSIC]"):]  # 'patched' -> 'patched_msg'
+                patched_msg = "[IMG]" + raw_msg[len("[MUSIC]"):]
             else:
                 patched_msg = "[IMG] " + raw_msg if raw_msg else "[IMG]"
-
-            # 스로틀링: 50번째 대기 메시지마다 한 번만 로그 전송
             wait_i_counter += 1
             if wait_i_counter % 50 != 0:
                 return
-
             try:
                 progress_cb({"stage": "wait", "msg": patched_msg})
             except (RuntimeError, ValueError, TypeError) as e_relay_callback:
@@ -2448,7 +2451,7 @@ def build_missing_images_from_story(
 
         return _wait_core(url, gdict, timeout=timeout, poll=poll, on_progress=_relay_progress)
 
-    # --- [5. 씬(Scene) 루프 시작 (메인 함수 로직)] ---
+    # --- [5. 씬 루프] ---
     created: List[_Path] = []
     base_url = str(video_doc.get("comfy_host") or story_doc.get("comfy_host") or "http://127.0.0.1:8188").rstrip("/")
     _notify("begin",
@@ -2458,17 +2461,15 @@ def build_missing_images_from_story(
     defaults_img = defaults_v.get("image") or (story_doc.get("defaults", {}).get("image") if story_doc else {}) or {}
     default_neg = str(defaults_img.get("negative") or "")
 
-    scenes_list: List[Dict[str, Any]] = list(
-        video_doc.get("scenes") or story_doc.get("scenes") or [])  # 'scenes' -> 'scenes_list'
+    scenes_list: List[Dict[str, Any]] = list(video_doc.get("scenes") or story_doc.get("scenes") or [])
     req_count = 0
 
     for idx, sc in enumerate(scenes_list):
         try:
             sid = str(sc.get("id") or f"scene_{idx:05d}")
-            img_path_target = img_root / f"{sid}.png"  # 'img_path' -> 'img_path_target'
+            img_path_target = img_root / f"{sid}.png"
 
-            # 이미지 존재 여부 확인
-            scene_img_file = str(sc.get("img_file") or "")  # 'scene_img' -> 'scene_img_file'
+            scene_img_file = str(sc.get("img_file") or "")
             if scene_img_file:
                 p_scene_img = _Path(scene_img_file)
                 if not p_scene_img.is_absolute():
@@ -2480,16 +2481,13 @@ def build_missing_images_from_story(
                 _notify("skip", f"[IMG] {sid} → 존재 (id) {img_path_target.name}")
                 continue
 
-            # 워크플로 복제
-            graph_clone = _json_loader.loads(_json_loader.dumps(graph_origin))  # 'graph' -> 'graph_clone'
+            graph_clone = _json_loader.loads(_json_loader.dumps(graph_origin))
 
-            # W/H 설정
-            for nid_latent in latent_ids:  # 'nid' -> 'nid_latent'
+            for nid_latent in latent_ids:
                 _set_input(graph_clone, nid_latent, "width", int(ui_width))
                 _set_input(graph_clone, nid_latent, "height", int(ui_height))
 
-            # 프롬프트 설정
-            pos_text_raw = str(sc.get("prompt_movie") or "").strip()  # 'pos_text' -> 'pos_text_raw'
+            pos_text_raw = str(sc.get("prompt_movie") or "").strip()
             if not pos_text_raw:
                 p_main = str(sc.get("prompt") or "").strip()
                 p_img = str(sc.get("prompt_img") or "").strip()
@@ -2497,27 +2495,23 @@ def build_missing_images_from_story(
             neg_text = str(sc.get("prompt_negative") or "") or default_neg
 
             def _apply_prompts(gdict: Dict[str, Any], pos: str, neg: str) -> None:
-                """(중첩 함수) 긍정/부정 프롬프트를 관련 노드에 주입"""
-                fields_list = ("text", "text_g", "text_l")  # 'fields' -> 'fields_list'
-                for nid_prompt, node_prompt in gdict.items():  # 'nid2', 'node2' -> 'nid_prompt', 'node_prompt'
+                fields_list = ("text", "text_g", "text_l")
+                for nid_prompt, node_prompt in gdict.items():
                     try:
                         if not isinstance(node_prompt, dict):
                             continue
-                        node_inputs = node_prompt.get("inputs", {})  # 'inp' -> 'node_inputs'
-                        if not any(f_key in node_inputs for f_key in fields_list):  # 'fk' -> 'f_key'
+                        node_inputs = node_prompt.get("inputs", {})
+                        if not any(f_key in node_inputs for f_key in fields_list):
                             continue
-
                         hint_str = str(node_prompt.get("label") or "") + " " + str(
                             node_prompt.get("_meta", {}).get("title") or "")
                         is_neg_prompt = ("neg" in hint_str.lower()) or ("negative" in hint_str.lower()) or (
-                                    "Negative" in hint_str)
-                        val_to_set = neg if is_neg_prompt else pos  # 'val' -> 'val_to_set'
-
+                                "Negative" in hint_str)
+                        val_to_set = neg if is_neg_prompt else pos
                         if not isinstance(node_inputs, dict):
                             node_inputs = node_prompt.setdefault("inputs", {})
-
                         for f_key in fields_list:
-                            if f_key in node_inputs:  # 값 존재 여부만 확인 후 덮어쓰기
+                            if f_key in node_inputs:
                                 node_inputs[f_key] = val_to_set
                     except (AttributeError, KeyError, TypeError) as e_apply_prompt:
                         _notify("warn", f"[IMG] 프롬프트 적용 중 경고: {e_apply_prompt}")
@@ -2525,61 +2519,64 @@ def build_missing_images_from_story(
 
             _apply_prompts(graph_clone, pos_text_raw, neg_text)
 
-            # --- ▼▼▼ [페이스 스왑 로직 수정됨] ▼▼▼ ---
-            # (기존의 단순 face_path 탐색 로직을 nunchaku_qwen_image_swap.json 맞춤형으로 변경)
-
-            # 1. 이 워크플로(nunchaku_qwen_image_swap.json)에 하드코딩된 노드 ID 맵
-            # (WorkflowNodeID, LoadImageNodeID, DefaultCharacterID)
-            # (참고: nunchaku_qwen_image_swap.json 파일 구조 기준)
             WORKFLOW_REACTOR_MAP = {
-                # ReActor 노드 ID : (연결된 LoadImage 노드 ID, 이 슬롯이 처리할 캐릭터 ID)
-                "28": ("25", "male_01"),  # ReActor_0 (Node 28) <- LoadImage (Node 25) <- "male_01"
-                "23": ("24", "female_01"),  # ReActor_1 (Node 23) <- LoadImage (Node 24) <- "female_01"
-                "22": ("19", "other_char")  # ReActor_2 (Node 22) <- LoadImage (Node 19) <- (씬에 'other_char'가 있을 때)
+                "28": ("25", "male_01"),
+                "23": ("24", "female_01"),
+                "22": ("19", "other_char"),
             }
 
-            # 2. 씬에서 캐릭터 스펙 파싱 (e.g., {"female_01": 1, "male_01": 0})
             scene_char_specs: Dict[str, int] = {}
             try:
-                # (파일 하단 1555라인 근처에 정의되어 있어야 함)
-                chars_list_data = sc.get("characters") or sc.get(
-                    "character_objs") or []  # 'chars_list' -> 'chars_list_data'
-                for item_spec in chars_list_data:  # 'item' -> 'item_spec'
-                    spec_dict = _parse_character_spec_img(item_spec)
-                    char_id_val = spec_dict.get("id")  # 'char_id' -> 'char_id_val'
-                    char_idx_val = spec_dict.get("index")  # 'char_idx' -> 'char_idx_val'
-                    if char_id_val:
-                        # 씬에 인덱스가 명시되지 않으면 0을 기본값으로 사용
-                        scene_char_specs[char_id_val] = 0 if char_idx_val is None else int(char_idx_val)
+                chars_list_data = sc.get("characters") or sc.get("character_objs") or []
+                for item_spec in chars_list_data:
+                    parsed_id = None
+                    parsed_idx = None
+                    if isinstance(item_spec, dict):
+                        parsed_id = str(item_spec.get("id") or item_spec.get("name") or "").strip()
+                        if "index" in item_spec:
+                            try:
+                                parsed_idx = int(item_spec.get("index"))
+                            except (TypeError, ValueError):
+                                parsed_idx = None
+                        elif "face_index" in item_spec:
+                            try:
+                                parsed_idx = int(item_spec.get("face_index"))
+                            except (TypeError, ValueError):
+                                parsed_idx = None
+                    elif isinstance(item_spec, str):
+                        raw_txt_val = item_spec.strip()
+                        if ":" in raw_txt_val:
+                            left_txt, right_txt = raw_txt_val.split(":", 1)
+                            parsed_id = left_txt.strip()
+                            try:
+                                parsed_idx = int(right_txt.strip())
+                            except ValueError:
+                                parsed_idx = None
+                        else:
+                            parsed_id = raw_txt_val
+                    if parsed_id:
+                        scene_char_specs[parsed_id] = 0 if parsed_idx is None else int(parsed_idx)
             except (AttributeError, TypeError, ValueError, IndexError) as e_parse:
                 _notify("warn", f"[IMG] {sid} 캐릭터 파싱 실패: {e_parse}")
 
             _notify("debug", f"[IMG] {sid} 씬 캐릭터 스펙: {scene_char_specs}")
 
-            # 3. 맵을 순회하며 ReActor 활성화 및 얼굴 이미지 주입
             enabled_reactors_count = 0
-            for reactor_id_str, (load_id_str, default_char_id_str) in WORKFLOW_REACTOR_MAP.items():  # 변수명 변경
-
-                char_id_for_this_node: Optional[str] = None
-                face_index_for_this_node: int = 0
-
+            for reactor_id_str, (load_id_str, default_char_id_str) in WORKFLOW_REACTOR_MAP.items():
+                char_id_for_node: Optional[str] = None
+                face_index_for_node: int = 0
                 if default_char_id_str in scene_char_specs:
-                    # 맵의 기본 ID (male_01, female_01)가 씬에 있으면 사용
-                    char_id_for_this_node = default_char_id_str
-                    face_index_for_this_node = scene_char_specs[default_char_id_str]
+                    char_id_for_node = default_char_id_str
+                    face_index_for_node = scene_char_specs[default_char_id_str]
 
-                if char_id_for_this_node:
-                    # 4. 캐릭터 이미지 파일 찾기
-                    # [수정] 이 함수의 중첩 헬퍼인 _resolve_face_image_by_name를 호출합니다.
-                    face_path_resolved = _resolve_face_image_by_name(
-                        char_id_for_this_node)  # 'face_path' -> 'face_path_resolved'
+                if char_id_for_node:
+                    face_path_resolved = _resolve_face_image_by_name(char_id_for_node)
                     face_name_in_input: Optional[str] = None
 
                     if face_path_resolved and face_path_resolved.exists():
                         try:
-                            # 5. ComfyUI input 폴더로 복사
                             from settings import COMFY_INPUT_DIR  # type: ignore
-                            comfy_in_dir = _Path(COMFY_INPUT_DIR)  # 'comfy_in' -> 'comfy_in_dir'
+                            comfy_in_dir = _Path(COMFY_INPUT_DIR)
                             comfy_in_dir.mkdir(parents=True, exist_ok=True)
                             face_name_in_input = face_path_resolved.name
                             shutil.copy2(str(face_path_resolved), str(comfy_in_dir / face_name_in_input))
@@ -2591,37 +2588,29 @@ def build_missing_images_from_story(
                             face_name_in_input = None
 
                     if face_name_in_input:
-                        # 6. 워크플로 주입: ReActor 활성화, LoadImage 경로 설정, 얼굴 인덱스 설정
                         _set_input(graph_clone, reactor_id_str, "enabled", True)
                         _set_input(graph_clone, load_id_str, "image", face_name_in_input)
-                        # ReActor는 인덱스를 str으로도 받을 수 있음
-                        _set_input(graph_clone, reactor_id_str, "input_faces_index", str(face_index_for_this_node))
-                        _set_input(graph_clone, reactor_id_str, "source_faces_index", "0")  # 소스 이미지는 얼굴 1개
+                        _set_input(graph_clone, reactor_id_str, "input_faces_index", str(face_index_for_node))
+                        _set_input(graph_clone, reactor_id_str, "source_faces_index", "0")
                         _notify("info",
-                                f"[IMG] {sid} ReActor 활성화: Node {reactor_id_str} (Char: {char_id_for_this_node}, FaceIdx: {face_index_for_this_node}, Img: {face_name_in_input})")
+                                f"[IMG] {sid} ReActor 활성화: Node {reactor_id_str} (Char: {char_id_for_node}, FaceIdx: {face_index_for_node}, Img: {face_name_in_input})")
                         enabled_reactors_count += 1
                     else:
-                        # 캐릭터는 지정됐으나 파일이 없음 -> 비활성화
                         _set_input(graph_clone, reactor_id_str, "enabled", False)
                         _notify("warn",
-                                f"[IMG] {sid} ReActor 비활성화: Node {reactor_id_str} ({char_id_for_this_node} 이미지 파일 없음)")
+                                f"[IMG] {sid} ReActor 비활성화: Node {reactor_id_str} ({char_id_for_node} 이미지 파일 없음)")
                 else:
-                    # 씬에 이 캐릭터가 없음 -> 비활성화
                     _set_input(graph_clone, reactor_id_str, "enabled", False)
 
             if enabled_reactors_count == 0:
                 _notify("info", f"[IMG] {sid} 씬에 매칭되는 캐릭터 없음. 페이스 스왑 비활성화.")
 
-            # --- ▲▲▲ [페이스 스왑 로직 수정 끝] ▲▲▲ ---
-
-            # KSampler 스텝 설정
-            for nid_sampler in ksampler_ids:  # 'nid' -> 'nid_sampler'
+            for nid_sampler in ksampler_ids:
                 _set_input(graph_clone, nid_sampler, "steps", int(steps))
 
-            # --- [6. 작업 제출 및 결과 처리 (메인 함수 로직)] ---
             req_count += 1
             _notify("submit", f"[IMG] /prompt {sid}")
-            result_data = _wait_img(  # 'result' -> 'result_data'
+            result_data = _wait_img(
                 base_url,
                 graph_clone,
                 timeout=timeout_sec,
@@ -2629,26 +2618,26 @@ def build_missing_images_from_story(
                 progress_cb=lambda d: _notify("wait", str(d.get("msg") or "")),
             )
 
-            files_list: List[Dict[str, Any]] = []  # 'files' -> 'files_list'
-            for out_val in (result_data.get("outputs") or {}).values():  # 'out' -> 'out_val'
+            files_list: List[Dict[str, Any]] = []
+            for out_val in (result_data.get("outputs") or {}).values():
                 if isinstance(out_val, dict):
                     files_list.extend(out_val.get("images", []) or [])
             if not files_list:
                 raise RuntimeError(f"{sid}: 출력 이미지 없음")
 
-            last_file_info = files_list[-1]  # 'last' -> 'last_file_info'
-            subfolder_str = str(last_file_info.get("subfolder") or "")  # 'subfolder' -> 'subfolder_str'
-            fname_str = str(last_file_info.get("filename") or "")  # 'fname' -> 'fname_str'
+            last_file_info = files_list[-1]
+            subfolder_str = str(last_file_info.get("subfolder") or "")
+            fname_str = str(last_file_info.get("filename") or "")
             if not fname_str:
                 raise RuntimeError(f"{sid}: 출력 파일명 없음")
 
             try:
-                r_image = requests.get(  # 'rimg' -> 'r_image'
+                r_image = requests.get(
                     base_url.rstrip("/") + "/view",
                     params={"filename": fname_str, "subfolder": subfolder_str},
                     timeout=30,
                 )
-                r_image.raise_for_status()  # HTTP 오류 체크
+                r_image.raise_for_status()
             except requests.RequestException as e_requests:
                 raise RuntimeError(f"{sid}: /view 실패: {e_requests}") from e_requests
 
@@ -2659,8 +2648,7 @@ def build_missing_images_from_story(
             except (IOError, OSError) as e_write_img:
                 raise IOError(f"{sid}: 이미지 파일 저장 실패: {e_write_img}") from e_write_img
 
-            # video.json에 경로 저장
-            for scene_item in scenes_list:  # 's' -> 'scene_item'
+            for scene_item in scenes_list:
                 if str(scene_item.get("id")) == sid:
                     scene_item["img_file"] = str(img_path_target)
                     break
@@ -2670,11 +2658,10 @@ def build_missing_images_from_story(
             except (OSError, ValueError, TypeError) as e_save_video:
                 _notify("warn", f"[IMG] {sid} video.json 저장 실패: {e_save_video}")
 
-            # story.json에도 경로 저장
             if story_doc:
                 try:
-                    scs_list = story_doc.get("scenes") or []  # 'scs' -> 'scs_list'
-                    for scene_item_story in scs_list:  # 's' -> 'scene_item_story'
+                    scs_list = story_doc.get("scenes") or []
+                    for scene_item_story in scs_list:
                         if str(scene_item_story.get("id")) == sid:
                             scene_item_story["img_file"] = str(img_path_target)
                             break
@@ -2689,14 +2676,13 @@ def build_missing_images_from_story(
             _notify("scene-error", f"[IMG] {sc.get('id')}: {type(err_scene).__name__}: {err_scene}")
             continue
         except Exception as e_scene_unknown:
-            # 예상치 못한 모든 예외 처리
             _notify("scene-error",
                     f"[IMG] {sc.get('id')} 예상치 못한 오류: {type(e_scene_unknown).__name__}: {e_scene_unknown}")
             continue
 
-    # --- [7. 루프 종료 및 요약] ---
     _notify("summary", f"[IMG] 생성={len(created)} / 요청={req_count}")
     return created
+
 
 
 

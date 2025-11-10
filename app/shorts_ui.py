@@ -2591,6 +2591,7 @@ class MainWindow(QtWidgets.QMainWindow):
         from PyQt5 import QtWidgets
         from pathlib import Path
         from typing import Optional
+        import random  # ★ 랜덤 시드
 
         # ----- 0) 버튼 비활성화(있을 때만) -----
         btn = getattr(self, "btn_missing_img", None) or getattr(getattr(self, "ui", None), "btn_missing_img", None)
@@ -2600,7 +2601,6 @@ class MainWindow(QtWidgets.QMainWindow):
         # ----- 1) 대상 JSON 경로: 반드시 video.json만 -----
         video_path: Optional[Path] = None
 
-        # (A) UI 텍스트박스 우선: 파일/폴더 모두 허용
         tb = getattr(self, "txt_story_path", None)
         if tb and hasattr(tb, "text"):
             txt = (tb.text() or "").strip()
@@ -2614,14 +2614,13 @@ class MainWindow(QtWidgets.QMainWindow):
                     if v.exists():
                         video_path = v
 
-        # (B) 프로젝트 디렉터리에서 video.json
         if video_path is None:
             proj_dir = ""
             getter = getattr(self, "_current_project_dir", None)
             if callable(getter):
                 try:
                     proj_dir = getter() or ""
-                except (RuntimeError, OSError, TypeError, ValueError):
+                except Exception:
                     proj_dir = ""
             if not proj_dir:
                 proj_dir = getattr(self, "project_dir", "") or ""
@@ -2630,7 +2629,6 @@ class MainWindow(QtWidgets.QMainWindow):
                 if v.exists():
                     video_path = v
 
-        # (C) 마지막 폴백: 현재 작업 폴더의 video.json
         if video_path is None:
             v = (Path.cwd() / "video.json").resolve()
             if v.exists():
@@ -2642,8 +2640,7 @@ class MainWindow(QtWidgets.QMainWindow):
                 btn.setEnabled(True)
             return
 
-        # ----- 2) 실행 전 정합성 보정: img_file 비어있는 씬(gap 포함)에 기본 경로 자동 주입 -----
-        # - 기존 생성 함수가 'img_file 비어있으면 스킵'일 수 있으므로, 실행 전에만 보정
+        # ----- 2) 실행 전 정합성 보정: img_file 비어있는 씬에 기본 경로 -----
         try:
             try:
                 from app.utils import load_json, save_json  # type: ignore
@@ -2658,7 +2655,7 @@ class MainWindow(QtWidgets.QMainWindow):
                     try:
                         imgs_dir.mkdir(parents=True, exist_ok=True)
                     except OSError:
-                        imgs_dir = video_path.parent / "imgs"  # 디렉터리 실패 시에도 경로 구성은 유지
+                        imgs_dir = video_path.parent / "imgs"
 
                     changed = False
                     for sc in scenes:
@@ -2672,18 +2669,27 @@ class MainWindow(QtWidgets.QMainWindow):
                             sc["img_file"] = str((imgs_dir / f"{sid}.png").resolve())
                             changed = True
 
-                    if changed:
+                    # ★ 여기서 랜덤 시드도 같이 주입해버리자
+                    #    Comfy 워크플로우에서 t2i_seed_for_workflow 같은 걸 읽도록 돼 있다면 여기 값이 쓰일 거야
+                    new_seed_val = random.randint(1, 2_147_483_646)
+                    doc.setdefault("defaults", {})
+                    doc["defaults"].setdefault("image", {})
+                    doc["defaults"]["image"]["t2i_seed"] = new_seed_val
+                    doc["t2i_seed_for_workflow"] = new_seed_val
+
+                    if changed or True:  # 시드 넣었으니까 저장
                         save_json(video_path, doc)
-        except (FileNotFoundError, OSError, TypeError, ValueError) as e_prep:
-            print(f"[prep] img_file 보정 경고: {e_prep}")
+
+        except Exception as e_prep:
+            print(f"[prep] img_file/seed 보정 경고: {e_prep}")
 
         # ----- 3) UI에서 W/H/스텝 읽기 -----
         def _get_combo_int(combo_name: str, default_val: int) -> int:
             combo = getattr(self, combo_name, None)
             try:
-                voji = combo.currentData()
-                return int(voji if voji is not None else default_val)
-            except (TypeError, ValueError, AttributeError):
+                val = combo.currentData()
+                return int(val if val is not None else default_val)
+            except Exception:
                 return int(default_val)
 
         ui_w = _get_combo_int("cmb_img_w", 720)
@@ -2692,17 +2698,17 @@ class MainWindow(QtWidgets.QMainWindow):
         spn = getattr(self, "spn_t2i_steps", None)
         try:
             steps = int(spn.value()) if spn is not None else 24
-        except (TypeError, ValueError, AttributeError):
+        except Exception:
             steps = 28
 
-        # ----- 4) 진행창 + 비동기 작업 실행 -----
+        # ----- 4) 비동기 작업 실행 -----
         try:
             from utils import run_job_with_progress_async
         except ImportError:
             from app.utils import run_job_with_progress_async  # type: ignore
 
         try:
-            from video_build import build_missing_images_from_story  # 로컬
+            from video_build import build_missing_images_from_story
         except ImportError:
             from app.video_build import build_missing_images_from_story  # type: ignore
 
@@ -2714,7 +2720,7 @@ class MainWindow(QtWidgets.QMainWindow):
 
         def job(on_progress):
             created = build_missing_images_from_story(
-                str(video_path),  # ✅ video.json만 대상으로 고정
+                str(video_path),
                 ui_width=ui_w,
                 ui_height=ui_h,
                 steps=steps,
@@ -2728,11 +2734,9 @@ class MainWindow(QtWidgets.QMainWindow):
         def done(ok: bool, payload, err):
             if isinstance(btn, QtWidgets.QAbstractButton):
                 btn.setEnabled(True)
-
             if not ok:
                 QtWidgets.QMessageBox.critical(self, "누락 이미지 생성 실패", str(err))
                 return
-
             created = (payload or {}).get("created") or []
             QtWidgets.QMessageBox.information(self, "누락 이미지 생성 완료", f"생성 {len(created)}개 완료")
 
