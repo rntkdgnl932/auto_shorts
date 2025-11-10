@@ -7044,7 +7044,7 @@ class MainWindow(QtWidgets.QMainWindow):
                         for i in range(combo.count()):
                             data = combo.itemData(i)
                             if isinstance(data, tuple) and len(data) == 3 and data[2] == key:
-                                index = i;
+                                index = i
                                 break
                     if index >= 0:
                         combo.setCurrentIndex(index)
@@ -9411,6 +9411,15 @@ _inject_render_prefs_methods()
 # ───────────────────────────── 실행 진입점 ─────────────────────────────
 
 
+def create_shorts_widget(parent=None):
+    """
+    all_ui.py에서 탭으로 불러 쓸 때 사용하는 진입점.
+    QMainWindow를 그냥 위젯처럼 돌려준다.
+    """
+    win = MainWindow()
+    if parent is not None:
+        win.setParent(parent)
+    return win
 
 
 
