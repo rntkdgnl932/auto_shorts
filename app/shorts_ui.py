@@ -6947,12 +6947,10 @@ class MainWindow(QtWidgets.QMainWindow):
 
     from pathlib import Path
 
-    # shorts_ui.py 파일의 _apply_project_meta 함수 전체를 이걸로 교체하세요.
-
     def _apply_project_meta(self, proj_dir: str) -> None:
         """
         project.json을 읽어 제목/가사/길이/변환/자동태그/프롬프트 UI에 반영.
-        - 프롬프트: prompt_user(우선), 없으면 prompt 사용
+        - [수정됨] ui_prefs 복원 시 findData(int)를 사용하여 정확한 인덱스 복원.
         """
         from pathlib import Path
         try:
@@ -6960,7 +6958,7 @@ class MainWindow(QtWidgets.QMainWindow):
         except Exception:
             from utils import load_json  # type: ignore
 
-        from PyQt5.QtGui import QFont  # <--- [신규] QFont 임포트
+        from PyQt5.QtGui import QFont
 
         pj = Path(proj_dir) / "project.json"
         meta = load_json(pj, {}) or {}
@@ -6989,7 +6987,7 @@ class MainWindow(QtWidgets.QMainWindow):
         except Exception:
             pass
 
-        # ✅ 프롬프트(긍정) UI 반영: prompt_user 우선, 없으면 prompt
+        # ✅ 프롬프트(긍정) UI 반영 (기존 로직 유지)
         prompt_val = (meta.get("prompt_user") or meta.get("prompt") or "").strip()
         # 다양한 위젯 이름에 방어적으로 대응
         prompt_widget = (
@@ -7006,36 +7004,59 @@ class MainWindow(QtWidgets.QMainWindow):
         except Exception:
             pass
 
-        # --- ▼▼▼ [수정] 렌더 설정(ui_prefs) 불러오기 (role= 제거) ▼▼▼ ---
+        # --- ▼▼▼ [핵심 수정] 렌더 설정(ui_prefs) 불러오기 ▼▼▼ ---
         ui_prefs = meta.get("ui_prefs") or {}
         if ui_prefs:
             try:
-                # W, H, FPS, Steps
-                w, h = ui_prefs.get("image_size", [720, 1080])
-                fps = ui_prefs.get("movie_fps", 30)
-                steps = ui_prefs.get("t2i_steps", 6)
+                # 1. 이미지 설정 값 로드 (int로 강제)
+                img_w, img_h = ui_prefs.get("image_size", [0, 0])
+                img_w_val, img_h_val = int(img_w), int(img_h)
+                img_steps = int(ui_prefs.get("image_steps", 28))
+                img_preset_key = ui_prefs.get("image_preset", "custom")
 
-                # findData로 정확한 값(int)을 찾아 인덱스 설정
-                idx_w = self.cmb_img_w.findData(int(w))  # <--- role= 제거
-                self.cmb_img_w.setCurrentIndex(idx_w if idx_w >= 0 else 0)
+                # 2. 렌더 설정 값 로드 (int로 강제)
+                render_w, render_h = ui_prefs.get("render_size", [0, 0])
+                render_w_val, render_h_val = int(render_w), int(render_h)
+                render_fps = int(ui_prefs.get("movie_fps", 30))
+                render_steps = int(ui_prefs.get("render_steps", 28))
+                render_preset_key = ui_prefs.get("render_preset", "custom")
 
-                idx_h = self.cmb_img_h.findData(int(h))  # <--- role= 제거
-                self.cmb_img_h.setCurrentIndex(idx_h if idx_h >= 0 else 0)
+                # ComboBox 복원 헬퍼 (데이터 값(int)으로 인덱스 찾기)
+                def _set_combo_by_data(combo, data_val):
+                    idx = combo.findData(int(data_val))
+                    if idx >= 0:
+                        combo.setCurrentIndex(idx)
 
-                idx_fps = self.cmb_movie_fps.findData(int(fps))  # <--- role= 제거
-                self.cmb_movie_fps.setCurrentIndex(idx_fps if idx_fps >= 0 else 0)
+                # 콤보박스 값 복원
+                _set_combo_by_data(self.cmb_img_w, img_w_val)
+                _set_combo_by_data(self.cmb_img_h, img_h_val)
+                self.spn_t2i_steps.setValue(img_steps)
 
-                self.spn_t2i_steps.setValue(int(steps))
+                _set_combo_by_data(self.cmb_render_w, render_w_val)
+                _set_combo_by_data(self.cmb_render_h, render_h_val)
+                _set_combo_by_data(self.cmb_movie_fps, render_fps)
+                self.spn_render_steps.setValue(render_steps)
 
-                # 프리셋 (W/H 설정 후 프리셋을 설정해야 UI 잠금/해제가 올바르게 동작)
-                preset_key = ui_prefs.get("resolution_preset", "custom")
-                preset_index = 0  # 기본값 (custom)
-                for i in range(self.cmb_res_preset.count()):
-                    item_data = self.cmb_res_preset.itemData(i)  # <--- role= 제거
-                    if isinstance(item_data, tuple) and len(item_data) == 3 and item_data[2] == preset_key:
-                        preset_index = i
-                        break
-                self.cmb_res_preset.setCurrentIndex(preset_index)
+                # 프리셋 복원 (핸들러 호출을 위한 emit)
+                def _set_preset_by_key(combo, key):
+                    index = combo.findData(key)
+                    if index < 0:
+                        for i in range(combo.count()):
+                            data = combo.itemData(i)
+                            if isinstance(data, tuple) and len(data) == 3 and data[2] == key:
+                                index = i;
+                                break
+                    if index >= 0:
+                        combo.setCurrentIndex(index)
+                        # 프리셋 핸들러를 호출하여 W/H 콤보박스의 잠금 상태를 업데이트
+                        try:
+                            handler = getattr(combo, "currentIndexChanged")
+                            if handler and hasattr(handler, "emit"): handler.emit(index)
+                        except Exception:
+                            pass
+
+                _set_preset_by_key(self.cmb_res_preset, img_preset_key)
+                _set_preset_by_key(self.cmb_render_preset, render_preset_key)
 
                 # 폰트
                 font_family = ui_prefs.get("font_family", "굴림")
@@ -7049,7 +7070,7 @@ class MainWindow(QtWidgets.QMainWindow):
 
             except Exception as e:
                 print(f"[UI] 렌더 설정 불러오기 실패: {e}")
-        # --- ▲▲▲ [수정] 불러오기 끝 ▲▲▲ ---
+        # --- ▲▲▲ [핵심 수정] 불러오기 끝 ▲▲▲ ---
 
     def _sync_convert_ui_from_meta(self, meta: dict) -> None:
         """
@@ -9265,17 +9286,33 @@ def _inject_render_prefs_methods():
                 _safe_connect(widget.currentFontChanged, self._save_ui_prefs_to_project)
 
     # ==== 메서드 정의: project.json 저장 ====
+    # 파일: shorts_ui.py (MainWindow 클래스 내부)
+
     def _save_ui_prefs_to_project(self) -> None:
-        """[수정됨] '이미지 설정'과 '렌더 설정' 값을 별도 키로 저장합니다."""
-        proj_dir = _guess_project_dir(self)
-        pj = proj_dir / "project.json"
+        """[수정됨] '이미지 설정'과 '렌더 설정' 값을 별도 키로 저장하고 project.json에만 저장합니다."""
+
+        # 헬퍼 함수를 통해 load_json, save_json을 안전하게 로드합니다.
+        try:
+            from app.utils import load_json, save_json
+        except ImportError:
+            from utils import load_json, save_json  # type: ignore
+
+        # 현재 활성 프로젝트 경로를 가져옵니다.
+        proj_dir_func = getattr(self, "_current_project_dir", None)
+        proj_dir = proj_dir_func() if callable(proj_dir_func) else getattr(self, "project_dir", None)
+
+        if proj_dir is None:
+            proj_dir = self._latest_project()
+            if proj_dir is None: return
+
+        pj = Path(proj_dir) / "project.json"
 
         meta = load_json(pj, {}) if pj.exists() else {}
         if not isinstance(meta, dict): meta = {}
 
         ui = meta.get("ui_prefs") or {}
 
-        # 1. "이미지 설정" 그룹 저장
+        # 1. "이미지 설정" 그룹 저장 (image_size/image_steps)
         img_w_sel = int(self.cmb_img_w.currentData())
         img_h_sel = int(self.cmb_img_h.currentData())
         img_preset_key = "custom"
@@ -9287,7 +9324,7 @@ def _inject_render_prefs_methods():
         ui["image_preset"] = str(img_preset_key)
         ui["image_steps"] = int(self.spn_t2i_steps.value())
 
-        # 2. "렌더 설정" 그룹 저장
+        # 2. "렌더 설정" 그룹 저장 (render_size/render_steps/movie_fps)
         render_w_sel = int(self.cmb_render_w.currentData())
         render_h_sel = int(self.cmb_render_h.currentData())
         render_preset_key = "custom"
@@ -9308,21 +9345,10 @@ def _inject_render_prefs_methods():
         except Exception as e:
             print(f"[UI] 폰트/크기 저장 실패: {e}")
 
-        # [호환성] 기존 키도 '렌더 설정' 값으로 저장
-        # (기존 '누락 이미지 생성'이 t2i_steps를 사용했었으므로, render_steps 값으로 채워줌)
-        # [수정] t2i_steps는 "이미지 설정"의 image_steps 값을 사용해야 함 (on_click_test2... 수정과 일치)
-        ui["t2i_steps"] = int(self.spn_t2i_steps.value())  # <-- image_steps 값으로 변경
-        # [수정] image_size는 "이미지 설정"의 image_size 값을 사용해야 함
-        # ui["image_size"] = [render_w_sel, render_h_sel] # <-- 이 줄 삭제 또는 image_size 값으로
-        # [수정] 호환성을 위해 image_size는 "렌더 설정" 값을 따르게 유지합니다.
-        # (on_video가 image_size를 사용했다면 render_size를 읽도록 수정하는 것이 더 근본적인 해결책입니다)
-        # -> v19에서 on_video는 render_size를 읽도록 수정되었습니다.
-        # -> 따라서 호환성 키인 image_size는 "이미지 설정" 값을 저장하는 것이 맞습니다.
-        # [재수정 v20] 호환성을 위해 기존 'image_size' 키는 "이미지 설정" 값을 저장합니다. (v19 수정 유지)
-        ui["image_size"] = [img_w_sel, img_h_sel]
-
-        # [호환성] 기존 'resolution_preset' 키는 "렌더 설정" 프리셋을 저장합니다.
+        # 4. 호환성 키 저장 (기존 로직 유지)
+        ui["t2i_steps"] = int(self.spn_t2i_steps.value())
         ui["resolution_preset"] = str(render_preset_key)
+        ui["image_size"] = [img_w_sel, img_h_sel]
 
         meta["ui_prefs"] = ui
         save_json(pj, meta)
