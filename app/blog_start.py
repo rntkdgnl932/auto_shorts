@@ -8,7 +8,7 @@ from wordpress_xmlrpc.methods.media import UploadFile
 from bs4 import BeautifulSoup
 from slugify import slugify
 from datetime import datetime
-from blog_function import call_gemini, stable_diffusion
+from blog_function import call_gemini, build_images_to_blog
 
 import variable as v_
 _wp_client = None
@@ -156,7 +156,7 @@ def life_tips_start(article, keyword):
     # === 체크포인트 3: 썸네일/본문 이미지 생성 ===
     short_slug = slugify(keyword)[:50]
 
-    thumb_media, _ = stable_diffusion(article, "thumb", f"{final_title}", short_slug)
+    thumb_media, _ = build_images_to_blog(article, "thumb", f"{final_title}", short_slug)
     if thumb_media is None:
         print("⚠️ 썸네일 생성 실패 → 대체 이미지 사용")
         thumb_media = {
@@ -168,7 +168,7 @@ def life_tips_start(article, keyword):
         }
     thumbnail_id = wp.call(UploadFile(thumb_media)).get("id")
 
-    scene_media, scene_caption = stable_diffusion(article, "scene", f"{final_title}", short_slug)
+    scene_media, scene_caption = build_images_to_blog(article, "scene", f"{final_title}", short_slug)
     if scene_media is None:
         print("⚠️ 본문 이미지 생성 실패 → 대체 이미지 사용")
         scene_path = v_.fallback_scene_path

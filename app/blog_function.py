@@ -8,6 +8,7 @@ import json
 import re
 from io import BytesIO
 from typing import Optional, Tuple
+import settings
 
 import requests
 from PIL import Image
@@ -536,3 +537,233 @@ def _sleep_exact(seconds: float, label: Optional[str] = None) -> None:
         time.sleep(min(0.2, end - now))
     elapsed = time.monotonic() - start
     print(f"⏱️ 실제 대기: {elapsed:.2f}s", flush=True)
+
+def build_images_to_blog(
+    article: str,
+    filename: str,
+    description: str,
+    slug: str,
+    *,
+    workflow_path: str | None = None,
+    width: int | None = None,
+    height: int = 512,
+    steps: int = 28,
+):
+    import json
+    import time
+    import requests
+    from io import BytesIO
+    from pathlib import Path
+    from PIL import Image
+    from xmlrpc import client as xmlrpc_client
+
+    # 1) 프롬프트/캡션 준비 ----------------------------------------------
+    try:
+        print(f"▶ [ComfyBlog] Gemini로 [{filename}] 이미지 프롬프트/캡션 생성 요청.", flush=True)
+
+        style_guideline = _make_style_guideline(filename)
+        meta_prompt = _build_meta_prompt(article, description, style_guideline)
+
+        response_text = call_gemini(meta_prompt, temperature=0.6, is_json=True)
+
+        try:
+            if response_text in ("SAFETY_BLOCKED", "API_ERROR") or not response_text:
+                raise ValueError(f"Gemini 실패: {response_text}")
+
+            parsed = json.loads(response_text)
+            short_prompt = (parsed.get("image_prompt") or "").strip()
+            image_caption = (parsed.get("caption") or "").strip()
+            if not short_prompt or not image_caption:
+                raise ValueError("JSON에 image_prompt/caption 누락")
+        except Exception as exc:
+            print(f"⚠️ [ComfyBlog] AI 프롬프트/캡션 생성 실패: {exc} → 대체 프롬프트 사용", flush=True)
+            short_prompt, image_caption = _fallback_prompt(description)
+
+        negative = (
+            "(text, logo, watermark:1.5), (deformed, distorted, disfigured:1.2), poorly drawn, bad anatomy, "
+            "blurry, lowres, nsfw, nude, extra fingers, mutated hands"
+        )
+        base_quality = "masterpiece, best quality, ultra-detailed, high resolution"
+        final_prompt = f"{base_quality}, {short_prompt}".strip()
+
+    except Exception as e_prompt:
+        print(f"❌ [ComfyBlog] 프롬프트 준비 중 오류: {type(e_prompt).__name__}: {e_prompt}", flush=True)
+        return None, None
+
+    # 2) ComfyUI 워크플로 로드 ----------------------------------------------
+    try:
+        try:
+            import settings  # type: ignore
+            comfy_host = getattr(settings, "COMFY_HOST", "http://127.0.0.1:8188")
+            jsons_dir = getattr(settings, "JSONS_DIR", None)
+        except Exception:
+            comfy_host = "http://127.0.0.1:8188"
+            jsons_dir = None
+
+        base_url = str(comfy_host).rstrip("/")
+
+        if workflow_path is not None:
+            wf_path = Path(workflow_path)
+        else:
+            if jsons_dir:
+                wf_path = Path(jsons_dir) / "nunchaku_qwen_image_swap.json"
+            else:
+                wf_path = Path("nunchaku_qwen_image_swap.json")
+
+        if not wf_path.exists():
+            raise FileNotFoundError(f"ComfyUI 워크플로 파일을 찾을 수 없습니다: {wf_path}")
+
+        with open(wf_path, "r", encoding="utf-8") as f:
+            graph = json.load(f)
+
+        # ★★★ 블로그에서는 안 쓸 노드 끄기 ★★★
+        def _disable_blog_nodes(g: dict) -> None:
+            # 업스케일, 비디오, 리액터 계열 끄기
+            UPSCALE = {
+                "ImageUpscaleWithModel",
+                "ImageScale",
+                "LatentUpscale",
+                "ImageResize",
+            }
+            VIDEO = {
+                "VHS_VideoCombine",
+                "VHS_VideoSave",
+                "VHS_VideoLoader",
+                "VHS_VideoPreview",
+                "VideoHelperSuite",
+            }
+            FACE = {
+                "ReActorFaceSwap",
+                "ReActorLoader",
+            }
+            for nid, node in g.items():
+                ctype = str(node.get("class_type") or "")
+                if ctype in UPSCALE or ctype in VIDEO or ctype in FACE:
+                    node.setdefault("inputs", {})
+                    node["inputs"]["enabled"] = False
+
+        _disable_blog_nodes(graph)
+
+        # 3) 블로그용으로 prompt / size / steps 주입 -------------------------
+        def _set_input(g: dict, nid: str, key: str, val):
+            g[str(nid)].setdefault("inputs", {})[key] = val
+
+        target_w = width or (768 if filename == "scene" else 640)
+        target_h = height
+
+        for node_id, node in graph.items():
+            ctype = str(node.get("class_type") or "")
+            inputs_map = node.get("inputs", {})
+
+            if ctype.startswith("Empty") and "width" in inputs_map:
+                _set_input(graph, node_id, "width", int(target_w))
+                _set_input(graph, node_id, "height", int(target_h))
+
+            if ctype.lower().startswith("cliptextencode") or "text" in inputs_map:
+                label = str(node.get("label") or "").lower()
+                if "neg" in label or "negative" in label:
+                    _set_input(graph, node_id, "text", negative)
+                else:
+                    _set_input(graph, node_id, "text", final_prompt)
+
+            if ctype == "KSampler":
+                _set_input(graph, node_id, "steps", int(steps))
+
+        # 4) /prompt 제출 ----------------------------------------------------
+        resp = requests.post(base_url + "/prompt", json={"prompt": graph}, timeout=15)
+        resp.raise_for_status()
+        prompt_id = resp.json().get("prompt_id")
+        if not prompt_id:
+            raise RuntimeError("ComfyUI가 prompt_id를 반환하지 않았습니다.")
+
+        # 5) /history 에서 이미지 찾기 ---------------------------------------
+        t0 = time.time()
+        img_bytes: bytes | None = None
+        while time.time() - t0 < 300:
+            h = requests.get(base_url + f"/history/{prompt_id}", timeout=10)
+            if h.status_code == 200:
+                hjson = h.json()
+                outputs = hjson.get(prompt_id, {}).get("outputs") or {}
+                for _, out_val in outputs.items():
+                    imgs = out_val.get("images") or []
+                    if imgs:
+                        # 이미지인 것부터 고른다
+                        def _is_image_name(name: str) -> bool:
+                            name = name.lower()
+                            return name.endswith(".png") or name.endswith(".jpg") or name.endswith(".jpeg") or name.endswith(".webp")
+
+                        chosen = None
+                        for cand in imgs:
+                            if _is_image_name(cand.get("filename", "")):
+                                chosen = cand
+                                break
+                        if not chosen:
+                            # 전부 동영상이면 그냥 마지막 걸로
+                            chosen = imgs[-1]
+
+                        fname = chosen.get("filename")
+                        subfolder = chosen.get("subfolder") or ""
+
+                        # 먼저 output으로
+                        params = {"filename": fname, "type": "output"}
+                        if subfolder:
+                            params["subfolder"] = subfolder
+
+                        try:
+                            view = requests.get(base_url + "/view", params=params, timeout=30)
+                            view.raise_for_status()
+                            img_bytes = view.content
+                        except requests.HTTPError:
+                            # 안 되면 temp로
+                            params["type"] = "temp"
+                            view = requests.get(base_url + "/view", params=params, timeout=30)
+                            view.raise_for_status()
+                            img_bytes = view.content
+
+                        break
+            if img_bytes:
+                break
+            time.sleep(1.5)
+
+        if not img_bytes:
+            raise RuntimeError("ComfyUI에서 이미지를 받지 못했습니다.")
+
+        # 6) 워드프레스용 media 로 변환 (SD와 비슷하게 리사이즈) ------------
+        img = Image.open(BytesIO(img_bytes)).convert("RGB")
+        target_w = 768 if filename == "scene" else 640
+        target_h = 512
+        resample_lanczos = getattr(
+            getattr(Image, "Resampling", Image),  # 1순위: Image.Resampling
+            "LANCZOS",  # 2순위: 거기서 LANCZOS
+            1,  # 둘 다 없으면 1 (lanczos) 숫자값
+        )
+
+        img = img.resize((target_w, target_h), resample_lanczos)
+
+        buf = BytesIO()
+        img.save(buf, format="WEBP", quality=85)
+        webp_bytes = buf.getvalue()
+
+        image_file = BytesIO(webp_bytes)
+        image_file.name = f"{slug}_{filename}.webp"
+        image_file.seek(0)
+
+        safe_caption = _clean_caption(image_caption)
+
+        media = {
+            "name": image_file.name,
+            "type": "image/webp",
+            "caption": safe_caption,
+            "description": (description or "").strip(),
+            "bits": xmlrpc_client.Binary(image_file.read()),
+        }
+        return media, safe_caption
+
+    except Exception as e_img:
+        print(f"⚠️ [ComfyBlog] 이미지 생성/변환 중 예외: {type(e_img).__name__}: {e_img}", flush=True)
+        return None, None
+
+
+
+
+
