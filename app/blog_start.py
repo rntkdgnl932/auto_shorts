@@ -330,17 +330,60 @@ def generate_impactful_titles(keyword, article_summary):
         print(f"⚠️ 제목 JSON 파싱 실패: {e}")
         return "API_ERROR"
 
+import re
+
 def pick_best_title(candidates, keyword):
-    def score(t):
+    # 자주 나오는 지겨운 패턴들
+    boring_patterns = [
+        r"\bA\s*to\s*Z\b",
+        r"\bAtoZ\b",
+        r"\d+\s*가지\b",
+        r"\d+\s*가디\b",     # 오타 방지
+        r"\d+\s*단계\b",
+        r"\d+\s*비법\b",
+    ]
+    # 너무 AI티 나는 단어들 (가끔은 좋지만 점수는 조금 깎자)
+    overused_words = ["비법", "꿀팁", "총정리", "완벽", "필수"]
+
+    def score(t: str) -> int:
         s = 0
         tl = len(t)
-        if keyword in t: s += 20
-        if 28 <= tl <= 42: s += 15
-        if re.search(r"\d", t): s += 5   # 숫자
-        if any(w in t for w in ["비법","꿀팁","총정리","완벽","필수"]): s += 5
-        if any(w in t for w in ["클릭","후기","내돈내산"]): s -= 5
+
+        # 1) 키워드가 들어가면 무조건 기본 점수
+        if keyword and keyword in t:
+            s += 25
+
+        # 2) 길이 적당하면 가산 (너가 쓴 28~42 유지)
+        if 28 <= tl <= 42:
+            s += 15
+
+        # 3) 숫자 있으면 살짝 + (완전 빼는게 아니면 유지)
+        if re.search(r"\d", t):
+            s += 4
+
+        # 4) 자주 쓰이는 단어는 +3만 (너무 높게 안함)
+        if any(w in t for w in overused_words):
+            s += 3
+
+        # 5) 지겨운 패턴이면 강하게 -10
+        for pat in boring_patterns:
+            if re.search(pat, t, re.IGNORECASE):
+                s -= 10
+                break
+
+        # 6) 클릭어/광고티 나면 -5
+        if any(w in t for w in ["클릭", "후기", "내돈내산"]):
+            s -= 5
+
         return s
+
+    # 빈값 들어올 때 대비
+    candidates = [c for c in candidates if c and c.strip()]
+    if not candidates:
+        return keyword or "제목 없음"
+
     return sorted(candidates, key=lambda x: score(x), reverse=True)[0]
+
 
 
 def generate_structured_content_json(article, keyword):
@@ -609,16 +652,29 @@ def issue_start():
     filtered_topics = filter_topics_by_category(topic_list)
 
     print("\n🔷 최종 필터링된 블로그 키워드:", filtered_topics)
+
+    used_topic = None
+
     if filtered_topics:
         for topic in filtered_topics:
             result_suggest = suggest_life_tip_topic_issue(topic)
             print("result_suggest", result_suggest)
 
             if result_suggest is True:
+                # 여기서 우리가 어떤 키워드로 글을 올렸는지 알 수 있음
+                used_topic = topic
                 break
             time.sleep(0.1)  # 100ms
     else:
         print("없..................")
+
+    # 여기서 UI로 넘겨줄 정보 정리
+    now_str = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+
+    return {
+        "title": used_topic,     # 실제로는 키워드지만 제목 대신 보여주기엔 충분함
+        "uploaded_at": now_str,
+    }
 
 
 

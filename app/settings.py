@@ -68,11 +68,6 @@ DEFAULT_HOST_CANDIDATES = [
     "http://localhost:8187",
 ]
 
-# UI 기본값 (영상 분할/프레임)
-DEFAULT_CHUNK: int = 300
-DEFAULT_OVERLAP: int = 5
-DEFAULT_INPUT_FPS: int = 60
-DEFAULT_TARGET_FPS: int = 60
 
 # 경로들 (프롬프트/워크플로 JSON)
 JSONS_DIR: Path = BASE_DIR.parent / "app" / "jsons"  # 기존 구조 유지
@@ -93,15 +88,6 @@ FFPROBE_EXE:  str = os.environ.get("FFPROBE_EXE", "")
 USE_HWACCEL: bool = True
 
 
-# FILE: settings.py
-# INSERT AFTER: the block where these already exist:
-#   DEFAULT_CHUNK: int = 300
-#   DEFAULT_OVERLAP: int = 12
-#   DEFAULT_INPUT_FPS: int = 60
-#   DEFAULT_TARGET_FPS: int = 60
-#
-# PURPOSE: 드롭다운에서 선택할 이미지 크기/FPS 후보와 기본값,
-#          타임라인 보정 파라미터를 '설정'으로 명확히 둡니다.
 
 # 1) 이미지 기본 크기 (가로, 세로)
 #    예: (832, 1472)는 9:16 세로형에 가깝습니다. (w, h)

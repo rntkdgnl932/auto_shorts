@@ -15,6 +15,7 @@ dir_path = "C:\\my_games\\shorts_make\\app\\blog_setting"
 file_path_topic = dir_path + "\\my_topic.txt"
 file_path_topic_system = dir_path + "\\topic_system.txt"
 file_path_topic_user = dir_path + "\\topic_user.txt"
+file_path_category_list = dir_path + "\\category_list.txt"
 
 
 
@@ -67,7 +68,18 @@ for i in range(3):
                 """
                 )
 
+for i in range(3):
+    if os.path.isfile(file_path_category_list) == True:
+        # 파일 읽기
+        with open(file_path_category_list, "r", encoding='utf-8-sig') as file:
+            category_list = file.read()
+            my_category = category_list.splitlines()
+            break
 
+
+    else:
+        with open(file_path_category_list, "w", encoding='utf-8-sig') as file:
+            file.write("생활 팁과 정보 (Blue)\n이슈 (Yellow)")
 
 
 

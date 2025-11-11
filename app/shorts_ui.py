@@ -77,7 +77,7 @@ try:
     # noinspection PyPep8Naming
     from app import settings as S
     from app.settings import (
-        BASE_DIR, COMFY_HOST, DEFAULT_CHUNK, DEFAULT_OVERLAP, DEFAULT_INPUT_FPS, DEFAULT_TARGET_FPS,
+        BASE_DIR, COMFY_HOST,
         JSONS_DIR, ACE_STEP_PROMPT_JSON, I2V_WORKFLOW, AUDIO_SAVE_FORMAT, FFMPEG_EXE, USE_HWACCEL, FINAL_OUT,
         DEFAULT_HOST_CANDIDATES, save_overrides
     )
@@ -90,7 +90,7 @@ except ImportError:
     # noinspection PyPep8Naming
     from app import settings as S  # type: ignore
     from app.settings import (  # type: ignore
-        BASE_DIR, COMFY_HOST, DEFAULT_CHUNK, DEFAULT_OVERLAP, DEFAULT_INPUT_FPS, DEFAULT_TARGET_FPS,
+        BASE_DIR, COMFY_HOST,
         JSONS_DIR, ACE_STEP_PROMPT_JSON, I2V_WORKFLOW, AUDIO_SAVE_FORMAT, FFMPEG_EXE, USE_HWACCEL, FINAL_OUT,
         DEFAULT_HOST_CANDIDATES, save_overrides
     )
@@ -5782,17 +5782,10 @@ class MainWindow(QtWidgets.QMainWindow):
 
         self.cb_audio_fmt = QtWidgets.QComboBox()
         self.cb_audio_fmt.addItems(["mp3", "wav", "opus"])
-        # overrides 적용 고려
         ov = s_mod.load_overrides() or {}
         cur_fmt = str(ov.get("AUDIO_SAVE_FORMAT", s_mod.AUDIO_SAVE_FORMAT)).lower()
         idx_fmt = max(0, self.cb_audio_fmt.findText(cur_fmt))
         self.cb_audio_fmt.setCurrentIndex(idx_fmt)
-
-        # 기본 프레임/분할
-        self.sb_d_chunk = self._spin(60, 5000, int(s_mod.DEFAULT_CHUNK), " /chunk")
-        self.sb_d_overlap = self._spin(1, 120, int(s_mod.DEFAULT_OVERLAP), " overlap")
-        self.sb_d_infps = self._spin(1, 240, int(s_mod.DEFAULT_INPUT_FPS), " inFPS")
-        self.sb_d_outfps = self._spin(1, 240, int(s_mod.DEFAULT_TARGET_FPS), " outFPS")
 
         # 프롬프트/워크플로 파일 경로
         self.le_prompt_json = QtWidgets.QLineEdit(str(s_mod.ACE_STEP_PROMPT_JSON))
@@ -5835,10 +5828,7 @@ class MainWindow(QtWidgets.QMainWindow):
         form.addRow("USE_HWACCEL", self.cb_hwaccel)
         form.addRow("FINAL_OUT", self.le_final)
         form.addRow("AUDIO_SAVE_FORMAT", self.cb_audio_fmt)
-        form.addRow("DEFAULT_CHUNK", self.sb_d_chunk)
-        form.addRow("DEFAULT_OVERLAP", self.sb_d_overlap)
-        form.addRow("DEFAULT_INPUT_FPS", self.sb_d_infps)
-        form.addRow("DEFAULT_TARGET_FPS", self.sb_d_outfps)
+        # ↓ 여기 4줄(DEFAULT_...)은 삭제
         form.addRow("ACE_STEP_PROMPT_JSON", pj_widget)
         form.addRow("I2V_WORKFLOW", i2v_widget)
 
@@ -5856,10 +5846,6 @@ class MainWindow(QtWidgets.QMainWindow):
                 USE_HWACCEL=bool(self.cb_hwaccel.isChecked()),
                 FINAL_OUT=self.le_final.text().strip(),
                 AUDIO_SAVE_FORMAT=self.cb_audio_fmt.currentText().strip().lower(),
-                DEFAULT_CHUNK=int(self.sb_d_chunk.value()),
-                DEFAULT_OVERLAP=int(self.sb_d_overlap.value()),
-                DEFAULT_INPUT_FPS=int(self.sb_d_infps.value()),
-                DEFAULT_TARGET_FPS=int(self.sb_d_outfps.value()),
                 ACE_STEP_PROMPT_JSON=self.le_prompt_json.text().strip(),
                 I2V_WORKFLOW=self.le_i2v.text().strip(),
             )
@@ -5869,16 +5855,9 @@ class MainWindow(QtWidgets.QMainWindow):
             QtWidgets.QMessageBox.information(self, "저장 완료", f"settings_local.json 저장됨\n\n{path}")
 
         def _do_apply():
-            """
-            설정을 settings_local.json에 저장하고, 런타임 settings 모듈 값도 즉시 반영.
-            그리고 현재 포맷/제목/경로에 맞게 ComfyUI 워크플로의 SaveAudio 노드들을
-            프로젝트 오디오 폴더(템플릿 [title] 치환)에 저장하도록 패치한다.
-            """
-            # 1) 파일로 저장 (settings_local.json)
             overrides = _collect_overrides()
             s_mod.save_overrides(**overrides)
 
-            # 2) 런타임(모듈 settings)에도 즉시 반영
             try:
                 import settings as _s
             except Exception:
@@ -5886,50 +5865,19 @@ class MainWindow(QtWidgets.QMainWindow):
 
             _s.BASE_DIR = overrides.get("BASE_DIR", _s.BASE_DIR)
             _s.COMFY_HOST = overrides.get("COMFY_HOST", _s.COMFY_HOST)
-            _s.DEFAULT_HOST_CANDIDATES = overrides.get("DEFAULT_HOST_CANDIDATES",
-                                                       getattr(_s, "DEFAULT_HOST_CANDIDATES", []))
+            _s.DEFAULT_HOST_CANDIDATES = overrides.get(
+                "DEFAULT_HOST_CANDIDATES", getattr(_s, "DEFAULT_HOST_CANDIDATES", [])
+            )
             _s.FFMPEG_EXE = overrides.get("FFMPEG_EXE", _s.FFMPEG_EXE)
             _s.USE_HWACCEL = bool(overrides.get("USE_HWACCEL", getattr(_s, "USE_HWACCEL", False)))
             _s.FINAL_OUT = overrides.get("FINAL_OUT", _s.FINAL_OUT)
             _s.AUDIO_SAVE_FORMAT = overrides.get("AUDIO_SAVE_FORMAT", getattr(_s, "AUDIO_SAVE_FORMAT", "mp3")).lower()
-            _s.DEFAULT_CHUNK = int(overrides.get("DEFAULT_CHUNK", getattr(_s, "DEFAULT_CHUNK", 600)))
-            _s.DEFAULT_OVERLAP = int(overrides.get("DEFAULT_OVERLAP", getattr(_s, "DEFAULT_OVERLAP", 5)))
-            _s.DEFAULT_INPUT_FPS = int(overrides.get("DEFAULT_INPUT_FPS", getattr(_s, "DEFAULT_INPUT_FPS", 24)))
-            _s.DEFAULT_TARGET_FPS = int(overrides.get("DEFAULT_TARGET_FPS", getattr(_s, "DEFAULT_TARGET_FPS", 24)))
             _s.ACE_STEP_PROMPT_JSON = overrides.get("ACE_STEP_PROMPT_JSON", _s.ACE_STEP_PROMPT_JSON)
             _s.I2V_WORKFLOW = overrides.get("I2V_WORKFLOW", _s.I2V_WORKFLOW)
 
-            # 3) 워크플로 JSON 저장 노드 포맷/경로 패치
-            try:
-                fmt = self.cb_audio_fmt.currentText().strip().lower()
-                json_path = Path(self.le_prompt_json.text().strip())
+            # 나머지 워크플로 패치 부분은 그대로 두면 됨
+            # (필요 없으면 여기서도 지워도 되고)
 
-                title = (self.le_title.text() or "").strip()
-                if not title:
-                    pdir = self._latest_project()
-                    if pdir and (pdir / "project.json").exists():
-                        try:
-                            from utils import load_json as _load_json
-                            meta = _load_json(pdir / "project.json", {}) or {}
-                            title = (meta.get("title") or "").strip()
-                        except Exception:
-                            title = ""
-
-                save_root = _s.FINAL_OUT or str(_s.BASE_DIR)
-                proj_audio_dir = _resolve_audio_dir_from_template(save_root, title or "untitled")
-
-                changed_fmt = rewrite_prompt_audio_format(json_path=json_path, desired_fmt=fmt)
-                changed = bool(changed_fmt)
-
-                QtWidgets.QMessageBox.information(
-                    self,
-                    "워크플로 수정",
-                    f"{'변경 적용됨' if changed else '변경 없음'}:\n{json_path}\n→ {proj_audio_dir}"
-                )
-            except Exception as e:
-                QtWidgets.QMessageBox.warning(self, "워크플로 수정 실패", str(e))
-
-            # 4) 완료 안내
             QtWidgets.QMessageBox.information(self, "적용 완료", "저장하고 런타임 값에도 적용했습니다.")
 
         btn_save.clicked.connect(_do_save)
