@@ -1992,7 +1992,10 @@ def run_job_with_progress_async(
             except Exception:
                 pass
         return
-
+    try:
+        setattr(owner, "_progress_dlg", dlg)
+    except Exception:
+        pass
     # 초기 로그 한 줄(네 _mk_progress.on_progress가 QTimer로 UI 스레드에 안전하게 반영)
     try:
         on_progress_ui({"stage": "ui", "msg": "[ui] 작업 시작 준비"})

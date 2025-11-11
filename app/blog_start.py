@@ -12,7 +12,7 @@ from blog_function import call_gemini, build_images_to_blog
 
 import variable as v_
 _wp_client = None
-CATEGORY = v_.my_category if hasattr(v_, 'my_category') else "일반"
+CATEGORY = v_.my_category_list if hasattr(v_, 'my_category') else "일반"
 
 # $ 제목 정하기 (메인 실행 함수)
 def suggest_life_tip_topic():
@@ -696,8 +696,8 @@ def suggest_life_tip_topic_issue(kw):
         print("v_.api_key", v_.api_key)
     elif "none" in v_.domain_adress:
         print("v_.domain_adress", v_.domain_adress)
-    elif "none" in v_.my_category:
-        print("v_.my_category", v_.my_category)
+    elif "none" in v_.my_category_list:
+        print("v_.my_category_list", v_.my_category_list)
 
     else:
         print("▶ suggest_life_tip_topic_issue", kw)
