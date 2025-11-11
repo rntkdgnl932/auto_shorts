@@ -99,9 +99,12 @@ def life_tips_keyword(keyword):
     today = datetime.today().strftime("%Y년 %m월 %d일")
 
     print(f"▶ 키워드 '{keyword}'로 본문 초안 생성 요청")
+    topic_text = getattr(v_, "my_topic", "생활 정보")
+    category_text = getattr(v_, "my_category", "기타")
+
     prompt = f"""
     [역할]
-    당신은 '{getattr(v_, 'my_topic', '생활 정보')}' 분야의 전문 작가이자 사실 확인 전문가입니다. 당신의 임무는 독자들이 신뢰할 수 있는 정확하고 깊이 있는 정보로 구성된 블로그 초안을 작성하는 것입니다.
+    당신은 '{topic_text}' 분야(블로그 카테고리: '{category_text}')의 전문 작가이자 사실 확인 전문가입니다. 당신의 임무는 독자들이 신뢰할 수 있는 정확하고 깊이 있는 정보로 구성된 블로그 초안을 작성하는 것입니다.
     [지시]
     '{keyword}'라는 주제에 대해, 아래 규칙을 모두 준수하여 블로그 포스팅을 위한 상세한 '초안'을 작성해주세요.
     [작성 규칙]
