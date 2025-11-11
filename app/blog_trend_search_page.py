@@ -213,74 +213,83 @@ def collect_all_topics():
 
 
 def filter_topics_by_category(topic_list):
-    from openai import OpenAI
     import json
     import re
+    from blog_function import call_gemini  # ← 이미 너 프로젝트에 있는 그 함수 경로로 맞춰
 
-    def is_korean(text):
-        return bool(re.search(r'[가-힣]', text))
+    def is_korean(text: str) -> bool:
+        return bool(re.search(r"[가-힣]", text))
 
+    # 한글만, 최대 60개
     topic_list = [t for t in topic_list if is_korean(t)][:60]
 
-    client = OpenAI(api_key=v_.api_key, timeout=200)
-
-    """
-    OpenAI GPT를 활용해 블로그 카테고리에 맞는 키워드 10개 추출
-    """
-
-    system_message = (
-        "당신은 콘텐츠 전문가이며, 주어진 블로그 카테고리에 가장 적합한 주제 1개를 JSON 배열 형식으로 출력하는 역할을 맡고 있습니다. "
-        "출력은 반드시 JSON 배열만 사용하며, 그 외 부가 설명은 포함하지 마세요. "
-        "이모지, 특수문자, 따옴표가 많은 문장, 부제 포함 등은 모두 제외하고 순수한 키워드 문장 10개만 반환하세요. "
-        "다음은 출력 예시이며, 이와 같은 형식으로 반환해야합니다." 
-        "[\"전기요금 절약하는 5가지 방법\"]"
+    system_part = (
+        "당신은 블로그 콘텐츠 기획 전문가입니다. "
+        "입력으로 주어지는 여러 개의 트렌드/뉴스/영상 제목 중에서 "
+        "현재 블로그의 카테고리와 실제로 관련성이 높고 사람들이 실제로 검색해서 볼 만한 주제만 골라야 합니다. "
+        "출력은 반드시 JSON 배열 형식으로만 하세요. 불필요한 설명, 말머리, 코드블록 표시는 모두 금지합니다."
     )
 
     user_prompt = f"""
-    다음은 뉴스, 트렌드, 유튜브 영상에서 수집된 제목 및 키워드 목록입니다:
+다음은 최근에 수집한 주제 제목 목록입니다:
 
-    {topic_list}
+{topic_list}
 
-    이 중 다음 블로그 카테고리와 가장 관련성 높은 주제 10개를 JSON 배열로 출력하세요:
+이 중에서 아래 블로그 카테고리와 가장 관련성이 높은 주제 10개만 골라서
+JSON 배열로만 출력하세요.
 
-    [카테고리 설명]
-    '{v_.my_category}', {v_.my_topic}
+[블로그 카테고리]
+- 카테고리: {v_.my_category}
+- 상세 분야/토픽: {getattr(v_, 'my_topic', '')}
 
-    ✅ 조건
-    - 한글 제목 중심
-    - 실용 정보, 생활 꿀팁, 정책, 정부 지원, 절약 노하우 등 실제로 도움이 되는 주제만
-    - 연예, 게임, 스포츠, 유머 영상, 단순 일상 Vlog 등은 제외
-    - 특수문자와 이모지 ❌
-    - 출력은 반드시 JSON 배열 형식으로 10개의 주제만 포함하세요. (예: ["전기요금 절약법", "폭염 대응 팁", ...])
-    """
+[선택 규칙]
+1. 생활 정보, 정책/지원금, 절약/비용절감, 금융, 실용 팁 쪽을 가장 우선해서 고른다.
+2. 연예, 단순 브이로그, 불분명한 뉴스 헤드라인, 유튜브용 자극 제목은 제외한다.
+3. 이모지, 특수문자, 과도한 따옴표는 제거된 형태로 둔다.
+4. 한국어 제목만 선택한다.
+5. 최종 출력은 예시처럼 한다:
+["전기요금 절약하는 5가지 방법", "2025년 정부지원금 신청 총정리", ...]
+6. 반드시 10개를 출력한다.
+"""
+
+    # Gemini 호출
+    try:
+        resp_text = call_gemini(
+            # 시스템 역할 + 유저 내용을 합쳐서 하나로 보낼게
+            system_part + "\n\n" + user_prompt,
+            temperature=0.3,
+            is_json=True,  # 가능하면 JSON으로 달라
+        )
+    except Exception as e:
+        print("❌ 필터링 실패(호출 오류):", e)
+        return []
+
+    # 안전장치
+    if not resp_text or resp_text in ("API_ERROR", "SAFETY_BLOCKED"):
+        print("❌ 필터링 실패(Gemini 응답 없음):", resp_text)
+        return []
+
+    # ```json ... ``` 벗겨내기
+    cleaned = (
+        resp_text.replace("```json", "")
+        .replace("```", "")
+        .strip()
+    )
+    print("🔍 Gemini 응답 원문:", cleaned)
 
     try:
-        response = client.chat.completions.create(
-            model="gpt-4o",
-            messages=[
-                {"role": "system", "content": system_message},
-                {"role": "user", "content": user_prompt}
-            ],
-            temperature=0.3
-        )
-
-        raw = response.choices[0].message.content.strip()
-
-        # ✅ "json"이나 ```json ``` 제거
-        raw = raw.replace("```json", "").replace("```", "").replace("json", "").strip()
-
-        print("🔍 GPT 응답 원문:", raw)
-
-        filtered = json.loads(raw)
-        if isinstance(filtered, list) and len(filtered) == 10:
-            return filtered
+        data = json.loads(cleaned)
+        if isinstance(data, list):
+            # 혹시 10개보다 많이 줬으면 10개만
+            return data[:10]
         else:
-            print("⚠️ 10개 배열이 아님:", filtered)
+            print("⚠️ JSON이 리스트가 아님:", data)
             return []
-
     except Exception as e:
-        print("❌ 필터링 실패:", e)
+        print("⚠️ JSON 파싱 실패:", e)
         return []
+
+
 
 
 def search_naver_blog_top_post(keyword):

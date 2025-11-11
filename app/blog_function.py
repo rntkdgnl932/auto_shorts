@@ -2,12 +2,11 @@ import google.generativeai as genai
 from google.generativeai.types import RequestOptions
 import google.api_core.exceptions as gax
 import random
-from typing import Any, Optional, TypedDict
+from typing import Any, Optional, TypedDict, Tuple
 import time
 import json
 import re
 from io import BytesIO
-from typing import Optional, Tuple
 import settings
 
 import requests
@@ -406,7 +405,7 @@ def _sd_txt2img(
     # --- 로컬 통신 전용 세션: 프록시/환경변수 무시 + keep-alive 해제 ---
     sess = requests.Session()
     sess.trust_env = False                     # ← HTTP(S)_PROXY 등 무시
-    sess.proxies = {"http": None, "https": None}
+    sess.proxies = {"http": "", "https": ""}
     sess.headers.update({"User-Agent": "AutoBlog/1.21", "Connection": "close"})
 
     # 네트워크 안정화(재시도)
@@ -551,11 +550,9 @@ def build_images_to_blog(
 ):
     import json
     import time
-    import requests
     from io import BytesIO
     from pathlib import Path
     from PIL import Image
-    from xmlrpc import client as xmlrpc_client
 
     # 1) 프롬프트/캡션 준비 ----------------------------------------------
     try:
@@ -585,6 +582,8 @@ def build_images_to_blog(
         )
         base_quality = "masterpiece, best quality, ultra-detailed, high resolution"
         final_prompt = f"{base_quality}, {short_prompt}".strip()
+        if len(final_prompt) > 480:
+            final_prompt = final_prompt[:480]
 
     except Exception as e_prompt:
         print(f"❌ [ComfyBlog] 프롬프트 준비 중 오류: {type(e_prompt).__name__}: {e_prompt}", flush=True)
@@ -593,7 +592,6 @@ def build_images_to_blog(
     # 2) ComfyUI 워크플로 로드 ----------------------------------------------
     try:
         try:
-            import settings  # type: ignore
             comfy_host = getattr(settings, "COMFY_HOST", "http://127.0.0.1:8188")
             jsons_dir = getattr(settings, "JSONS_DIR", None)
         except Exception:
@@ -636,11 +634,12 @@ def build_images_to_blog(
                 "ReActorFaceSwap",
                 "ReActorLoader",
             }
-            for nid, node in g.items():
-                ctype = str(node.get("class_type") or "")
-                if ctype in UPSCALE or ctype in VIDEO or ctype in FACE:
-                    node.setdefault("inputs", {})
-                    node["inputs"]["enabled"] = False
+
+            for node_id, node_data in g.items():
+                class_type = str(node_data.get("class_type") or "")
+                if class_type in UPSCALE or class_type in VIDEO or class_type in FACE:
+                    node_data.setdefault("inputs", {})
+                    node_data["inputs"]["enabled"] = False
 
         _disable_blog_nodes(graph)
 
@@ -670,7 +669,14 @@ def build_images_to_blog(
                 _set_input(graph, node_id, "steps", int(steps))
 
         # 4) /prompt 제출 ----------------------------------------------------
-        resp = requests.post(base_url + "/prompt", json={"prompt": graph}, timeout=15)
+        payload = {
+            "prompt": graph,
+            "extra_pnginfo": {
+                "workflow": graph
+            },
+        }
+
+        resp = requests.post(base_url + "/prompt", json=payload, timeout=15)
         resp.raise_for_status()
         prompt_id = resp.json().get("prompt_id")
         if not prompt_id:

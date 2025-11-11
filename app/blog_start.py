@@ -18,10 +18,6 @@ CATEGORY = v_.my_category_list if hasattr(v_, 'my_category') else "일반"
 def suggest_life_tip_topic():
     print("▶ 새로운 주제 추천 요청")
     result_titles = load_existing_titles()
-    today = datetime.today().strftime("%Y년 %m월 %d일")
-    month = datetime.today().month
-    seasons = {3: "봄", 4: "봄", 5: "봄", 6: "여름", 7: "여름", 8: "여름", 9: "가을", 10: "가을", 11: "가을"}
-    current_season = seasons.get(month, "겨울")
 
     # ✅ 사용자 정의 역할(System)과 주제(User)를 동적으로 반영
     system_prompt = v_.my_topic_system if hasattr(v_,
@@ -188,7 +184,7 @@ def life_tips_start(article, keyword):
     plain_text_content = " ".join(
         [s.get('title', '') + " " + s.get('content', '') for s in structured_content.get('sections', [])])
 
-    meta_description = generate_meta_description(plain_text_content, keyword)
+    meta_description = generate_meta_description(plain_text_content)
     if meta_description in ["SAFETY_BLOCKED", "API_ERROR"]:
         print(f"❌ 메타 디스크립션 생성 실패({meta_description}). 포스팅 중단.")
         return False
@@ -333,8 +329,6 @@ def generate_impactful_titles(keyword, article_summary):
         print(f"⚠️ 제목 JSON 파싱 실패: {e}")
         return "API_ERROR"
 
-import re
-
 def pick_best_title(candidates, keyword):
     # 자주 나오는 지겨운 패턴들
     boring_patterns = [
@@ -451,7 +445,7 @@ def generate_structured_content_json(article, keyword):
     except:
         return "API_ERROR"
 
-def generate_meta_description(content_text, keyword):
+def generate_meta_description(content_text):
     """(분업 2) 본문 텍스트를 기반으로 메타 디스크립션을 생성"""
     print("  ▶ (분업 2) Gemini로 메타 디스크립션 생성 중...")
     prompt = f"다음 글을 SEO에 최적화하여 120자 내외의 흥미로운 '메타 디스크립션'으로 요약해줘. 반드시 한 문장의 순수 텍스트만 출력해야 해.\n\n[본문 요약]\n{content_text[:1000]}"
@@ -623,15 +617,30 @@ def extract_tags_from_html_with_ui(html_content, keyword):
         return "API_ERROR"
 
 def extract_tags_fallback(html, keyword):
-    text = BeautifulSoup(html, "html.parser").get_text(" ")
+    import re
+    from bs4 import BeautifulSoup
+
+    soup = BeautifulSoup(html, "html.parser")
+
+    # 1) 그냥 전체 텍스트만 뽑는다 (인자 없이!)
+    text = soup.get_text()
+    # 2) 줄바꿈/탭 등은 공백 하나로 정리
+    text = re.sub(r"\s+", " ", text).strip()
+
     words = re.findall(r"[가-힣A-Za-z0-9]{2,}", text)
-    stops = set([keyword, "한줄요약", "개인의견"])
+
+    stops = {str(keyword), "한줄요약", "개인의견"}
     freq = {}
     for w in words:
         if w.lower() in stops or len(w) > 20:
             continue
         freq[w] = freq.get(w, 0) + 1
-    return [w for w,_ in sorted(freq.items(), key=lambda x: x[1], reverse=True)[:7]]
+
+    # 상위 7개만
+    return [w for w, _ in sorted(freq.items(), key=lambda x: x[1], reverse=True)[:7]]
+
+
+
 
 def safe_term_cate(term):
     if not term or not isinstance(term, str): return "일반"
@@ -684,9 +693,6 @@ def issue_start():
 
 def suggest_life_tip_topic_issue(kw):
 
-    from datetime import datetime
-    today = datetime.today().strftime("%Y년 %m월 %d일")
-    month = datetime.today().month
 
 
     suggest__ = False
