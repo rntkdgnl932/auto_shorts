@@ -1959,44 +1959,38 @@ class _JobWorker(QtCore.QObject):
 # progress.py (하단에 추가 또는 기존 함수 교체)
 
 # progress.py  ── 전체 교체
+
 def run_job_with_progress_async(
     owner: QtWidgets.QWidget,
     title: str,
-    job,  # Callable[[Callable[[dict], None]], Any]
+    job,
     *,
     tail_file=None,
-    on_done=None,  # Callable[[bool, Any, Optional[BaseException]], None]
+    on_done=None,
 ) -> None:
-    """
-    비동기 작업 실행 + 진행창 + (옵션) 로그 테일링(tail_file).
-    - owner: 부모 위젯
-    - title: 진행창 제목
-    - job(on_progress: Callable[[dict], None]) -> Any: 백그라운드에서 실행할 함수
-    - tail_file: 실시간 테일링할 로그 파일 경로(선택)  → _mk_progress 내부에서 처리
-    - on_done(ok: bool, payload: Any, err: Optional[Exception]): 완료 콜백
-    """
     from PyQt5 import QtCore
 
-    # --- 네가 제공한 _mk_progress는 (on_progress, finalize, dlg) 순서로 3개 반환 ---
-    try:
-        on_progress_ui, finalize_ui, dlg = _mk_progress(owner, title, tail_file=tail_file)  # type: ignore
-    except Exception as e:
-        # _mk_progress가 없거나 실패하면 바로 알리고 종료(불필요한 대체 구현 없이 명확히 처리)
+    # 0) 기존 진행창 재사용 여부 확인
+    reuse_ctx = getattr(owner, "_progress_ctx", None)
+    on_progress_ui = finalize_ui = dlg = None
+    reused = False
+
+    if reuse_ctx is not None:
         try:
-            QtWidgets.QMessageBox.critical(owner, "진행창 초기화 실패", str(e))  # type: ignore
+            old_on_progress, old_finalize, old_dlg = reuse_ctx
+            if old_dlg is not None and old_dlg.isVisible():
+                on_progress_ui, finalize_ui, dlg = old_on_progress, old_finalize, old_dlg
+                reused = True
         except Exception:
             pass
-        if callable(on_done):
-            try:
-                on_done(False, None, e)
-            except Exception:
-                pass
-        return
-    try:
-        setattr(owner, "_progress_dlg", dlg)
-    except Exception:
-        pass
-    # 초기 로그 한 줄(네 _mk_progress.on_progress가 QTimer로 UI 스레드에 안전하게 반영)
+
+    # 1) 재사용 불가하면 새로 만든다
+    if dlg is None:
+        on_progress_ui, finalize_ui, dlg = _mk_progress(owner, title, tail_file=tail_file)  # type: ignore
+        setattr(owner, "_progress_ctx", (on_progress_ui, finalize_ui, dlg))
+        reused = False  # 새 창이니까 원래 finalize 써도 됨
+
+    # 2) 시작 로그
     try:
         on_progress_ui({"stage": "ui", "msg": "[ui] 작업 시작 준비"})
     except Exception:
@@ -2004,7 +1998,7 @@ def run_job_with_progress_async(
 
     class _Worker(QtCore.QObject):
         progress = QtCore.pyqtSignal(dict)
-        finished = QtCore.pyqtSignal(object, object)  # (payload, err)
+        finished = QtCore.pyqtSignal(object, object)
 
         @QtCore.pyqtSlot()
         def run(self):
@@ -2012,7 +2006,6 @@ def run_job_with_progress_async(
             err = None
             try:
                 def on_progress(info: dict):
-                    # 워커 스레드 → 메인 스레드로 신호만 보냄(실제 UI 반영은 슬롯에서)
                     if not isinstance(info, dict):
                         info = {"msg": str(info)}
                     self.progress.emit(info)
@@ -2027,7 +2020,6 @@ def run_job_with_progress_async(
     obj.moveToThread(th)
 
     def _on_progress(info: dict):
-        # 메인 스레드: 네 _mk_progress가 넘긴 on_progress_ui 호출(내부가 QTimer로 UI 반영)
         try:
             on_progress_ui(info)
         except Exception:
@@ -2036,13 +2028,21 @@ def run_job_with_progress_async(
     def _on_finished(payload, err):
         ok = (err is None)
 
-        # finalize 호출로 진행창 마무리
-        try:
-            finalize_ui(ok, payload, err)
-        except Exception:
-            pass
+        # 새로 만든 창일 때만 원래 finalize 호출
+        if not reused:
+            try:
+                finalize_ui(ok, payload, err)
+            except Exception:
+                pass
+        else:
+            # 재사용 창일 때는 닫기버튼/추가 UI 생성 막기 위해 아무것도 안 함
+            # 필요하면 여기서 로그만 하나 찍자
+            try:
+                on_progress_ui({"stage": "done", "msg": "[ui] 작업 1건 완료 (재사용 중)"})
+            except Exception:
+                pass
 
-        # 완료 콜백
+        # 호출자가 준 on_done은 항상 불러줌
         if callable(on_done):
             try:
                 on_done(ok, payload, err)
@@ -2069,7 +2069,7 @@ def run_job_with_progress_async(
     obj.finished.connect(_on_finished)
     th.started.connect(obj.run)
 
-    # GC 방지: 소유자에 스레드 참조를 보관
+    # GC 방지
     try:
         jobs = getattr(owner, "_progress_jobs", None)
         if not isinstance(jobs, list):
@@ -2086,7 +2086,7 @@ def run_job_with_progress_async(
     except Exception:
         pass
 
-    # 스레드 시작(실패 시 finalize + on_done(False, ...))
+    # 스레드 시작
     try:
         th.start()
     except Exception as start_exc:
@@ -2094,16 +2094,166 @@ def run_job_with_progress_async(
             on_progress_ui({"stage": "error", "msg": f"[error] thread start failed: {start_exc}"})
         except Exception:
             pass
-        try:
-            finalize_ui(False, None, start_exc)
-        except Exception:
-            pass
+        # 첫 창일 때만 finalize
+        if not reused:
+            try:
+                finalize_ui(False, None, start_exc)
+            except Exception:
+                pass
         if callable(on_done):
             try:
                 on_done(False, None, start_exc)
             except Exception:
                 pass
         return
+
+
+
+# def run_job_with_progress_async(
+#     owner: QtWidgets.QWidget,
+#     title: str,
+#     job,  # Callable[[Callable[[dict], None]], Any]
+#     *,
+#     tail_file=None,
+#     on_done=None,  # Callable[[bool, Any, Optional[BaseException]], None]
+# ) -> None:
+#     """
+#     비동기 작업 실행 + 진행창 + (옵션) 로그 테일링(tail_file).
+#     - owner: 부모 위젯
+#     - title: 진행창 제목
+#     - job(on_progress: Callable[[dict], None]) -> Any: 백그라운드에서 실행할 함수
+#     - tail_file: 실시간 테일링할 로그 파일 경로(선택)  → _mk_progress 내부에서 처리
+#     - on_done(ok: bool, payload: Any, err: Optional[Exception]): 완료 콜백
+#     """
+#     from PyQt5 import QtCore
+#
+#     # --- 네가 제공한 _mk_progress는 (on_progress, finalize, dlg) 순서로 3개 반환 ---
+#     try:
+#         on_progress_ui, finalize_ui, dlg = _mk_progress(owner, title, tail_file=tail_file)  # type: ignore
+#     except Exception as e:
+#         # _mk_progress가 없거나 실패하면 바로 알리고 종료(불필요한 대체 구현 없이 명확히 처리)
+#         try:
+#             QtWidgets.QMessageBox.critical(owner, "진행창 초기화 실패", str(e))  # type: ignore
+#         except Exception:
+#             pass
+#         if callable(on_done):
+#             try:
+#                 on_done(False, None, e)
+#             except Exception:
+#                 pass
+#         return
+#     try:
+#         setattr(owner, "_progress_dlg", dlg)
+#     except Exception:
+#         pass
+#     # 초기 로그 한 줄(네 _mk_progress.on_progress가 QTimer로 UI 스레드에 안전하게 반영)
+#     try:
+#         on_progress_ui({"stage": "ui", "msg": "[ui] 작업 시작 준비"})
+#     except Exception:
+#         pass
+#
+#     class _Worker(QtCore.QObject):
+#         progress = QtCore.pyqtSignal(dict)
+#         finished = QtCore.pyqtSignal(object, object)  # (payload, err)
+#
+#         @QtCore.pyqtSlot()
+#         def run(self):
+#             payload = None
+#             err = None
+#             try:
+#                 def on_progress(info: dict):
+#                     # 워커 스레드 → 메인 스레드로 신호만 보냄(실제 UI 반영은 슬롯에서)
+#                     if not isinstance(info, dict):
+#                         info = {"msg": str(info)}
+#                     self.progress.emit(info)
+#                 payload = job(on_progress)
+#             except Exception as ex:
+#                 err = ex
+#             finally:
+#                 self.finished.emit(payload, err)
+#
+#     obj = _Worker()
+#     th = QtCore.QThread(dlg)
+#     obj.moveToThread(th)
+#
+#     def _on_progress(info: dict):
+#         # 메인 스레드: 네 _mk_progress가 넘긴 on_progress_ui 호출(내부가 QTimer로 UI 반영)
+#         try:
+#             on_progress_ui(info)
+#         except Exception:
+#             pass
+#
+#     def _on_finished(payload, err):
+#         ok = (err is None)
+#
+#         # finalize 호출로 진행창 마무리
+#         try:
+#             finalize_ui(ok, payload, err)
+#         except Exception:
+#             pass
+#
+#         # 완료 콜백
+#         if callable(on_done):
+#             try:
+#                 on_done(ok, payload, err)
+#             except Exception:
+#                 pass
+#
+#         # 스레드 정리
+#         try:
+#             th.quit()
+#             th.wait(100)
+#         except Exception:
+#             pass
+#
+#         # 소유자에 보관했던 스레드 참조 제거
+#         try:
+#             jobss = getattr(owner, "_progress_jobs", [])
+#             if th in jobss:
+#                 jobss.remove(th)
+#             setattr(owner, "_progress_jobs", jobss)
+#         except Exception:
+#             pass
+#
+#     obj.progress.connect(_on_progress)
+#     obj.finished.connect(_on_finished)
+#     th.started.connect(obj.run)
+#
+#     # GC 방지: 소유자에 스레드 참조를 보관
+#     try:
+#         jobs = getattr(owner, "_progress_jobs", None)
+#         if not isinstance(jobs, list):
+#             jobs = []
+#         jobs.append(th)
+#         setattr(owner, "_progress_jobs", jobs)
+#         setattr(th, "_worker_ref", obj)
+#     except Exception:
+#         pass
+#
+#     # 시작 로그
+#     try:
+#         on_progress_ui({"stage": "ui", "msg": "[ui] 백그라운드 스레드 시작"})
+#     except Exception:
+#         pass
+#
+#     # 스레드 시작(실패 시 finalize + on_done(False, ...))
+#     try:
+#         th.start()
+#     except Exception as start_exc:
+#         try:
+#             on_progress_ui({"stage": "error", "msg": f"[error] thread start failed: {start_exc}"})
+#         except Exception:
+#             pass
+#         try:
+#             finalize_ui(False, None, start_exc)
+#         except Exception:
+#             pass
+#         if callable(on_done):
+#             try:
+#                 on_done(False, None, start_exc)
+#             except Exception:
+#                 pass
+#         return
 
 
 

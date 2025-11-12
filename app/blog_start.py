@@ -12,7 +12,6 @@ from blog_function import call_gemini, build_images_to_blog
 
 import variable as v_
 _wp_client = None
-CATEGORY = v_.my_category_list if hasattr(v_, 'my_category') else "일반"
 
 # $ 제목 정하기 (메인 실행 함수)
 def suggest_life_tip_topic():
@@ -266,8 +265,9 @@ def life_tips_start(article, keyword):
     post.title = final_title
     post.content = final_html
     post.excerpt = meta_description
+    current_cat = getattr(v_, "my_category", "일반")
     post.terms_names = {
-        'category': [safe_term_cate(CATEGORY)],
+        'category': [safe_term_cate(current_cat)],
         'post_tag': list(set([safe_term_word(keyword)] + [safe_term_word(t) for t in auto_tags]))
     }
     if thumbnail_id: post.thumbnail = thumbnail_id
