@@ -4543,6 +4543,199 @@ def build_video_json_with_gap_policy(
 
 
 
+# video_build.py
+
+from pathlib import Path
+from typing import Any, Callable, Dict, List, Optional
+
+def fill_prompt_movie_with_ai(
+    project_dir: "Path",
+    ask: "Callable[[str, str], str]",
+    *,
+    log_fn: Optional[Callable[[str], None]] = None,
+) -> None:
+    """
+    전제:
+      - project_dir 아래 video.json이 존재
+    하는 일:
+      1) video.json에서 fps를 확정(우선순위: defaults.movie.target_fps → root fps → defaults.image.fps → 30)
+      2) 각 scene.duration × fps로 총 프레임 계산
+      3) frame_segments 없으면 plan_segments(total_frames)로 생성
+      4) 각 세그먼트 prompt_movie가 비어있으면 AI로 한 줄 생성하여 채움
+    기존 기능은 훼손하지 않음 (이미 값이 있으면 덮어쓰지 않음).
+    """
+    # 안전 로드/세이브
+    try:
+        from app.utils import load_json, save_json  # type: ignore
+    except Exception:
+        from utils import load_json, save_json  # type: ignore
+
+    # plan_segments 우선 가져오되, 없으면 로컬 대체
+    try:
+        # 같은 모듈에 있다면 이 임포트는 무해, 다른 구성이라면 아래 except로 안전 대체
+        from video_build import plan_segments  # type: ignore
+    except Exception:
+        def plan_segments(total_frames: int) -> List[List[int]]:
+            """fallback: 총 프레임을 60프레임 기준으로 균등 분할"""
+            if total_frames <= 0:
+                return []
+            size = 60
+            out: List[List[int]] = []
+            s = 0
+            while s < total_frames:
+                e = min(s + size, total_frames)
+                out.append([s, e])
+                s = e
+            return out
+
+    def _log(msg: str) -> None:
+        if callable(log_fn):
+            try:
+                log_fn(msg)
+            except Exception:
+                pass
+
+    pdir = Path(project_dir).resolve()
+    vpath = pdir / "video.json"
+    vdoc: Dict[str, Any] = load_json(vpath, {}) or {}
+    if not isinstance(vdoc, dict):
+        _log("[fill_prompt_movie_with_ai] video.json 형식 오류")
+        return
+
+    # ── 1) FPS 확정 ─────────────────────────────────────────────
+    defaults_map: Dict[str, Any] = vdoc.get("defaults") or {}
+    movie_def: Dict[str, Any] = defaults_map.get("movie") or {}
+    image_def: Dict[str, Any] = defaults_map.get("image") or {}
+
+    fps_candidates = [
+        movie_def.get("target_fps"),
+        vdoc.get("fps"),
+        image_def.get("fps"),
+        30,
+    ]
+    fps = 30
+    for cand in fps_candidates:
+        try:
+            if cand is not None:
+                fps = int(cand)
+                break
+        except (TypeError, ValueError):
+            continue
+
+    # 동기화(부족하면 채워줌) — 원본 값이 있을 땐 덮어쓰지 않음이 아니라 “일관화”가 목적이라 동기화함.
+    vdoc.setdefault("fps", fps)
+    vdoc.setdefault("defaults", {})
+    vdoc["defaults"].setdefault("movie", {})
+    vdoc["defaults"]["movie"]["target_fps"] = fps
+    vdoc["defaults"]["movie"]["input_fps"] = fps
+    vdoc["defaults"]["movie"]["fps"] = fps
+    vdoc["defaults"].setdefault("image", {})
+    vdoc["defaults"]["image"]["fps"] = fps
+
+    # ── 2) 씬 루프 ─────────────────────────────────────────────
+    scenes = vdoc.get("scenes") or []
+    if not isinstance(scenes, list):
+        _log("[fill_prompt_movie_with_ai] scenes 없음")
+        save_json(vpath, vdoc)  # 동기화된 fps만이라도 반영
+        return
+
+    changed = False
+
+    for sc in scenes:
+        if not isinstance(sc, dict):
+            continue
+
+        # 총 프레임 계산
+        try:
+            dur = float(sc.get("duration") or 0.0)
+        except (TypeError, ValueError):
+            dur = 0.0
+        total_frames = int(round(dur * fps)) if dur > 0 else 0
+        if total_frames <= 0:
+            _log(f"[fill_prompt_movie_with_ai] scene {sc.get('id')} duration/fps로 프레임 산출 불가 → 스킵")
+            continue
+
+        # frame_segments 없으면 생성
+        segs = sc.get("frame_segments")
+        if not isinstance(segs, list) or not segs:
+            pairs = plan_segments(total_frames)  # [[s,e], ...]
+            segs_out: List[Dict[str, Any]] = []
+            for s_f, e_f in pairs:
+                segs_out.append({
+                    "start_frame": int(s_f),
+                    "end_frame": int(e_f),
+                    "prompt_movie": ""
+                })
+            sc["frame_segments"] = segs_out
+            segs = segs_out
+            changed = True
+        else:
+            # 최소 필드 정합성 보정
+            fixed: List[Dict[str, Any]] = []
+            for item in segs:
+                if isinstance(item, dict) and ("start_frame" in item) and ("end_frame" in item):
+                    fixed.append(item)
+            sc["frame_segments"] = fixed
+            segs = fixed
+
+        # 세그먼트 프롬프트 채우기: 이미 값이 있으면 그대로 둠
+        # base 텍스트: direct_prompt > prompt > lyric > prompt_movie(씬 전체)
+        base_text = ""
+        for key in ("direct_prompt", "prompt", "lyric", "prompt_movie"):
+            val = sc.get(key)
+            if isinstance(val, str) and val.strip():
+                base_text = val.strip()
+                break
+
+        if not base_text:
+            # 완전 빈 경우엔 세그먼트만 생성하고 넘어감
+            _log(f"[fill_prompt_movie_with_ai] scene {sc.get('id')} 참조 텍스트 없음 → 세그먼트만 생성")
+            continue
+
+        system_msg = (
+            "You convert a scene description into a single, concise, cinematic i2v prompt line. "
+            "Avoid redundant commas; describe only THIS sub-part."
+        )
+
+        for seg in segs:
+            if not isinstance(seg, dict):
+                continue
+            if str(seg.get("prompt_movie") or "").strip():
+                continue  # 이미 있으면 보존
+
+            user_msg = (
+                "Rewrite the following scene description into one concise English i2v prompt line. "
+                "Keep it cinematic/photorealistic, avoid repeated commas, focus just on this sub-part.\n\n"
+                f"Original:\n{base_text}\n\n"
+                f"Segment frame range: {seg.get('start_frame')}–{seg.get('end_frame')}"
+            )
+            try:
+                one_line = str(ask(system_msg, user_msg) or "").strip()
+            except Exception:
+                one_line = ""
+
+            if not one_line:
+                one_line = base_text  # AI 실패 시 최소 보장
+            seg["prompt_movie"] = one_line
+            changed = True
+
+    if changed:
+        vdoc["scenes"] = scenes
+        save_json(vpath, vdoc)
+        _log("[fill_prompt_movie_with_ai] fps 동기화 + frame_segments 생성/보강 + 세그먼트 프롬프트 채움 완료")
+    else:
+        # fps 동기화만 반영되었을 수도 있으므로 저장
+        save_json(vpath, vdoc)
+        _log("[fill_prompt_movie_with_ai] 변경 없음(또는 fps 동기화만 수행)")
+
+
+
+
+
+
+
+
+
 
 
 
