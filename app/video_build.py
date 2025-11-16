@@ -4549,7 +4549,6 @@ from pathlib import Path
 from typing import Any, Callable, Dict, List, Optional
 
 
-
 # video_build.py의 fill_prompt_movie_with_ai 함수 전체를 이 코드로 교체하세요.
 
 def fill_prompt_movie_with_ai(
@@ -4564,10 +4563,12 @@ def fill_prompt_movie_with_ai(
       - project_dir 아래 video.json이 존재
     하는 일:
       1) video.json에서 fps를 확정
-      2) 각 씬(Scene)을 순회
-      3) 씬의 frame_segments 목록과 base_text를 수집
-      4) AI를 씬당 '한 번만' 호출하여 모든 세그먼트의 프롬프트를 '배열'로 받음
-      5) 비어있던 prompt_movie를 AI가 생성한 프롬프트로 채움
+      2) [신규] project.json에서 'original_vibe'(원본 프롬프트) 로드
+      3) 각 씬(Scene)을 순회
+      4) [신규] '다음 씬 가사'(next_scene_lyric) 정보 파악
+      5) AI를 씬당 '한 번만' 호출하여 (원본분위기+현재가사+현재비주얼+캐릭터+시간구조+다음가사)를
+         바탕으로 모든 세그먼트의 프롬프트를 '배열'로 받음
+      6) 비어있던 prompt_movie를 AI가 생성한 프롬프트로 채움
     """
     # 안전 로드/세이브
     try:
@@ -4583,7 +4584,7 @@ def fill_prompt_movie_with_ai(
     except Exception:
         def plan_segments(total_frames: int, base_chunk: int = 60, overlap: int = 12, pad_tail: int = 5) -> list[
             tuple[int, int]]:
-            # ... (기존 plan_segments 폴백 로직) ...
+            # (기존 plan_segments 폴백 로직)
             if total_frames <= 0: return []
             size = base_chunk
             out: List[List[int]] = []
@@ -4608,7 +4609,16 @@ def fill_prompt_movie_with_ai(
         _log("[fill_prompt_movie_with_ai] video.json 형식 오류")
         return
 
-    # ── 1) FPS 확정 (기존과 동일) ─────────────────────────────
+    # --- ▼▼▼ [신규] 1. 원본 분위기 (project.json) 로드 ▼▼▼ ---
+    pj_path = pdir / "project.json"
+    original_vibe_prompt = ""
+    if pj_path.exists():
+        pj_doc = load_json(pj_path, {}) or {}
+        if isinstance(pj_doc, dict):
+            original_vibe_prompt = pj_doc.get("prompt_user") or pj_doc.get("prompt", "")
+    # --- ▲▲▲ [신규] 끝 ▲▲▲ ---
+
+    # ── 2) FPS 확정 (기존과 동일) ─────────────────────────────
     defaults_map: Dict[str, Any] = vdoc.get("defaults") or {}
     movie_def: Dict[str, Any] = defaults_map.get("movie") or {}
     image_def: Dict[str, Any] = defaults_map.get("image") or {}
@@ -4637,7 +4647,7 @@ def fill_prompt_movie_with_ai(
     except Exception:
         base_chunk_val, overlap_val = 60, 12
 
-    # ── 2) 씬 루프 (구조 변경) ──────────────────────────────────
+    # ── 3) 씬 루프 (구조 변경) ──────────────────────────────────
     scenes = vdoc.get("scenes") or []
     if not isinstance(scenes, list):
         _log("[fill_prompt_movie_with_ai] scenes 없음")
@@ -4647,19 +4657,27 @@ def fill_prompt_movie_with_ai(
     changed = False
 
     # --- ▼▼▼ [수정된 AI 시스템 프롬프트] ▼▼▼ ---
-    # (사용자님의 제안: 시간, 연속성 정보 포함)
     system_msg = (
-        "You are an AI assistant for video prompt generation.\n"
-        "The user provides a main scene description (`base_text`) and a list of `frame_segments` (e.g., [\"0-65f\", \"49-125f\"]).\n"
-        "You MUST return a JSON object ONLY: {\"segment_prompts\": [\"prompt 1\", \"prompt 2\", ...]}.\n"
-        "The length of the `segment_prompts` array MUST exactly match the length of the `frame_segments` list.\n"
-        "[CRITICAL RULE]: Each prompt MUST be different. Create a logical progression (e.g., wide shot -> medium shot -> close up) using the frame ranges as context.\n"
-        "DO NOT just repeat the same description. Describe cinematic movement and progression.\n"
-        "Prompts must be concise, in English, and suitable for an i2v model."
+        "You are an expert music video director and visual storyteller.\n"
+        "The user will provide the context for a single scene:\n"
+        "1. `original_vibe`: The overall theme/mood of the entire song (from project.json).\n"
+        "2. `scene_lyric`: The specific lyric for THIS scene.\n"
+        "3. `base_visual`: The base visual description for THIS scene.\n"
+        "4. `characters`: The characters appearing in THIS scene.\n"
+        "5. `time_structure`: The frame segments for THIS scene (e.g., [\"0-65f\", \"49-125f\"]).\n"
+        "6. `next_scene_lyric`: The lyric for the *next* scene (to help you create a good transition).\n\n"
+        "Your task is to return a JSON object ONLY: {\"segment_prompts\": [\"prompt 1\", \"prompt 2\", ...]}.\n"
+        "The length of the `segment_prompts` array MUST exactly match the length of the `time_structure` list.\n\n"
+        "[!! CRITICAL RULES !!]\n"
+        "1. Based on the `scene_lyric` and `original_vibe`, describe a specific **Action** or **Expression** for the `characters`.\n"
+        "2. Create a logical **progression of movement** across the segments (e.g., 'wide shot, starts walking' -> 'medium shot, walking' -> 'close up, looks up').\n"
+        "3. Include **camera work** (zoom, pan, dolly) in each segment.\n"
+        "4. Use the `next_scene_lyric` to inform the *last* segment's prompt, creating a smooth transition to the next scene's mood.\n"
+        "5. DO NOT create static, doll-like prompts. Create movement and storytelling."
     )
     # --- ▲▲▲ [수정 끝] ▲▲▲ ---
 
-    for sc in scenes:
+    for i, sc in enumerate(scenes):
         if not isinstance(sc, dict):
             continue
 
@@ -4684,38 +4702,55 @@ def fill_prompt_movie_with_ai(
             segs = segs_out
             changed = True  # 세그먼트가 생성되었으므로 'changed'
 
-        # 3. 비어있는 프롬프트가 있는지 확인
+        # 3. 비어있는 프롬프트가 있는지 확인 (기존과 동일)
         prompts_list = [seg.get("prompt_movie", "") for seg in segs]
-        if all(prompts_list):  # 모든 프롬프트가 이미 채워져 있으면
+        if all(prompts_list):
             _log(f"[{scene_id}] 모든 세그먼트 프롬프트가 이미 존재합니다. (AI 호출 스킵)")
             continue
 
         # 4. AI 호출을 위한 데이터 수집 (기존과 동일)
-        base_text = ""
-        for key in ("direct_prompt", "prompt", "lyric", "prompt_movie"):
+        base_visual = ""
+        for key in ("direct_prompt", "prompt", "prompt_img", "prompt_movie"):
             val = sc.get(key)
             if isinstance(val, str) and val.strip():
-                base_text = val.strip()
+                base_visual = val.strip()
                 break
-        if not base_text:
-            _log(f"[{scene_id}] 참조 텍스트가 없어 AI 호출을 건너뜁니다.")
+
+        scene_lyric = sc.get("lyric", "")
+
+        if not base_visual and not scene_lyric:  # 둘 다 없으면 스킵
+            _log(f"[{scene_id}] 참조 텍스트(prompt/lyric)가 없어 AI 호출을 건너뜁니다.")
             continue
 
-        # 5. AI 호출 (씬당 1회)
+        # --- ▼▼▼ [신규] 5. '다음 씬 가사' 찾기 ▼▼▼ ---
+        next_scene_lyric = "(Scene End)"
+        if i + 1 < len(scenes):
+            next_sc = scenes[i + 1]
+            if isinstance(next_sc, dict):
+                next_scene_lyric = next_sc.get("lyric", "") or "(Next scene has no lyric)"
+        # --- ▲▲▲ [신규] 끝 ▲▲▲ ---
+
+        # 6. AI 호출 (씬당 1회)
         _log(f"[{scene_id}] {len(segs)}개 세그먼트 프롬프트 AI 요청 중...")
 
-        # AI에게 전달할 프레임 범위 목록 (예: ["0-65f", "49-125f", ...])
         frame_ranges_info = [f"{s.get('start_frame')}-{s.get('end_frame')}f" for s in segs]
 
-        user_msg = json.dumps({
-            "base_text": base_text,
-            "frame_segments": frame_ranges_info
-        }, ensure_ascii=False)
+        # --- ▼▼▼ [수정] AI에게 전달할 문맥 6가지로 확장 ▼▼▼ ---
+        user_prompt_payload = {
+            "original_vibe": original_vibe_prompt,
+            "scene_lyric": scene_lyric,
+            "base_visual": base_visual,
+            "characters": sc.get("characters", []),
+            "time_structure": frame_ranges_info,
+            "next_scene_lyric": next_scene_lyric
+        }
+        user_msg = json.dumps(user_prompt_payload, ensure_ascii=False)
+        # --- ▲▲▲ [수정] 끝 ▲▲▲ ---
 
         try:
             ai_raw_response = ask(system_msg, user_msg)
 
-            # AI 응답 파싱
+            # (AI 응답 파싱 - 기존과 동일)
             json_start = ai_raw_response.find("{")
             json_end = ai_raw_response.rfind("}") + 1
             if not (0 <= json_start < json_end):
@@ -4727,12 +4762,11 @@ def fill_prompt_movie_with_ai(
             if not isinstance(new_prompts, list) or len(new_prompts) != len(segs):
                 raise RuntimeError(f"AI가 요청된 세그먼트 개수({len(segs)})만큼 프롬프트를 반환하지 않았습니다. (반환: {len(new_prompts)}개)")
 
-            # 6. 세그먼트 프롬프트 주입
+            # 7. 세그먼트 프롬프트 주입 (기존과 동일)
             filled_count = 0
-            for i, seg in enumerate(segs):
-                # 비어있는 프롬프트만 채우기
+            for i_seg, seg in enumerate(segs):
                 if not seg.get("prompt_movie", ""):
-                    seg["prompt_movie"] = str(new_prompts[i]).strip()
+                    seg["prompt_movie"] = str(new_prompts[i_seg]).strip()
                     filled_count += 1
 
             if filled_count > 0:
@@ -4744,7 +4778,6 @@ def fill_prompt_movie_with_ai(
 
         except Exception as e_ai_call:
             _log(f"[{scene_id}] AI 호출 또는 프롬프트 주입 실패: {e_ai_call}")
-            # (실패 시 기존에 채워져 있던 프롬프트는 유지됨)
             continue
 
     if changed:
@@ -4752,7 +4785,7 @@ def fill_prompt_movie_with_ai(
         save_json(vpath, vdoc)
         _log("[fill_prompt_movie_with_ai] FPS 동기화, frame_segments 생성/보강, AI 프롬프트 채우기 완료.")
     else:
-        save_json(vpath, vdoc)  # (FPS 동기화만 반영될 수 있으므로 저장)
+        save_json(vpath, vdoc)
         _log("[fill_prompt_movie_with_ai] 변경 없음 (또는 FPS 동기화만 수행)")
 
 

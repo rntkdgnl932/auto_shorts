@@ -821,212 +821,251 @@ class ScenePromptEditDialog(QtWidgets.QDialog):
 
         run_job_with_progress_async(owner=self, title=f"AI 프롬프트 생성 중 ({self.json_path.name})", job=job, on_done=done)
 
+
     def on_ai_request(self):
-        """제이슨수정 창에서 'AI 요청' 버튼 핸들러"""
-        import json
+            """
+            제이슨수정 창에서 'AI 요청' 버튼 핸들러
+            [수정됨] 6가지 문맥(원본분위기, 현재가사, direct_prompt, 캐릭터, 시간, 다음가사)을 AI에 전달
+            """
+            import json
 
-        # --- [필요한 유틸리티 임포트] ---
-        try:
-            from app.utils import load_json, save_json, run_job_with_progress_async
-        except ImportError:
-            from utils import load_json, save_json, run_job_with_progress_async  # type: ignore
-        # --- [임포트 끝] ---
-
-        # --- [FPS 동기화 로직 (기존과 동일)] ---
-        try:
-            main_window = self.parent()
-            if main_window and hasattr(main_window, "cmb_movie_fps"):
-                cmb_fps = getattr(main_window, "cmb_movie_fps")
-                ui_fps = int(cmb_fps.currentData())
-
-                self.full_video_data.setdefault("defaults", {})
-                self.full_video_data["defaults"].setdefault("movie", {})
-                self.full_video_data["defaults"]["movie"]["target_fps"] = ui_fps
-                self.full_video_data["defaults"]["movie"]["input_fps"] = ui_fps
-                self.full_video_data["defaults"]["movie"]["fps"] = ui_fps
-                self.full_video_data["defaults"].setdefault("image", {})["fps"] = ui_fps
-                self.full_video_data["fps"] = int(ui_fps)
-
-                print(f"[JSON Edit] AI 요청 시 UI FPS ({ui_fps})를 video.json 데이터에 동기화했습니다.")
-
-        except Exception as e_fps_sync:
-            print(f"[JSON Edit] AI 요청 중 FPS 동기화 실패: {e_fps_sync}")
-        # --- [FPS 동기화 끝] ---
-
-        # 1) 화면에 있는 direct_prompt 들고오기 (기존과 동일)
-        scenes_to_process: list[tuple[dict, str]] = []
-        scenes_map = {scene.get("id"): scene for scene in self.scenes_data if isinstance(scene, dict) and "id" in scene}
-        for scene_id, text_edit_widget in self.widget_map:
-            if scene_id in scenes_map:
-                direct_prompt_text = text_edit_widget.toPlainText().strip()
-                if direct_prompt_text:
-                    scenes_to_process.append((scenes_map[scene_id], direct_prompt_text))
-
-        if not scenes_to_process:
-            QtWidgets.QMessageBox.information(self, "알림",
-                                              "AI로 요청할 'direct_prompt' 내용이 없습니다.\n(UI의 FPS 설정값은 video.json에 저장됩니다.)", )
-            # [FPS 저장 로직 (기존과 동일)]
+            # --- [필요한 유틸리티 임포트] ---
             try:
-                save_json(self.json_path, self.full_video_data)
-                print(f"[JSON Edit] 프롬프트는 비어있으나, FPS 값({self.full_video_data.get('fps')})을 저장했습니다.")
-            except Exception as e_save_fps_only:
-                print(f"[JSON Edit] FPS만 저장하는 데 실패: {e_save_fps_only}")
-            return
+                from app.utils import load_json, save_json, run_job_with_progress_async
+            except ImportError:
+                from utils import load_json, save_json, run_job_with_progress_async  # type: ignore
+            # --- [임포트 끝] ---
 
-            # 버튼 잠그기 (기존과 동일)
-        self.btn_ai_request.setEnabled(False)
-        self.btn_update.setEnabled(False)
-        self.btn_cancel.setEnabled(False)
+            # --- [FPS 동기화 로직 (기존과 동일)] ---
+            try:
+                main_window = self.parent()
+                if main_window and hasattr(main_window, "cmb_movie_fps"):
+                    cmb_fps = getattr(main_window, "cmb_movie_fps")
+                    ui_fps = int(cmb_fps.currentData())
 
-        def job(progress_callback):
-            _log = lambda msg: progress_callback({"msg": msg})
-            _log(f"총 {len(scenes_to_process)}개 씬에 대해 프롬프트를 AI로 갱신합니다...")
+                    self.full_video_data.setdefault("defaults", {})
+                    self.full_video_data["defaults"].setdefault("movie", {})
+                    self.full_video_data["defaults"]["movie"]["target_fps"] = ui_fps
+                    self.full_video_data["defaults"]["movie"]["input_fps"] = ui_fps
+                    self.full_video_data["defaults"]["movie"]["fps"] = ui_fps
+                    self.full_video_data["defaults"].setdefault("image", {})["fps"] = ui_fps
+                    self.full_video_data["fps"] = int(ui_fps)
 
-            quality_tags = self._AI_QUALITY_TAGS
-            default_negative_tags = self._AI_DEFAULT_NEGATIVE_TAGS
-            updated_count = 0
+                    print(f"[JSON Edit] AI 요청 시 UI FPS ({ui_fps})를 video.json 데이터에 동기화했습니다.")
 
-            # --- ▼▼▼ [수정된 AI 시스템 프롬프트] ▼▼▼ ---
-            # (사용자 제안: 시간, 연속성 정보 포함)
-            base_system_prompt = (
-                "You are an AI assistant for video prompt generation.\n"
-                "The user will give you a core scene idea (`direct_prompt`) and a list of `frame_segments` (e.g., [\"0-65f\", \"49-125f\"]).\n"
-                "You must return a JSON object ONLY with these keys:\n"
-                "1. \"prompt_ko\": Korean description of the whole scene.\n"
-                "2. \"prompt_img_base\": English, comma-separated visual tags for the whole scene (5-12 words).\n"
-                "3. \"motion_hint\": short English motion/camera hint (e.g. \"slow zoom in\"). Can be \"\".\n"
-                "4. \"segment_prompts\": an array of English prompt lines.\n"
-                "   The length of 'segment_prompts' MUST exactly match the length of the `frame_segments` list.\n"
-                "[!! CRITICAL RULE !!]: Each prompt MUST be different. Create a logical progression (e.g., wide shot -> medium shot -> close up) using the frame ranges as context.\n"
-                "   DO NOT just repeat the same description. Describe cinematic movement and progression.\n"
-                "Return ONLY JSON. No extra text."
-            )
-            # --- ▲▲▲ [수정 끝] ▲▲▲ ---
+            except Exception as e_fps_sync:
+                print(f"[JSON Edit] AI 요청 중 FPS 동기화 실패: {e_fps_sync}")
+            # --- [FPS 동기화 끝] ---
 
-            for scene_dict, dp_text in scenes_to_process:
-                scene_id = scene_dict.get("id", "scene")
+            # --- ▼▼▼ [신규] 1. 원본 분위기 (project.json) 로드 ▼▼▼ ---
+            original_vibe_prompt = ""
+            try:
+                pj_path = self.json_path.parent / "project.json"
+                if pj_path.exists():
+                    pj_doc = load_json(pj_path, {}) or {}
+                    if isinstance(pj_doc, dict):
+                        original_vibe_prompt = pj_doc.get("prompt_user") or pj_doc.get("prompt", "")
+            except Exception as e_load_pj:
+                print(f"[JSON Edit] project.json 로드 실패: {e_load_pj}")
+            # --- ▲▲▲ [신규] 끝 ▲▲▲ ---
 
-                # --- ▼▼▼ [수정] 프레임 세그먼트 정보 수집 ▼▼▼ ---
-                frame_segments = scene_dict.get("frame_segments") or []
-                seg_count = len(frame_segments)
-                frame_ranges_info = [f"{s.get('start_frame')}-{s.get('end_frame')}f" for s in frame_segments]
-                # --- ▲▲▲ [수정 끝] ▲▲▲ ---
+            # 2) 화면에 있는 direct_prompt 들고오기 (기존과 동일)
+            scenes_to_process: list[tuple[dict, str]] = []
+            scenes_map = {scene.get("id"): scene for scene in self.scenes_data if
+                          isinstance(scene, dict) and "id" in scene}
+            for scene_id, text_edit_widget in self.widget_map:
+                if scene_id in scenes_map:
+                    direct_prompt_text = text_edit_widget.toPlainText().strip()
+                    if direct_prompt_text:
+                        scenes_to_process.append((scenes_map[scene_id], direct_prompt_text))
 
-                _log(f"[{scene_id}] AI 요청 중... (segments={seg_count})")
-
-                # --- ▼▼▼ [수정] user 프롬프트에 세그먼트 정보 추가 ▼▼▼ ---
-                user_prompt_payload = {
-                    "direct_prompt": dp_text,
-                    "frame_segments": frame_ranges_info,  # 예: ["0-65f", "49-125f", ...]
-                    "segment_count": seg_count,  # (호환성을 위해 개수도 유지)
-                    "note": (
-                        "Write segment_prompts in ENGLISH. "
-                        "segment_prompts.length must equal segment_count. "
-                        "Use the frame_segments list to create a logical progression."
-                    ),
-                }
-                user_prompt = json.dumps(user_prompt_payload, ensure_ascii=False)
-                # --- ▲▲▲ [수정 끝] ▲▲▲ ---
-
-                try:
-                    ai_raw = self.ai_instance.ask_smart(
-                        base_system_prompt,
-                        user_prompt,  # 수정된 user_prompt 전달
-                        prefer="gemini",
-                        allow_fallback=True,
-                    )
-                except Exception as e_ai:
-                    _log(f"[{scene_id}] AI 호출 실패: {e_ai}")
-                    continue
-
-                # (이하 AI 응답 파싱 및 저장 로직은 기존과 동일)
-                json_start = ai_raw.find("{")
-                json_end = ai_raw.rfind("}") + 1
-                if not (0 <= json_start < json_end):
-                    _log(f"[{scene_id}] AI가 JSON을 반환하지 않았습니다.")
-                    continue
-                try:
-                    ai_json = json.loads(ai_raw[json_start:json_end])
-                except Exception as e_json:
-                    _log(f"[{scene_id}] JSON 파싱 실패: {e_json}")
-                    continue
-
-                prompt_ko = (ai_json.get("prompt_ko") or "").strip()
-                prompt_img_base = (ai_json.get("prompt_img_base") or "").strip()
-                motion_hint = (ai_json.get("motion_hint") or "").strip()
-                seg_prompts = ai_json.get("segment_prompts") or []
-
-                if prompt_ko and prompt_img_base:
-                    scene_dict["prompt"] = prompt_ko
-                    scene_dict["prompt_img"] = f"{prompt_img_base}, {quality_tags}"
-                    if motion_hint:
-                        scene_dict["prompt_movie"] = f"{prompt_img_base}, {quality_tags}, motion: {motion_hint}"
-                    else:
-                        scene_dict["prompt_movie"] = scene_dict["prompt_img"]
-                    scene_dict["prompt_negative"] = default_negative_tags
-                    updated_count += 1
-                    _log(f"[{scene_id}] 기본 프롬프트 갱신 완료")
-
-                if seg_count > 0:
-                    filled = 0
-                    if isinstance(seg_prompts, list) and len(seg_prompts) >= seg_count:
-                        for i in range(seg_count):
-                            seg_item = frame_segments[i]
-                            seg_text = seg_prompts[i]
-                            if isinstance(seg_text, dict):
-                                seg_text = (seg_text.get("prompt_movie") or seg_text.get("text") or "")
-                            seg_text = str(seg_text).strip()
-                            if seg_text:
-                                seg_item["prompt_movie"] = seg_text
-                                filled += 1
-                        _log(f"[{scene_id}] 세그먼트 프롬프트 {filled}/{seg_count}개 AI로 채움")
-                    elif filled == 0:
-                        base_en = prompt_img_base or dp_text
-                        base_en = str(base_en).strip()
-                        for seg_item in frame_segments:
-                            seg_item["prompt_movie"] = base_en
-                        _log(f"[{scene_id}] AI 세그먼트 응답이 부족하거나 없음 → 영어 베이스로 일괄 채움")
-                    scene_dict["frame_segments"] = frame_segments
-
-            # 저장 (기존과 동일)
-            if updated_count > 0:
-                _log("변경 내용을 video.json 에 저장합니다...")
-                self.full_video_data["scenes"] = self.scenes_data
+            if not scenes_to_process:
+                QtWidgets.QMessageBox.information(self, "알림",
+                                                  "AI로 요청할 'direct_prompt' 내용이 없습니다.\n(UI의 FPS 설정값은 video.json에 저장됩니다.)", )
+                # [FPS 저장 로직 (기존과 동일)]
                 try:
                     save_json(self.json_path, self.full_video_data)
-                except Exception as e_save:
-                    _log(f"video.json 저장 실패: {e_save}")
-
-            return {"updated_count": updated_count}
-
-        def done(ok, payload, err):
-            # (done 콜백 함수는 기존과 동일)
-            self.btn_ai_request.setEnabled(True)
-            self.btn_update.setEnabled(True)
-            self.btn_cancel.setEnabled(True)
-            if not ok:
-                QtWidgets.QMessageBox.critical(self, "AI 요청 실패", f"작업 중 오류가 발생했습니다:\n{err}")
+                    print(f"[JSON Edit] 프롬프트는 비어있으나, FPS 값({self.full_video_data.get('fps')})을 저장했습니다.")
+                except Exception as e_save_fps_only:
+                    print(f"[JSON Edit] FPS만 저장하는 데 실패: {e_save_fps_only}")
                 return
-            count = (payload or {}).get("updated_count", 0)
-            if count > 0:
-                QtWidgets.QMessageBox.information(
-                    self,
-                    "AI 요청 완료",
-                    f"총 {count}개 씬의 프롬프트를 갱신했습니다.\n세그먼트 프롬프트도 함께 저장되었습니다.",
-                )
-            else:
-                QtWidgets.QMessageBox.warning(
-                    self,
-                    "AI 요청",
-                    "AI가 갱신한 내용이 없거나 저장에 실패했습니다.",
-                )
 
-        run_job_with_progress_async(
-            owner=self,
-            title=f"AI 프롬프트 생성 중 ({self.json_path.name})",
-            job=job,
-            on_done=done,
-        )
+                # 버튼 잠그기 (기존과 동일)
+            self.btn_ai_request.setEnabled(False)
+            self.btn_update.setEnabled(False)
+            self.btn_cancel.setEnabled(False)
+
+            def job(progress_callback):
+                _log = lambda msg: progress_callback({"msg": msg})
+                _log(f"총 {len(scenes_to_process)}개 씬에 대해 프롬프트를 AI로 갱신합니다...")
+
+                quality_tags = self._AI_QUALITY_TAGS
+                default_negative_tags = self._AI_DEFAULT_NEGATIVE_TAGS
+                updated_count = 0
+
+                # --- ▼▼▼ [수정된 AI 시스템 프롬프트] ▼▼▼ ---
+                base_system_prompt = (
+                    "You are an expert music video director and visual storyteller.\n"
+                    "The user will provide the context for a single scene:\n"
+                    "1. `original_vibe`: The overall theme/mood of the entire song (from project.json).\n"
+                    "2. `scene_lyric`: The specific lyric for THIS scene.\n"
+                    "3. `base_visual` (direct_prompt): The user's core visual idea for THIS scene.\n"
+                    "4. `characters`: The characters appearing in THIS scene.\n"
+                    "5. `time_structure`: The frame segments for THIS scene (e.g., [\"0-65f\", \"49-125f\"]).\n"
+                    "6. `next_scene_lyric`: The lyric for the *next* scene (to help you create a good transition).\n\n"
+                    "Your task is to return a JSON object ONLY with these keys:\n"
+                    "1. \"prompt_ko\": Korean description of the whole scene (based on all context).\n"
+                    "2. \"prompt_img_base\": English, comma-separated visual tags for the whole scene (5-12 words).\n"
+                    "3. \"motion_hint\": short English motion/camera hint (e.g. \"slow zoom in\"). Can be \"\".\n"
+                    "4. \"segment_prompts\": an array of English prompt lines.\n"
+                    "   The length of 'segment_prompts' MUST exactly match the length of the `time_structure` list.\n\n"
+                    "[!! CRITICAL RULES !!]\n"
+                    "1. Based on the `scene_lyric`, `original_vibe`, and `base_visual`, describe a specific **Action** or **Expression** for the `characters`.\n"
+                    "2. Create a logical **progression of movement** across the segments (e.g., 'wide shot, starts walking' -> 'medium shot, walking' -> 'close up, looks up').\n"
+                    "3. Include **camera work** (zoom, pan, dolly) in each segment.\n"
+                    "4. Use the `next_scene_lyric` to inform the *last* segment's prompt, creating a smooth transition to the next scene's mood.\n"
+                    "5. DO NOT create static, doll-like prompts. Create movement and storytelling."
+                )
+                # --- ▲▲▲ [수정 끝] ▲▲▲ ---
+
+                for scene_dict, dp_text in scenes_to_process:
+                    scene_id = scene_dict.get("id", "scene")
+
+                    # --- ▼▼▼ [수정] 6가지 문맥 수집 ▼▼▼ ---
+                    frame_segments = scene_dict.get("frame_segments") or []
+                    seg_count = len(frame_segments)
+                    frame_ranges_info = [f"{s.get('start_frame')}-{s.get('end_frame')}f" for s in frame_segments]
+
+                    scene_lyric = scene_dict.get("lyric", "")
+                    characters = scene_dict.get("characters", [])
+
+                    # '다음 씬 가사' 찾기
+                    next_scene_lyric = "(Scene End)"
+                    current_index = -1
+                    for idx, s in enumerate(self.scenes_data):  # self.scenes_data는 전체 씬 목록
+                        if isinstance(s, dict) and s.get("id") == scene_id:
+                            current_index = idx
+                            break
+
+                    if current_index != -1 and current_index + 1 < len(self.scenes_data):
+                        next_sc = self.scenes_data[current_index + 1]
+                        if isinstance(next_sc, dict):
+                            next_scene_lyric = next_sc.get("lyric", "") or "(Next scene has no lyric)"
+                    # --- [수집 끝] ---
+
+                    _log(f"[{scene_id}] AI 요청 중... (segments={seg_count})")
+
+                    # --- ▼▼▼ [수정] user 프롬프트에 6가지 문맥 전달 ▼▼▼ ---
+                    user_prompt_payload = {
+                        "original_vibe": original_vibe_prompt,
+                        "scene_lyric": scene_lyric,
+                        "base_visual": dp_text,  # direct_prompt를 base_visual로 전달
+                        "characters": characters,
+                        "time_structure": frame_ranges_info,
+                        "next_scene_lyric": next_scene_lyric
+                    }
+                    user_prompt = json.dumps(user_prompt_payload, ensure_ascii=False)
+                    # --- ▲▲▲ [수정 끝] ▲▲▲ ---
+
+                    try:
+                        ai_raw = self.ai_instance.ask_smart(
+                            base_system_prompt,
+                            user_prompt,  # 수정된 user_prompt 전달
+                            prefer="gemini",
+                            allow_fallback=True,
+                        )
+                    except Exception as e_ai:
+                        _log(f"[{scene_id}] AI 호출 실패: {e_ai}")
+                        continue
+
+                    # (이하 AI 응답 파싱 및 저장 로직은 기존과 동일)
+                    json_start = ai_raw.find("{")
+                    json_end = ai_raw.rfind("}") + 1
+                    if not (0 <= json_start < json_end):
+                        _log(f"[{scene_id}] AI가 JSON을 반환하지 않았습니다.")
+                        continue
+                    try:
+                        ai_json = json.loads(ai_raw[json_start:json_end])
+                    except Exception as e_json:
+                        _log(f"[{scene_id}] JSON 파싱 실패: {e_json}")
+                        continue
+
+                    prompt_ko = (ai_json.get("prompt_ko") or "").strip()
+                    prompt_img_base = (ai_json.get("prompt_img_base") or "").strip()
+                    motion_hint = (ai_json.get("motion_hint") or "").strip()
+                    seg_prompts = ai_json.get("segment_prompts") or []
+
+                    if prompt_ko and prompt_img_base:
+                        scene_dict["prompt"] = prompt_ko
+                        scene_dict["prompt_img"] = f"{prompt_img_base}, {quality_tags}"
+                        if motion_hint:
+                            scene_dict["prompt_movie"] = f"{prompt_img_base}, {quality_tags}, motion: {motion_hint}"
+                        else:
+                            scene_dict["prompt_movie"] = scene_dict["prompt_img"]
+                        scene_dict["prompt_negative"] = default_negative_tags
+                        updated_count += 1
+                        _log(f"[{scene_id}] 기본 프롬프트 갱신 완료")
+
+                    if seg_count > 0:
+                        filled = 0
+                        if isinstance(seg_prompts, list) and len(seg_prompts) >= seg_count:
+                            for i in range(seg_count):
+                                seg_item = frame_segments[i]
+                                seg_text = seg_prompts[i]
+                                if isinstance(seg_text, dict):
+                                    seg_text = (seg_text.get("prompt_movie") or seg_text.get("text") or "")
+                                seg_text = str(seg_text).strip()
+                                if seg_text:
+                                    seg_item["prompt_movie"] = seg_text
+                                    filled += 1
+                            _log(f"[{scene_id}] 세그먼트 프롬프트 {filled}/{seg_count}개 AI로 채움")
+                        elif filled == 0:
+                            base_en = prompt_img_base or dp_text
+                            base_en = str(base_en).strip()
+                            for seg_item in frame_segments:
+                                seg_item["prompt_movie"] = base_en
+                            _log(f"[{scene_id}] AI 세그먼트 응답이 부족하거나 없음 → 영어 베이스로 일괄 채움")
+                        scene_dict["frame_segments"] = frame_segments
+
+                # 저장 (기존과 동일)
+                if updated_count > 0:
+                    _log("변경 내용을 video.json 에 저장합니다...")
+                    self.full_video_data["scenes"] = self.scenes_data
+                    try:
+                        save_json(self.json_path, self.full_video_data)
+                    except Exception as e_save:
+                        _log(f"video.json 저장 실패: {e_save}")
+
+                return {"updated_count": updated_count}
+
+            def done(ok, payload, err):
+                # (done 콜백 함수는 기존과 동일)
+                self.btn_ai_request.setEnabled(True)
+                self.btn_update.setEnabled(True)
+                self.btn_cancel.setEnabled(True)
+                if not ok:
+                    QtWidgets.QMessageBox.critical(self, "AI 요청 실패", f"작업 중 오류가 발생했습니다:\n{err}")
+                    return
+                count = (payload or {}).get("updated_count", 0)
+                if count > 0:
+                    QtWidgets.QMessageBox.information(
+                        self,
+                        "AI 요청 완료",
+                        f"총 {count}개 씬의 프롬프트를 갱신했습니다.\n세그먼트 프롬프트도 함께 저장되었습니다.",
+                    )
+                else:
+                    QtWidgets.QMessageBox.warning(
+                        self,
+                        "AI 요청",
+                        "AI가 갱신한 내용이 없거나 저장에 실패했습니다.",
+                    )
+
+            run_job_with_progress_async(
+                owner=self,
+                title=f"AI 프롬프트 생성 중 ({self.json_path.name})",
+                job=job,
+                on_done=done,
+            )
 
     def on_upload_image(self, scene_id: str, preview_label: QtWidgets.QLabel, upload_button: QtWidgets.QPushButton,
                         delete_image_button: QtWidgets.QPushButton, scene_data: Dict[str, Any]):
