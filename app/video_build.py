@@ -4548,45 +4548,51 @@ def build_video_json_with_gap_policy(
 from pathlib import Path
 from typing import Any, Callable, Dict, List, Optional
 
+
+
+# video_build.py의 fill_prompt_movie_with_ai 함수 전체를 이 코드로 교체하세요.
+
 def fill_prompt_movie_with_ai(
-    project_dir: "Path",
-    ask: "Callable[[str, str], str]",
-    *,
-    log_fn: Optional[Callable[[str], None]] = None,
+        project_dir: "Path",
+        ask: "Callable[[str, str], str]",
+        *,
+        log_fn: Optional[Callable[[str], None]] = None,
 ) -> None:
     """
+    [수정됨]
     전제:
       - project_dir 아래 video.json이 존재
     하는 일:
-      1) video.json에서 fps를 확정(우선순위: defaults.movie.target_fps → root fps → defaults.image.fps → 30)
-      2) 각 scene.duration × fps로 총 프레임 계산
-      3) frame_segments 없으면 plan_segments(total_frames)로 생성
-      4) 각 세그먼트 prompt_movie가 비어있으면 AI로 한 줄 생성하여 채움
-    기존 기능은 훼손하지 않음 (이미 값이 있으면 덮어쓰지 않음).
+      1) video.json에서 fps를 확정
+      2) 각 씬(Scene)을 순회
+      3) 씬의 frame_segments 목록과 base_text를 수집
+      4) AI를 씬당 '한 번만' 호출하여 모든 세그먼트의 프롬프트를 '배열'로 받음
+      5) 비어있던 prompt_movie를 AI가 생성한 프롬프트로 채움
     """
     # 안전 로드/세이브
     try:
         from app.utils import load_json, save_json  # type: ignore
+        import json  # AI 응답 파싱용
     except Exception:
         from utils import load_json, save_json  # type: ignore
+        import json  # AI 응답 파싱용
 
-    # plan_segments 우선 가져오되, 없으면 로컬 대체
+    # plan_segments (기존과 동일)
     try:
-        # 같은 모듈에 있다면 이 임포트는 무해, 다른 구성이라면 아래 except로 안전 대체
         from video_build import plan_segments  # type: ignore
     except Exception:
-        def plan_segments(total_frames: int) -> List[List[int]]:
-            """fallback: 총 프레임을 60프레임 기준으로 균등 분할"""
-            if total_frames <= 0:
-                return []
-            size = 60
+        def plan_segments(total_frames: int, base_chunk: int = 60, overlap: int = 12, pad_tail: int = 5) -> list[
+            tuple[int, int]]:
+            # ... (기존 plan_segments 폴백 로직) ...
+            if total_frames <= 0: return []
+            size = base_chunk
             out: List[List[int]] = []
             s = 0
             while s < total_frames:
                 e = min(s + size, total_frames)
                 out.append([s, e])
                 s = e
-            return out
+            return [(pair[0], pair[1]) for pair in out if len(pair) == 2]
 
     def _log(msg: str) -> None:
         if callable(log_fn):
@@ -4602,131 +4608,152 @@ def fill_prompt_movie_with_ai(
         _log("[fill_prompt_movie_with_ai] video.json 형식 오류")
         return
 
-    # ── 1) FPS 확정 ─────────────────────────────────────────────
+    # ── 1) FPS 확정 (기존과 동일) ─────────────────────────────
     defaults_map: Dict[str, Any] = vdoc.get("defaults") or {}
     movie_def: Dict[str, Any] = defaults_map.get("movie") or {}
     image_def: Dict[str, Any] = defaults_map.get("image") or {}
 
-    fps_candidates = [
-        movie_def.get("target_fps"),
-        vdoc.get("fps"),
-        image_def.get("fps"),
-        30,
-    ]
+    fps_candidates = [movie_def.get("target_fps"), vdoc.get("fps"), image_def.get("fps"), 30, ]
     fps = 30
     for cand in fps_candidates:
-        try:
-            if cand is not None:
-                fps = int(cand)
-                break
-        except (TypeError, ValueError):
-            continue
+        if cand is not None:
+            try:
+                fps = int(cand); break
+            except (TypeError, ValueError):
+                continue
 
-    # 동기화(부족하면 채워줌) — 원본 값이 있을 땐 덮어쓰지 않음이 아니라 “일관화”가 목적이라 동기화함.
+    # (FPS 동기화 로직 - 기존과 동일)
     vdoc.setdefault("fps", fps)
     vdoc.setdefault("defaults", {})
-    vdoc["defaults"].setdefault("movie", {})
-    vdoc["defaults"]["movie"]["target_fps"] = fps
+    vdoc["defaults"].setdefault("movie", {})["target_fps"] = fps
     vdoc["defaults"]["movie"]["input_fps"] = fps
     vdoc["defaults"]["movie"]["fps"] = fps
-    vdoc["defaults"].setdefault("image", {})
-    vdoc["defaults"]["image"]["fps"] = fps
+    vdoc["defaults"].setdefault("image", {})["fps"] = fps
 
-    # ── 2) 씬 루프 ─────────────────────────────────────────────
+    # (Chunk/Overlap 값 읽기 - 기존과 동일)
+    try:
+        base_chunk_val = int(movie_def.get("base_chunk", 60))
+        overlap_val = int(movie_def.get("overlap", 12))
+    except Exception:
+        base_chunk_val, overlap_val = 60, 12
+
+    # ── 2) 씬 루프 (구조 변경) ──────────────────────────────────
     scenes = vdoc.get("scenes") or []
     if not isinstance(scenes, list):
         _log("[fill_prompt_movie_with_ai] scenes 없음")
-        save_json(vpath, vdoc)  # 동기화된 fps만이라도 반영
+        save_json(vpath, vdoc)
         return
 
     changed = False
+
+    # --- ▼▼▼ [수정된 AI 시스템 프롬프트] ▼▼▼ ---
+    # (사용자님의 제안: 시간, 연속성 정보 포함)
+    system_msg = (
+        "You are an AI assistant for video prompt generation.\n"
+        "The user provides a main scene description (`base_text`) and a list of `frame_segments` (e.g., [\"0-65f\", \"49-125f\"]).\n"
+        "You MUST return a JSON object ONLY: {\"segment_prompts\": [\"prompt 1\", \"prompt 2\", ...]}.\n"
+        "The length of the `segment_prompts` array MUST exactly match the length of the `frame_segments` list.\n"
+        "[CRITICAL RULE]: Each prompt MUST be different. Create a logical progression (e.g., wide shot -> medium shot -> close up) using the frame ranges as context.\n"
+        "DO NOT just repeat the same description. Describe cinematic movement and progression.\n"
+        "Prompts must be concise, in English, and suitable for an i2v model."
+    )
+    # --- ▲▲▲ [수정 끝] ▲▲▲ ---
 
     for sc in scenes:
         if not isinstance(sc, dict):
             continue
 
-        # 총 프레임 계산
+        scene_id = sc.get("id", "unknown")
+
+        # 1. 총 프레임 계산 (기존과 동일)
         try:
             dur = float(sc.get("duration") or 0.0)
         except (TypeError, ValueError):
             dur = 0.0
         total_frames = int(round(dur * fps)) if dur > 0 else 0
-        if total_frames <= 0:
-            _log(f"[fill_prompt_movie_with_ai] scene {sc.get('id')} duration/fps로 프레임 산출 불가 → 스킵")
-            continue
+        if total_frames <= 0: continue
 
-        # frame_segments 없으면 생성
+        # 2. frame_segments 생성 (기존과 동일)
         segs = sc.get("frame_segments")
         if not isinstance(segs, list) or not segs:
-            pairs = plan_segments(total_frames)  # [[s,e], ...]
+            pairs_tuples = plan_segments(total_frames, base_chunk=base_chunk_val, overlap=overlap_val)
             segs_out: List[Dict[str, Any]] = []
-            for s_f, e_f in pairs:
-                segs_out.append({
-                    "start_frame": int(s_f),
-                    "end_frame": int(e_f),
-                    "prompt_movie": ""
-                })
+            for s_f, e_f in pairs_tuples:
+                segs_out.append({"start_frame": int(s_f), "end_frame": int(e_f), "prompt_movie": ""})
             sc["frame_segments"] = segs_out
             segs = segs_out
-            changed = True
-        else:
-            # 최소 필드 정합성 보정
-            fixed: List[Dict[str, Any]] = []
-            for item in segs:
-                if isinstance(item, dict) and ("start_frame" in item) and ("end_frame" in item):
-                    fixed.append(item)
-            sc["frame_segments"] = fixed
-            segs = fixed
+            changed = True  # 세그먼트가 생성되었으므로 'changed'
 
-        # 세그먼트 프롬프트 채우기: 이미 값이 있으면 그대로 둠
-        # base 텍스트: direct_prompt > prompt > lyric > prompt_movie(씬 전체)
+        # 3. 비어있는 프롬프트가 있는지 확인
+        prompts_list = [seg.get("prompt_movie", "") for seg in segs]
+        if all(prompts_list):  # 모든 프롬프트가 이미 채워져 있으면
+            _log(f"[{scene_id}] 모든 세그먼트 프롬프트가 이미 존재합니다. (AI 호출 스킵)")
+            continue
+
+        # 4. AI 호출을 위한 데이터 수집 (기존과 동일)
         base_text = ""
         for key in ("direct_prompt", "prompt", "lyric", "prompt_movie"):
             val = sc.get(key)
             if isinstance(val, str) and val.strip():
                 base_text = val.strip()
                 break
-
         if not base_text:
-            # 완전 빈 경우엔 세그먼트만 생성하고 넘어감
-            _log(f"[fill_prompt_movie_with_ai] scene {sc.get('id')} 참조 텍스트 없음 → 세그먼트만 생성")
+            _log(f"[{scene_id}] 참조 텍스트가 없어 AI 호출을 건너뜁니다.")
             continue
 
-        system_msg = (
-            "You convert a scene description into a single, concise, cinematic i2v prompt line. "
-            "Avoid redundant commas; describe only THIS sub-part."
-        )
+        # 5. AI 호출 (씬당 1회)
+        _log(f"[{scene_id}] {len(segs)}개 세그먼트 프롬프트 AI 요청 중...")
 
-        for seg in segs:
-            if not isinstance(seg, dict):
-                continue
-            if str(seg.get("prompt_movie") or "").strip():
-                continue  # 이미 있으면 보존
+        # AI에게 전달할 프레임 범위 목록 (예: ["0-65f", "49-125f", ...])
+        frame_ranges_info = [f"{s.get('start_frame')}-{s.get('end_frame')}f" for s in segs]
 
-            user_msg = (
-                "Rewrite the following scene description into one concise English i2v prompt line. "
-                "Keep it cinematic/photorealistic, avoid repeated commas, focus just on this sub-part.\n\n"
-                f"Original:\n{base_text}\n\n"
-                f"Segment frame range: {seg.get('start_frame')}–{seg.get('end_frame')}"
-            )
-            try:
-                one_line = str(ask(system_msg, user_msg) or "").strip()
-            except Exception:
-                one_line = ""
+        user_msg = json.dumps({
+            "base_text": base_text,
+            "frame_segments": frame_ranges_info
+        }, ensure_ascii=False)
 
-            if not one_line:
-                one_line = base_text  # AI 실패 시 최소 보장
-            seg["prompt_movie"] = one_line
-            changed = True
+        try:
+            ai_raw_response = ask(system_msg, user_msg)
+
+            # AI 응답 파싱
+            json_start = ai_raw_response.find("{")
+            json_end = ai_raw_response.rfind("}") + 1
+            if not (0 <= json_start < json_end):
+                raise RuntimeError(f"AI가 JSON을 반환하지 않았습니다: {ai_raw_response[:100]}")
+
+            ai_json = json.loads(ai_raw_response[json_start:json_end])
+            new_prompts = ai_json.get("segment_prompts", [])
+
+            if not isinstance(new_prompts, list) or len(new_prompts) != len(segs):
+                raise RuntimeError(f"AI가 요청된 세그먼트 개수({len(segs)})만큼 프롬프트를 반환하지 않았습니다. (반환: {len(new_prompts)}개)")
+
+            # 6. 세그먼트 프롬프트 주입
+            filled_count = 0
+            for i, seg in enumerate(segs):
+                # 비어있는 프롬프트만 채우기
+                if not seg.get("prompt_movie", ""):
+                    seg["prompt_movie"] = str(new_prompts[i]).strip()
+                    filled_count += 1
+
+            if filled_count > 0:
+                _log(f"[{scene_id}] AI로 {filled_count}개의 새 프롬프트 주입 완료.")
+                sc["frame_segments"] = segs
+                changed = True
+            else:
+                _log(f"[{scene_id}] AI가 프롬프트를 반환했으나, 이미 모든 프롬프트가 채워져 있었습니다.")
+
+        except Exception as e_ai_call:
+            _log(f"[{scene_id}] AI 호출 또는 프롬프트 주입 실패: {e_ai_call}")
+            # (실패 시 기존에 채워져 있던 프롬프트는 유지됨)
+            continue
 
     if changed:
         vdoc["scenes"] = scenes
         save_json(vpath, vdoc)
-        _log("[fill_prompt_movie_with_ai] fps 동기화 + frame_segments 생성/보강 + 세그먼트 프롬프트 채움 완료")
+        _log("[fill_prompt_movie_with_ai] FPS 동기화, frame_segments 생성/보강, AI 프롬프트 채우기 완료.")
     else:
-        # fps 동기화만 반영되었을 수도 있으므로 저장
-        save_json(vpath, vdoc)
-        _log("[fill_prompt_movie_with_ai] 변경 없음(또는 fps 동기화만 수행)")
+        save_json(vpath, vdoc)  # (FPS 동기화만 반영될 수 있으므로 저장)
+        _log("[fill_prompt_movie_with_ai] 변경 없음 (또는 FPS 동기화만 수행)")
 
 
 

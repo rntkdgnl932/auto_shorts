@@ -247,5 +247,18 @@
     "_meta": {
       "title": "확산 모델 로드"
     }
+  },
+  "999": {
+    "inputs": {
+      "filename_prefix": "keyframe_qwen",
+      "images": [
+        "3",
+        0
+      ]
+    },
+    "class_type": "SaveImage",
+    "_meta": {
+      "title": "Save Keyframe (API Output)"
+    }
   }
 }
