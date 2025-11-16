@@ -252,13 +252,130 @@
     "inputs": {
       "filename_prefix": "keyframe_qwen",
       "images": [
-        "3",
+        "1002",
         0
       ]
     },
     "class_type": "SaveImage",
     "_meta": {
       "title": "Save Keyframe (API Output)"
+    }
+  },
+  "1000": {
+    "inputs": {
+      "enabled": true,
+      "swap_model": "inswapper_128.onnx",
+      "facedetection": "retinaface_resnet50",
+      "face_restore_model": "GFPGANv1.4.pth",
+      "face_restore_visibility": 1,
+      "codeformer_weight": 0.9,
+      "detect_gender_input": "no",
+      "detect_gender_source": "no",
+      "input_faces_index": "2",
+      "source_faces_index": "0",
+      "console_log_level": 1,
+      "input_image": [
+        "3",
+        0
+      ],
+      "source_image": [
+        "1004",
+        0
+      ]
+    },
+    "class_type": "ReActorFaceSwap",
+    "_meta": {
+      "title": "ReActor 🌌 Fast Face Swap_2"
+    }
+  },
+  "1001": {
+    "inputs": {
+      "enabled": true,
+      "swap_model": "inswapper_128.onnx",
+      "facedetection": "retinaface_resnet50",
+      "face_restore_model": "GFPGANv1.4.pth",
+      "face_restore_visibility": 1,
+      "codeformer_weight": 0.9,
+      "detect_gender_input": "no",
+      "detect_gender_source": "no",
+      "input_faces_index": "1",
+      "source_faces_index": "0",
+      "console_log_level": 1,
+      "input_image": [
+        "1000",
+        0
+      ],
+      "source_image": [
+        "1006",
+        0
+      ]
+    },
+    "class_type": "ReActorFaceSwap",
+    "_meta": {
+      "title": "ReActor 🌌 Fast Face Swap_1"
+    }
+  },
+  "1002": {
+    "inputs": {
+      "enabled": true,
+      "swap_model": "inswapper_128.onnx",
+      "facedetection": "retinaface_resnet50",
+      "face_restore_model": "GFPGANv1.4.pth",
+      "face_restore_visibility": 1,
+      "codeformer_weight": 0.9,
+      "detect_gender_input": "no",
+      "detect_gender_source": "no",
+      "input_faces_index": "0",
+      "source_faces_index": "0",
+      "console_log_level": 1,
+      "input_image": [
+        "1001",
+        0
+      ],
+      "source_image": [
+        "1005",
+        0
+      ]
+    },
+    "class_type": "ReActorFaceSwap",
+    "_meta": {
+      "title": "ReActor 🌌 Fast Face Swap_0"
+    }
+  },
+  "1004": {
+    "inputs": {
+      "image": "ComfyUI_00063_.png"
+    },
+    "class_type": "LoadImage",
+    "_meta": {
+      "title": "이미지 로드"
+    }
+  },
+  "1005": {
+    "inputs": {
+      "image": "female_01.png"
+    },
+    "class_type": "LoadImage",
+    "_meta": {
+      "title": "이미지 로드"
+    }
+  },
+  "1006": {
+    "inputs": {
+      "image": "male_01.png"
+    },
+    "class_type": "LoadImage",
+    "_meta": {
+      "title": "이미지 로드"
+    }
+  },
+  "1007": {
+    "inputs": {
+      "model_name": "RealESRGAN_x4plus.pth"
+    },
+    "class_type": "UpscaleModelLoader",
+    "_meta": {
+      "title": "Upscaler"
     }
   }
 }

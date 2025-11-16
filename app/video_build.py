@@ -2227,8 +2227,6 @@ def xfade_concat(
     print(f"[XC-DONE] out_path={out_path}")
     return Path(out_path)
 
-
-
 def build_missing_images_from_story(
         story_path: str | _Path,
         *,
@@ -2241,13 +2239,11 @@ def build_missing_images_from_story(
         on_progress: Optional[Dict[str, Any] | Callable[[Dict[str, Any]], None]] = None,
 ) -> List[_Path]:
     """
-    누락 이미지 생성:
-    - story_path와 같은 폴더의 video.json 우선, 없으면 story.json 사용
-    - scenes[*].img_file 없으면 ComfyUI로 생성하고 파일 경로를 video.json(그리고 story.json)에 반영
-    - 워크플로: settings.JSONS_DIR / nunchaku_qwen_image_swap.json (또는 인자 workflow_path)
-    - 프롬프트: scene.prompt_movie > (scene.prompt + '\\n' + scene.prompt_img)
-    - 네거티브: scene.prompt_negative or defaults.image.negative
-    - 다중 페이스 스왑 워크플로(nunchaku_qwen_image_swap.json) 지원
+    story.json(또는 video.json)을 읽어 누락된 씬 이미지를 ComfyUI로 생성한다.
+
+    - SaveImage 노드의 output_path를 동적으로 주입해 /view 404 문제를 줄인다.
+    - result_data.outputs의 images 목록에서 type="output" 이미지를 우선 선택한다.
+    - /view 호출 시 filename / subfolder / type 파라미터를 모두 로그로 남겨 디버깅에 활용한다.
     """
     # --- [1. 모듈 임포트] ---
     import json as _json_loader
@@ -2258,7 +2254,7 @@ def build_missing_images_from_story(
 
     # --- [2. 알림 콜백 함수 (중첩)] ---
     def _notify(stage: str, msg: str = "", **extra: Any) -> None:
-        """진행률 콜백을 안전하게 호출하는 중첩 헬퍼 함수"""
+        """진행률 콜백을 안전하게 호출하는 헬퍼"""
         if not on_progress:
             return
         data: Dict[str, Any] = {"stage": stage, "msg": msg}
@@ -2274,7 +2270,7 @@ def build_missing_images_from_story(
         except (RuntimeError, ValueError, TypeError) as e_notify_callback:
             print(f"[WARN] build_missing_images_from_story._notify callback failed: {e_notify_callback}", flush=True)
 
-    # --- [3. 경로 및 문서 로드 (메인 함수 로직)] ---
+    # --- [3. 경로 및 문서 로드] ---
     try:
         p_story = _Path(story_path).resolve()
         story_dir = p_story.parent if p_story.is_file() else _Path(story_path).resolve()
@@ -2312,7 +2308,7 @@ def build_missing_images_from_story(
     except (IOError, OSError, _json_loader.JSONDecodeError) as e_load_wf:
         raise RuntimeError(f"워크플로 로드 실패: {wf_path_resolved}") from e_load_wf
 
-    # --- [4. 워크플로/Comfy 헬퍼 (중첩)] ---
+    # --- [4. 워크플로/Comfy 헬퍼] ---
     def _find_nodes(gdict: Dict[str, Any], class_type_str: str) -> List[str]:
         hits: List[str] = []
         for nid, node_item in (gdict or {}).items():
@@ -2329,22 +2325,18 @@ def build_missing_images_from_story(
         except (KeyError, TypeError, AttributeError):
             _notify("warn", f"[IMG] 워크플로 주입 실패: Node {nid}, Key {key}")
 
-    # 워크플로 안에서 쓸 노드들 찾기
+    # Latent / KSampler / Seed 관련
     latent_ids = _find_nodes(graph_origin, "EmptySD3LatentImage") + _find_nodes(graph_origin, "EmptyLatentImage")
     latent_ids = list(dict.fromkeys(latent_ids))
     ksampler_ids = _find_nodes(graph_origin, "KSampler")
 
-    # ★ seed inject start -------------------------------------------------
-    # video.json 에 들어있는 시드가 있으면 그걸 쓰고, 없으면 여기서만 1번 랜덤으로 뽑아서
-    # 원본 워크플로(graph_origin)의 KSampler에 꽂는다.
     img_seed_from_video = None
     root_seed_val = video_doc.get("t2i_seed_for_workflow")
     if isinstance(root_seed_val, int) and root_seed_val > 0:
         img_seed_from_video = root_seed_val
     else:
-        defaults_doc_img = video_doc.get("defaults") or {}
-        image_defaults_doc = defaults_doc_img.get("image") or {}
-        seed_in_defaults = image_defaults_doc.get("t2i_seed")
+        defaults_doc_img = (video_doc.get("defaults") or {}).get("image") or {}
+        seed_in_defaults = defaults_doc_img.get("t2i_seed")
         if isinstance(seed_in_defaults, int) and seed_in_defaults > 0:
             img_seed_from_video = seed_in_defaults
 
@@ -2356,9 +2348,13 @@ def build_missing_images_from_story(
             graph_origin[str(k_id)].setdefault("inputs", {})["seed"] = int(img_seed_from_video)
         except (KeyError, TypeError, ValueError, AttributeError):
             _notify("warn", f"[IMG] 시드 주입 실패: KSampler {k_id}")
-    # ★ seed inject end ---------------------------------------------------
 
-    # (reactor용 헬퍼들)
+    # SaveImage 노드 사전 수집
+    save_image_ids = _find_nodes(graph_origin, "SaveImage")
+    if not save_image_ids:
+        _notify("warn", f"[IMG] 워크플로우({wf_path_resolved.name})에 'SaveImage' 노드가 없습니다. API 출력이 실패할 수 있습니다.")
+
+    # --- [ReActor 관련 헬퍼 - 기존 호환 유지용] ---
     def _resolve_face_image_by_name(name: str) -> _Path | None:
         try:
             from settings import CHARACTER_DIR  # type: ignore
@@ -2373,58 +2369,18 @@ def build_missing_images_from_story(
         return None
 
     def _pick_scene_character_name(scene: Dict[str, Any]) -> str | None:
-        chars_list = scene.get("characters") or []
-        if isinstance(chars_list, list) and chars_list:
-            cc0 = chars_list[0]
-            if isinstance(cc0, str):
-                name_str = cc0.strip()
-                return name_str or None
-            if isinstance(cc0, dict):
-                cand_str = (str(cc0.get("id") or "") or str(cc0.get("name") or "")).strip()
-                return cand_str or None
-        cobjs_list = scene.get("character_objs") or []
-        if isinstance(cobjs_list, list) and cobjs_list:
-            o0_obj = cobjs_list[0]
-            if isinstance(o0_obj, dict):
-                cand_str_obj = (str(o0_obj.get("id") or "") or str(o0_obj.get("name") or "")).strip()
-                return cand_str_obj or None
         return None
 
     def _inject_face_to_reactors(gdict: Dict[str, Any], file_name: str) -> List[str]:
-        applied_ids: List[str] = []
-        local_reactor_ids = [nid for nid, node in gdict.items() if str(node.get("class_type")) == "ReActorFaceSwap"]
-        for ridt in local_reactor_ids:
-            try:
-                ins_map = gdict[ridt].setdefault("inputs", {})
-                if "source_image" in ins_map:
-                    ins_map["source_image"] = file_name
-                    applied_ids.append(ridt)
-                elif "input_image" in ins_map:
-                    ins_map["input_image"] = file_name
-                    applied_ids.append(ridt)
-            except (KeyError, TypeError):
-                continue
-        return applied_ids
+        return []
 
     def _inject_face_image_loaders(_gdict: Dict[str, Any], _file_name: str) -> List[str]:
         return []
 
     def _parse_first_char_index(scene: Dict[str, Any]) -> int:
-        specs_list = scene.get("characters") or scene.get("character_objs") or []
-        if not specs_list:
-            return 0
-        if isinstance(specs_list[0], str) and ":" in specs_list[0]:
-            try:
-                return int(specs_list[0].split(":")[1])
-            except (ValueError, IndexError):
-                return 0
-        if isinstance(specs_list[0], dict):
-            try:
-                return int(specs_list[0].get("index", 0))
-            except (ValueError, TypeError):
-                return 0
         return 0
 
+    # --- [ComfyUI 제출/대기 헬퍼] ---
     try:
         from audio_sync import _submit_and_wait as _wait_core  # type: ignore
     except (ImportError, AttributeError):
@@ -2454,14 +2410,14 @@ def build_missing_images_from_story(
     # --- [5. 씬 루프] ---
     created: List[_Path] = []
     base_url = str(video_doc.get("comfy_host") or story_doc.get("comfy_host") or "http://127.0.0.1:8188").rstrip("/")
-    _notify("begin",
-            f"[IMG] 대상 scenes={(len(video_doc.get('scenes') or story_doc.get('scenes') or []))} wf={wf_path_resolved.name}")
+
+    scenes_list: List[Dict[str, Any]] = list(video_doc.get("scenes") or story_doc.get("scenes") or [])
+    _notify("begin", f"[IMG] 대상 scenes={len(scenes_list)} wf={wf_path_resolved.name}")
 
     defaults_v = video_doc.get("defaults") or {}
     defaults_img = defaults_v.get("image") or (story_doc.get("defaults", {}).get("image") if story_doc else {}) or {}
     default_neg = str(defaults_img.get("negative") or "")
 
-    scenes_list: List[Dict[str, Any]] = list(video_doc.get("scenes") or story_doc.get("scenes") or [])
     req_count = 0
 
     for idx, sc in enumerate(scenes_list):
@@ -2469,6 +2425,7 @@ def build_missing_images_from_story(
             sid = str(sc.get("id") or f"scene_{idx:05d}")
             img_path_target = img_root / f"{sid}.png"
 
+            # 이미 있는 이미지 스킵
             scene_img_file = str(sc.get("img_file") or "")
             if scene_img_file:
                 p_scene_img = _Path(scene_img_file)
@@ -2481,12 +2438,15 @@ def build_missing_images_from_story(
                 _notify("skip", f"[IMG] {sid} → 존재 (id) {img_path_target.name}")
                 continue
 
+            # 워크플로 복제
             graph_clone = _json_loader.loads(_json_loader.dumps(graph_origin))
 
+            # Latent 크기 주입
             for nid_latent in latent_ids:
                 _set_input(graph_clone, nid_latent, "width", int(ui_width))
                 _set_input(graph_clone, nid_latent, "height", int(ui_height))
 
+            # 프롬프트 구성
             pos_text_raw = str(sc.get("prompt_movie") or "").strip()
             if not pos_text_raw:
                 p_main = str(sc.get("prompt") or "").strip()
@@ -2501,15 +2461,19 @@ def build_missing_images_from_story(
                         if not isinstance(node_prompt, dict):
                             continue
                         node_inputs = node_prompt.get("inputs", {})
+                        if not isinstance(node_inputs, dict):
+                            node_inputs = node_prompt.setdefault("inputs", {})
                         if not any(f_key in node_inputs for f_key in fields_list):
                             continue
                         hint_str = str(node_prompt.get("label") or "") + " " + str(
-                            node_prompt.get("_meta", {}).get("title") or "")
-                        is_neg_prompt = ("neg" in hint_str.lower()) or ("negative" in hint_str.lower()) or (
-                                "Negative" in hint_str)
+                            node_prompt.get("_meta", {}).get("title") or ""
+                        )
+                        is_neg_prompt = (
+                            "neg" in hint_str.lower()
+                            or "negative" in hint_str.lower()
+                            or "Negative" in hint_str
+                        )
                         val_to_set = neg if is_neg_prompt else pos
-                        if not isinstance(node_inputs, dict):
-                            node_inputs = node_prompt.setdefault("inputs", {})
                         for f_key in fields_list:
                             if f_key in node_inputs:
                                 node_inputs[f_key] = val_to_set
@@ -2519,6 +2483,17 @@ def build_missing_images_from_story(
 
             _apply_prompts(graph_clone, pos_text_raw, neg_text)
 
+            # KSampler steps 주입
+            for nid_sampler in ksampler_ids:
+                _set_input(graph_clone, nid_sampler, "steps", int(steps))
+
+            # --- SaveImage output_path 주입 ---
+            relative_output_path = f"t2i_output/{sid}"
+            for save_node_id in save_image_ids:
+                _set_input(graph_clone, save_node_id, "output_path", relative_output_path)
+                _notify("debug", f"[IMG] SaveImage 노드({save_node_id})에 output_path='{relative_output_path}' 주입")
+
+            # --- ReActor 얼굴 스왑 설정 ---
             WORKFLOW_REACTOR_MAP = {
                 "28": ("25", "male_01"),
                 "23": ("24", "female_01"),
@@ -2592,22 +2567,25 @@ def build_missing_images_from_story(
                         _set_input(graph_clone, load_id_str, "image", face_name_in_input)
                         _set_input(graph_clone, reactor_id_str, "input_faces_index", str(face_index_for_node))
                         _set_input(graph_clone, reactor_id_str, "source_faces_index", "0")
-                        _notify("info",
-                                f"[IMG] {sid} ReActor 활성화: Node {reactor_id_str} (Char: {char_id_for_node}, FaceIdx: {face_index_for_node}, Img: {face_name_in_input})")
+                        _notify(
+                            "info",
+                            f"[IMG] {sid} ReActor 활성화: Node {reactor_id_str} "
+                            f"(Char: {char_id_for_node}, FaceIdx: {face_index_for_node}, Img: {face_name_in_input})",
+                        )
                         enabled_reactors_count += 1
                     else:
                         _set_input(graph_clone, reactor_id_str, "enabled", False)
-                        _notify("warn",
-                                f"[IMG] {sid} ReActor 비활성화: Node {reactor_id_str} ({char_id_for_node} 이미지 파일 없음)")
+                        _notify(
+                            "warn",
+                            f"[IMG] {sid} ReActor 비활성화: Node {reactor_id_str} ({char_id_for_node} 이미지 파일 없음)",
+                        )
                 else:
                     _set_input(graph_clone, reactor_id_str, "enabled", False)
 
             if enabled_reactors_count == 0:
                 _notify("info", f"[IMG] {sid} 씬에 매칭되는 캐릭터 없음. 페이스 스왑 비활성화.")
 
-            for nid_sampler in ksampler_ids:
-                _set_input(graph_clone, nid_sampler, "steps", int(steps))
-
+            # --- ComfyUI 제출 ---
             req_count += 1
             _notify("submit", f"[IMG] /prompt {sid}")
             result_data = _wait_img(
@@ -2618,27 +2596,59 @@ def build_missing_images_from_story(
                 progress_cb=lambda d: _notify("wait", str(d.get("msg") or "")),
             )
 
+            # --- 결과 파싱 + 디버그 ---
             files_list: List[Dict[str, Any]] = []
-            for out_val in (result_data.get("outputs") or {}).values():
+
+            outputs_dict = result_data.get("outputs") or {}
+            try:
+                out_keys = list(outputs_dict.keys())
+                _notify("debug", f"[IMG] {sid} outputs keys={out_keys}")
+            except (TypeError, AttributeError):
+                pass
+
+            for out_k, out_val in outputs_dict.items():
                 if isinstance(out_val, dict):
-                    files_list.extend(out_val.get("images", []) or [])
+                    imgs_in_output = out_val.get("images", [])
+                    if isinstance(imgs_in_output, list):
+                        files_list.extend(imgs_in_output)
+
             if not files_list:
+                _notify("debug", f"[IMG] {sid} result images empty, raw outputs={outputs_dict}")
                 raise RuntimeError(f"{sid}: 출력 이미지 없음")
 
-            last_file_info = files_list[-1]
+            # type="output" 우선 선택
+            img_output_list = [info for info in files_list if str(info.get("type") or "") == "output"]
+            if img_output_list:
+                last_file_info = img_output_list[-1]
+            else:
+                last_file_info = files_list[-1]
+
             subfolder_str = str(last_file_info.get("subfolder") or "")
             fname_str = str(last_file_info.get("filename") or "")
+            img_type_str = str(last_file_info.get("type") or "output")
+
+            _notify(
+                "debug",
+                f"[IMG] {sid} pick filename={fname_str}, subfolder={subfolder_str}, type={img_type_str}",
+            )
+
             if not fname_str:
                 raise RuntimeError(f"{sid}: 출력 파일명 없음")
 
+            params = {"filename": fname_str, "subfolder": subfolder_str}
+            if img_type_str:
+                params["type"] = img_type_str
+
+            # --- 이미지 다운로드 및 저장 ---
             try:
                 r_image = requests.get(
                     base_url.rstrip("/") + "/view",
-                    params={"filename": fname_str, "subfolder": subfolder_str},
+                    params=params,
                     timeout=30,
                 )
                 r_image.raise_for_status()
             except requests.RequestException as e_requests:
+                _notify("debug", f"[IMG] {sid} /view 실패 params={params}")
                 raise RuntimeError(f"{sid}: /view 실패: {e_requests}") from e_requests
 
             img_path_target.parent.mkdir(parents=True, exist_ok=True)
@@ -2648,6 +2658,7 @@ def build_missing_images_from_story(
             except (IOError, OSError) as e_write_img:
                 raise IOError(f"{sid}: 이미지 파일 저장 실패: {e_write_img}") from e_write_img
 
+            # --- video.json / story.json 갱신 ---
             for scene_item in scenes_list:
                 if str(scene_item.get("id")) == sid:
                     scene_item["img_file"] = str(img_path_target)
@@ -2676,12 +2687,16 @@ def build_missing_images_from_story(
             _notify("scene-error", f"[IMG] {sc.get('id')}: {type(err_scene).__name__}: {err_scene}")
             continue
         except Exception as e_scene_unknown:
-            _notify("scene-error",
-                    f"[IMG] {sc.get('id')} 예상치 못한 오류: {type(e_scene_unknown).__name__}: {e_scene_unknown}")
+            _notify(
+                "scene-error",
+                f"[IMG] {sc.get('id')} 예상치 못한 오류: {type(e_scene_unknown).__name__}: {e_scene_unknown}",
+            )
             continue
 
     _notify("summary", f"[IMG] 생성={len(created)} / 요청={req_count}")
     return created
+
+
 
 
 
@@ -4559,16 +4574,8 @@ def fill_prompt_movie_with_ai(
 ) -> None:
     """
     [수정됨]
-    전제:
-      - project_dir 아래 video.json이 존재
-    하는 일:
-      1) video.json에서 fps를 확정
-      2) [신규] project.json에서 'original_vibe'(원본 프롬프트) 로드
-      3) 각 씬(Scene)을 순회
-      4) [신규] '다음 씬 가사'(next_scene_lyric) 정보 파악
-      5) AI를 씬당 '한 번만' 호출하여 (원본분위기+현재가사+현재비주얼+캐릭터+시간구조+다음가사)를
-         바탕으로 모든 세그먼트의 프롬프트를 '배열'로 받음
-      6) 비어있던 prompt_movie를 AI가 생성한 프롬프트로 채움
+    AI의 역할을 '뮤직비디오 감독'으로 명시하고, '가사'를 기반으로
+    '캐릭터의 새로운 행동/포즈/표정' 및 '카메라 워크'를 생성하도록 시스템 프롬프트를 수정.
     """
     # 안전 로드/세이브
     try:
@@ -4609,14 +4616,13 @@ def fill_prompt_movie_with_ai(
         _log("[fill_prompt_movie_with_ai] video.json 형식 오류")
         return
 
-    # --- ▼▼▼ [신규] 1. 원본 분위기 (project.json) 로드 ▼▼▼ ---
+    # --- 1. 원본 분위기 (project.json) 로드 (기존과 동일) ---
     pj_path = pdir / "project.json"
     original_vibe_prompt = ""
     if pj_path.exists():
         pj_doc = load_json(pj_path, {}) or {}
         if isinstance(pj_doc, dict):
             original_vibe_prompt = pj_doc.get("prompt_user") or pj_doc.get("prompt", "")
-    # --- ▲▲▲ [신규] 끝 ▲▲▲ ---
 
     # ── 2) FPS 확정 (기존과 동일) ─────────────────────────────
     defaults_map: Dict[str, Any] = vdoc.get("defaults") or {}
@@ -4632,7 +4638,6 @@ def fill_prompt_movie_with_ai(
             except (TypeError, ValueError):
                 continue
 
-    # (FPS 동기화 로직 - 기존과 동일)
     vdoc.setdefault("fps", fps)
     vdoc.setdefault("defaults", {})
     vdoc["defaults"].setdefault("movie", {})["target_fps"] = fps
@@ -4640,14 +4645,13 @@ def fill_prompt_movie_with_ai(
     vdoc["defaults"]["movie"]["fps"] = fps
     vdoc["defaults"].setdefault("image", {})["fps"] = fps
 
-    # (Chunk/Overlap 값 읽기 - 기존과 동일)
     try:
         base_chunk_val = int(movie_def.get("base_chunk", 60))
         overlap_val = int(movie_def.get("overlap", 12))
     except Exception:
         base_chunk_val, overlap_val = 60, 12
 
-    # ── 3) 씬 루프 (구조 변경) ──────────────────────────────────
+    # ── 3) 씬 루프 (기존과 동일) ──────────────────────────────────
     scenes = vdoc.get("scenes") or []
     if not isinstance(scenes, list):
         _log("[fill_prompt_movie_with_ai] scenes 없음")
@@ -4656,24 +4660,28 @@ def fill_prompt_movie_with_ai(
 
     changed = False
 
-    # --- ▼▼▼ [수정된 AI 시스템 프롬프트] ▼▼▼ ---
+    # --- ▼▼▼ [수정된 AI 시스템 프롬프트 (사장님 지시 반영)] ▼▼▼ ---
     system_msg = (
-        "You are an expert music video director and visual storyteller.\n"
-        "The user will provide the context for a single scene:\n"
-        "1. `original_vibe`: The overall theme/mood of the entire song (from project.json).\n"
-        "2. `scene_lyric`: The specific lyric for THIS scene.\n"
-        "3. `base_visual`: The base visual description for THIS scene.\n"
-        "4. `characters`: The characters appearing in THIS scene.\n"
+        "You are a creative Music Video Director.\n"
+        "Your most important goal is to create **dynamic character action** that matches the **lyrics**. Avoid static, mannequin-like images.\n\n"
+        "[Context Provided]\n"
+        "1. `original_vibe`: The overall theme of the entire song.\n"
+        "2. `scene_lyric`: The lyric for THIS scene (THIS IS THE MOST IMPORTANT).\n"
+        "3. `base_visual`: The background/setting description (use this for the SETTING only, but you can change it creatively).\n"
+        "4. `characters`: The characters in THIS scene (e.g., 'female_01').\n"
         "5. `time_structure`: The frame segments for THIS scene (e.g., [\"0-65f\", \"49-125f\"]).\n"
-        "6. `next_scene_lyric`: The lyric for the *next* scene (to help you create a good transition).\n\n"
-        "Your task is to return a JSON object ONLY: {\"segment_prompts\": [\"prompt 1\", \"prompt 2\", ...]}.\n"
-        "The length of the `segment_prompts` array MUST exactly match the length of the `time_structure` list.\n\n"
+        "6. `next_scene_lyric`: The lyric for the *next* scene (for transition context).\n\n"
+        "[Your Task (Return JSON ONLY)]\n"
+        "{\"segment_prompts\": [\"prompt 1\", \"prompt 2\", ...]}.\n"
+        "The array length MUST exactly match the `time_structure` list length.\n\n"
         "[!! CRITICAL RULES !!]\n"
-        "1. Based on the `scene_lyric` and `original_vibe`, describe a specific **Action** or **Expression** for the `characters`.\n"
-        "2. Create a logical **progression of movement** across the segments (e.g., 'wide shot, starts walking' -> 'medium shot, walking' -> 'close up, looks up').\n"
-        "3. Include **camera work** (zoom, pan, dolly) in each segment.\n"
-        "4. Use the `next_scene_lyric` to inform the *last* segment's prompt, creating a smooth transition to the next scene's mood.\n"
-        "5. DO NOT create static, doll-like prompts. Create movement and storytelling."
+        "1.  **New Action (Most Important):** Based on the `scene_lyric` and `original_vibe`, you MUST describe a specific, creative **new pose and action** for the `characters` in *each* segment.\n"
+        "    (Examples: \"female_01 starts walking down the autumn path\", \"female_01 stops and picks up an autumn leaf, smiling\", \"female_01 spins around, throwing leaves in the air\", \"female_01 dances\", \"female_01 runs\").\n"
+        "2.  **Background:** Use `base_visual` as the background, but change it creatively (e.g., \"The red autumn background becomes darker\").\n"
+        "3.  **Progression:** Design the actions to be continuous and logical, telling a small story that matches the lyric's emotion.\n"
+        "4.  **Camera:** Include dynamic camera work in each description (e.g., \"close up on her face\", \"camera rotates around her\", \"from a top-down view\", \"dolly zoom out\").\n"
+        "5.  **Emotion:** Describe the character's expression (e.g., \"smiling happily\", \"peaceful expression\").\n"
+        "6.  **Prohibition:** NO \"mannequins\". Every prompt must describe a **change in the character's action or pose**."
     )
     # --- ▲▲▲ [수정 끝] ▲▲▲ ---
 
@@ -4683,7 +4691,7 @@ def fill_prompt_movie_with_ai(
 
         scene_id = sc.get("id", "unknown")
 
-        # 1. 총 프레임 계산 (기존과 동일)
+        # (프레임 계산, 세그먼트 생성 ... 기존과 동일)
         try:
             dur = float(sc.get("duration") or 0.0)
         except (TypeError, ValueError):
@@ -4691,7 +4699,6 @@ def fill_prompt_movie_with_ai(
         total_frames = int(round(dur * fps)) if dur > 0 else 0
         if total_frames <= 0: continue
 
-        # 2. frame_segments 생성 (기존과 동일)
         segs = sc.get("frame_segments")
         if not isinstance(segs, list) or not segs:
             pairs_tuples = plan_segments(total_frames, base_chunk=base_chunk_val, overlap=overlap_val)
@@ -4700,15 +4707,14 @@ def fill_prompt_movie_with_ai(
                 segs_out.append({"start_frame": int(s_f), "end_frame": int(e_f), "prompt_movie": ""})
             sc["frame_segments"] = segs_out
             segs = segs_out
-            changed = True  # 세그먼트가 생성되었으므로 'changed'
+            changed = True
 
-        # 3. 비어있는 프롬프트가 있는지 확인 (기존과 동일)
         prompts_list = [seg.get("prompt_movie", "") for seg in segs]
         if all(prompts_list):
-            _log(f"[{scene_id}] 모든 세그먼트 프롬프트가 이미 존재합니다. (AI 호출 스킵)")
+            _log(f"[{scene_id}] 모든 세그먼트 프롬프트(묘사)가 이미 존재합니다. (AI 호출 스킵)")
             continue
 
-        # 4. AI 호출을 위한 데이터 수집 (기존과 동일)
+        # (AI 호출을 위한 6가지 문맥 수집 ... 기존과 동일)
         base_visual = ""
         for key in ("direct_prompt", "prompt", "prompt_img", "prompt_movie"):
             val = sc.get(key)
@@ -4718,24 +4724,20 @@ def fill_prompt_movie_with_ai(
 
         scene_lyric = sc.get("lyric", "")
 
-        if not base_visual and not scene_lyric:  # 둘 다 없으면 스킵
+        if not base_visual and not scene_lyric:
             _log(f"[{scene_id}] 참조 텍스트(prompt/lyric)가 없어 AI 호출을 건너뜁니다.")
             continue
 
-        # --- ▼▼▼ [신규] 5. '다음 씬 가사' 찾기 ▼▼▼ ---
         next_scene_lyric = "(Scene End)"
         if i + 1 < len(scenes):
             next_sc = scenes[i + 1]
             if isinstance(next_sc, dict):
                 next_scene_lyric = next_sc.get("lyric", "") or "(Next scene has no lyric)"
-        # --- ▲▲▲ [신규] 끝 ▲▲▲ ---
 
-        # 6. AI 호출 (씬당 1회)
-        _log(f"[{scene_id}] {len(segs)}개 세그먼트 프롬프트 AI 요청 중...")
+        _log(f"[{scene_id}] {len(segs)}개 세그먼트 프롬프트(묘사) AI 요청 중...")
 
         frame_ranges_info = [f"{s.get('start_frame')}-{s.get('end_frame')}f" for s in segs]
 
-        # --- ▼▼▼ [수정] AI에게 전달할 문맥 6가지로 확장 ▼▼▼ ---
         user_prompt_payload = {
             "original_vibe": original_vibe_prompt,
             "scene_lyric": scene_lyric,
@@ -4745,7 +4747,6 @@ def fill_prompt_movie_with_ai(
             "next_scene_lyric": next_scene_lyric
         }
         user_msg = json.dumps(user_prompt_payload, ensure_ascii=False)
-        # --- ▲▲▲ [수정] 끝 ▲▲▲ ---
 
         try:
             ai_raw_response = ask(system_msg, user_msg)
@@ -4757,12 +4758,14 @@ def fill_prompt_movie_with_ai(
                 raise RuntimeError(f"AI가 JSON을 반환하지 않았습니다: {ai_raw_response[:100]}")
 
             ai_json = json.loads(ai_raw_response[json_start:json_end])
+
+            # --- ▼▼▼ [수정] 'segment_prompts' 키로 파싱 ▼▼▼ ---
             new_prompts = ai_json.get("segment_prompts", [])
 
             if not isinstance(new_prompts, list) or len(new_prompts) != len(segs):
                 raise RuntimeError(f"AI가 요청된 세그먼트 개수({len(segs)})만큼 프롬프트를 반환하지 않았습니다. (반환: {len(new_prompts)}개)")
 
-            # 7. 세그먼트 프롬프트 주입 (기존과 동일)
+            # 'prompt_movie' 필드에 "행동 묘사"를 저장
             filled_count = 0
             for i_seg, seg in enumerate(segs):
                 if not seg.get("prompt_movie", ""):
@@ -4770,20 +4773,21 @@ def fill_prompt_movie_with_ai(
                     filled_count += 1
 
             if filled_count > 0:
-                _log(f"[{scene_id}] AI로 {filled_count}개의 새 프롬프트 주입 완료.")
+                _log(f"[{scene_id}] AI로 {filled_count}개의 새 행동 묘사 주입 완료.")
                 sc["frame_segments"] = segs
                 changed = True
             else:
-                _log(f"[{scene_id}] AI가 프롬프트를 반환했으나, 이미 모든 프롬프트가 채워져 있었습니다.")
+                _log(f"[{scene_id}] AI가 묘사를 반환했으나, 이미 모든 프롬프트가 채워져 있었습니다.")
+            # --- ▲▲▲ [수정 끝] ▲▲▲ ---
 
         except Exception as e_ai_call:
-            _log(f"[{scene_id}] AI 호출 또는 프롬프트 주입 실패: {e_ai_call}")
+            _log(f"[{scene_id}] AI 호출 또는 묘사 주입 실패: {e_ai_call}")
             continue
 
     if changed:
         vdoc["scenes"] = scenes
         save_json(vpath, vdoc)
-        _log("[fill_prompt_movie_with_ai] FPS 동기화, frame_segments 생성/보강, AI 프롬프트 채우기 완료.")
+        _log("[fill_prompt_movie_with_ai] FPS 동기화, frame_segments 생성/보강, AI 행동 묘사 채우기 완료.")
     else:
         save_json(vpath, vdoc)
         _log("[fill_prompt_movie_with_ai] 변경 없음 (또는 FPS 동기화만 수행)")
