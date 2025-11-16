@@ -825,6 +825,30 @@ class ScenePromptEditDialog(QtWidgets.QDialog):
         """제이슨수정 창에서 'AI 요청' 버튼 핸들러"""
         import json
 
+        # --- ▼▼▼ [여기에 코드 추가] ▼▼▼ ---
+        # AI 요청 시 UI의 현재 FPS를 video.json(self.full_video_data)에 동기화
+        try:
+            main_window = self.parent()  # self.parent()가 MainWindow 인스턴스
+            if main_window and hasattr(main_window, "cmb_movie_fps"):
+                cmb_fps = getattr(main_window, "cmb_movie_fps")
+                ui_fps = int(cmb_fps.currentData())
+
+                # self.full_video_data (video.json의 메모리 내 복사본)에 FPS 값 주입
+                self.full_video_data.setdefault("defaults", {})
+                self.full_video_data["defaults"].setdefault("movie", {})
+                self.full_video_data["defaults"]["movie"]["target_fps"] = ui_fps
+                self.full_video_data["defaults"]["movie"]["input_fps"] = ui_fps
+                self.full_video_data["defaults"]["movie"]["fps"] = ui_fps
+                self.full_video_data["defaults"].setdefault("image", {})["fps"] = ui_fps
+                self.full_video_data["fps"] = int(ui_fps)
+
+                print(f"[JSON Edit] AI 요청 시 UI FPS ({ui_fps})를 video.json 데이터에 동기화했습니다.")
+
+        except Exception as e_fps_sync:
+            # 실패해도 치명적이지 않으므로 로그만 남기고 계속 진행
+            print(f"[JSON Edit] AI 요청 중 FPS 동기화 실패: {e_fps_sync}")
+        # --- ▲▲▲ [추가 끝] ▲▲▲ ---
+
         # 1) 화면에 있는 direct_prompt 들고오기
         scenes_to_process: list[tuple[dict, str]] = []
         scenes_map = {
@@ -2885,7 +2909,7 @@ class MainWindow(QtWidgets.QMainWindow):
 
         spn = getattr(self, "spn_t2i_steps", None)
         try:
-            steps = int(spn.value()) if spn is not None else 24
+            steps = int(spn.value()) if spn is not None else 16
         except Exception:
             steps = 28
 
@@ -3410,6 +3434,9 @@ class MainWindow(QtWidgets.QMainWindow):
 
         return target_fps_val
 
+    # shorts_ui.py의 on_click_build_story_from_seg_async 함수를
+    # (다시) 아래의 전체 코드로 덮어쓰십시오.
+
     def on_click_build_story_from_seg_async(self) -> None:
         """
         seg.json → story.json 스켈레톤 → video.json(갭 포함) 생성 → video.json만 AI 강화 → 프롬프트 주입 → 가사 재주입
@@ -3649,16 +3676,18 @@ class MainWindow(QtWidgets.QMainWindow):
         # --- ▼▼▼ [수정] video_json_path 변수를 job 함수 상단에서 미리 정의 ▼▼▼ ---
         video_json_path = proj_dir_path / "video.json"
 
-        # --- ▼▼▼ [수정] FPS 읽기 도우미 함수 추가 (on_click_test1_analyze에서 가져옴) ▼▼▼ ---
+        # --- ▼▼▼ [수정] FPS 읽기 도우미 함수 추가 ▼▼▼ ---
         def _read_ui_fps() -> int:
+            """(on_click_test1_analyze에서 가져옴)"""
             try:
                 cmb = getattr(self, "cmb_movie_fps", None)
                 return int(cmb.currentData()) if cmb and hasattr(cmb, "currentData") else 30
             except Exception:
                 return 30
 
-        # --- ▼▼▼ [수정] AI 호출 래퍼 추가 (on_click_test1_analyze에서 가져옴) ▼▼▼ ---
+        # --- ▼▼▼ [수정] AI 호출 래퍼 추가 ▼▼▼ ---
         def _ask_en(system_msg: str, user_msg: str) -> str:
+            """(on_click_test1_analyze에서 가져옴)"""
             try:
                 # self._ai 인스턴스가 AI 클래스라고 가정
                 return str(self._ai.ask_smart(system_msg, user_msg, prefer="gemini", allow_fallback=True) or "")
@@ -4107,14 +4136,15 @@ class MainWindow(QtWidgets.QMainWindow):
             else:
                 _log_progress("[WARN] video.json 경로가 없어 가사 재주입 생략")
 
-            # --- ▼▼▼ [수정] 6단계: FPS 동기화 및 세그먼트 프롬프트 생성 ▼▼▼ ---
+            # --- ▼▼▼ [수정] 6단계: UI FPS 동기화 및 세그먼트 프롬프트 생성 ▼▼▼ ---
+            # (on_click_test1_analyze에서 가져온 로직)
             _log_progress("[6/6] FPS 동기화 및 세그먼트 프롬프트 생성 시작...")
             try:
                 # video_json_path (Path 객체)와 _ask_en (Callable)은
                 # 이 job 함수 외부 스코프(on_click_build_story_from_seg_async)에 정의되어 있음
                 # fill_prompt_movie_with_ai 함수는 파일 상단에서 임포트됨
 
-                # --- [수정] UI FPS를 video.json에 먼저 저장 ---
+                # --- [핵심 수정] UI FPS를 video.json에 먼저 저장 ---
                 vdoc_fps = load_json(video_json_path, {}) or {}
                 if not isinstance(vdoc_fps, dict): vdoc_fps = {}
 
@@ -4135,7 +4165,7 @@ class MainWindow(QtWidgets.QMainWindow):
                     _ask_en,  # 2. AI 호출 함수 (외부 스코프에서 가져옴)
                     log_fn=_log_progress  # 3. 로그 출력 함수
                 )
-                _log_progress("[6/6] FPS 동기화 및 세그먼트 프롬프트 생성 완료.")
+                _log_progress("[6/6] 세그먼트 프롬프트 생성 완료 (UI FPS 기준).")
 
             except ImportError as e_import_fill:
                 _log_progress(f"[ERROR] 6/6 단계: fill_prompt_movie_with_ai 임포트 실패: {e_import_fill}")
@@ -4158,8 +4188,8 @@ class MainWindow(QtWidgets.QMainWindow):
                     _log_progress(
                         f"[ERROR] 최종 provider 저장 중 예상치 못한 오류: {type(e_final_unknown).__name__}: {e_final_unknown}")
 
-            # --- ▼▼▼ [수정] 반환값에 FPS 포함 ▼▼▼ ---
-            final_fps_val = _read_ui_fps()  # 최종 저장된 FPS 값
+            # --- ▼▼▼ [수정] 반환값에 UI FPS 포함 ▼▼▼ ---
+            final_fps_val = _read_ui_fps()  # 최종 저장된 UI FPS 값
             return {"story_path": str(story_path), "video_path": video_path_str or "", "fps": final_fps_val}
             # --- ▲▲▲ [수정] 끝 ▲▲▲ ---
 
@@ -7256,7 +7286,8 @@ class MainWindow(QtWidgets.QMainWindow):
 
     def _apply_project_meta(self, proj_dir: str) -> None:
         """
-        project.json을 읽어 제목/가사/길이/변환/자동태그/프롬프트 UI에 반영.
+        project.json과 video.json을 읽어 UI에 반영.
+        - [수정됨] video.json의 FPS 값을 우선적으로 UI에 반영.
         - [수정됨] ui_prefs 복원 시 findData(int)를 사용하여 정확한 인덱스 복원.
         """
         from pathlib import Path
@@ -7294,9 +7325,8 @@ class MainWindow(QtWidgets.QMainWindow):
         except Exception:
             pass
 
-        # ✅ 프롬프트(긍정) UI 반영 (기존 로직 유지)
+        # 프롬프트(긍정) UI 반영
         prompt_val = (meta.get("prompt_user") or meta.get("prompt") or "").strip()
-        # 다양한 위젯 이름에 방어적으로 대응
         prompt_widget = (
                 getattr(self, "le_prompt", None)
                 or getattr(self, "te_prompt", None)
@@ -7311,8 +7341,63 @@ class MainWindow(QtWidgets.QMainWindow):
         except Exception:
             pass
 
-        # --- ▼▼▼ [핵심 수정] 렌더 설정(ui_prefs) 불러오기 ▼▼▼ ---
+        # --- ▼▼▼ [수정된 FPS 로드 로직] ▼▼▼ ---
+
+        # 1. video.json 로드 시도
+        vj_path = Path(proj_dir) / "video.json"
+        vmeta = load_json(vj_path, {}) if vj_path.exists() else {}
+        if not isinstance(vmeta, dict): vmeta = {}
+
+        # 2. video.json에서 FPS 값 탐색 (우선순위)
+        vj_fps_val = None
+        try:
+            defaults = vmeta.get("defaults", {})
+            movie_defaults = defaults.get("movie", {})
+            image_defaults = defaults.get("image", {})
+
+            candidates = [
+                movie_defaults.get("target_fps"),
+                vmeta.get("fps"),
+                movie_defaults.get("fps"),
+                image_defaults.get("fps")
+            ]
+            for cand in candidates:
+                if cand is not None:
+                    vj_fps_val = int(cand)
+                    break
+        except Exception:
+            vj_fps_val = None
+
+        # 3. project.json (ui_prefs)에서 FPS 값 탐색 (폴백)
         ui_prefs = meta.get("ui_prefs") or {}
+        pj_fps_val = None
+        if ui_prefs:
+            try:
+                pj_fps_val = int(ui_prefs.get("movie_fps", 30))
+            except Exception:
+                pj_fps_val = 30
+
+        # 4. 최종 FPS 결정 (video.json 우선)
+        final_fps_to_set = vj_fps_val if vj_fps_val is not None else (pj_fps_val if pj_fps_val is not None else 30)
+
+        # 5. ComboBox 복원 헬퍼 (데이터 값(int)으로 인덱스 찾기)
+        def _set_combo_by_data(combo, data_val):
+            # 콤보박스가 로드되기 전일 수 있으므로 방어
+            if not hasattr(self, "cmb_movie_fps"):
+                return
+            idx = combo.findData(int(data_val))
+            if idx >= 0:
+                combo.setCurrentIndex(idx)
+
+        # 6. UI에 최종 FPS 값 설정
+        try:
+            _set_combo_by_data(self.cmb_movie_fps, final_fps_to_set)
+        except Exception as e_set_fps:
+            print(f"[UI] FPS 콤보박스 설정 실패: {e_set_fps}")
+
+        # --- ▲▲▲ [수정된 FPS 로직] 끝 ▲▲▲ ---
+
+        # --- ▼▼▼ [기존 로직] 나머지 ui_prefs (W, H, Steps 등)는 project.json 값 그대로 사용 ▼▼▼ ---
         if ui_prefs:
             try:
                 # 1. 이미지 설정 값 로드 (int로 강제)
@@ -7324,28 +7409,31 @@ class MainWindow(QtWidgets.QMainWindow):
                 # 2. 렌더 설정 값 로드 (int로 강제)
                 render_w, render_h = ui_prefs.get("render_size", [0, 0])
                 render_w_val, render_h_val = int(render_w), int(render_h)
-                render_fps = int(ui_prefs.get("movie_fps", 30))
+                # render_fps = int(ui_prefs.get("movie_fps", 30)) # <-- 이 줄은 위(수정된 로직)에서 처리됨
                 render_steps = int(ui_prefs.get("render_steps", 28))
                 render_preset_key = ui_prefs.get("render_preset", "custom")
 
                 # ComboBox 복원 헬퍼 (데이터 값(int)으로 인덱스 찾기)
+                # (위에서 이미 정의했지만, 만약을 위해 여기서도 정의)
                 def _set_combo_by_data(combo, data_val):
+                    if not hasattr(combo, "findData"): return
                     idx = combo.findData(int(data_val))
                     if idx >= 0:
                         combo.setCurrentIndex(idx)
 
-                # 콤보박스 값 복원
+                # 콤보박스 값 복원 (FPS 제외)
                 _set_combo_by_data(self.cmb_img_w, img_w_val)
                 _set_combo_by_data(self.cmb_img_h, img_h_val)
                 self.spn_t2i_steps.setValue(img_steps)
 
                 _set_combo_by_data(self.cmb_render_w, render_w_val)
                 _set_combo_by_data(self.cmb_render_h, render_h_val)
-                _set_combo_by_data(self.cmb_movie_fps, render_fps)
+                # _set_combo_by_data(self.cmb_movie_fps, render_fps) # <-- 이 줄은 위(수정된 로직)에서 처리됨
                 self.spn_render_steps.setValue(render_steps)
 
                 # 프리셋 복원 (핸들러 호출을 위한 emit)
                 def _set_preset_by_key(combo, key):
+                    if not hasattr(combo, "findData"): return
                     index = combo.findData(key)
                     if index < 0:
                         for i in range(combo.count()):
@@ -7377,7 +7465,7 @@ class MainWindow(QtWidgets.QMainWindow):
 
             except Exception as e:
                 print(f"[UI] 렌더 설정 불러오기 실패: {e}")
-        # --- ▲▲▲ [핵심 수정] 불러오기 끝 ▲▲▲ ---
+        # --- ▲▲▲ [기존 로직] 끝 ▲▲▲ ---
 
     def _sync_convert_ui_from_meta(self, meta: dict) -> None:
         """
@@ -9279,7 +9367,7 @@ def _inject_render_prefs_methods():
                 class SettingsFallbackPrefs:
                     IMAGE_SIZE_CHOICES = [240, 480, 512, 720, 832, 960, 1024, 1080, 1280, 1440, 1920, 2560]
                     DEFAULT_IMG_SIZE = (720, 1080)
-                    MOVIE_FPS_CHOICES = [24, 30, 60]
+                    MOVIE_FPS_CHOICES = [16, 24, 30, 60]
                     DEFAULT_MOVIE_FPS = 30
                     DEFAULT_T2I_STEPS = 6
 
@@ -9377,7 +9465,7 @@ def _inject_render_prefs_methods():
         h_candidates_set.add(int(default_h_val))
         h_candidates_val = sorted(list(h_candidates_set))
 
-        fps_choices_val = getattr(s_mod_prefs, "MOVIE_FPS_CHOICES", [24, 30, 60])
+        fps_choices_val = getattr(s_mod_prefs, "MOVIE_FPS_CHOICES", [16, 24, 30, 60])
         default_fps_val = int(getattr(s_mod_prefs, "DEFAULT_MOVIE_FPS", 30))
         default_steps_val = int(getattr(s_mod_prefs, "DEFAULT_T2I_STEPS", 6))
 

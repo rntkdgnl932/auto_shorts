@@ -98,7 +98,7 @@ IMAGE_SIZE_CHOICES: list[int] = [240, 480, 520, 720, 960, 1080, 1280, 1440, 1920
 
 # 2) 렌더 FPS 기본/후보 (24 또는 60 선택)
 DEFAULT_MOVIE_FPS: int = 30
-MOVIE_FPS_CHOICES: list[int] = [24, 30, 60]
+MOVIE_FPS_CHOICES: list[int] = [16, 24, 30, 60]
 
 # 3) 청크 오버랩(프레임) — i2v를 여러 덩어리로 만들 때 경계 끊김을 줄이기 위해
 #    앞/뒤 청크가 겹치는 프레임 수. 60fps에서 12프레임은 약 0.2초.

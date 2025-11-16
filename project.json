@@ -4,7 +4,7 @@
       1080,
       1920
     ],
-    "movie_fps": 24,
+    "movie_fps": 16,
     "resolution_preset": "custom",
     "t2i_steps": 6,
     "font_family": "굴림",
