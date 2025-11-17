@@ -840,12 +840,13 @@ class ScenePromptEditDialog(QtWidgets.QDialog):
 
         run_job_with_progress_async(owner=self, title=f"AI 프롬프트 생성 중 ({self.json_path.name})", job=job, on_done=done)
 
-
+    # shorts_ui.py의 ScenePromptEditDialog 클래스 내부
+    # on_ai_request 함수를 이 코드로 덮어쓰세요.
 
     def on_ai_request(self):
         """
         제이슨수정 창에서 'AI 요청' 버튼 핸들러
-        [수정됨] 6가지 문맥을 전달하고 AI가 '행동 묘사'를 생성하도록 수정
+        [수정됨] 6가지 문맥(원본분위기, 현재가사, direct_prompt, 캐릭터, 시간, 다음가사)을 AI에 전달
         """
         import json
 
@@ -877,7 +878,7 @@ class ScenePromptEditDialog(QtWidgets.QDialog):
             print(f"[JSON Edit] AI 요청 중 FPS 동기화 실패: {e_fps_sync}")
         # --- [FPS 동기화 끝] ---
 
-        # --- 1. 원본 분위기 (project.json) 로드 (기존과 동일) ---
+        # --- ▼▼▼ [신규] 1. 원본 분위기 (project.json) 로드 ▼▼▼ ---
         original_vibe_prompt = ""
         try:
             pj_path = self.json_path.parent / "project.json"
@@ -887,6 +888,7 @@ class ScenePromptEditDialog(QtWidgets.QDialog):
                     original_vibe_prompt = pj_doc.get("prompt_user") or pj_doc.get("prompt", "")
         except Exception as e_load_pj:
             print(f"[JSON Edit] project.json 로드 실패: {e_load_pj}")
+        # --- ▲▲▲ [신규] 끝 ▲▲▲ ---
 
         # 2) 화면에 있는 direct_prompt 들고오기 (기존과 동일)
         scenes_to_process: list[tuple[dict, str]] = []
@@ -922,7 +924,7 @@ class ScenePromptEditDialog(QtWidgets.QDialog):
             default_negative_tags = self._AI_DEFAULT_NEGATIVE_TAGS
             updated_count = 0
 
-            # --- ▼▼▼ [수정된 AI 시스템 프롬프트 (사장님 지시 반영)] ▼▼▼ ---
+            # --- ▼▼▼ [수정된 AI 시스템 프롬프트 (뮤직비디오 감독)] ▼▼▼ ---
             base_system_prompt = (
                 "You are a creative Music Video Director.\n"
                 "Your most important goal is to create **dynamic character action** that matches the **lyrics**. Avoid static, mannequin-like images.\n\n"
@@ -963,7 +965,7 @@ class ScenePromptEditDialog(QtWidgets.QDialog):
 
                 next_scene_lyric = "(Scene End)"
                 current_index = -1
-                for idx, s in enumerate(self.scenes_data):
+                for idx, s in enumerate(self.scenes_data):  # self.scenes_data는 전체 씬 목록
                     if isinstance(s, dict) and s.get("id") == scene_id:
                         current_index = idx
                         break
@@ -1207,12 +1209,13 @@ class ScenePromptEditDialog(QtWidgets.QDialog):
         except (OSError, Exception) as e_delete:
             QtWidgets.QMessageBox.critical(self, "삭제 실패", f"파일 삭제 중 오류가 발생했습니다:\n{e_delete}")
 
+    # shorts_ui.py의 ScenePromptEditDialog 클래스 내부
+    # load_and_build_ui 함수를 이 코드로 덮어쓰세요.
+
     def load_and_build_ui(self):
         """
-        [수정됨 v41] (사용자 요청 반영)
-        - 씬 레이아웃을 [이미지+버튼] | [프롬프트] | [씬 캐릭터]의 "세로 3줄" (3-Column)로 변경.
-        - 이미지 크기는 150px 썸네일로 복귀.
-        - (v29, v37 수정 유지)
+        [수정됨 v42] (사장님 요청 반영)
+        - "세그먼트 수정" 버튼 추가 및 `SegmentEditDialog` 열기 기능 연결.
         """
         try:
             # --- (v37) settings 임포트 (버그 수정) ---
@@ -1232,19 +1235,17 @@ class ScenePromptEditDialog(QtWidgets.QDialog):
                 raise ValueError("video.json에 'scenes' 키가 없거나 리스트가 아닙니다.")
 
             # --- [v29] 캐릭터 스타일 그룹 + 추가 버튼 가로 배치 ---
+            # (기존 캐릭터 스타일 그룹 로직은 동일)
             top_char_layout = QtWidgets.QHBoxLayout()
             self.character_styles_group = self._build_character_styles_group()
             top_char_layout.addWidget(self.character_styles_group, 1)
-            add_button = QtWidgets.QPushButton("캐릭터\n추가")
-            add_button.setToolTip(
-                f"폴더[{getattr(s_conf, 'CHARACTER_DIR', 'C:/.../character')}]에서 캐릭터 파일을 선택해 목록에 추가합니다."
-            )
-            add_button.clicked.connect(self.on_add_character_style)
-            add_button.setSizePolicy(QtWidgets.QSizePolicy.Policy.Fixed, QtWidgets.QSizePolicy.Policy.Fixed)
+            # (캐릭터 추가 버튼 로직은 _build_character_styles_group 안으로 이동했음)
+
             main_layout = self.layout()
             if main_layout and hasattr(main_layout, "insertLayout"):
+                # [수정] 0번 인덱스(맨 위)에 캐릭터 스타일 그룹 삽입
                 main_layout.insertLayout(0, top_char_layout)
-            # --- [v29] 배치 끝 ---
+                # --- [v29] 배치 끝 ---
 
             font = QtGui.QFont()
             font.setFamily("Courier" if "Courier" in QtGui.QFontDatabase().families() else "Monospace")
@@ -1273,7 +1274,7 @@ class ScenePromptEditDialog(QtWidgets.QDialog):
                 for scene in chunk:
                     if not isinstance(scene, dict): continue
 
-                    # [v22] 씬 라벨 정보 (한 줄로 길게)
+                    # (씬 라벨 정보 ... 기존과 동일)
                     scene_id = scene.get("id", "ID-없음")
                     lyric = (scene.get("lyric") or "").strip()
                     start_f = scene.get("start", 0.0)
@@ -1292,19 +1293,17 @@ class ScenePromptEditDialog(QtWidgets.QDialog):
 
                     # --- [v41 수정] 가로 3단 레이아웃 ---
                     row_container = QtWidgets.QWidget()
-                    # [v41] QVBoxLayout -> QHBoxLayout
                     row_layout = QtWidgets.QHBoxLayout(row_container)
                     row_layout.setContentsMargins(0, 0, 0, 0)
                     row_layout.setSpacing(8)
 
-                    # --- 1. (왼쪽) 이미지 + 버튼 3개 ---
+                    # --- 1. (왼쪽) 이미지 + 버튼 ---
                     left_vbox_widget = QtWidgets.QWidget()
                     left_vbox = QtWidgets.QVBoxLayout(left_vbox_widget)
                     left_vbox.setContentsMargins(0, 0, 0, 0)
                     left_vbox.setSpacing(4)
 
                     img_preview_label = ClickableLabel()
-                    # [v41] 150x150 썸네일로 복귀
                     img_preview_label.setFixedSize(self.THUMBNAIL_SIZE, self.THUMBNAIL_SIZE)
                     img_preview_label.setAlignment(Qt.AlignmentFlag.AlignCenter)
 
@@ -1319,9 +1318,8 @@ class ScenePromptEditDialog(QtWidgets.QDialog):
                     left_vbox.addWidget(upload_button)
                     left_vbox.addWidget(delete_image_button)
                     left_vbox.addWidget(delete_video_button)
-                    left_vbox.addStretch(1)  # 하단 공간 채우기
-
-                    row_layout.addWidget(left_vbox_widget, 0)  # [v41] 1단 추가 (Stretch 0)
+                    left_vbox.addStretch(1)
+                    row_layout.addWidget(left_vbox_widget, 0)
 
                     # --- 2. (중간) Direct Prompt 텍스트 편집기 ---
                     text_edit = QtWidgets.QTextEdit()
@@ -1329,11 +1327,9 @@ class ScenePromptEditDialog(QtWidgets.QDialog):
                     text_edit.setFont(font)
                     text_edit.setMinimumHeight(150)
                     text_edit.setToolTip(f"Scene ID: {scene_id}\n이 씬의 direct_prompt를 입력하세요.")
-                    # [v41] 세로 크기 정책을 Expanding으로 설정
                     text_edit.setSizePolicy(QtWidgets.QSizePolicy.Policy.Expanding,
                                             QtWidgets.QSizePolicy.Policy.Expanding)
-
-                    row_layout.addWidget(text_edit, 1)  # [v41] 2단 추가 (Stretch 1 - 확장)
+                    row_layout.addWidget(text_edit, 1)
 
                     # --- 3. (오른쪽) 씬별 캐릭터 관리 UI ---
                     right_vbox_widget = QtWidgets.QWidget()
@@ -1359,37 +1355,36 @@ class ScenePromptEditDialog(QtWidgets.QDialog):
                     char_btn_layout.addWidget(btn_add_char)
                     char_btn_layout.addWidget(btn_del_char)
                     right_vbox.addLayout(char_btn_layout)
-                    right_vbox.addStretch(1)  # [v41] 하단 공간 채우기
 
-                    btn_add_char.clicked.connect(functools.partial(self.on_add_char_to_scene, char_list_widget))
-                    btn_del_char.clicked.connect(functools.partial(self.on_del_char_from_scene, char_list_widget))
+                    # --- ▼▼▼ [신규] "세그먼트 수정" 버튼 추가 ▼▼▼ ---
+                    btn_edit_segments = QtWidgets.QPushButton("세그먼트 수정")
+                    btn_edit_segments.setToolTip(f"[{scene_id}] 씬의 세그먼트(키프레임) 이미지와 프롬프트를 수정합니다.")
+                    right_vbox.addWidget(btn_edit_segments)  # 캐릭터 목록 아래에 추가
+                    # --- ▲▲▲ [신규] 끝 ▲▲▲ ---
 
-                    row_layout.addWidget(right_vbox_widget, 0)  # [v41] 3단 추가 (Stretch 0)
+                    right_vbox.addStretch(1)
+                    row_layout.addWidget(right_vbox_widget, 0)
                     # --- [v41] 레이아웃 수정 끝 ---
 
-                    # (이하 이미지 상태 설정 및 버튼 연결 코드는 기존과 동일)
+                    # (이미지 상태 설정 및 버튼 연결 코드는 기존과 동일)
                     img_file_str = scene.get("img_file", "")
                     img_path = Path(img_file_str) if img_file_str else None
                     has_image = img_path and img_path.exists()
-
+                    # (이미지 표시 로직은 기존과 동일)
                     if has_image:
                         pixmap = QtGui.QPixmap(str(img_path))
                         if not pixmap.isNull():
-                            # [v41] 150x150 스케일링으로 복귀
-                            pixmap_scaled = pixmap.scaled(
-                                self.THUMBNAIL_SIZE, self.THUMBNAIL_SIZE,
-                                Qt.AspectRatioMode.KeepAspectRatio,
-                                Qt.TransformationMode.SmoothTransformation
-                            )
+                            pixmap_scaled = pixmap.scaled(self.THUMBNAIL_SIZE, self.THUMBNAIL_SIZE,
+                                                          Qt.AspectRatioMode.KeepAspectRatio,
+                                                          Qt.TransformationMode.SmoothTransformation)
                             img_preview_label.setPixmap(pixmap_scaled)
                             img_preview_label.setToolTip(f"경로: {img_file_str}\n(클릭해서 크게 보기)")
-                            img_preview_label.clicked.connect(functools.partial(self.show_large_image, img_file_str))
+                            img_preview_label.clicked.connect(
+                                functools.partial(self.show_large_image, img_file_str))
                             upload_button.setText("이미지 변경")
                             delete_image_button.setEnabled(True)
-                            delete_image_button.setToolTip(f"경로: {img_file_str}\n(클릭 시 이 씬의 이미지 파일을 삭제합니다.)")
                         else:
                             img_preview_label.setText("[파일\n오류]")
-                            img_preview_label.setToolTip(f"경로: {img_file_str}\n(파일을 읽을 수 없음)")
                             img_preview_label.setStyleSheet("border: 1px solid red; color: red;")
                             upload_button.setText("다시 업로드")
                             delete_image_button.setEnabled(True)
@@ -1400,26 +1395,29 @@ class ScenePromptEditDialog(QtWidgets.QDialog):
                         upload_button.setText("업로드")
                         delete_image_button.setEnabled(False)
 
+                    # (기존 버튼 연결)
                     upload_button.clicked.connect(
                         functools.partial(self.on_upload_image, scene_id, img_preview_label, upload_button,
-                                          delete_image_button, scene)
-                    )
+                                          delete_image_button, scene))
                     delete_image_button.clicked.connect(
                         functools.partial(self.on_delete_image, img_path if img_path else Path(), img_preview_label,
-                                          upload_button, delete_image_button, scene)
-                    )
-
+                                          upload_button, delete_image_button, scene))
                     clips_dir = self.json_path.parent / "clips"
                     video_file_path = clips_dir / f"{scene_id}.mp4"
                     video_exists = video_file_path.exists()
                     delete_video_button.setEnabled(video_exists)
-                    if video_exists:
-                        delete_video_button.setToolTip(f"경로: {video_file_path}\n(클릭 시 이 씬의 영상 파일을 삭제합니다.)")
-                    else:
-                        delete_video_button.setToolTip(f"영상 파일 없음:\n{video_file_path}")
                     delete_video_button.clicked.connect(
-                        functools.partial(self.on_delete_video, video_file_path, delete_video_button)
+                        functools.partial(self.on_delete_video, video_file_path, delete_video_button))
+
+                    # (캐릭터 추가/삭제 연결)
+                    btn_add_char.clicked.connect(functools.partial(self.on_add_char_to_scene, char_list_widget))
+                    btn_del_char.clicked.connect(functools.partial(self.on_del_char_from_scene, char_list_widget))
+
+                    # --- ▼▼▼ [신규] "세그먼트 수정" 버튼 연결 ▼▼▼ ---
+                    btn_edit_segments.clicked.connect(
+                        functools.partial(self.on_open_segment_editor, scene_id, scene)
                     )
+                    # --- ▲▲▲ [신규] 끝 ▲▲▲ ---
 
                     form_layout_page.addRow(label, row_container)
                     self.widget_map.append((scene_id, text_edit))
@@ -1440,6 +1438,28 @@ class ScenePromptEditDialog(QtWidgets.QDialog):
             self.btn_update.setEnabled(False)
             self.btn_prev.setEnabled(False)
             self.btn_next.setEnabled(False)
+
+    def on_open_segment_editor(self, scene_id: str, scene_data: Dict[str, Any]):
+            """[신규] '세그먼트 수정' 버튼 핸들러. 새 다이얼로그를 엽니다."""
+            try:
+                # SegmentEditDialog를 생성하고 실행합니다.
+                dialog = SegmentEditDialog(
+                    scene_id=scene_id,
+                    scene_data=scene_data,
+                    full_video_data=self.full_video_data,
+                    json_path=self.json_path,
+                    ai_instance=self.ai_instance,
+                    parent=self
+                )
+                dialog.exec_()
+
+                # (참고) SegmentEditDialog가 '업데이트' 버튼을 누를 때
+                # self.full_video_data 객체를 직접 수정하고 파일에 저장합니다.
+                # 이 창(ScenePromptEditDialog)은 닫힐 때 최신 데이터를 다시 로드하지 않으므로,
+                # '업데이트' 버튼을 눌러야 이 창의 변경사항도 저장됩니다.
+
+            except Exception as e:
+                QtWidgets.QMessageBox.critical(self, "세그먼트 편집기 오류", f"세그먼트 편집기를 여는 중 오류가 발생했습니다:\n{e}")
 
     def update_page_ui(self):
         """(v17 추가) 페이지 전환 및 버튼 상태 업데이트"""
@@ -10453,6 +10473,568 @@ def _inject_render_prefs_methods():
 
 # === 주입을 즉시 실행 (MainWindow 인스턴스 생성 전에!) ===
 _inject_render_prefs_methods()
+
+
+# shorts_ui.py 파일 맨 아래 (main 함수 직전)에 이 클래스 전체를 붙여넣으세요.
+
+class SegmentEditDialog(QtWidgets.QDialog):
+    """
+    [신규] 씬(Scene) 내부의 세그먼트(Frame Segments)를 편집하는 전용 다이얼로그.
+    - 1단계(qwen)로 생성된 키프레임(kf_1.png...)을 직접 보고 수정합니다.
+    - 'prompt_movie' (AI가 생성한 행동 묘사)를 직접 수정합니다.
+    - 'direct_prompt' (AI 요청용)를 입력받습니다.
+    - [요청사항] "영상 삭제" 버튼은 UI만 있고 기능은 비활성화됩니다.
+    """
+    _AI_QUALITY_TAGS = "photorealistic, cinematic lighting, high detail, 8k, masterpiece"
+    _AI_DEFAULT_NEGATIVE_TAGS = "lowres, bad anatomy, bad proportions, extra limbs, extra fingers, missing fingers, jpeg artifacts, signature, logo, nsfw, text, letters, typography, watermark"
+
+    def __init__(self,
+                 scene_id: str,
+                 scene_data: Dict[str, Any],
+                 full_video_data: Dict[str, Any],
+                 json_path: Path,
+                 ai_instance: AI,
+                 parent: Optional[QtWidgets.QWidget] = None):
+
+        super().__init__(parent)
+
+        self.scene_id = scene_id
+        self.scene_data = scene_data  # t_001 씬 객체
+        self.full_video_data = full_video_data  # video.json 전체 (저장용)
+        self.json_path = json_path  # video.json 경로 (저장용)
+        self.ai_instance = ai_instance
+
+        # 이 씬의 세그먼트 목록 (이것이 실제 데이터 소스)
+        self.frame_segments_data: List[Dict[str, Any]] = self.scene_data.get("frame_segments", [])
+
+        # 위젯 매핑용
+        self.widget_map_prompt: List[Tuple[int, QtWidgets.QTextEdit]] = []  # (seg_index, prompt_movie_widget)
+        self.widget_map_direct: List[Tuple[int, QtWidgets.QTextEdit]] = []  # (seg_index, direct_prompt_widget)
+
+        self.THUMBNAIL_SIZE = 150
+
+        self.setWindowTitle(f"세그먼트 수정: [{self.scene_id}]")
+        self.setMinimumSize(900, 700)
+        self.setWindowModality(QtCore.Qt.WindowModality.WindowModal)
+
+        # --- 1. 메인 레이아웃 ---
+        main_layout = QtWidgets.QVBoxLayout(self)
+        main_layout.setSpacing(2)
+
+        # --- 2. 스크롤 영역 (세그먼트 목록) ---
+        page_scroll_area = QtWidgets.QScrollArea()
+        page_scroll_area.setWidgetResizable(True)
+        scroll_content_widget = QtWidgets.QWidget()
+        form_layout_page = QtWidgets.QFormLayout(scroll_content_widget)
+        form_layout_page.setRowWrapPolicy(QtWidgets.QFormLayout.RowWrapPolicy.WrapAllRows)
+        form_layout_page.setLabelAlignment(Qt.AlignmentFlag.AlignRight)
+        form_layout_page.setVerticalSpacing(8)
+        page_scroll_area.setWidget(scroll_content_widget)
+
+        main_layout.addWidget(page_scroll_area)
+
+        # --- 3. 하단 버튼 레이아웃 ---
+        button_layout = QtWidgets.QHBoxLayout()
+        self.btn_ai_request = QtWidgets.QPushButton("AI 요청 (Direct Prompt)")
+        self.btn_update = QtWidgets.QPushButton("업데이트")
+        self.btn_cancel = QtWidgets.QPushButton("닫기")
+        self.btn_ai_request.setToolTip(
+            "오른쪽 'Direct Prompt' 내용을 기반으로\nAI에게 이 씬의 모든 'prompt_movie' 행동 묘사를 새로 요청합니다."
+        )
+        button_layout.addStretch(1)
+        button_layout.addWidget(self.btn_cancel)
+        button_layout.addWidget(self.btn_ai_request)
+        button_layout.addWidget(self.btn_update)
+        main_layout.addLayout(button_layout)
+
+        # --- 4. 시그널 연결 ---
+        self.btn_update.clicked.connect(self.on_update_and_close)
+        self.btn_cancel.clicked.connect(self.reject)
+        self.btn_ai_request.clicked.connect(self.on_ai_request_segment)
+
+        # --- 5. UI 빌드 ---
+        self.load_and_build_segments_ui(form_layout_page)
+
+    def load_and_build_segments_ui(self, form_layout: QtWidgets.QFormLayout):
+        """세그먼트 목록을 UI에 그립니다."""
+        try:
+            base_imgs_dir = self.json_path.parent / "imgs"
+
+            # 폰트
+            font = QtGui.QFont()
+            font.setFamily("Courier" if "Courier" in QtGui.QFontDatabase().families() else "Monospace")
+            font.setPointSize(10)
+
+            if not self.frame_segments_data:
+                form_layout.addRow(QtWidgets.QLabel(f"[{self.scene_id}] 씬에 'frame_segments' 데이터가 없습니다."))
+                return
+
+            # --- 세그먼트 루프 ---
+            for seg_index, segment_data in enumerate(self.frame_segments_data):
+                if not isinstance(segment_data, dict): continue
+
+                # --- 라벨 ---
+                start_f = segment_data.get("start_frame", 0)
+                end_f = segment_data.get("end_frame", 0)
+                keyframe_id = f"kf_{seg_index + 1}"  # kf_0은 원본이므로 kf_1부터 시작
+
+                label_text = (
+                    f"<b>{self.scene_id} / 세그먼트 {seg_index + 1}</b> (키프레임: {keyframe_id}.png) | "
+                    f"<b>프레임:</b> [{start_f} ~ {end_f}]"
+                )
+                label = QtWidgets.QLabel(label_text)
+                label.setWordWrap(False)
+
+                # --- 3단 레이아웃 컨테이너 ---
+                row_container = QtWidgets.QWidget()
+                row_layout = QtWidgets.QHBoxLayout(row_container)
+                row_layout.setContentsMargins(0, 0, 0, 0)
+                row_layout.setSpacing(8)
+
+                # --- 1. (왼쪽) 이미지 + 버튼 3개 ---
+                left_vbox_widget = QtWidgets.QWidget()
+                left_vbox = QtWidgets.QVBoxLayout(left_vbox_widget)
+                left_vbox.setContentsMargins(0, 0, 0, 0)
+                left_vbox.setSpacing(4)
+
+                img_preview_label = ClickableLabel()
+                img_preview_label.setFixedSize(self.THUMBNAIL_SIZE, self.THUMBNAIL_SIZE)
+                img_preview_label.setAlignment(Qt.AlignmentFlag.AlignCenter)
+
+                upload_button = QtWidgets.QPushButton("이미지 변경")
+                upload_button.setFixedSize(self.THUMBNAIL_SIZE, 28)
+                delete_image_button = QtWidgets.QPushButton("이미지 삭제")
+                delete_image_button.setFixedSize(self.THUMBNAIL_SIZE, 28)
+
+                # [요청사항] 영상삭제 버튼은 UI만 만들고 기능 비활성화
+                delete_video_button = QtWidgets.QPushButton("청크 영상삭제 (UI)")
+                delete_video_button.setFixedSize(self.THUMBNAIL_SIZE, 28)
+                delete_video_button.setEnabled(False)
+                delete_video_button.setToolTip("이 버튼은 현재 비활성화되어 있습니다.")
+
+                left_vbox.addWidget(img_preview_label)
+                left_vbox.addWidget(upload_button)
+                left_vbox.addWidget(delete_image_button)
+                left_vbox.addWidget(delete_video_button)
+                left_vbox.addStretch(1)
+                row_layout.addWidget(left_vbox_widget, 0)
+
+                # --- 2. (중간) prompt_movie 텍스트 편집기 ---
+                prompt_movie_edit = QtWidgets.QTextEdit()
+                prompt_movie_edit.setPlainText(segment_data.get("prompt_movie", ""))
+                prompt_movie_edit.setFont(font)
+                prompt_movie_edit.setMinimumHeight(150)
+                prompt_movie_edit.setToolTip(f"[{keyframe_id}] 행동 묘사 프롬프트 (prompt_movie)")
+                prompt_movie_edit.setSizePolicy(QtWidgets.QSizePolicy.Policy.Expanding,
+                                                QtWidgets.QSizePolicy.Policy.Expanding)
+                row_layout.addWidget(prompt_movie_edit, 1)
+
+                # --- 3. (오른쪽) direct_prompt (AI 요청용) 텍스트 편집기 ---
+                direct_prompt_edit = QtWidgets.QTextEdit()
+                direct_prompt_edit.setPlainText(segment_data.get("direct_prompt", ""))  # 세그먼트에도 direct_prompt가 있을 수 있음
+                direct_prompt_edit.setFont(font)
+                direct_prompt_edit.setMinimumHeight(150)
+                direct_prompt_edit.setToolTip(f"[{keyframe_id}] AI 요청 시 사용할 Direct Prompt")
+                direct_prompt_edit.setSizePolicy(QtWidgets.QSizePolicy.Policy.Expanding,
+                                                 QtWidgets.QSizePolicy.Policy.Expanding)
+                row_layout.addWidget(direct_prompt_edit, 1)
+
+                # --- 위젯 매핑 ---
+                self.widget_map_prompt.append((seg_index, prompt_movie_edit))
+                self.widget_map_direct.append((seg_index, direct_prompt_edit))
+
+                # --- 이미지 상태 설정 및 버튼 연결 ---
+                keyframe_path = base_imgs_dir / self.scene_id / f"{keyframe_id}.png"
+                img_file_str = str(keyframe_path)
+                has_image = keyframe_path.exists()
+
+                if has_image:
+                    pixmap = QtGui.QPixmap(img_file_str)
+                    if not pixmap.isNull():
+                        pixmap_scaled = pixmap.scaled(self.THUMBNAIL_SIZE, self.THUMBNAIL_SIZE,
+                                                      Qt.AspectRatioMode.KeepAspectRatio,
+                                                      Qt.TransformationMode.SmoothTransformation)
+                        img_preview_label.setPixmap(pixmap_scaled)
+                        img_preview_label.setToolTip(f"경로: {img_file_str}\n(클릭해서 크게 보기)")
+                        img_preview_label.clicked.connect(functools.partial(self.show_large_image, img_file_str))
+                        upload_button.setText("이미지 변경")
+                        delete_image_button.setEnabled(True)
+                    else:
+                        img_preview_label.setText("[파일\n오류]")
+                        img_preview_label.setStyleSheet("border: 1px solid red; color: red;")
+                        upload_button.setText("다시 업로드")
+                        delete_image_button.setEnabled(True)
+                else:
+                    img_preview_label.setText("[이미지\n없음]")
+                    img_preview_label.setToolTip(f"경로: {img_file_str}\n(파일이 존재하지 않습니다)")
+                    img_preview_label.setStyleSheet("border: 1px dashed gray; color: gray;")
+                    upload_button.setText("업로드")
+                    delete_image_button.setEnabled(False)
+
+                # [기능 연결]
+                upload_button.clicked.connect(
+                    functools.partial(self.on_upload_segment_image, seg_index, keyframe_path, img_preview_label,
+                                      upload_button, delete_image_button)
+                )
+                delete_image_button.clicked.connect(
+                    functools.partial(self.on_delete_segment_image, seg_index, keyframe_path, img_preview_label,
+                                      upload_button, delete_image_button)
+                )
+
+                form_layout.addRow(label, row_container)
+
+        except Exception as e_load_ui:
+            form_layout.addRow(QtWidgets.QLabel(f"UI 빌드 중 오류 발생:\n{e_load_ui}\n\n{traceback.format_exc()}"))
+            self.btn_update.setEnabled(False)
+            self.btn_ai_request.setEnabled(False)
+
+    def on_upload_segment_image(self, seg_index: int, target_path: Path,
+                                preview_label: ClickableLabel, upload_button: QtWidgets.QPushButton,
+                                delete_button: QtWidgets.QPushButton):
+        """[신규] 세그먼트 키프레임 이미지 업로드"""
+        src_path_str, _ = QtWidgets.QFileDialog.getOpenFileName(
+            self, f"'{self.scene_id}' 세그먼트 {seg_index + 1} 이미지 선택", str(target_path.parent),
+            "Images (*.png *.jpg *.jpeg *.webp)"
+        )
+        if not src_path_str: return
+
+        try:
+            target_path.parent.mkdir(parents=True, exist_ok=True)
+            shutil.copy2(str(src_path_str), str(target_path))
+        except Exception as e_copy:
+            QtWidgets.QMessageBox.warning(self, "업로드 오류", f"파일 복사 중 오류가 발생했습니다:\n{e_copy}")
+            return
+
+        target_path_str = str(target_path)
+        pixmap = QtGui.QPixmap(target_path_str)
+        if not pixmap.isNull():
+            pixmap_scaled = pixmap.scaled(self.THUMBNAIL_SIZE, self.THUMBNAIL_SIZE, Qt.AspectRatioMode.KeepAspectRatio,
+                                          Qt.TransformationMode.SmoothTransformation)
+            preview_label.setPixmap(pixmap_scaled)
+            preview_label.setText("")
+            preview_label.setToolTip(f"경로: {target_path_str}\n(클릭해서 크게 보기)")
+            upload_button.setText("이미지 변경")
+            delete_button.setEnabled(True)
+
+            try:
+                preview_label.clicked.disconnect()
+            except (TypeError, RuntimeError):
+                pass
+            preview_label.clicked.connect(lambda: self.show_large_image(target_path_str))
+        else:
+            preview_label.setText("[파일\n오류]")
+            preview_label.setToolTip(f"경로: {target_path_str}\n(파일을 읽을 수 없음)")
+            upload_button.setText("다시 업로드")
+            delete_button.setEnabled(False)
+
+    def on_delete_segment_image(self, seg_index: int, image_path: Path,
+                                preview_label: ClickableLabel, upload_button: QtWidgets.QPushButton,
+                                delete_button: QtWidgets.QPushButton):
+        """[신규] 세그먼트 키프레임 이미지 삭제"""
+        if not image_path.exists():
+            QtWidgets.QMessageBox.warning(self, "오류", "파일이 이미 존재하지 않습니다.")
+
+        reply = QtWidgets.QMessageBox.question(
+            self, "이미지 삭제 확인", f"정말로 이 세그먼트의 키프레임 이미지를 삭제하시겠습니까?\n\n{image_path.name}",
+            QtWidgets.QMessageBox.Yes | QtWidgets.QMessageBox.No, QtWidgets.QMessageBox.No
+        )
+        if reply != QtWidgets.QMessageBox.Yes: return
+
+        try:
+            if image_path.exists(): image_path.unlink()
+            QtWidgets.QMessageBox.information(self, "삭제 완료", f"파일을 삭제했습니다:\n{image_path.name}")
+
+            preview_label.setPixmap(QtGui.QPixmap())
+            preview_label.setText("[이미지\n없음]")
+            preview_label.setToolTip(f"파일이 삭제되었습니다. (경로: {image_path})")
+            preview_label.setStyleSheet("border: 1px dashed gray; color: gray;")
+            try:
+                preview_label.clicked.disconnect()
+            except (TypeError, RuntimeError):
+                pass
+            upload_button.setText("업로드")
+            delete_button.setEnabled(False)
+        except FileNotFoundError:
+            QtWidgets.QMessageBox.warning(self, "오류", "파일이 이미 존재하지 않았습니다.")
+            delete_button.setEnabled(False)
+        except (OSError, Exception) as e_delete:
+            QtWidgets.QMessageBox.critical(self, "삭제 실패", f"파일 삭제 중 오류가 발생했습니다:\n{e_delete}")
+
+
+    def on_update_and_close(self):
+        """
+        [수정됨] '업데이트' 버튼. 수정한 prompt_movie와 direct_prompt를 video.json에 저장
+        (창을 닫지 않습니다.)
+        """
+        try:
+            # 1. prompt_movie 업데이트
+            updated_prompts = 0
+            for seg_index, text_edit in self.widget_map_prompt:
+                if seg_index < len(self.frame_segments_data):
+                    new_prompt = text_edit.toPlainText().strip()
+                    segment = self.frame_segments_data[seg_index]
+                    if segment.get("prompt_movie", "") != new_prompt:
+                        segment["prompt_movie"] = new_prompt
+                        updated_prompts += 1
+
+            # 2. direct_prompt 업데이트
+            updated_direct = 0
+            for seg_index, text_edit in self.widget_map_direct:
+                if seg_index < len(self.frame_segments_data):
+                    new_prompt = text_edit.toPlainText().strip()
+                    segment = self.frame_segments_data[seg_index]
+                    if segment.get("direct_prompt", "") != new_prompt:
+                        segment["direct_prompt"] = new_prompt
+                        updated_direct += 1
+
+            # 3. 씬 데이터에 세그먼트 목록 다시 쓰기
+            self.scene_data["frame_segments"] = self.frame_segments_data
+
+            # 4. full_video_data에서 씬 찾아서 교체
+            scene_list = self.full_video_data.get("scenes", [])
+            for i, scene in enumerate(scene_list):
+                if isinstance(scene, dict) and scene.get("id") == self.scene_id:
+                    scene_list[i] = self.scene_data  # 수정된 씬 객체로 교체
+                    break
+            self.full_video_data["scenes"] = scene_list
+
+            # 5. 파일 저장
+            save_json(self.json_path, self.full_video_data)
+
+            QtWidgets.QMessageBox.information(self, "업데이트 완료",
+                                              f"[{self.scene_id}] 씬의 세그먼트가 저장되었습니다:\n\n"
+                                              f"- 행동 묘사(prompt_movie) {updated_prompts}개 업데이트됨\n"
+                                              f"- Direct Prompt {updated_direct}개 업데이트됨\n\n"
+                                              f"(창은 닫히지 않았습니다. '닫기' 버튼으로 종료하세요.)")
+
+            # self.accept() # <-- [핵심 수정] 이 줄을 삭제/주석 처리하여 창이 닫히지 않게 함
+
+        except Exception as e_update:
+            QtWidgets.QMessageBox.critical(self, "저장 오류", f"파일을 저장하는 중 오류가 발생했습니다:\n{e_update}")
+
+    # shorts_ui.py의 SegmentEditDialog 클래스 내부
+    # on_ai_request_segment 함수를 이 코드로 덮어쓰세요.
+
+    def on_ai_request_segment(self):
+            """[신규] 세그먼트 수정 창의 'AI 요청' 버튼"""
+
+            # --- [수정] save_json 임포트 ---
+            try:
+                from app.utils import load_json, save_json, run_job_with_progress_async
+            except ImportError:
+                from utils import load_json, save_json, run_job_with_progress_async  # type: ignore
+            # --- [수정] 끝 ---
+
+            # 1. Direct Prompt 읽기 (하나라도 있어야 함)
+            direct_prompts_to_process: List[Tuple[int, str]] = []
+            for seg_index, text_edit_widget in self.widget_map_direct:
+                direct_prompt_text = text_edit_widget.toPlainText().strip()
+                if direct_prompt_text:
+                    direct_prompts_to_process.append((seg_index, direct_prompt_text))
+
+            if not direct_prompts_to_process:
+                QtWidgets.QMessageBox.information(self, "알림", "AI로 요청할 'Direct Prompt' 내용이 없습니다.")
+                return
+
+            # (FPS 수정은 ScenePromptEditDialog에서만 하므로 여기서는 제외)
+
+            # 2. 원본 분위기 (project.json) 로드
+            original_vibe_prompt = ""
+            try:
+                pj_path = self.json_path.parent / "project.json"
+                if pj_path.exists():
+                    pj_doc = load_json(pj_path, {}) or {}
+                    if isinstance(pj_doc, dict):
+                        original_vibe_prompt = pj_doc.get("prompt_user") or pj_doc.get("prompt", "")
+            except Exception as e_load_pj:
+                print(f"[JSON Edit] project.json 로드 실패: {e_load_pj}")
+
+            # 3. 다음 씬 가사 찾기
+            next_scene_lyric = "(Scene End)"
+            scene_list = self.full_video_data.get("scenes", [])
+            current_index = -1
+            for idx, s in enumerate(scene_list):
+                if isinstance(s, dict) and s.get("id") == self.scene_id:
+                    current_index = idx
+                    break
+            if current_index != -1 and current_index + 1 < len(scene_list):
+                next_sc = scene_list[current_index + 1]
+                if isinstance(next_sc, dict):
+                    next_scene_lyric = next_sc.get("lyric", "") or "(Next scene has no lyric)"
+
+            # 4. 버튼 잠그기
+            self.btn_ai_request.setEnabled(False)
+            self.btn_update.setEnabled(False)
+            self.btn_cancel.setEnabled(False)
+
+            # 5. Job 정의
+            def job(progress_callback):
+                _log = lambda msg: progress_callback({"msg": msg})
+                _log(f"[{self.scene_id}] 씬의 {len(direct_prompts_to_process)}개 세그먼트에 대해 AI 요청...")
+
+                # [수정된 AI 시스템 프롬프트 (뮤직비디오 감독)]
+                base_system_prompt = (
+                    "You are a creative Music Video Director.\n"
+                    "Your most important goal is to create **dynamic character action** that matches the **lyrics**. Avoid static, mannequin-like images.\n\n"
+                    "[Context Provided]\n"
+                    "1. `original_vibe`: The overall theme of the entire song.\n"
+                    "2. `scene_lyric`: The lyric for THIS scene (THIS IS THE MOST IMPORTANT).\n"
+                    "3. `base_visual` (direct_prompt): The user's core visual idea for THIS segment.\n"
+                    "4. `characters`: The characters in THIS scene.\n"
+                    "5. `time_structure`: The frame segment for THIS segment (e.g., \"0-65f\").\n"
+                    "6. `next_scene_lyric`: The lyric for the *next* scene (for transition context).\n\n"
+                    "Your task is to return a JSON object ONLY: {\"segment_prompt\": \"...\"}.\n"
+                    "The value must be a single string (NOT an array).\n\n"
+                    "[!! CRITICAL RULES !!]\n"
+                    "1.  **New Action (Most Important):** Based on the `scene_lyric` and `base_visual`, describe a specific, creative **new pose and action** for the `characters`.\n"
+                    "    (Examples: \"female_01 starts walking down the autumn path\", \"female_01 stops and picks up an autumn leaf, smiling\").\n"
+                    "2.  **Camera:** Include dynamic camera work (e.g., \"close up on her face\", \"camera rotates around her\").\n"
+                    "3.  **Emotion:** Describe the character's expression (e.g., \"smiling happily\").\n"
+                    "4.  **Prohibition:** NO \"mannequins\"."
+                )
+
+                updated_count = 0
+
+                # 6. [수정] 세그먼트 루프 (Direct Prompt가 있는 것만)
+                for seg_index, dp_text in direct_prompts_to_process:
+                    if seg_index >= len(self.frame_segments_data): continue
+
+                    segment_data = self.frame_segments_data[seg_index]
+                    scene_id = self.scene_id
+                    seg_label = f"{scene_id} (Seg {seg_index + 1})"
+
+                    frame_range_info = f"{segment_data.get('start_frame')}-{segment_data.get('end_frame')}f"
+
+                    _log(f"[{seg_label}] AI 요청 중... (Direct Prompt: {dp_text[:30]}...)")
+
+                    user_prompt_payload = {
+                        "original_vibe": original_vibe_prompt,
+                        "scene_lyric": self.scene_data.get("lyric", ""),  # 씬 전체 가사
+                        "base_visual": dp_text,  # 세그먼트의 Direct Prompt
+                        "characters": self.scene_data.get("characters", []),
+                        "time_structure": frame_range_info,  # 세그먼트 1개의 시간
+                        "next_scene_lyric": next_scene_lyric
+                    }
+                    user_prompt = json.dumps(user_prompt_payload, ensure_ascii=False)
+
+                    try:
+                        ai_raw = self.ai_instance.ask_smart(
+                            base_system_prompt, user_prompt,
+                            prefer="gemini", allow_fallback=True,
+                        )
+                        json_start = ai_raw.find("{")
+                        json_end = ai_raw.rfind("}") + 1
+                        if not (0 <= json_start < json_end):
+                            _log(f"[{seg_label}] AI가 JSON을 반환하지 않았습니다.")
+                            continue
+
+                        ai_json = json.loads(ai_raw[json_start:json_end])
+                        new_prompt_movie = (ai_json.get(
+                            "segment_prompt") or "").strip()  # "segment_prompts" (배열) -> "segment_prompt" (문자열)
+
+                        if new_prompt_movie:
+                            # [수정] 메모리(self.frame_segments_data)에 즉시 반영
+                            segment_data["prompt_movie"] = new_prompt_movie
+                            updated_count += 1
+                            _log(f"[{seg_label}] AI 행동 묘사 갱신 완료.")
+                        else:
+                            _log(f"[{seg_label}] AI가 'segment_prompt'를 반환하지 않았습니다.")
+
+                    except Exception as e_ai:
+                        _log(f"[{seg_label}] AI 호출 실패: {e_ai}")
+                        continue
+
+                # --- ▼▼▼ [핵심 수정] AI 작업 완료 후 즉시 저장 로직 추가 ▼▼▼ ---
+                if updated_count > 0:
+                    _log(f"AI가 갱신한 {updated_count}개 내용을 video.json에 저장합니다...")
+                    try:
+                        # 1. 씬 데이터에 세그먼트 목록 다시 쓰기
+                        self.scene_data["frame_segments"] = self.frame_segments_data
+
+                        # 2. full_video_data에서 씬 찾아서 교체
+                        scene_list_local = self.full_video_data.get("scenes", [])
+                        for i, scene_local in enumerate(scene_list_local):
+                            if isinstance(scene_local, dict) and scene_local.get("id") == self.scene_id:
+                                scene_list_local[i] = self.scene_data  # 수정된 씬 객체로 교체
+                                break
+                        self.full_video_data["scenes"] = scene_list_local
+
+                        # 3. 파일 저장
+                        save_json(self.json_path, self.full_video_data)
+                        _log("저장 완료.")
+
+                    except Exception as e_save:
+                        _log(f"[ERROR] AI 요청 후 저장 실패: {e_save}")
+                # --- ▲▲▲ [수정 끝] ▲▲▲ ---
+
+                return {"updated_count": updated_count}
+
+            # 7. Done 콜백
+            def done(ok, payload, err):
+                self.btn_ai_request.setEnabled(True)
+                self.btn_update.setEnabled(True)
+                self.btn_cancel.setEnabled(True)
+
+                if not ok:
+                    QtWidgets.QMessageBox.critical(self, "AI 요청 실패", f"작업 중 오류가 발생했습니다:\n{err}")
+                    return
+
+                count = (payload or {}).get("updated_count", 0)
+                if count > 0:
+                    # AI가 갱신한 데이터를 UI 텍스트 상자에 다시 로드
+                    self.reload_prompts_from_data()
+                    QtWidgets.QMessageBox.information(self, "AI 요청 완료",
+                                                      f"총 {count}개 세그먼트의 'prompt_movie'를 갱신하고 파일에 즉시 저장했습니다.")
+                else:
+                    QtWidgets.QMessageBox.warning(self, "AI 요청", "AI가 갱신한 내용이 없습니다.")
+
+            run_job_with_progress_async(
+                owner=self,
+                title=f"AI 세그먼트 프롬프트 생성 중 ({self.scene_id})",
+                job=job,
+                on_done=done,
+            )
+
+    def reload_prompts_from_data(self):
+        """[신규] AI 작업 후, self.frame_segments_data의 최신 'prompt_movie' 값을 UI에 다시 로드"""
+        for seg_index, text_edit in self.widget_map_prompt:
+            if seg_index < len(self.frame_segments_data):
+                new_prompt = self.frame_segments_data[seg_index].get("prompt_movie", "")
+                text_edit.setPlainText(new_prompt)
+
+    # (show_large_image는 ScenePromptEditDialog의 것을 그대로 사용)
+    def show_large_image(self, path_str: str):
+        """썸네일 클릭 시 800x800 박스에 맞게 이미지 표시"""
+        if not path_str:
+            QtWidgets.QMessageBox.information(self, "미리보기", "이 씬에는 이미지 경로가 지정되지 않았습니다.")
+            return
+
+        pixmap = QtGui.QPixmap(path_str)
+        if pixmap.isNull():
+            QtWidgets.QMessageBox.warning(self, "미리보기 오류", f"이미지를 불러올 수 없습니다:\n{path_str}")
+            return
+
+        dialog = QtWidgets.QDialog(self)
+        dialog.setWindowTitle(f"이미지 미리보기: {Path(path_str).name}")
+        label = QtWidgets.QLabel()
+        max_preview_w, max_preview_h = 800, 800
+        img_w, img_h = pixmap.width(), pixmap.height()
+
+        if img_w > max_preview_w or img_h > max_preview_h:
+            scaled_pixmap = pixmap.scaled(
+                max_preview_w, max_preview_h,
+                Qt.AspectRatioMode.KeepAspectRatio,
+                Qt.TransformationMode.SmoothTransformation
+            )
+            label.setPixmap(scaled_pixmap)
+            dialog.resize(scaled_pixmap.width() + 20, scaled_pixmap.height() + 20)
+        else:
+            label.setPixmap(pixmap)
+            dialog.resize(img_w + 20, img_h + 20)
+
+        layout = QtWidgets.QVBoxLayout(dialog)
+        layout.addWidget(label)
+        dialog.exec_()
 
 # ───────────────────────────── 실행 진입점 ─────────────────────────────
 

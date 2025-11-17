@@ -4575,7 +4575,7 @@ def fill_prompt_movie_with_ai(
     """
     [수정됨]
     AI의 역할을 '뮤직비디오 감독'으로 명시하고, '가사'를 기반으로
-    '캐릭터의 새로운 행동/포즈/표정' 및 '카메라 워크'를 생성하도록 시스템 프롬프트를 수정.
+    '캐릭터의 새로운 행동/포즈/표정' 및 '카메라 워크'가 포함된 '장면 묘사'를 생성하도록 수정.
     """
     # 안전 로드/세이브
     try:
@@ -4616,13 +4616,14 @@ def fill_prompt_movie_with_ai(
         _log("[fill_prompt_movie_with_ai] video.json 형식 오류")
         return
 
-    # --- 1. 원본 분위기 (project.json) 로드 (기존과 동일) ---
+    # --- ▼▼▼ [신규] 1. 원본 분위기 (project.json) 로드 ▼▼▼ ---
     pj_path = pdir / "project.json"
     original_vibe_prompt = ""
     if pj_path.exists():
         pj_doc = load_json(pj_path, {}) or {}
         if isinstance(pj_doc, dict):
             original_vibe_prompt = pj_doc.get("prompt_user") or pj_doc.get("prompt", "")
+    # --- ▲▲▲ [신규] 끝 ▲▲▲ ---
 
     # ── 2) FPS 확정 (기존과 동일) ─────────────────────────────
     defaults_map: Dict[str, Any] = vdoc.get("defaults") or {}
@@ -4638,6 +4639,7 @@ def fill_prompt_movie_with_ai(
             except (TypeError, ValueError):
                 continue
 
+    # (FPS 동기화 로직 - 기존과 동일)
     vdoc.setdefault("fps", fps)
     vdoc.setdefault("defaults", {})
     vdoc["defaults"].setdefault("movie", {})["target_fps"] = fps
@@ -4645,13 +4647,14 @@ def fill_prompt_movie_with_ai(
     vdoc["defaults"]["movie"]["fps"] = fps
     vdoc["defaults"].setdefault("image", {})["fps"] = fps
 
+    # (Chunk/Overlap 값 읽기 - 기존과 동일)
     try:
         base_chunk_val = int(movie_def.get("base_chunk", 60))
         overlap_val = int(movie_def.get("overlap", 12))
     except Exception:
         base_chunk_val, overlap_val = 60, 12
 
-    # ── 3) 씬 루프 (기존과 동일) ──────────────────────────────────
+    # ── 3) 씬 루프 (구조 변경) ──────────────────────────────────
     scenes = vdoc.get("scenes") or []
     if not isinstance(scenes, list):
         _log("[fill_prompt_movie_with_ai] scenes 없음")
@@ -4660,19 +4663,18 @@ def fill_prompt_movie_with_ai(
 
     changed = False
 
-    # --- ▼▼▼ [수정된 AI 시스템 프롬프트 (사장님 지시 반영)] ▼▼▼ ---
+    # --- ▼▼▼ [수정된 AI 시스템 프롬프트 (뮤직비디오 감독)] ▼▼▼ ---
     system_msg = (
         "You are a creative Music Video Director.\n"
         "Your most important goal is to create **dynamic character action** that matches the **lyrics**. Avoid static, mannequin-like images.\n\n"
         "[Context Provided]\n"
-        "1. `original_vibe`: The overall theme of the entire song.\n"
-        "2. `scene_lyric`: The lyric for THIS scene (THIS IS THE MOST IMPORTANT).\n"
+        "1. `original_vibe`: The overall theme of the entire song (e.g., 'sadness', 'joy').\n"
+        "2. `scene_lyric`: The specific lyric for THIS scene (THIS IS THE MOST IMPORTANT).\n"
         "3. `base_visual`: The background/setting description (use this for the SETTING only, but you can change it creatively).\n"
         "4. `characters`: The characters in THIS scene (e.g., 'female_01').\n"
         "5. `time_structure`: The frame segments for THIS scene (e.g., [\"0-65f\", \"49-125f\"]).\n"
         "6. `next_scene_lyric`: The lyric for the *next* scene (for transition context).\n\n"
-        "[Your Task (Return JSON ONLY)]\n"
-        "{\"segment_prompts\": [\"prompt 1\", \"prompt 2\", ...]}.\n"
+        "Your task is to return a JSON object ONLY: {\"segment_prompts\": [\"prompt 1\", \"prompt 2\", ...]}.\n"
         "The array length MUST exactly match the `time_structure` list length.\n\n"
         "[!! CRITICAL RULES !!]\n"
         "1.  **New Action (Most Important):** Based on the `scene_lyric` and `original_vibe`, you MUST describe a specific, creative **new pose and action** for the `characters` in *each* segment.\n"
@@ -4691,7 +4693,7 @@ def fill_prompt_movie_with_ai(
 
         scene_id = sc.get("id", "unknown")
 
-        # (프레임 계산, 세그먼트 생성 ... 기존과 동일)
+        # 1. 총 프레임 계산 (기존과 동일)
         try:
             dur = float(sc.get("duration") or 0.0)
         except (TypeError, ValueError):
@@ -4699,6 +4701,7 @@ def fill_prompt_movie_with_ai(
         total_frames = int(round(dur * fps)) if dur > 0 else 0
         if total_frames <= 0: continue
 
+        # 2. frame_segments 생성 (기존과 동일)
         segs = sc.get("frame_segments")
         if not isinstance(segs, list) or not segs:
             pairs_tuples = plan_segments(total_frames, base_chunk=base_chunk_val, overlap=overlap_val)
@@ -4707,14 +4710,15 @@ def fill_prompt_movie_with_ai(
                 segs_out.append({"start_frame": int(s_f), "end_frame": int(e_f), "prompt_movie": ""})
             sc["frame_segments"] = segs_out
             segs = segs_out
-            changed = True
+            changed = True  # 세그먼트가 생성되었으므로 'changed'
 
+        # 3. 비어있는 프롬프트가 있는지 확인 (기존과 동일)
         prompts_list = [seg.get("prompt_movie", "") for seg in segs]
         if all(prompts_list):
             _log(f"[{scene_id}] 모든 세그먼트 프롬프트(묘사)가 이미 존재합니다. (AI 호출 스킵)")
             continue
 
-        # (AI 호출을 위한 6가지 문맥 수집 ... 기존과 동일)
+        # 4. AI 호출을 위한 데이터 수집 (기존과 동일)
         base_visual = ""
         for key in ("direct_prompt", "prompt", "prompt_img", "prompt_movie"):
             val = sc.get(key)
@@ -4724,20 +4728,24 @@ def fill_prompt_movie_with_ai(
 
         scene_lyric = sc.get("lyric", "")
 
-        if not base_visual and not scene_lyric:
+        if not base_visual and not scene_lyric:  # 둘 다 없으면 스킵
             _log(f"[{scene_id}] 참조 텍스트(prompt/lyric)가 없어 AI 호출을 건너뜁니다.")
             continue
 
+        # --- ▼▼▼ [신규] 5. '다음 씬 가사' 찾기 ▼▼▼ ---
         next_scene_lyric = "(Scene End)"
         if i + 1 < len(scenes):
             next_sc = scenes[i + 1]
             if isinstance(next_sc, dict):
                 next_scene_lyric = next_sc.get("lyric", "") or "(Next scene has no lyric)"
+        # --- ▲▲▲ [신규] 끝 ▲▲▲ ---
 
+        # 6. AI 호출 (씬당 1회)
         _log(f"[{scene_id}] {len(segs)}개 세그먼트 프롬프트(묘사) AI 요청 중...")
 
         frame_ranges_info = [f"{s.get('start_frame')}-{s.get('end_frame')}f" for s in segs]
 
+        # --- ▼▼▼ [수정] AI에게 전달할 문맥 6가지로 확장 ▼▼▼ ---
         user_prompt_payload = {
             "original_vibe": original_vibe_prompt,
             "scene_lyric": scene_lyric,
@@ -4747,11 +4755,12 @@ def fill_prompt_movie_with_ai(
             "next_scene_lyric": next_scene_lyric
         }
         user_msg = json.dumps(user_prompt_payload, ensure_ascii=False)
+        # --- ▲▲▲ [수정] 끝 ▲▲▲ ---
 
         try:
             ai_raw_response = ask(system_msg, user_msg)
 
-            # (AI 응답 파싱 - 기존과 동일)
+            # (AI 응답 파싱)
             json_start = ai_raw_response.find("{")
             json_end = ai_raw_response.rfind("}") + 1
             if not (0 <= json_start < json_end):
