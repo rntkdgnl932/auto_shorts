@@ -517,92 +517,8 @@ def build_shots_with_i2v(
             # 콜백이 깨져도 전체는 계속
             pass
 
-    # ── ffprobe 프레임수 ───────────────────────────────────────
-    def _probe_nb_frames_ffprobe(ffprobe_exe_local: str, src_path_local: Path) -> int:
-        cmd_probe = [
-            ffprobe_exe_local,
-            "-v", "error",
-            "-select_streams", "v:0",
-            "-count_frames",
-            "-show_entries", "stream=nb_read_frames",
-            "-of", "default=nokey=1:noprint_wrappers=1",
-            str(src_path_local),
-        ]
-        proc_probe = subprocess.run(
-            cmd_probe,
-            stdout=subprocess.PIPE,
-            stderr=subprocess.STDOUT,
-            text=True,
-            encoding="utf-8",
-            errors="ignore",
-            check=False,
-        )
-        if proc_probe.returncode != 0:
-            return 0
-        try:
-            return int((proc_probe.stdout or "0").strip() or "0")
-        except ValueError:
-            return 0
 
-    # ── 트림 ──────────────────────────────────────────────────
-    def _trim_to_frames(
-            ffmpeg_exe_local: str,
-            ffprobe_exe_local: str,
-            src_local: Path,
-            dst_local: Path,
-            target_frames: int,
-            fps_val: int
-    ) -> bool:
-        if target_frames <= 0:
-            return False
-        tmp_out_local = dst_local.with_suffix(".tmp.mp4")
-        if tmp_out_local.exists():
-            try:
-                tmp_out_local.unlink()
-            except OSError:
-                pass
-        trim_cmd = [
-            ffmpeg_exe_local, "-y",
-            "-fflags", "+genpts",
-            "-i", str(src_local),
-            "-vf", "trim=end_frame={0},setpts=PTS-STARTPTS".format(int(target_frames)),
-            "-r", str(int(max(1, fps_val))),
-            "-fps_mode", "cfr",
-            "-vsync", "cfr",
-            "-map_metadata", "-1",
-            "-metadata", "title=",
-            "-sn",
-            "-c:v", "libx264", "-crf", "18",
-            "-pix_fmt", "yuv420p",
-            str(tmp_out_local),
-        ]
-        trim_proc = subprocess.run(
-            trim_cmd,
-            stdout=subprocess.PIPE,
-            stderr=subprocess.STDOUT,
-            text=True,
-            encoding="utf-8",
-            errors="ignore",
-            check=False,
-        )
-        if trim_proc.returncode != 0:
-            _notify("[TRIM] ffmpeg 트림 실패")
-            if tmp_out_local.exists():
-                try:
-                    tmp_out_local.unlink()
-                except OSError:
-                    pass
-            return False
-        got_frames = _probe_nb_frames_ffprobe(ffprobe_exe_local, tmp_out_local)
-        if got_frames != int(target_frames):
-            _notify("[TRIM] 프레임 불일치: 기대 {0}f vs 실제 {1}f".format(target_frames, got_frames))
-        try:
-            if dst_local.exists():
-                dst_local.unlink()
-        except OSError:
-            pass
-        tmp_out_local.rename(dst_local)
-        return True
+
 
     # ── concat(겹침 덮어쓰기) ─────────────────────────────────
     def _concat_cut_no_fade(
@@ -4802,11 +4718,105 @@ def fill_prompt_movie_with_ai(
         _log("[fill_prompt_movie_with_ai] 변경 없음 (또는 FPS 동기화만 수행)")
 
 
+# video_build.py (파일 상단, import 구역 바로 뒤에 붙여넣으세요)
+
+def _probe_nb_frames_ffprobe(ffprobe_exe_local: str, src_path_local: Path) -> int:
+    """[신규-전역] ffprobe로 비디오의 총 프레임 수를 읽어옵니다."""
+
+    cmd_probe = [
+        ffprobe_exe_local,
+        "-v", "error",
+        "-select_streams", "v:0",
+        "-count_frames",
+        "-show_entries", "stream=nb_read_frames",
+        "-of", "default=nokey=1:noprint_wrappers=1",
+        str(src_path_local),
+    ]
+    proc_probe = subprocess.run(
+        cmd_probe,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.STDOUT,
+        text=True,
+        encoding="utf-8",
+        errors="ignore",
+        check=False,
+    )
+    if proc_probe.returncode != 0:
+        return 0
+    try:
+        return int((proc_probe.stdout or "0").strip() or "0")
+    except ValueError:
+        return 0
 
 
+def _trim_to_frames(
+        ffmpeg_exe_local: str,
+        ffprobe_exe_local: str,
+        src_local: Path,
+        dst_local: Path,
+        target_frames: int,
+        fps_val: int,
+        on_progress: "Optional[Callable[[Dict[str, Any]], None]]" = None,
+) -> bool:
+    """[신규-전역] 비디오를 target_frames 길이로 정확히 잘라냅니다."""
 
+    def _notify(notify_msg: str) -> None:
+        if on_progress is None: return
+        try:
+            on_progress({"msg": "[TRIM] " + notify_msg})
+        except Exception:
+            pass
 
-
+    if target_frames <= 0:
+        return False
+    tmp_out_local = dst_local.with_suffix(".tmp.mp4")
+    if tmp_out_local.exists():
+        try:
+            tmp_out_local.unlink()
+        except OSError:
+            pass
+    trim_cmd = [
+        ffmpeg_exe_local, "-y",
+        "-fflags", "+genpts",
+        "-i", str(src_local),
+        "-vf", "trim=end_frame={0},setpts=PTS-STARTPTS".format(int(target_frames)),
+        "-r", str(int(max(1, fps_val))),
+        "-fps_mode", "cfr",
+        "-vsync", "cfr",
+        "-map_metadata", "-1",
+        "-metadata", "title=",
+        "-sn",
+        "-c:v", "libx264", "-crf", "18",
+        "-pix_fmt", "yuv420p",
+        str(tmp_out_local),
+    ]
+    trim_proc = subprocess.run(
+        trim_cmd,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.STDOUT,
+        text=True,
+        encoding="utf-8",
+        errors="ignore",
+        check=False,
+    )
+    if trim_proc.returncode != 0:
+        _notify(f"ffmpeg 트림 실패: {trim_proc.stdout}")
+        if tmp_out_local.exists():
+            try:
+                tmp_out_local.unlink()
+            except OSError:
+                pass
+        return False
+    got_frames = _probe_nb_frames_ffprobe(ffprobe_exe_local, tmp_out_local)
+    if got_frames != int(target_frames):
+        _notify("프레임 불일치: 기대 {0}f vs 실제 {1}f".format(target_frames, got_frames))
+    try:
+        if dst_local.exists():
+            dst_local.unlink()
+    except OSError:
+        pass
+    tmp_out_local.rename(dst_local)
+    return True
 
 
 
