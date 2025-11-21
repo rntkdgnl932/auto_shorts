@@ -76,6 +76,12 @@ JSONS_DIR.mkdir(parents=True, exist_ok=True)
 ACE_STEP_PROMPT_JSON: Path = JSONS_DIR / "ace_step_1_t2m.json"  # 음악 생성 프롬프트 JSON
 I2V_WORKFLOW:         Path = JSONS_DIR / "guff_movie.json"         # i2v 워크플로 JSON
 
+# Wan / SeedVR2 보간용 세그먼트 최대 프레임 수 (메모리 안전 상한)
+# - 0 또는 음수면 "제한 없음"
+# - 기본값 48 (너무 빡세면 40, 더 여유 있으면 56 등으로 조절 가능)
+WAN_MAX_FRAMES_PER_SEGMENT: int = int(os.environ.get("WAN_MAX_FRAMES_PER_SEGMENT", "500"))
+
+
 # 오디오/비디오 저장 관련
 # - AUDIO_SAVE_FORMAT 은 "wav"|"mp3"|"opus" 중 하나
 AUDIO_SAVE_FORMAT: str = os.environ.get("AUDIO_SAVE_FORMAT", "mp3").lower()

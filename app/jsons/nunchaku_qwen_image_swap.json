@@ -121,7 +121,9 @@
   "13": {
     "inputs": {
       "model_name": "nunchaku\\svdq-fp4_r128-qwen-image-lightningv1.1-8steps.safetensors",
-      "cpu_offload": "auto"
+      "cpu_offload": "auto",
+      "num_blocks_on_gpu": 1,
+      "use_pin_memory": "disable"
     },
     "class_type": "NunchakuQwenImageDiTLoader",
     "_meta": {
@@ -295,26 +297,10 @@
       "title": "ReActor 🌌 Fast Face Swap_0"
     }
   },
-  "29": {
-    "inputs": {
-      "upscale_model": [
-        "32",
-        0
-      ],
-      "image": [
-        "28",
-        0
-      ]
-    },
-    "class_type": "ImageUpscaleWithModel",
-    "_meta": {
-      "title": "모델을 사용한 이미지 확대"
-    }
-  },
   "30": {
     "inputs": {
       "images": [
-        "33",
+        "28",
         0
       ]
     },
@@ -323,36 +309,11 @@
       "title": "이미지 미리보기"
     }
   },
-  "32": {
-    "inputs": {
-      "model_name": "RealESRGAN_x4plus.pth"
-    },
-    "class_type": "UpscaleModelLoader",
-    "_meta": {
-      "title": "Upscaler"
-    }
-  },
-  "33": {
-    "inputs": {
-      "upscale_method": "bicubic",
-      "width": 0,
-      "height": 0,
-      "crop": "center",
-      "image": [
-        "29",
-        0
-      ]
-    },
-    "class_type": "ImageScale",
-    "_meta": {
-      "title": "이미지 확대"
-    }
-  },
   "35": {
     "inputs": {
       "filename_prefix": "t_01",
       "images": [
-        "33",
+        "28",
         0
       ]
     },

@@ -44,6 +44,16 @@ except Exception:
         def normalize_to_v11(story: dict) -> dict:  # type: ignore
             return story
 # shorts_ui.py (상단 import 구역 추가)
+try:
+    from app.utils import load_json, run_job_with_progress_async
+    from app.audio_sync import _submit_and_wait as _submit_and_wait_comfy
+    from app.video_build import concatenate_scene_clips, _trim_to_frames
+    from app.settings import COMFY_HOST, JSONS_DIR, COMFY_INPUT_DIR, FFMPEG_EXE, FFPROBE_EXE, WAN_MAX_FRAMES_PER_SEGMENT
+except ImportError:
+    from utils import load_json, run_job_with_progress_async  # type: ignore
+    from audio_sync import _submit_and_wait as _submit_and_wait_comfy  # type: ignore
+    from video_build import concatenate_scene_clips, _trim_to_frames  # type: ignore
+    from settings import COMFY_HOST, JSONS_DIR, COMFY_INPUT_DIR, FFMPEG_EXE, FFPROBE_EXE, WAN_MAX_FRAMES_PER_SEGMENT  # type: ignore
 
 # (이미 있다면 중복 추가 금지)
 from app.audio_sync import build_story_json  # ← story/analyze 사용
@@ -3073,33 +3083,33 @@ class MainWindow(QtWidgets.QMainWindow):
 
     def on_click_segments_missing_images_with_log(self):
         """
-        [2단계] 세그먼트 이미지 생성 (Qwen I2I)
-        [수정됨] _log 참조 오류를 해결하기 위해 헬퍼 함수들을 job 내부로 이동.
+        [2단계] 세그먼트 이미지 생성 (Qwen I2I) - 주입 검증 강화판
+
+        수정 사항:
+        1. [Fix] ReActor 매핑 오류 수정 (23번 ReActor의 소스는 20번이 아니라 18번).
+           -> 20번(메인 이미지)이 오염되지 않도록 보호.
+        2. [Debug] 주입되는 이미지 경로와 프롬프트를 로그에 출력.
         """
         from pathlib import Path
         import shutil
         import json
         from PyQt5 import QtWidgets
-        import traceback  # 오류 추적
-        import requests  # 웹 요청
+        import requests
         from typing import Any, Dict, Optional
 
-        # --- 필요한 유틸리티 임포트 ---
+        # --- 유틸 임포트 ---
         try:
-            from app.utils import load_json, save_json, run_job_with_progress_async
+            from app.utils import load_json, run_job_with_progress_async
             from app.audio_sync import _submit_and_wait as _submit_and_wait_comfy
             from app.settings import COMFY_HOST, JSONS_DIR, COMFY_INPUT_DIR, COMFY_OUTPUT_DIR, CHARACTER_DIR
         except ImportError:
-            from utils import load_json, save_json, run_job_with_progress_async  # type: ignore
+            from utils import load_json, run_job_with_progress_async  # type: ignore
             from audio_sync import _submit_and_wait as _submit_and_wait_comfy  # type: ignore
-            from settings import COMFY_HOST, JSONS_DIR, COMFY_INPUT_DIR, COMFY_OUTPUT_DIR, \
-                CHARACTER_DIR  # type: ignore
+            from settings import COMFY_HOST, JSONS_DIR, COMFY_INPUT_DIR, COMFY_OUTPUT_DIR, CHARACTER_DIR  # type: ignore
 
-        # --- 1. 버튼 비활성화 --- (기존과 동일)
         btn = getattr(self, "btn_segments_img", None)
         if btn: btn.setEnabled(False)
 
-        # --- 2. 경로 및 워크플로우 준비 ---
         try:
             proj_dir = self._current_project_dir()
             if not proj_dir or not proj_dir.exists():
@@ -3107,7 +3117,7 @@ class MainWindow(QtWidgets.QMainWindow):
 
             video_json_path = proj_dir / "video.json"
             if not video_json_path.exists():
-                raise FileNotFoundError(f"video.json을 찾을 수 없습니다. '프로젝트분석'을 먼저 실행하세요.\n{video_json_path}")
+                raise FileNotFoundError(f"video.json을 찾을 수 없습니다.\n{video_json_path}")
 
             qwen_wf_path = Path(JSONS_DIR) / "qwen2509_i2i.json"
             if not qwen_wf_path.exists():
@@ -3115,26 +3125,22 @@ class MainWindow(QtWidgets.QMainWindow):
 
             qwen_workflow_template = load_json(qwen_wf_path)
             if not qwen_workflow_template:
-                raise ValueError("qwen2509_i2i.json 워크플로우 파일을 읽을 수 없습니다.")
+                raise ValueError("qwen2509_i2i.json 파일을 읽을 수 없습니다.")
 
             comfy_input_path = Path(COMFY_INPUT_DIR)
-            comfy_output_dir = Path(COMFY_OUTPUT_DIR)
-            character_base_dir = Path(CHARACTER_DIR)  # [신규] 캐릭터 폴더
+            character_base_dir = Path(CHARACTER_DIR)
 
         except Exception as e_prep:
             QtWidgets.QMessageBox.critical(self, "준비 오류", str(e_prep))
             if btn: btn.setEnabled(True)
             return
 
-        # --- 4. 백그라운드 작업(job) 정의 ---
         def job(progress_callback):
             _log = lambda msg: progress_callback({"msg": msg})
-
             _log(f"qwen2509_i2i.json 워크플로우(ReActor 포함)를 사용하여 키프레임 생성을 시작합니다.")
 
-            # --- ▼▼▼ [수정] 헬퍼 함수들을 job 내부로 이동 ( _log 접근 위함) ▼▼▼ ---
+            # --- 헬퍼 함수 ---
             def _parse_character_spec(raw_obj: Any) -> Dict[str, Any]:
-                """ 'female_01:0' 또는 {'id':'female_01', 'index':0} 등을 파싱 """
                 if isinstance(raw_obj, str):
                     parts = raw_obj.split(":", 1)
                     cid = parts[0].strip()
@@ -3145,33 +3151,26 @@ class MainWindow(QtWidgets.QMainWindow):
                     idx = raw_obj.get("index")
                     try:
                         idx_int = int(idx) if idx is not None else 0
-                    except (ValueError, TypeError):
+                    except:
                         idx_int = 0
                     return {"id": cid, "index": idx_int}
                 return {"id": "", "index": 0}
 
             def _resolve_character_image_path(char_id: str) -> Optional[Path]:
-                """ CHARACTER_DIR에서 캐릭터 이미지 파일(png, jpg) 찾기 """
-                if not char_id:
-                    return None
+                if not char_id: return None
                 for ext in (".png", ".jpg", ".jpeg", ".webp"):
                     p = character_base_dir / f"{char_id}{ext}"
-                    if p.exists():
-                        return p
+                    if p.exists(): return p
                 return None
 
-            def _copy_face_to_comfy_input(face_path: Path) -> str:
-                """ 얼굴 이미지를 Comfy input 폴더로 복사하고 파일명 반환 """
+            def _copy_to_input(src_path: Path) -> str:
                 try:
-                    dst = comfy_input_path / face_path.name
-                    shutil.copy2(str(face_path), str(dst))
-                    return face_path.name
-                except Exception as e_copy_face:
-                    # [수정] _log 사용
-                    _log(f"[WARN] 얼굴 이미지 복사 실패 ({face_path.name}): {e_copy_face}")
+                    dst = comfy_input_path / src_path.name
+                    shutil.copy2(str(src_path), str(dst))
+                    return src_path.name
+                except Exception as e:
+                    _log(f"[WARN] 파일 복사 실패 ({src_path.name}): {e}")
                     return ""
-
-            # --- ▲▲▲ [수정] 헬퍼 이동 끝 ▲▲▲ ---
 
             vdoc = load_json(video_json_path)
             scenes = vdoc.get("scenes", [])
@@ -3180,13 +3179,18 @@ class MainWindow(QtWidgets.QMainWindow):
 
             processed_count = 0
 
-            # --- [신규] qwen 워크플로우의 ReActor 노드 맵 ---
+            # ★ [수정됨] ReActor ID 매핑 (정확한 Source Loader ID로 수정)
+            # Node 20: 메인 입력 이미지 (건드리면 안 됨, Source로 쓰면 안 됨)
+            # Node 18: ReActor_2 (23번)용 Source Loader
+            # Node 17: ReActor_1 (19번)용 Source Loader
+            # Node 21: ReActor_0 (22번)용 Source Loader
             QWEN_REACTOR_MAP = {
-                "1002": ("1005", "female_01"),  # ReActor_0 (female_01.png)
-                "1001": ("1006", "male_01"),  # ReActor_1 (male_01.png)
-                "1000": ("1004", "other_char"),  # ReActor_2 (ComfyUI_00063_.png)
+                "19": ("17", "female_01"),  # Slot 1
+                "22": ("21", "male_01"),  # Slot 2
+                "23": ("18", "other_char"),  # Slot 3 (20 -> 18로 수정!)
             }
-            # --- [신규] 끝 ---
+
+            SAVE_NODE_ID = "24"
 
             for scene_index, scene in enumerate(scenes):
                 scene_id = scene.get("id")
@@ -3194,173 +3198,143 @@ class MainWindow(QtWidgets.QMainWindow):
                 frame_segments = scene.get("frame_segments", [])
 
                 if not scene_id or not img_file_str or not frame_segments:
-                    _log(f"[{scene_id or 'Unknown'}] 스킵: ID, 기준 이미지, 또는 frame_segments가 없습니다.")
                     continue
 
-                # --- 4A. 기준 이미지 준비 --- (기존과 동일)
                 base_image_path = Path(img_file_str)
                 if not base_image_path.exists():
-                    _log(f"[{scene_id}] 스킵: 기준 이미지 '{base_image_path.name}'를 찾을 수 없습니다.")
+                    _log(f"[{scene_id}] 스킵: 기준 이미지 없음.")
                     continue
 
-                try:
-                    comfy_base_image_path = comfy_input_path / base_image_path.name
-                    shutil.copy2(str(base_image_path), str(comfy_base_image_path))
-                except Exception as e_copy:
-                    _log(f"[{scene_id}] ComfyUI input 폴더로 기준 이미지 복사 실패: {e_copy}")
-                    continue
+                # 메인 이미지 복사
+                main_img_name = _copy_to_input(base_image_path)
 
-                # --- 4B. 키프레임 저장 폴더 생성 --- (기존과 동일)
                 keyframe_dir = base_image_path.parent / scene_id
                 keyframe_dir.mkdir(parents=True, exist_ok=True)
 
-                kf_0_path = keyframe_dir / f"kf_0.png"
+                # 원본 보존 (kf_0)
+                kf_0_path = keyframe_dir / "kf_0.png"
                 if not kf_0_path.exists():
                     shutil.copy2(str(base_image_path), str(kf_0_path))
-                    _log(f"[{scene_id}] 원본 이미지 저장: {kf_0_path.name}")
 
-                # --- 4C. 씬의 캐릭터/인덱스 정보 파싱 --- (기존과 동일)
+                # --- ReActor 설정 준비 ---
                 scene_char_specs: Dict[str, int] = {}
-                scene_chars_list = scene.get("characters", [])
-                for char_raw in scene_chars_list:
+                for char_raw in scene.get("characters", []):
                     spec = _parse_character_spec(char_raw)
-                    if spec["id"]:
-                        scene_char_specs[spec["id"]] = spec["index"]
+                    if spec["id"]: scene_char_specs[spec["id"]] = spec["index"]
 
-                # --- 4D. 이 씬에서 사용할 얼굴 이미지 미리 복사 --- (기존과 동일)
                 face_files_to_inject: Dict[str, str] = {}
                 reactors_to_enable: Dict[str, str] = {}
 
-                for reactor_node_id, (load_node_id, default_char_id) in QWEN_REACTOR_MAP.items():
-                    if default_char_id in scene_char_specs:
-                        face_index_for_node = scene_char_specs[default_char_id]
-                        face_path = _resolve_character_image_path(default_char_id)
+                for reactor_id, (load_id, default_char) in QWEN_REACTOR_MAP.items():
+                    if default_char in scene_char_specs:
+                        idx = scene_char_specs[default_char]
+                        fpath = _resolve_character_image_path(default_char)
+                        if fpath:
+                            fname = _copy_to_input(fpath)
+                            if fname:
+                                face_files_to_inject[load_id] = fname
+                                reactors_to_enable[reactor_id] = str(idx)
 
-                        if face_path:
-                            face_filename = _copy_face_to_comfy_input(face_path)
-                            if face_filename:
-                                face_files_to_inject[load_node_id] = face_filename
-                                reactors_to_enable[reactor_node_id] = str(face_index_for_node)
-
-                _log(
-                    f"[{scene_id}] ReActor 활성화: {list(reactors_to_enable.keys())} (인덱스: {list(reactors_to_enable.values())})")
-
-                # --- 4E. 세그먼트 루프 실행 --- (기존과 동일)
+                # --- 세그먼트 루프 ---
                 for seg_index, segment in enumerate(frame_segments):
                     seg_prompt = segment.get("prompt_movie", "").strip()
-                    if not seg_prompt:
-                        _log(f"[{scene_id}] 세그먼트 {seg_index + 1} 스킵: 프롬프트가 비어있습니다.")
-                        continue
+                    if not seg_prompt: continue
 
                     keyframe_name = f"kf_{seg_index + 1}.png"
                     keyframe_path = keyframe_dir / keyframe_name
 
                     if keyframe_path.exists():
-                        _log(f"[{scene_id}] 세그먼트 {seg_index + 1} 스킵: 이미지가 존재합니다 ({keyframe_name})")
                         processed_count += 1
                         continue
 
-                    _log(f"[{scene_id}] 세그먼트 {seg_index + 1}/{len(frame_segments)} 생성 중...")
+                    _log(f"[{scene_id}] 세그먼트 {seg_index + 1} 생성 중...")
 
                     try:
-                        wf = json.loads(json.dumps(qwen_workflow_template))  # Deepcopy
-                        wf["11"]["inputs"]["image"] = base_image_path.name
-                        wf["8"]["inputs"]["prompt"] = seg_prompt
-                        wf["4"]["inputs"]["seed"] = (scene_index * 1000) + seg_index + 12345
+                        wf = json.loads(json.dumps(qwen_workflow_template))
 
-                        for reactor_id, (load_id, default_id) in QWEN_REACTOR_MAP.items():
-                            if reactor_id in wf:
-                                if reactor_id in reactors_to_enable:
-                                    wf[reactor_id]["inputs"]["enabled"] = True
-                                    wf[reactor_id]["inputs"]["input_faces_index"] = reactors_to_enable[reactor_id]
-                                    wf[reactor_id]["inputs"]["source_faces_index"] = "0"
-                                    if load_id in wf and load_id in face_files_to_inject:
-                                        wf[load_id]["inputs"]["image"] = face_files_to_inject[load_id]
+                        # 1. ★ 메인 이미지 주입 (Node 20) ★
+                        if "20" in wf:
+                            wf["20"]["inputs"]["image"] = main_img_name
+                            _log(f"   -> [Input] Image: {main_img_name}")
+                        else:
+                            _log("   -> [ERR] Node 20 (LoadImage) not found!")
+
+                        # 2. ★ 프롬프트 주입 (Node 7) ★
+                        if "7" in wf:
+                            wf["7"]["inputs"]["prompt"] = seg_prompt
+                            _log(f"   -> [Input] Prompt: {seg_prompt[:50]}...")
+
+                        # 3. 시드
+                        if "4" in wf:
+                            wf["4"]["inputs"]["seed"] = (scene_index * 1000) + seg_index + 12345
+
+                        # 4. ReActor 설정
+                        for r_id, (l_id, def_char) in QWEN_REACTOR_MAP.items():
+                            if r_id in wf:
+                                if r_id in reactors_to_enable:
+                                    wf[r_id]["inputs"]["enabled"] = True
+                                    wf[r_id]["inputs"]["input_faces_index"] = reactors_to_enable[r_id]
+                                    wf[r_id]["inputs"]["source_faces_index"] = 0
+                                    if l_id in wf and l_id in face_files_to_inject:
+                                        wf[l_id]["inputs"]["image"] = face_files_to_inject[l_id]
+                                        _log(f"   -> [ReActor] {def_char} ON (Node {r_id})")
                                 else:
-                                    wf[reactor_id]["inputs"]["enabled"] = False
+                                    wf[r_id]["inputs"]["enabled"] = False
 
-                        API_OUTPUT_NODE_ID = "999"
-                        relative_output_path = f"keyframe_output/{scene_id}"
-                        wf[API_OUTPUT_NODE_ID] = {
-                            "inputs": {
-                                "filename_prefix": f"kf_{seg_index + 1}",
-                                "output_path": relative_output_path,
-                                "images": ["1002", 0]
-                            },
-                            "class_type": "SaveImage",
-                            "_meta": {"title": "Save Keyframe (API Output)"}
-                        }
+                        # 5. 저장 파일명 설정
+                        if SAVE_NODE_ID in wf:
+                            wf[SAVE_NODE_ID]["inputs"]["filename_prefix"] = f"qwen_kf/{scene_id}/{seg_index + 1}"
 
-                        result = _submit_and_wait_comfy(
-                            COMFY_HOST,
-                            wf,
-                            timeout=600,
-                            poll=2.0
-                        )
+                        # 실행
+                        result = _submit_and_wait_comfy(COMFY_HOST, wf, timeout=900, poll=3.0)
 
+                        # 결과 파싱
                         outputs_dict = result.get("outputs", {})
-                        output_node_content = outputs_dict.get(API_OUTPUT_NODE_ID, {})
-                        if not isinstance(output_node_content, dict):
-                            raise RuntimeError(f"ComfyUI가 '{API_OUTPUT_NODE_ID}'번 노드에서 딕셔너리를 반환하지 않았습니다.")
-                        output_images = output_node_content.get("images", [])
-                        if not output_images:
-                            for key, value in outputs_dict.items():
-                                if isinstance(value, dict) and "images" in value:
-                                    output_images = value.get("images", [])
-                                    if output_images:
-                                        _log(
-                                            f"[{scene_id}] 경고: 예상된 출력('{API_OUTPUT_NODE_ID}')을 찾지 못해 '{key}' 노드의 'images' 출력을 사용합니다.")
-                                        break
-                        if not output_images:
-                            raise RuntimeError(
-                                f"ComfyUI 워크플로우가 '{API_OUTPUT_NODE_ID}'번 노드의 'images' 목록에서 이미지를 반환하지 않았습니다.")
+                        target_out = outputs_dict.get(SAVE_NODE_ID, {})
+                        images = target_out.get("images", [])
 
-                        output_info = output_images[0]
-                        output_filename = output_info.get("filename")
-                        output_subfolder = output_info.get("subfolder")
+                        # Fallback
+                        if not images:
+                            for nid, out_val in outputs_dict.items():
+                                if "images" in out_val:
+                                    images = out_val["images"]
+                                    break
 
-                        _log(f"[{scene_id}] 이미지 다운로드 중: {output_subfolder}/{output_filename}")
-                        try:
-                            image_response = requests.get(
-                                f"{COMFY_HOST}/view",
-                                params={"filename": output_filename, "subfolder": output_subfolder,
-                                        "type": "output"},
-                                timeout=60
-                            )
-                            image_response.raise_for_status()
+                        if not images:
+                            raise RuntimeError("이미지 생성 실패 (출력 없음)")
 
-                            with open(keyframe_path, "wb") as f:
-                                f.write(image_response.content)
+                        img_info = images[0]
+                        filename = img_info.get("filename")
+                        subfolder = img_info.get("subfolder")
+                        file_type = img_info.get("type", "output")
 
-                            _log(f"[{scene_id}] 성공: {keyframe_name} 저장됨.")
-                            processed_count += 1
+                        _log(f"   -> [Download] {filename}")
 
-                        except requests.exceptions.RequestException as req_err:
-                            raise RuntimeError(f"ComfyUI에서 이미지 다운로드 실패: {req_err}")
-                        except Exception as dl_err:
-                            raise RuntimeError(f"이미지 저장 중 오류 발생: {dl_err}")
+                        resp = requests.get(
+                            f"{COMFY_HOST}/view",
+                            params={"filename": filename, "subfolder": subfolder, "type": file_type},
+                            timeout=60
+                        )
+                        resp.raise_for_status()
+
+                        with open(keyframe_path, "wb") as f:
+                            f.write(resp.content)
+
+                        processed_count += 1
 
                     except Exception as e_seg:
-                        tb_str = traceback.format_exc()
-                        _log(f"[{scene_id}] 세그먼트 {seg_index + 1} 처리 실패: {e_seg}\n{tb_str}")
+                        _log(f"[{scene_id}] 세그먼트 {seg_index + 1} 실패: {e_seg}")
 
-            return f"키프레임 생성 완료. 총 {processed_count}/{total_segments}개 처리."
+            return f"완료. 생성된 키프레임: {processed_count}개"
 
-        # --- 5. 완료 콜백 --- (기존과 동일)
-        def done(ok: bool, payload, err):
-            if not ok:
-                QtWidgets.QMessageBox.critical(self, "세그먼트 생성 실패", str(err))
-            else:
-                QtWidgets.QMessageBox.information(self, "세그먼트 생성 완료", str(payload))
+        def done(ok, payload, err):
             if btn: btn.setEnabled(True)
+            if not ok:
+                QtWidgets.QMessageBox.critical(self, "실패", str(err))
+            else:
+                QtWidgets.QMessageBox.information(self, "완료", str(payload))
 
-        # --- 6. 비동기 실행 --- (기존과 동일)
-        run_job_with_progress_async(
-            owner=self,
-            title="세그먼트 이미지 생성 (Qwen I2I)",
-            job=job,
-            on_done=done
-        )
+        run_job_with_progress_async(self, "세그먼트 이미지 생성 (Qwen)", job, on_done=done)
 
 
 
@@ -9382,34 +9356,31 @@ class MainWindow(QtWidgets.QMainWindow):
 
     def on_video_wan(self, *, on_done_override: Optional[Callable] = None) -> None:
         """
-        [3단계] 영상 생성 (Wan 2.2 보간)
+        [3단계] 영상 생성 (Wan 2.2 Start-End Interpolation 모드)
 
-        - 2단계에서 생성된 키프레임(imgs/{id}/kf_*.png)을 읽어서,
-          구간별 보간 영상을 imgs/{id}/seg_*.mp4 로 만든다.
-        - 이미 존재하는 seg_*.mp4 는 스킵한다.
-        - 모든 세그먼트가 준비되면 clips/{id}.mp4 로 병합 후,
-          _trim_to_frames 로 최종 프레임 수에 맞게 트림한다.
-
-        [출력 선택 규칙]
-        - 1순위: 노드 439 (VHS_VideoCombine, SeedVR2 업스케일 최종본)의 video/videos/gifs
-        - 2순위: outputs 안의 모든 노드를 훑어 video/videos/gifs 중 첫 번째 (백업 플랜)
+        수정 사항:
+        1. [워크플로우] 'wan2.2movie.json' 전용 ID 매핑 적용 (Start: 386, End: 387, Len: 405)
+        2. [로직] 키프레임(kf_i, kf_i+1)을 Start/End로 주입하여 구간 생성.
+        3. [구조] 41프레임 단위 고정 분할 (오버랩 없음).
+        4. [ReActor] 제거됨 (워크플로우에 없음).
         """
         from pathlib import Path
         from typing import Any, Dict, Callable as _CallableType
         import shutil
         import json
-        import traceback
         import requests
+        import random
+        import time
+        import subprocess
         from PyQt5 import QtWidgets
 
-        # --- 버튼 핸들 찾기 (on_video와 유사 패턴) ---
+        # --- 버튼 제어 ---
         btn_video_widget: Optional[QtWidgets.QAbstractButton] = None
         for btn_name in ("btn_video", "btn_build_video"):
             widget_candidate = getattr(self, btn_name, None)
-            if isinstance(widget_candidate, QtWidgets.QAbstractButton):
+            if widget_candidate is not None:
                 btn_video_widget = widget_candidate
                 break
-
         if btn_video_widget:
             try:
                 btn_video_widget.setEnabled(False)
@@ -9417,443 +9388,276 @@ class MainWindow(QtWidgets.QMainWindow):
                 pass
 
         try:
-            # --- 유틸 및 설정 임포트 ---
+            # --- 임포트 ---
             try:
                 from app.utils import load_json, run_job_with_progress_async
-                from app.audio_sync import _submit_and_wait as _submit_and_wait_comfy
+                # 오버랩 없는 단순 병합 함수 필요 (concatenate_scene_clips 재사용)
                 from app.video_build import concatenate_scene_clips, _trim_to_frames
-                from app.settings import COMFY_HOST, JSONS_DIR, COMFY_INPUT_DIR, FFMPEG_EXE, FFPROBE_EXE
+                from app.settings import COMFY_HOST, JSONS_DIR, COMFY_INPUT_DIR, FFMPEG_EXE, FFPROBE_EXE, CHARACTER_DIR
             except ImportError:
                 from utils import load_json, run_job_with_progress_async  # type: ignore
-                from audio_sync import _submit_and_wait as _submit_and_wait_comfy  # type: ignore
                 from video_build import concatenate_scene_clips, _trim_to_frames  # type: ignore
-                from settings import COMFY_HOST, JSONS_DIR, COMFY_INPUT_DIR, FFMPEG_EXE, FFPROBE_EXE  # type: ignore
+                from settings import COMFY_HOST, JSONS_DIR, COMFY_INPUT_DIR, FFMPEG_EXE, FFPROBE_EXE, \
+                    CHARACTER_DIR  # type: ignore
 
-            # --- 현재 프로젝트 폴더 확인 (on_video와 같은 방식) ---
-            proj_dir_val: Optional[str] = None
-            proj_dir_getter = getattr(self, "_current_project_dir", None)
-            if callable(proj_dir_getter):
-                try:
-                    proj_dir_obj = proj_dir_getter()
-                    if isinstance(proj_dir_obj, (str, Path)):
-                        proj_dir_val = str(proj_dir_obj)
-                except Exception as e_get_proj:
-                    print(f"[경고] on_video_wan: _current_project_dir 호출 실패: {e_get_proj}")
-
+            # --- 경로 준비 ---
+            proj_dir_val = None
+            if hasattr(self, "_current_project_dir") and callable(self._current_project_dir):
+                proj_dir_val = str(self._current_project_dir())
             if not proj_dir_val:
-                proj_dir_attr = getattr(self, "project_dir", None)
-                if isinstance(proj_dir_attr, (str, Path)):
-                    proj_dir_val = str(proj_dir_attr)
+                proj_dir_val = str(getattr(self, "project_dir", ""))
 
             if not proj_dir_val:
                 QtWidgets.QMessageBox.warning(self, "오류", "프로젝트 폴더가 선택되지 않았습니다.")
-                if btn_video_widget:
-                    try:
-                        btn_video_widget.setEnabled(True)
-                    except RuntimeError:
-                        pass
+                if btn_video_widget: btn_video_widget.setEnabled(True)
                 return
 
             proj_dir = Path(proj_dir_val)
-
-            # 필수 파일/폴더
             video_json_path = proj_dir / "video.json"
             if not video_json_path.exists():
-                QtWidgets.QMessageBox.critical(
-                    self,
-                    "오류",
-                    f"video.json을 찾을 수 없습니다.\n'프로젝트분석'을 먼저 실행하세요.\n{video_json_path}",
-                )
-                if btn_video_widget:
-                    try:
-                        btn_video_widget.setEnabled(True)
-                    except RuntimeError:
-                        pass
+                QtWidgets.QMessageBox.critical(self, "오류", f"video.json 없음: {video_json_path}")
+                if btn_video_widget: btn_video_widget.setEnabled(True)
                 return
 
+            # ★ [수정] wan2.2movie.json 로드
             wan_wf_path = Path(JSONS_DIR) / "wan2.2movie.json"
             if not wan_wf_path.exists():
-                QtWidgets.QMessageBox.critical(
-                    self,
-                    "오류",
-                    f"Wan 2.2 워크플로우(wan2.2movie.json)를 찾을 수 없습니다.\n{wan_wf_path}",
-                )
-                if btn_video_widget:
-                    try:
-                        btn_video_widget.setEnabled(True)
-                    except RuntimeError:
-                        pass
+                QtWidgets.QMessageBox.critical(self, "오류", f"워크플로우 파일 없음: {wan_wf_path.name}")
+                if btn_video_widget: btn_video_widget.setEnabled(True)
                 return
 
             wan_workflow_template = load_json(wan_wf_path)
-            if not wan_workflow_template:
-                QtWidgets.QMessageBox.critical(
-                    self,
-                    "오류",
-                    "wan2.2movie.json 워크플로우를 읽을 수 없습니다.",
-                )
-                if btn_video_widget:
-                    try:
-                        btn_video_widget.setEnabled(True)
-                    except RuntimeError:
-                        pass
-                return
 
             comfy_input_path = Path(COMFY_INPUT_DIR)
 
-            # 작업 폴더들
-            xfade_work_dir = proj_dir / "xfade_work"
-            xfade_work_dir.mkdir(parents=True, exist_ok=True)
             clips_dir = proj_dir / "clips"
             clips_dir.mkdir(parents=True, exist_ok=True)
-            imgs_base_dir = proj_dir / "imgs"
 
-            # --- 백그라운드 작업 정의 ---
+            imgs_base_dir = proj_dir / "imgs"
+            imgs_base_dir.mkdir(parents=True, exist_ok=True)
+
+            # --- 헬퍼 ---
+            def _is_valid_video(path: Path) -> bool:
+                if not path.exists() or path.stat().st_size < 1024: return False
+                try:
+                    cmd = [FFPROBE_EXE, "-v", "error", "-select_streams", "v:0", "-show_entries", "stream=codec_name",
+                           "-of", "default=noprint_wrappers=1:nokey=1", str(path)]
+                    subprocess.run(cmd, check=True, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, timeout=5)
+                    return True
+                except:
+                    return False
+
+            def _submit_and_wait_custom(base_url: str, graph: Dict, timeout: int, poll: float,
+                                        log_func: Callable) -> Dict:
+                prompt_url = f"{base_url.rstrip('/')}/prompt"
+                history_url = f"{base_url.rstrip('/')}/history"
+                try:
+                    payload = {"prompt": graph, "client_id": "shorts_maker_wan_se"}
+                    resp = requests.post(prompt_url, json=payload, timeout=30)
+                    if resp.status_code != 200: raise RuntimeError(f"HTTP {resp.status_code}: {resp.text}")
+                    prompt_id = resp.json().get("prompt_id")
+                    if not prompt_id: raise RuntimeError("No prompt_id")
+                except Exception as e:
+                    raise RuntimeError(f"제출 실패: {e}")
+
+                start_time = time.time()
+                while True:
+                    if time.time() - start_time > timeout: raise TimeoutError("시간 초과")
+                    try:
+                        h_resp = requests.get(f"{history_url}/{prompt_id}", timeout=10)
+                        if h_resp.status_code == 200 and prompt_id in h_resp.json():
+                            return h_resp.json()[prompt_id]
+                    except:
+                        pass
+                    time.sleep(poll)
+
+            # --- Job ---
             def _job(progress_callback: _CallableType[[Dict[str, Any]], None]) -> str:
                 _log = lambda msg: progress_callback({"msg": msg})
-
-                _log("wan2.2movie.json 워크플로우로 영상 보간을 시작합니다.")
+                _log(f"워크플로우({wan_wf_path.name}) - Start-End Interpolation 모드")
 
                 vdoc = load_json(video_json_path) or {}
+                fps_val = int(vdoc.get("fps", 16))
                 scenes = vdoc.get("scenes") or []
-                if not scenes:
-                    _log("video.json에 scenes가 없습니다. 작업을 종료합니다.")
-                    return "생성할 씬이 없습니다."
+                if not scenes: return "생성할 씬이 없습니다."
 
-                DEFAULT_OVERLAP = 12  # plan_segments 기본 오버랩과 맞춤
+                SEG_LEN = 41  # 고정 세그먼트 길이
 
                 for scene in scenes:
                     scene_id = scene.get("id")
-                    frame_segments = scene.get("frame_segments") or []
+                    if not scene_id: continue
 
-                    if not scene_id or not frame_segments:
-                        _log(f"[{scene_id or 'Unknown'}] 스킵: ID 또는 frame_segments가 없습니다.")
-                        continue
+                    # 1. 목표 프레임 계산
+                    try:
+                        duration_val = float(scene.get("duration", 0.0))
+                    except:
+                        duration_val = 0.0
+                    scene_total_frames = int(round(duration_val * fps_val))
+                    if scene_total_frames <= 0: continue
 
-                    keyframe_dir = imgs_base_dir / scene_id
-                    final_clip_path = clips_dir / f"{scene_id}.mp4"
+                    _log(f"[{scene_id}] 처리 시작 (목표 {scene_total_frames}f)")
 
-                    # 키프레임 검사
-                    keyframe_paths = sorted(keyframe_dir.glob("kf_*.png"))
-                    if len(keyframe_paths) != len(frame_segments) + 1:
-                        _log(
-                            f"[{scene_id}] 스킵: 키프레임 개수({len(keyframe_paths)}) != 세그먼트 개수({len(frame_segments)}) + 1"
-                        )
-                        _log(f"[{scene_id}] '세그먼트 이미지 생성'을 먼저 실행하세요.")
-                        continue
+                    # 2. 구간 분할 (41프레임 단위)
+                    # 예: 100f -> 0~41, 41~82, 82~100 (3구간)
+                    segments = []
+                    cursor = 0
+                    while cursor < scene_total_frames:
+                        end = min(cursor + SEG_LEN, scene_total_frames)
+                        segments.append((cursor, end))
+                        cursor = end
 
-                    _log(f"[{scene_id}] 씬 처리 시작... (총 {len(frame_segments)}개 세그먼트)")
+                    # 3. 폴더 준비
+                    scene_chunk_dir = clips_dir / scene_id
+                    if scene_chunk_dir.exists(): shutil.rmtree(scene_chunk_dir)  # 기존 잔여물 삭제 (필수)
+                    scene_chunk_dir.mkdir(parents=True, exist_ok=True)
 
-                    video_chunks_to_merge: list[Path] = []
+                    video_chunks: list[Path] = []
                     scene_failed = False
 
-                    for idx, segment_info in enumerate(frame_segments):
-                        start_keyframe_path = keyframe_paths[idx]
-                        end_keyframe_path = keyframe_paths[idx + 1]
+                    # 4. 구간별 생성
+                    for idx, (s_f, e_f) in enumerate(segments):
+                        chunk_name = f"seg_{idx:03d}.mp4"
+                        chunk_path = scene_chunk_dir / chunk_name
+                        video_chunks.append(chunk_path)
 
-                        chunk_name = f"seg_{idx + 1}.mp4"
-                        chunk_path = keyframe_dir / chunk_name
-                        video_chunks_to_merge.append(chunk_path)
+                        # 실제 생성해야 할 길이 (끝-시작)
+                        # 주의: Interpolation 모델은 보통 '양 끝 포함' 프레임 수를 요구함.
+                        # 예: 0~41 -> 41프레임 생성 (0번, 41번 이미지가 있고 그 사이+양끝 포함 42장? 아니면 간격이 41?)
+                        # Wan VACE 노드는 'num_frames'가 생성될 총 프레임 수(양 끝 포함)를 의미할 가능성이 높음.
+                        current_seg_len = e_f - s_f
+                        if current_seg_len <= 1: continue  # 너무 짧으면 스킵
 
-                        # 이미 있으면 스킵
-                        if chunk_path.exists() and chunk_path.stat().st_size > 1024:
-                            _log(f"[{scene_id}] 청크 {idx + 1} 스킵: 이미 존재합니다 ({chunk_name})")
-                            continue
+                        # 키프레임 이미지 준비 (Start & End)
+                        # 1단계(이미지 생성)에서 kf_0, kf_1... 로 저장되어 있다고 가정
+                        # idx번째 구간의 시작은 kf_{idx}, 끝은 kf_{idx+1}
+                        # 마지막 구간의 끝 이미지는? -> kf_{idx+1}이 없으면 곤란함.
+                        # 사용자 로직: "세그먼트별 프롬프트 이용" -> video.json에 frame_segments가 있고 그 개수만큼 이미지가 있어야 함.
 
-                        _log(
-                            f"[{scene_id}] 청크 {idx + 1}/{len(frame_segments)} 생성 중 "
-                            f"({start_keyframe_path.name} -> {end_keyframe_path.name})..."
-                        )
+                        kf_start_name = f"kf_{idx}.png"
+                        kf_end_name = f"kf_{idx + 1}.png"
 
-                        try:
-                            # 워크플로우 deepcopy
-                            wf = json.loads(json.dumps(wan_workflow_template))
+                        kf_start_path = imgs_base_dir / scene_id / kf_start_name
+                        kf_end_path = imgs_base_dir / scene_id / kf_end_name
 
-                            # 키프레임 복사
-                            shutil.copy2(str(start_keyframe_path), comfy_input_path / start_keyframe_path.name)
-                            shutil.copy2(str(end_keyframe_path), comfy_input_path / end_keyframe_path.name)
-
-                            # 입력 이미지 주입
-                            wf["386"]["inputs"]["image"] = start_keyframe_path.name
-                            wf["387"]["inputs"]["image"] = end_keyframe_path.name
-
-                            # FPS / Overlap / FrameCount 세팅
-                            scene_fps = int(vdoc.get("fps", 16))
-                            seg_start = int(segment_info.get("start_frame", 0))
-                            seg_end = int(segment_info.get("end_frame", 0))
-                            seg_len = max(0, seg_end - seg_start)
-
-                            wf["426"]["inputs"]["value"] = float(scene_fps)  # FPS
-                            wf["400"]["inputs"]["value"] = int(DEFAULT_OVERLAP)  # Overlap
-                            wf["405"]["inputs"]["value"] = int(seg_len)  # Frame Count
-
-                            # 439 VideoCombine 출력 강제
-                            api_output_node_id = "439"
-                            node_439 = wf.get(api_output_node_id)
-                            if isinstance(node_439, dict):
-                                inputs_439 = node_439.setdefault("inputs", {})
-                                inputs_439["save_output"] = True
-                                inputs_439["filename_prefix"] = f"wan_chunks/{scene_id}/seg_{idx + 1}"
-                                _log(
-                                    f"[{scene_id}] ComfyUI 출력 노드({api_output_node_id}) "
-                                    f"save_output=True, prefix=wan_chunks/{scene_id}/seg_{idx + 1}"
-                                )
+                        # 예외 처리: 마지막 구간인데 끝 이미지가 없다면?
+                        # 보통 마지막 이미지는 t_00x.png (씬 대표 이미지)일 수도 있고, kf_마지막 번호일 수도 있음.
+                        # 여기선 일단 파일이 있어야 진행. 없으면 에러.
+                        if not kf_start_path.exists():
+                            # 첫 시작이면 씬 대표 이미지 사용 시도
+                            if idx == 0 and Path(scene.get("img_file", "")).exists():
+                                kf_start_path = Path(scene.get("img_file"))
                             else:
-                                _log(
-                                    f"[{scene_id}] 경고: 워크플로우에 노드 {api_output_node_id}가 없어 "
-                                    f"save_output을 강제할 수 없습니다."
-                                )
+                                _log(f"[ERR] 시작 이미지 {kf_start_name} 없음.")
+                                scene_failed = True
+                                break
 
-                            # Comfy 실행
-                            result = _submit_and_wait_comfy(
-                                COMFY_HOST,
-                                wf,
-                                timeout=1800,
-                                poll=5.0,
-                            )
-
-                            outputs_dict = result.get("outputs") or {}
-                            _log(f"[{scene_id}] Comfy outputs keys: {list(outputs_dict.keys())}")
-
-                            # --- 1순위: 439 노드 video/videos/gifs ---
-                            output_videos: list[Dict[str, Any]] = []
-                            node_439_out = outputs_dict.get("439")
-                            if isinstance(node_439_out, dict):
-                                for key in ("videos", "video", "gifs", "gif"):
-                                    vids = node_439_out.get(key)
-                                    if isinstance(vids, list) and vids:
-                                        output_videos = [v for v in vids if isinstance(v, dict)]
-                                        if output_videos:
-                                            _log(
-                                                f"[{scene_id}] 439 노드에서 '{key}'로 "
-                                                f"비디오/클립 {len(output_videos)}개 발견."
-                                            )
-                                            break
-
-                            # --- 2순위: 모든 노드 훑어서 video/videos/gifs 찾기 ---
-                            if not output_videos:
-                                candidates: list[Dict[str, Any]] = []
-                                for node_k, out_val in outputs_dict.items():
-                                    if not isinstance(out_val, dict):
-                                        continue
-                                    for key in ("videos", "video", "gifs", "gif"):
-                                        vids = out_val.get(key)
-                                        if isinstance(vids, list):
-                                            for info in vids:
-                                                if isinstance(info, dict):
-                                                    candidates.append(
-                                                        {
-                                                            "node": str(node_k),
-                                                            "key": key,
-                                                            "info": info,
-                                                        }
-                                                    )
-                                if candidates:
-                                    chosen = None
-                                    for cand in candidates:
-                                        if cand["node"] == "439":
-                                            chosen = cand
-                                            break
-                                    if chosen is None:
-                                        chosen = candidates[0]
-                                    output_videos = [chosen["info"]]
-                                    _log(
-                                        f"[{scene_id}] 백업 경로 사용: node={chosen['node']}, "
-                                        f"key={chosen['key']}"
-                                    )
-
-                            if not output_videos:
-                                # 디버그용 키 로그
-                                try:
-                                    keys_all = list(outputs_dict.keys())
-                                    keys_439 = (
-                                        list(node_439_out.keys())
-                                        if isinstance(node_439_out, dict)
-                                        else "N/A"
-                                    )
-                                    _log(
-                                        f"[{scene_id}] outputs keys={keys_all}, "
-                                        f"node_439_keys={keys_439}"
-                                    )
-                                except Exception:
-                                    pass
-                                raise RuntimeError(
-                                    "ComfyUI 워크플로우가 비디오를 반환하지 않았습니다 "
-                                    "(노드 439 또는 다른 노드에서 video/videos/gifs 키를 찾지 못함)."
-                                )
-
-                            output_info = output_videos[0]
-                            output_filename = output_info.get("filename")
-                            output_subfolder = output_info.get("subfolder")
-                            if not output_filename:
-                                raise RuntimeError(
-                                    "ComfyUI 결과에서 filename을 찾을 수 없습니다."
-                                )
-
-                            # /view 로 mp4(또는 gif) 다운로드
-                            _log(f"[{scene_id}] 청크 다운로드 중: {output_subfolder}/{output_filename}")
-                            try:
-                                resp = requests.get(
-                                    f"{COMFY_HOST}/view",
-                                    params={
-                                        "filename": output_filename,
-                                        "subfolder": output_subfolder,
-                                        "type": "output",
-                                    },
-                                    timeout=120,
-                                )
-                                resp.raise_for_status()
-                                with open(chunk_path, "wb") as f:
-                                    f.write(resp.content)
-                                _log(f"[{scene_id}] 성공: {chunk_name} 저장됨.")
-                            except requests.exceptions.RequestException as req_err:
-                                raise RuntimeError(
-                                    f"ComfyUI에서 청크 비디오 다운로드 실패: {req_err}"
-                                ) from req_err
-                            except Exception as dl_err:
-                                raise RuntimeError(
-                                    f"청크 비디오 저장 중 오류 발생: {dl_err}"
-                                ) from dl_err
-
-                        except Exception as e_chunk:
-                            _log(
-                                f"[{scene_id}] 청크 {idx + 1} 처리 실패: {e_chunk}\n"
-                                f"{traceback.format_exc()}"
-                            )
+                        if not kf_end_path.exists():
+                            # 마지막 구간이면 시작 이미지를 복사해서 끝 이미지로 쓸 수도 없음 (움직임이 없으므로).
+                            # 일단 에러 처리
+                            _log(f"[ERR] 끝 이미지 {kf_end_name} 없음.")
                             scene_failed = True
                             break
 
-                    if scene_failed:
-                        _log(f"[{scene_id}] 청크 생성 실패로 씬 병합/트림을 건너뜁니다.")
-                        continue
-
-                    if not video_chunks_to_merge:
-                        _log(f"[{scene_id}] 생성된 청크 파일이 없습니다. (병합 스킵)")
-                        continue
-
-                    # 병합
-                    _log(
-                        f"[{scene_id}] {len(video_chunks_to_merge)}개 청크 병합 중... "
-                        f"-> {final_clip_path.name}"
-                    )
-                    merged_video_path = xfade_work_dir / f"merged_{scene_id}.mp4"
-                    try:
-                        concatenate_scene_clips(
-                            clip_paths=video_chunks_to_merge,
-                            out_path=merged_video_path,
-                            ffmpeg_exe=FFMPEG_EXE,
-                        )
-                    except Exception as e_concat:
                         _log(
-                            f"[{scene_id}] FFmpeg 병합 실패: {e_concat}\n"
-                            f"{traceback.format_exc()}"
-                        )
-                        continue
+                            f"[{scene_id}] 구간 {idx + 1}/{len(segments)} 생성 ({current_seg_len}f, {kf_start_name}~{kf_end_name})...")
 
-                    # 최종 트림
-                    _log(f"[{scene_id}] 최종 길이로 트림 중...")
-                    try:
-                        scene_fps = int(vdoc.get("fps", 16))
-                        scene_duration = float(scene.get("duration", 0.0))
-                        interpolation_factor = int(
-                            wan_workflow_template
-                            .get("455", {})
-                            .get("inputs", {})
-                            .get("interpolation_factor", 2)
-                        )
-                        final_fps = scene_fps * interpolation_factor
-                        final_frames_to_keep = int(round(scene_duration * final_fps))
+                        try:
+                            wf = json.loads(json.dumps(wan_workflow_template))
 
-                        if final_frames_to_keep <= 0:
-                            raise ValueError(
-                                f"최종 프레임 수가 0입니다 "
-                                f"(Duration: {scene_duration}s, Final FPS: {final_fps})"
+                            # 이미지 복사 & 주입
+                            shutil.copy2(str(kf_start_path), comfy_input_path / kf_start_path.name)
+                            shutil.copy2(str(kf_end_path), comfy_input_path / kf_end_path.name)
+
+                            # ★ ID 매핑 (wan2.2movie.json 기준)
+                            if "386" in wf: wf["386"]["inputs"]["image"] = kf_start_path.name  # Start
+                            if "387" in wf: wf["387"]["inputs"]["image"] = kf_end_path.name  # End
+                            if "405" in wf: wf["405"]["inputs"]["value"] = int(current_seg_len)  # Frames
+
+                            # 프롬프트 (해당 구간의 프롬프트 찾기)
+                            # video.json의 frame_segments 리스트에서 idx번째 항목 사용
+                            seg_prompt = ""
+                            frame_segs = scene.get("frame_segments", [])
+                            if idx < len(frame_segs):
+                                seg_prompt = frame_segs[idx].get("prompt_movie", "")
+                            if not seg_prompt: seg_prompt = scene.get("prompt_movie", "")
+
+                            if "106" in wf: wf["106"]["inputs"]["positive_prompt"] = seg_prompt
+
+                            # 시드
+                            seed = random.randint(1, 9999999999)
+                            if "391" in wf: wf["391"]["inputs"]["seed"] = seed
+
+                            # 저장 (439번이 Upscaled 최종본)
+                            target_save = "439"
+                            if target_save in wf:
+                                prefix = f"wan_se/{scene_id}/{idx}"
+                                wf[target_save]["inputs"]["filename_prefix"] = prefix
+                            else:
+                                raise RuntimeError("저장 노드(439)를 찾을 수 없습니다.")
+
+                            # 실행
+                            res = _submit_and_wait_custom(COMFY_HOST, wf, timeout=1800, poll=5.0, log_func=_log)
+
+                            # 결과 처리
+                            outs = res.get("outputs", {})
+                            tgt_out = outs.get(target_save, {})
+                            vids = tgt_out.get("videos") or tgt_out.get("gifs")
+
+                            if not vids: raise RuntimeError(f"결과 없음 (Output: {list(outs.keys())})")
+
+                            dl_info = vids[0]
+                            ftype = dl_info.get("type", "output")
+                            resp = requests.get(
+                                f"{COMFY_HOST}/view",
+                                params={"filename": dl_info['filename'], "subfolder": dl_info['subfolder'],
+                                        "type": ftype},
+                                timeout=120
                             )
+                            if len(resp.content) < 1024: raise RuntimeError("0바이트 파일")
 
-                        _trim_to_frames(
-                            FFMPEG_EXE,
-                            FFPROBE_EXE,
-                            merged_video_path,
-                            final_clip_path,
-                            final_frames_to_keep,
-                            final_fps,
-                        )
-                        _log(
-                            f"[{scene_id}] 완료: {final_clip_path.name} "
-                            f"(총 {final_frames_to_keep} 프레임)"
-                        )
-                    except Exception as e_trim:
-                        _log(
-                            f"[{scene_id}] 최종 트림 실패: {e_trim}\n"
-                            f"{traceback.format_exc()}"
-                        )
-                        continue
+                            with open(chunk_path, "wb") as f:
+                                f.write(resp.content)
 
-                return "모든 씬의 영상 생성이 완료되었습니다."
+                            if not _is_valid_video(chunk_path): raise RuntimeError("손상된 파일")
 
-            # --- 완료 콜백 ---
-            def _done(ok: bool, payload: Any, err: Optional[Exception]) -> None:
+                        except Exception as e:
+                            _log(f"[{scene_id}] 생성 실패: {e}")
+                            scene_failed = True
+                            try:
+                                chunk_path.unlink()
+                            except:
+                                pass
+                            break
+
+                    # 5. 단순 병합 (Concat)
+                    if not scene_failed and video_chunks:
+                        final_path = clips_dir / f"{scene_id}.mp4"
+                        try:
+                            concatenate_scene_clips(video_chunks, final_path, FFMPEG_EXE)
+                            _log(f"[{scene_id}] 병합 완료.")
+
+                            # 최종 길이 보정 (선택 사항)
+                            # _trim_to_frames(FFMPEG_EXE, FFPROBE_EXE, final_path, final_path, scene_total_frames, fps_val)
+
+                        except Exception as e:
+                            _log(f"[{scene_id}] 병합 실패: {e}")
+
+                return "작업 완료"
+
+            def _done(ok, payload, err):
                 if on_done_override:
-                    try:
-                        on_done_override(ok, payload, err)
-                    except Exception as e_override:
-                        print(f"[오류] on_video_wan의 on_done_override 호출 실패: {e_override}")
-                        QtWidgets.QMessageBox.critical(
-                            self,
-                            "매크로 오류",
-                            f"영상 생성 후 콜백 실패:\n{e_override}",
-                        )
-                    return
+                    on_done_override(ok, payload, err)
+                elif not ok:
+                    QtWidgets.QMessageBox.critical(self, "실패", str(err))
+                else:
+                    QtWidgets.QMessageBox.information(self, "완료", str(payload))
+                if btn_video_widget: btn_video_widget.setEnabled(True)
 
-                if not ok and err:
-                    err_type_name = type(err).__name__
-                    err_message = str(err)
-                    print(f"[오류] Wan 영상 생성 작업 실패: {err_type_name}: {err_message}")
-                    QtWidgets.QMessageBox.critical(
-                        self,
-                        "영상 생성 실패(Wan)",
-                        f"{err_type_name}: {err_message}",
-                    )
-                elif ok:
-                    msg = str(payload) if payload is not None else "영상 생성이 완료되었습니다."
-                    QtWidgets.QMessageBox.information(
-                        self,
-                        "영상 생성 완료(Wan)",
-                        msg,
-                    )
+            run_job_with_progress_async(owner=self, title="Wan 2.2 (Start-End)", job=_job, on_done=_done)
 
-            # --- 비동기 실행 ---
-            run_job_with_progress_async(
-                owner=self,
-                title="영상 생성 (Wan 2.2 보간)",
-                job=_job,
-                on_done=_done,
-            )
-
-        except Exception as e_outer:
-            print(f"[오류] on_video_wan 실행 중 오류 발생: {type(e_outer).__name__}: {e_outer}")
-            if on_done_override:
-                try:
-                    on_done_override(False, None, e_outer)
-                except Exception as e_override2:
-                    print(f"[오류] on_video_wan on_done_override(outer) 호출 실패: {e_override2}")
-                    QtWidgets.QMessageBox.critical(
-                        self,
-                        "영상 생성 실패(Wan)",
-                        f"{type(e_outer).__name__}: {e_outer}",
-                    )
-            else:
-                QtWidgets.QMessageBox.critical(
-                    self,
-                    "영상 생성 실패(Wan)",
-                    f"{type(e_outer).__name__}: {e_outer}",
-                )
-        finally:
-            if on_done_override is None and btn_video_widget:
-                try:
-                    btn_video_widget.setEnabled(True)
-                except RuntimeError:
-                    pass
+        except Exception as e:
+            if btn_video_widget: btn_video_widget.setEnabled(True)
+            QtWidgets.QMessageBox.critical(self, "오류", str(e))
 
     # ────────────── 기타 ──────────────
     def _set_total_frames_from_audio(self, audio_path: Path) -> None:
@@ -10373,6 +10177,7 @@ def _inject_render_prefs_methods():
         default_steps_val = int(getattr(s_mod_prefs, "DEFAULT_T2I_STEPS", 6))
 
         presets_data = [
+            ("Shorts 9:16 · 540×960", 540, 960, "540×960"),
             ("Shorts 9:16 · 720×1280", 720, 1280, "shorts_720x1280"),
             ("Shorts 9:16 · 832×1472", 832, 1472, "shorts_832x1472"),
             ("Shorts 9:16 · 1080×1920", 1080, 1920, "shorts_1080x1920"),
@@ -11105,25 +10910,54 @@ class SegmentEditDialog(QtWidgets.QDialog):
                 _log(f"[{self.scene_id}] 씬의 {len(direct_prompts_to_process)}개 세그먼트에 대해 AI 요청...")
 
                 # [수정된 AI 시스템 프롬프트 (뮤직비디오 감독)]
+                # --- ▼▼▼ [수정된 AI 시스템 프롬프트 (뮤직비디오 감독)] ▼▼▼ ---
                 base_system_prompt = (
                     "You are a creative Music Video Director.\n"
-                    "Your most important goal is to create **dynamic character action** that matches the **lyrics**. Avoid static, mannequin-like images.\n\n"
+                    "Your most important goal is to create dynamic, cinematic prompts for an AI video model that match the **lyrics**.\n"
+                    "Avoid static, mannequin-like images.\n\n"
                     "[Context Provided]\n"
                     "1. `original_vibe`: The overall theme of the entire song.\n"
                     "2. `scene_lyric`: The lyric for THIS scene (THIS IS THE MOST IMPORTANT).\n"
-                    "3. `base_visual` (direct_prompt): The user's core visual idea for THIS segment.\n"
-                    "4. `characters`: The characters in THIS scene.\n"
-                    "5. `time_structure`: The frame segment for THIS segment (e.g., \"0-65f\").\n"
+                    "3. `base_visual` (direct_prompt): The user's concept text for THIS scene.\n"
+                    "   - It may contain explicit POSE / ACTION instructions (e.g. \"both arms up\", \"jumping\", \"hugging\").\n"
+                    "4. `characters`: The characters in THIS scene (e.g., 'female_01').\n"
+                    "5. `time_structure`: The frame segments for THIS scene (e.g., [\"0-65f\", \"49-125f\"]).\n"
                     "6. `next_scene_lyric`: The lyric for the *next* scene (for transition context).\n\n"
-                    "Your task is to return a JSON object ONLY: {\"segment_prompt\": \"...\"}.\n"
-                    "The value must be a single string (NOT an array).\n\n"
+                    "[Your Task (Return JSON ONLY)]\n"
+                    "1. \"prompt_ko\": Korean description of the whole scene (based on all context).\n"
+                    "2. \"prompt_img_base\": English, comma-separated visual tags for the whole scene (5-12 words).\n"
+                    "3. \"motion_hint\": short English motion/camera hint (e.g. \"slow zoom in\"). Can be \"\".\n"
+                    "4. \"segment_prompts\": an array of English scene descriptions.\n"
+                    "   The array length MUST exactly match the `time_structure` list length.\n\n"
                     "[!! CRITICAL RULES !!]\n"
-                    "1.  **New Action (Most Important):** Based on the `scene_lyric` and `base_visual`, describe a specific, creative **new pose and action** for the `characters`.\n"
-                    "    (Examples: \"female_01 starts walking down the autumn path\", \"female_01 stops and picks up an autumn leaf, smiling\").\n"
-                    "2.  **Camera:** Include dynamic camera work (e.g., \"close up on her face\", \"camera rotates around her\").\n"
-                    "3.  **Emotion:** Describe the character's expression (e.g., \"smiling happily\").\n"
-                    "4.  **Prohibition:** NO \"mannequins\"."
+                    "1.  **Hard Rule for base_visual (POSE/ACTION):**\n"
+                    "    - If `base_visual` contains any explicit pose/action from the user\n"
+                    "      (e.g. \"raise both arms up\", \"arms wide open\", \"kneeling down\"),\n"
+                    "      you MUST preserve that pose/action in ALL `segment_prompts` descriptions\n"
+                    "      unless it clearly contradicts the scene_lyric.\n"
+                    "    - NEVER ignore or replace a user-specified pose/action from `base_visual`.\n"
+                    "    - You may ADD extra motion around that pose (camera moves, small variations),\n"
+                    "      but the core pose (e.g. \"both arms up\") must remain.\n"
+                    "2.  **New Action:** Based on the lyrics, design specific actions and motion\n"
+                    "    for the `characters` in each `segment_prompts` description.\n"
+                    "    (Examples: \"female_01 walks forward through falling leaves\",\n"
+                    "              \"female_01 spins around, throwing leaves in the air\").\n"
+                    "    These actions must still respect any explicit pose from `base_visual`.\n"
+                    "3.  **Background:** Use `base_visual` as the base for the background/setting\n"
+                    "    (location, time of day, mood). You may evolve it gradually\n"
+                    "    (e.g., \"The red autumn background becomes darker\"),\n"
+                    "    but do not contradict explicit user instructions.\n"
+                    "4.  **Progression:** Design the actions to be continuous and logical\n"
+                    "    across segments, telling a small story that matches the lyric's emotion.\n"
+                    "5.  **Camera:** Include dynamic camera work in the segment prompts when possible\n"
+                    "    (e.g. \"slow zoom towards her face\", \"camera rotates around her\",\n"
+                    "          \"from a top-down view\").\n"
+                    "6.  **Emotion:** Describe the character's expression\n"
+                    "    (e.g., \"smiling happily\", \"peaceful expression\").\n"
+                    "7.  **Prohibition:** NO mannequins. Every segment description must indicate\n"
+                    "    some change in the character's action, pose, camera, or emotion.\n"
                 )
+                # --- ▲▲▲ [수정 끝] ▲▲▲ ---
 
                 updated_count = 0
 
@@ -11161,8 +10995,36 @@ class SegmentEditDialog(QtWidgets.QDialog):
                             continue
 
                         ai_json = json.loads(ai_raw[json_start:json_end])
-                        new_prompt_movie = (ai_json.get(
-                            "segment_prompt") or "").strip()  # "segment_prompts" (배열) -> "segment_prompt" (문자열)
+
+                        # [수정] 여러 형태의 응답을 허용하는 segment 프롬프트 추출 로직
+                        new_prompt_movie = ""
+
+                        # 1) 권장 키: "segment_prompt"
+                        val = ai_json.get("segment_prompt")
+                        if isinstance(val, str):
+                            new_prompt_movie = val.strip()
+
+                        # 2) 배열 형태 호환: "segment_prompts": ["...", ...] → 첫 번째 사용
+                        if not new_prompt_movie:
+                            seg_list = ai_json.get("segment_prompts")
+                            if isinstance(seg_list, list) and seg_list:
+                                first = seg_list[0]
+                                if isinstance(first, str):
+                                    new_prompt_movie = first.strip()
+
+                        # 3) 기타 키 호환: "prompt_movie", "prompt"
+                        if not new_prompt_movie:
+                            for alt_key in ("prompt_movie", "prompt"):
+                                alt_val = ai_json.get(alt_key)
+                                if isinstance(alt_val, str) and alt_val.strip():
+                                    new_prompt_movie = alt_val.strip()
+                                    break
+
+                        # 4) dict에 필드가 하나뿐이고 그 값이 문자열이면 그것도 허용
+                        if not new_prompt_movie and isinstance(ai_json, dict) and len(ai_json) == 1:
+                            only_val = next(iter(ai_json.values()))
+                            if isinstance(only_val, str):
+                                new_prompt_movie = only_val.strip()
 
                         if new_prompt_movie:
                             # [수정] 메모리(self.frame_segments_data)에 즉시 반영
@@ -11170,7 +11032,8 @@ class SegmentEditDialog(QtWidgets.QDialog):
                             updated_count += 1
                             _log(f"[{seg_label}] AI 행동 묘사 갱신 완료.")
                         else:
-                            _log(f"[{seg_label}] AI가 'segment_prompt'를 반환하지 않았습니다.")
+                            _log(f"[{seg_label}] AI가 사용 가능한 행동 묘사를 반환하지 않았습니다.")
+
 
                     except Exception as e_ai:
                         _log(f"[{seg_label}] AI 호출 실패: {e_ai}")

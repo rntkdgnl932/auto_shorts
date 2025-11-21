@@ -135,73 +135,83 @@ def _submit_and_wait(base_url: str, graph: Dict[str, Any], *, timeout: float, po
     return {}  # history placeholder
 
 # ── 분할/겹침 ───────────────────────────────────────────────────────────────
-def plan_segments(frame_length: int, base_chunk: int = 60, overlap: int = 12, pad_tail: int = 5) -> list[tuple[int, int]]:
+def plan_segments(frame_length: int, base_chunk: int = 82, overlap: int = 6, pad_tail: int = 5) -> List[
+    Tuple[int, int]]:
     """
-    세그먼트 분할(앞에서 세기 규칙 + 항상 +5 프레임 여유).
-    - 총 프레임 ≤ base_chunk 인 경우에도 (0, frame_length + pad_tail) 로 1청크 생성
-    - 총 프레임 > base_chunk:
-        * 시작 인덱스:
-          s0 = 0
-          s1 = s0 + (base_chunk - overlap + 1)  # 예: 0 + (60 - 12 + 1) = 49
-          s(k) = s(k-1) + base_chunk            # 이후 +60
-        * 종료 인덱스(배타 end):
-          e0 = base_chunk + pad_tail            # 60 + 5 = 65
-          e(k) = e(k-1) + base_chunk            # 이후 +60
-          마지막 청크만 e_last = frame_length + pad_tail 로 캡
-    - 반환 튜플은 (inclusive_start, exclusive_end).
-    예)
-      120 → [(0, 65), (49, 125)]
-      174 → [(0, 65), (49, 125), (109, 179)]
-      245 → [(0, 65), (49, 125), (109, 185), (169, 245), (229, 250)]
-      55  → [(0, 60)] 가 아니라 [(0, 60)]이 아님. (항상 +5) → [(0, 60)]? 55+5=60 → [(0, 60)]
+    [수정됨] Wan 2.2 오버랩 생성 전략:
+    - base_chunk: 유효 구간 길이 (예: 82)
+    - overlap: 다음 청크 생성을 위해 뒤로 감는 프레임 수 (예: 6)
+    - pad_tail: 생성 안전망 (예: 5) -> 실제 생성 요청 길이는 base + pad
+
+    반환값: [(start_frame, end_frame), ...]
+    1) 0 ~ 87 (82+5) -> 유효: 0~82
+    2) 76 (82-6) ~ 163 (76+82+5) -> 유효: 82~158
+    ...
     """
-    total = 0 if frame_length is None else int(frame_length)
+    total = int(frame_length)
     if total <= 0:
         return []
 
-    base = 60 if base_chunk is None else int(base_chunk)
-    if base <= 0:
-        base = 60
+    base = int(base_chunk)
+    ov = int(overlap)
+    pad = int(pad_tail)
 
-    ov = 0 if overlap is None else int(overlap)
-    if ov < 0:
-        ov = 0
-    if ov > base:
-        ov = base
+    segments: List[Tuple[int, int]] = []
 
-    pad = 5 if pad_tail is None else int(pad_tail)
-    if pad < 0:
-        pad = 0
+    # '유효 구간'의 시작 커서
+    effective_cursor = 0
 
-    # 총 프레임이 base 이하여도 항상 +pad 적용
-    if total <= base:
-        end_ex = total + pad
-        return [(0, end_ex)]
-
-    first_step = base - ov + 1
-    if first_step < 1:
-        first_step = 1
-
-    segments: list[tuple[int, int]] = []
-    ps_start = 0
-    ps_end = base + pad
-    if ps_end >= total + pad:
-        ps_end = total + pad
-    segments.append((ps_start, ps_end))
-
-    next_start = ps_start + first_step
-    next_end = ps_end + base
-
-    while next_start < total:
-        end_capped = next_end if next_end < (total + pad) else (total + pad)
-        if end_capped > next_start:
-            segments.append((next_start, end_capped))
+    while effective_cursor < total:
+        # 1. 실제 생성 시작점
+        if effective_cursor == 0:
+            start_frame = 0
         else:
-            break
-        next_start = next_start + base
-        next_end = next_end + base
+            # 이전 유효 구간 끝에서 오버랩만큼 뒤로 이동
+            start_frame = effective_cursor - ov
+
+        # 2. 실제 생성 끝점 (시작점 + 기본길이 + 안전패딩)
+        end_frame = start_frame + base + pad
+
+        segments.append((start_frame, end_frame))
+
+        # 3. 유효 커서 전진 (기본 길이만큼)
+        effective_cursor += base
 
     return segments
+
+
+def plan_segments_s_e(total_frames: int, base_chunk: int = 41) -> List[Tuple[int, int]]:
+    """
+    [Wan 전용] 단순 (start, end) 세그먼트 분할.
+    - 오버랩 없음.
+    - 각 세그먼트 길이는 최대 base_chunk 프레임.
+    - 마지막 세그먼트는 남은 프레임만 사용.
+
+    예)
+      total_frames=33 → [(0, 33)]
+      total_frames=41 → [(0, 41)]
+      total_frames=60 → [(0, 41), (41, 60)]
+      total_frames=65 → [(0, 41), (41, 65)]
+    """
+    out: List[Tuple[int, int]] = []
+
+    if total_frames <= 0:
+        return out
+    if base_chunk <= 0:
+        # base_chunk가 0이거나 음수면 전체를 한 번에
+        out.append((0, total_frames))
+        return out
+
+    start = 0
+    while start < total_frames:
+        end = start + base_chunk
+        if end > total_frames:
+            end = total_frames
+        out.append((start, end))
+        start = end
+
+    return out
+
 
 def recalc_overlap(in_fps: int, out_fps: int, overlap: int) -> int:
     if in_fps == out_fps:
@@ -478,13 +488,8 @@ def build_shots_with_i2v(
         on_progress: "Optional[Callable[[Dict[str, Any]], None]]" = None
 ) -> None:
     """
-    각 씬을 i2v로 생성합니다. UI 설정을 워크플로우(guff_movie.json)에 적용하고, 파일 접두사에 날짜를 씁니다.
-    - 씬 레벨 시드 1회 생성 → 모든 청크 공통 사용
-    - 청크 2+ : 이전 청크의 마지막 overlap 프레임 시퀀스를 conditioning 입력으로 제공(가능 시)
-      * 시퀀스 미지원 워크플로우면 기존 1프레임 PNG 폴백
-    - 기본 청크 크기 60f, 겹침 12f
-    - 임시 청크 mp4는 clips/xfade_work 에 저장
-    - guff_movie.json 의 ReActor/LoadImage 노드 ID와 호환 (27/28/29 + 30/31/32)
+    각 씬을 i2v로 생성합니다. UI 설정을 워크플로우(No.48.WAN2.2...json)에 적용하고, 파일 접두사에 날짜를 씁니다.
+    - [수정됨] settings 로드 로직 단순화 (불필요한 별칭 제거)
     """
     # ── 표준 모듈 ─────────────────────────────────────────────
     import json as json_mod
@@ -514,11 +519,7 @@ def build_shots_with_i2v(
         try:
             on_progress({"msg": "[I2V] " + text_val})
         except (TypeError, ValueError, RuntimeError):
-            # 콜백이 깨져도 전체는 계속
             pass
-
-
-
 
     # ── concat(겹침 덮어쓰기) ─────────────────────────────────
     def _concat_cut_no_fade(
@@ -544,10 +545,10 @@ def build_shots_with_i2v(
 
         def _norm(norm_src_local: Path, norm_dst_local: Path) -> Tuple[int, bool]:
             filter_str_local = (
-                "fps={fps},"  # fps
-                "scale=w={w}:h={h}:force_original_aspect_ratio=decrease,"  # scale
-                "pad={w}:{h}:(ow-iw)/2:(oh-ih)/2,"  # pad
-                "setsar=1,format=yuv420p"  # format
+                "fps={fps},"
+                "scale=w={w}:h={h}:force_original_aspect_ratio=decrease,"
+                "pad={w}:{h}:(ow-iw)/2:(oh-ih)/2,"
+                "setsar=1,format=yuv420p"
             ).format(
                 fps=int(max(1, fps_local)),
                 w=int(merge_out_w_local),
@@ -660,7 +661,7 @@ def build_shots_with_i2v(
                 return False
 
             try:
-                current_concat_path.unlink(missing_ok=True)  # type: ignore
+                current_concat_path.unlink(missing_ok=True)
             except OSError:
                 pass
             current_concat_path = next_concat_path
@@ -698,13 +699,11 @@ def build_shots_with_i2v(
             return {"id": txt_val, "index": None}
         return {"id": "", "index": None}
 
-    # ── 없는 헬퍼: 캐릭터 얼굴 경로 ─────────────────────────────
-    # ── 없는 헬퍼: 캐릭터 얼굴 경로 ─────────────────────────────
     def _resolve_character_image_path_i2v(
             scene_obj: Dict[str, Any],
             video_doc_local: Dict[str, Any],
             char_id: str,
-            character_dir_path_str: str,  # ← 여기 이름만 바꿨다 (원래 character_dir_conf 였음)
+            character_dir_path_str: str,
     ) -> str:
         char_id_str = str(char_id or "").strip()
         if not char_id_str:
@@ -725,7 +724,6 @@ def build_shots_with_i2v(
     _notify("영상 생성 시작: project_dir='{0}'".format(project_dir))
     _notify("UI 설정: W={0}, H={1}, FPS={2}, Steps={3}".format(ui_width, ui_height, ui_fps, ui_steps))
 
-    # ── 프로젝트 경로 ─────────────────────────────────────────
     project_dir_path = Path(project_dir).resolve()
     if not project_dir_path.is_dir():
         _notify("[오류] 프로젝트 디렉토리가 아닙니다: {0}".format(project_dir_path))
@@ -733,33 +731,37 @@ def build_shots_with_i2v(
 
     video_json_path = project_dir_path / "video.json"
 
-    # ── utils 로드 (app.utils → utils) ────────────────────────
     try:
-        from app.utils import load_json as load_json_fn, ensure_dir as ensure_dir_fn  # type: ignore
+        from app.utils import load_json as load_json_fn, ensure_dir as ensure_dir_fn
     except (ImportError, ModuleNotFoundError):
         try:
-            from utils import load_json as load_json_fn, ensure_dir as ensure_dir_fn  # type: ignore
+            from utils import load_json as load_json_fn, ensure_dir as ensure_dir_fn
         except (ImportError, ModuleNotFoundError) as util_err:
             raise ImportError("필수 유틸리티(load_json, ensure_dir) 로드 실패: {0}".format(util_err)) from util_err
 
-    # ── settings 로드 ─────────────────────────────────────────
+    # ── settings 로드 (수정됨: 불필요한 별칭 사용 안 함) ────────
+    settings_obj = None
     try:
-        import settings as settings_mod  # type: ignore
-        settings_obj = settings_mod
+        import settings
+        settings_obj = settings
     except ImportError:
         try:
-            from app import settings as settings_mod_app  # type: ignore
-            settings_obj = settings_mod_app
+            from app import settings
+            settings_obj = settings
         except ImportError:
-            class _SettingsFallback(object):
-                JSONS_DIR = str(project_dir_path / "jsons")
-                I2V_WORKFLOW = None
-                COMFY_INPUT_DIR = str(project_dir_path / "comfy_inputs")
-                COMFY_HOST = "http://127.0.0.1:8188"
-                FFMPEG_EXE = "ffmpeg"
-                FFPROBE_EXE = "ffprobe"
-                CHARACTER_DIR = str(project_dir_path / "character")
-            settings_obj = _SettingsFallback()
+            pass
+
+    # 만약 settings.py가 진짜 없으면 기본값(Fallback) 사용
+    if settings_obj is None:
+        class _SettingsFallback(object):
+            JSONS_DIR = str(project_dir_path / "jsons")
+            I2V_WORKFLOW = None
+            COMFY_INPUT_DIR = str(project_dir_path / "comfy_inputs")
+            COMFY_HOST = "http://127.0.0.1:8188"
+            FFMPEG_EXE = "ffmpeg"
+            FFPROBE_EXE = "ffprobe"
+            CHARACTER_DIR = str(project_dir_path / "character")
+        settings_obj = _SettingsFallback()
 
     jsons_dir_conf = getattr(settings_obj, "JSONS_DIR", str(project_dir_path / "jsons"))
     i2v_workflow_conf = getattr(settings_obj, "I2V_WORKFLOW", None)
@@ -773,7 +775,6 @@ def build_shots_with_i2v(
     comfy_input_dir = Path(str(comfy_input_conf))
     comfy_input_dir.mkdir(parents=True, exist_ok=True)
 
-    # ── video.json 로드 ──────────────────────────────────────
     video_doc = load_json_fn(video_json_path, {}) or {}
     if not isinstance(video_doc, dict):
         _notify("[오류] video.json 형식 오류: {0}".format(video_json_path))
@@ -794,14 +795,12 @@ def build_shots_with_i2v(
         except OSError:
             pass
 
-    # ── comfy host 결정 ──────────────────────────────────────
     try:
         base_url = str((video_doc or {}).get("comfy_host") or comfy_host_conf).rstrip("/")
     except Exception:
         base_url = str(comfy_host_conf).rstrip("/")
 
-    # ── 워크플로 경로 결정 ────────────────────────────────────
-    workflow_path = None  # type: Optional[Path]
+    workflow_path = None
     if i2v_workflow_conf:
         candidate_1 = Path(str(i2v_workflow_conf))
         if not candidate_1.is_absolute():
@@ -819,20 +818,23 @@ def build_shots_with_i2v(
             if candidate_2.is_file():
                 workflow_path = candidate_2
     if workflow_path is None:
-        candidate_3 = base_jsons_path / "guff_movie.json"
+        # [수정] 기본 파일명을 새 워크플로우 이름으로 변경
+        candidate_3 = base_jsons_path / "No.48.WAN2.2-LightX2V-I2V.json"
         if candidate_3.is_file():
             workflow_path = candidate_3
         else:
-            raise FileNotFoundError("워크플로 파일을 찾을 수 없습니다: guff_movie.json")
+            candidate_original = base_jsons_path / "guff_movie.json"
+            if candidate_original.is_file():
+                workflow_path = candidate_original
+            else:
+                 raise FileNotFoundError("워크플로 파일을 찾을 수 없습니다.")
 
     _notify("사용할 워크플로우: {0} (경로: {1})".format(workflow_path.name, workflow_path))
 
-    # ── 워크플로 로드 ────────────────────────────────────────
     with workflow_path.open("r", encoding="utf-8") as wf_f:
         graph_origin = json_mod.load(wf_f)
 
-    # ── KSampler 노드 미리 수집 (ui_steps 덮어쓸 때 NameError 방지) ─
-    ksampler_ids_in_graph = []  # type: List[str]
+    ksampler_ids_in_graph = []
     for node_id_in_graph, node_data_in_graph in graph_origin.items():
         node_class_type_name = ""
         try:
@@ -842,38 +844,34 @@ def build_shots_with_i2v(
         if node_class_type_name in ("KSamplerAdvanced", "KSampler"):
             ksampler_ids_in_graph.append(str(node_id_in_graph))
 
-    # ── comfy 제출 함수 로드 ─────────────────────────────────
-    submit_and_wait_fn = None  # type: Optional[Callable[..., Dict[str, Any]]]
+    submit_and_wait_fn = None
     try:
-        from app.audio_sync import _submit_and_wait as submit_and_wait_fn  # type: ignore
+        from app.audio_sync import _submit_and_wait as submit_and_wait_fn
     except (ImportError, ModuleNotFoundError):
         try:
-            from audio_sync import _submit_and_wait as submit_and_wait_fn  # type: ignore
+            from audio_sync import _submit_and_wait as submit_and_wait_fn
         except (ImportError, ModuleNotFoundError) as e_wait:
             raise RuntimeError("_submit_and_wait 함수 로드 실패: {0}".format(e_wait)) from e_wait
     if submit_and_wait_fn is None:
         raise RuntimeError("_submit_and_wait 함수를 audio_sync 모듈에서 찾을 수 없습니다.")
 
-    # ── 날짜 prefix ─────────────────────────────────────────
     try:
         date_prefix = datetime.date.today().strftime("%Y-%m-%d")
     except Exception:
         date_prefix = "YYYY-MM-DD"
 
-    # ── defaults 에서 청크 설정 ─────────────────────────────
     defaults_all_doc_2 = video_doc.get("defaults") or {}
     defaults_i2v_doc_2 = defaults_all_doc_2.get("i2v") or {}
     try:
-        max_frames_per_chunk = int(defaults_i2v_doc_2.get("max_frames_per_chunk", 60))
+        max_frames_per_chunk = int(defaults_i2v_doc_2.get("max_frames_per_chunk", 41))
     except (TypeError, ValueError):
-        max_frames_per_chunk = 60
+        max_frames_per_chunk = 41
     try:
-        overlap_frames_for_chunk = int(defaults_i2v_doc_2.get("overlap_frames_chunk", 12))
+        overlap_frames_for_chunk = int(defaults_i2v_doc_2.get("overlap_frames_chunk", 0))
     except (TypeError, ValueError):
-        overlap_frames_for_chunk = 12
+        overlap_frames_for_chunk = 0
     _notify("청크 설정: 최대 {0}f, 겹침 {1}f".format(max_frames_per_chunk, overlap_frames_for_chunk))
 
-    # ── 씬 루프 ─────────────────────────────────────────────
     for scene_index, scene_item in enumerate(scenes):
         if not isinstance(scene_item, dict):
             _notify("[경고] scenes[{0}] 항목 형식 오류. 건너뜁니다.".format(scene_index))
@@ -890,8 +888,7 @@ def build_shots_with_i2v(
         except OSError:
             pass
 
-        # 입력 이미지 찾기
-        scene_image_path = None  # type: Optional[Path]
+        scene_image_path = None
         declared_img = str(scene_item.get("img_file") or "").strip()
         if declared_img:
             candidate_path = Path(declared_img)
@@ -921,20 +918,23 @@ def build_shots_with_i2v(
         except (IOError, OSError, shutil.Error):
             pass
 
-        # 씬 시드
         try:
             scene_seed_val = random.randint(0, 999999999999999)
         except ValueError:
             scene_seed_val = int(time.time() * 1000000)
 
-        # 페이스 스왑 매핑
+        # ── [수정] ReActor 매핑 (No.48 워크플로우 기준) ────────────────────────
+        # No.48 연결 순서: 118(VAE) -> 175 -> 173 -> 174 -> 166(Interpolate)
+        # ID 175: "other_char" (LoadImage 176)
+        # ID 173: "female_01" (LoadImage 177)
+        # ID 174: "male_01" (LoadImage 178)
         reactor_node_map = {
-            "29": ("32", "male_01"),
-            "28": ("31", "female_01"),
-            "27": ("30", "other_char"),
+            "174": ("178", "male_01"),    # Last Reactor Node
+            "173": ("177", "female_01"),  # Middle Reactor Node
+            "175": ("176", "other_char"), # First Reactor Node
         }
 
-        scene_character_specs = {}  # type: Dict[str, int]
+        scene_character_specs = {}
         try:
             scene_chars_list = scene_item.get("characters") or scene_item.get("character_objs") or []
             for scene_char_raw in scene_chars_list:
@@ -949,8 +949,8 @@ def build_shots_with_i2v(
         except (TypeError, ValueError):
             pass
 
-        face_files_to_inject_map = {}  # type: Dict[str, str]
-        reactors_to_enable_map = {}  # type: Dict[str, str]
+        face_files_to_inject_map = {}
+        reactors_to_enable_map = {}
         for reactor_node_id_str, reactor_meta in reactor_node_map.items():
             load_node_id_str, default_character_id_str = reactor_meta
             if default_character_id_str in scene_character_specs:
@@ -959,7 +959,7 @@ def build_shots_with_i2v(
                     scene_item,
                     video_doc,
                     default_character_id_str,
-                    character_dir_conf,  # ← 바깥에서 settings에서 가져온 이 이름은 그대로 둔다
+                    character_dir_conf,
                 )
                 if face_path_resolved:
                     face_name_input = Path(face_path_resolved).name
@@ -970,18 +970,19 @@ def build_shots_with_i2v(
                     face_files_to_inject_map[load_node_id_str] = face_name_input
                     reactors_to_enable_map[reactor_node_id_str] = str(face_idx_for_node)
 
-        # guff_movie.json 기준 주요 노드
-        combine_node_id = "21"
-        i2v_node_id = "25"
-        i2v_source_loader_node_id = "26"
-        resize_node_id = "24"
+        # ── [수정] No.48 워크플로우 기준 주요 노드 ID 설정 ──────────────────
+        combine_node_id = "172"          # VHS Video Combine (Upscaled/Final)
+        i2v_node_id = "18"               # WanImageToVideo
+        i2v_source_loader_node_id = "120" # LoadImage (Start)
+        resize_node_id = "121"           # LayerUtility ImageScale (주의: input 방식 다름)
+
+        # 프롬프트 노드 ID (아래 루프에서 사용됨: Pos="135", Neg="125")
 
         try:
             scene_duration = float(scene_item.get("duration", 1.0))
         except (TypeError, ValueError):
             scene_duration = 1.0
 
-        # fps 결정
         if ui_fps is not None and ui_fps > 0:
             target_fps_val = int(ui_fps)
         else:
@@ -1002,19 +1003,36 @@ def build_shots_with_i2v(
         except (TypeError, ValueError):
             frame_length = target_fps_val
 
-        # ── plan_segments 는 네 모듈에 있다고 가정 ─────
-        segments_list = plan_segments(  # type: ignore[name-defined]
-            frame_length,
-            base_chunk=max_frames_per_chunk,
-            overlap=overlap_frames_for_chunk
-        )  # type: List[Tuple[int, int]]
+        segments_list = []
+        segment_prompts = []
+        frame_segs_doc = scene_item.get("frame_segments")
+        if isinstance(frame_segs_doc, list) and frame_segs_doc:
+            for seg_obj in frame_segs_doc:
+                if not isinstance(seg_obj, dict):
+                    continue
+                try:
+                    s_f = int(seg_obj.get("start_frame", 0))
+                    e_f = int(seg_obj.get("end_frame", 0))
+                except (TypeError, ValueError):
+                    continue
+                if e_f <= s_f:
+                    continue
+                segments_list.append((s_f, e_f))
+                segment_prompts.append(str(seg_obj.get("prompt_movie") or "").strip())
 
-        chunk_paths = []  # type: List[Path]
+        if not segments_list:
+            segments_list = plan_segments(
+                frame_length,
+                base_chunk=82,
+                overlap=6,
+                pad_tail=5
+            )
+
+        chunk_paths = []
         scene_failed = False
         current_input_image_name = scene_server_image_name
-        temp_frames = []  # type: List[Path]
+        temp_frames = []
 
-        # 시퀀스 로더 있는지 확인
         has_sequence_loader = False
         sequence_loader_node_id = ""
         for node_key, node_val in graph_origin.items():
@@ -1033,6 +1051,17 @@ def build_shots_with_i2v(
                 has_sequence_loader = True
                 break
 
+        base_scene_pos = str(scene_item.get("prompt_movie") or scene_item.get("prompt") or "")
+        base_neg_txt = str(scene_item.get("prompt_negative") or "")
+        force_neg_tags = (
+            "text, watermark, logo, letters, (file name:1.5), (title:1.5), (t_001:1.5), (t_002:1.5), "
+            "(mp4:1.5), signature, typography, caption, subtitles, text overlay"
+        )
+        if base_neg_txt:
+            neg_txt = "{0}, {1}".format(base_neg_txt.rstrip(", "), force_neg_tags)
+        else:
+            neg_txt = force_neg_tags
+
         for chunk_index, segment_pair in enumerate(segments_list):
             if scene_failed:
                 break
@@ -1048,10 +1077,8 @@ def build_shots_with_i2v(
                 chunk_label, start_f, end_f, chunk_len
             ))
 
-            # 워크플로 복제
             graph_chunk = json_mod.loads(json_mod.dumps(graph_origin))
 
-            # 오버레이 끄기
             for node_id_str, node_val in graph_chunk.items():
                 if not isinstance(node_val, dict):
                     continue
@@ -1076,8 +1103,8 @@ def build_shots_with_i2v(
                     if key_dim in inputs_map:
                         inputs_map[key_dim] = 0
 
-            # ReActor 활성/비활성
-            for reactor_id in ("27", "28", "29"):
+            # [수정] ReActor 활성화 로직 (ID 변경됨: 173, 174, 175)
+            for reactor_id in ("173", "174", "175"):
                 node_re = graph_chunk.get(reactor_id)
                 if not isinstance(node_re, dict):
                     continue
@@ -1085,68 +1112,62 @@ def build_shots_with_i2v(
                 if reactor_id in reactors_to_enable_map:
                     node_re_inputs["enabled"] = True
                     node_re_inputs["input_faces_index"] = reactors_to_enable_map[reactor_id]
+                    # source_faces_index는 보통 0으로 고정
                     node_re_inputs["source_faces_index"] = "0"
                 else:
                     node_re_inputs["enabled"] = False
 
-            # 얼굴 LoadImage 주입
             for load_node_id, face_filename in face_files_to_inject_map.items():
                 node_load = graph_chunk.get(load_node_id)
                 if isinstance(node_load, dict):
                     node_load.setdefault("inputs", {})["image"] = face_filename
 
-            # I2V 입력 이미지 주입
             node_26_chunk = graph_chunk.get(i2v_source_loader_node_id)
             if isinstance(node_26_chunk, dict):
                 node_26_chunk.setdefault("inputs", {})["image"] = current_input_image_name
 
-            # 리사이즈
             node_24_chunk = graph_chunk.get(resize_node_id)
             if isinstance(node_24_chunk, dict):
                 resize_inputs = node_24_chunk.setdefault("inputs", {})
+                # 주의: No.48의 121번 노드는 LayerUtility이므로 width/height 키가 동작하지 않을 수 있음
+                # 워크플로우가 해당 키를 무시하면 문제는 없으나, 리사이징이 적용 안 될 수 있음.
                 if ui_width and ui_width > 0:
                     resize_inputs["width"] = ui_width
                 if ui_height and ui_height > 0:
                     resize_inputs["height"] = ui_height
 
-            # FPS 덮어쓰기
             node_21_chunk = graph_chunk.get(combine_node_id)
             if isinstance(node_21_chunk, dict) and ui_fps and ui_fps > 0:
                 node_21_chunk.setdefault("inputs", {})["frame_rate"] = ui_fps
 
-            # steps 덮어쓰기
             if ui_steps and ui_steps > 0:
                 for sampler_id in ksampler_ids_in_graph:
                     node_samp = graph_chunk.get(sampler_id)
                     if isinstance(node_samp, dict):
                         node_samp.setdefault("inputs", {})["steps"] = ui_steps
 
-            # i2v 길이
             node_25_chunk = graph_chunk.get(i2v_node_id)
             if isinstance(node_25_chunk, dict):
                 node_25_chunk.setdefault("inputs", {})["length"] = chunk_len
 
-            # 프롬프트
-            pos_txt = str(scene_item.get("prompt_movie") or scene_item.get("prompt") or "")
-            base_neg_txt = str(scene_item.get("prompt_negative") or "")
-            force_neg_tags = (
-                "text, watermark, logo, letters, (file name:1.5), (title:1.5), (t_001:1.5), (t_002:1.5), "
-                "(mp4:1.5), signature, typography, caption, subtitles, text overlay"
-            )
-            if base_neg_txt:
-                neg_txt = "{0}, {1}".format(base_neg_txt.rstrip(", "), force_neg_tags)
+            if segment_prompts and chunk_index < len(segment_prompts) and segment_prompts[chunk_index]:
+                pos_txt = segment_prompts[chunk_index]
             else:
-                neg_txt = force_neg_tags
+                pos_txt = base_scene_pos
+
             if pos_txt:
-                node_22_chunk = graph_chunk.get("22")
+                # [수정] Positive Prompt ID: 135
+                node_22_chunk = graph_chunk.get("135")
                 if isinstance(node_22_chunk, dict):
                     node_22_chunk.setdefault("inputs", {})["text"] = pos_txt
-            node_23_chunk = graph_chunk.get("23")
+
+            # [수정] Negative Prompt ID: 125
+            node_23_chunk = graph_chunk.get("125")
             if isinstance(node_23_chunk, dict):
                 node_23_chunk.setdefault("inputs", {})["text"] = neg_txt
 
-            # 저장 prefix
-            node_save_chunk = graph_chunk.get("21")
+            # [수정] Save Node ID: 172 (Combine Node ID 변수 사용)
+            node_save_chunk = graph_chunk.get(combine_node_id)
             if isinstance(node_save_chunk, dict):
                 save_inputs = node_save_chunk.setdefault("inputs", {})
                 raw_prefix = str(save_inputs.get("filename_prefix") or "i2v_fallback")
@@ -1157,9 +1178,8 @@ def build_shots_with_i2v(
                 new_prefix = "{0}/{1}".format(date_prefix, suffix_str)
                 save_inputs["filename_prefix"] = new_prefix
 
-            # conditioning 시퀀스 (이전 청크 → 이번 청크)
             use_sequence_conditioning = False
-            seq_dir_for_condition = None  # type: Optional[Path]
+            seq_dir_for_condition = None
             seq_pattern_text = ""
             if has_sequence_loader and chunk_index > 0 and overlap_frames_for_chunk > 0:
                 prev_chunk_path = work_dir / "_chunk_{0}_{1:05d}.mp4".format(scene_id, chunk_index - 1)
@@ -1227,7 +1247,6 @@ def build_shots_with_i2v(
                         node_seq_inputs["pattern"] = seq_pattern_text
                     node_seq_inputs["frame_rate"] = target_fps_val
 
-            # 워크플로우 제출
             _notify("워크플로우 제출 시작 ({0})".format(chunk_label))
             try:
                 result_data_chunk = submit_and_wait_fn(
@@ -1243,10 +1262,10 @@ def build_shots_with_i2v(
                 continue
 
             outputs_dict = cast(dict, result_data_chunk.get("outputs") or {})
-            target_info = None  # type: Optional[Dict[str, Any]]
+            target_info = None
 
-            candidate_infos = []  # type: List[Dict[str, Any]]
-            any_infos = []  # type: List[Dict[str, Any]]
+            candidate_infos = []
+            any_infos = []
 
             for node_out_id, out_val in outputs_dict.items():
                 if not isinstance(out_val, dict):
@@ -1300,7 +1319,6 @@ def build_shots_with_i2v(
                 scene_failed = True
                 continue
 
-            # PNG → MP4 변환
             if filename_pick.lower().endswith(".png"):
                 temp_png_path = work_dir / "_temp_{0}_{1:05d}.png".format(scene_id, chunk_index)
                 with open(temp_png_path, "wb") as f_png:
@@ -1326,7 +1344,7 @@ def build_shots_with_i2v(
                     check=False,
                 )
                 try:
-                    temp_png_path.unlink(missing_ok=True)  # type: ignore
+                    temp_png_path.unlink(missing_ok=True)
                 except OSError:
                     pass
                 if png_proc.returncode != 0:
@@ -1350,7 +1368,6 @@ def build_shots_with_i2v(
 
             chunk_paths.append(chunk_path)
 
-            # 다음 conditioning 프레임 추출
             if chunk_index < len(segments_list) - 1:
                 next_frame_name = "{0}_temp_frame_{1:05d}.png".format(scene_id, chunk_index)
                 next_frame_path = comfy_input_dir / next_frame_name
@@ -1407,10 +1424,9 @@ def build_shots_with_i2v(
                         except requests_mod.RequestException:
                             current_input_image_name = scene_server_image_name
 
-        # temp png 정리
         for tmp_png in temp_frames:
             try:
-                tmp_png.unlink(missing_ok=True)  # type: ignore
+                tmp_png.unlink(missing_ok=True)
             except OSError:
                 pass
 
@@ -1418,7 +1434,7 @@ def build_shots_with_i2v(
             _notify("[오류] 씬 {0} 처리 중 실패가 있어 최종 파일 생성을 건너뜁니다.".format(scene_id))
             for bad_chunk in chunk_paths:
                 try:
-                    bad_chunk.unlink(missing_ok=True)  # type: ignore
+                    bad_chunk.unlink(missing_ok=True)
                 except OSError:
                     pass
             continue
@@ -1447,7 +1463,7 @@ def build_shots_with_i2v(
 
         for tmp_mp4 in chunk_paths:
             try:
-                tmp_mp4.unlink(missing_ok=True)  # type: ignore
+                tmp_mp4.unlink(missing_ok=True)
             except OSError:
                 pass
 
@@ -2149,8 +2165,8 @@ def build_missing_images_from_story(
         ui_width: int,
         ui_height: int,
         steps: int = 28,
-        timeout_sec: int = 300,
-        poll_sec: float = 1.5,
+        timeout_sec: int = 900,
+        poll_sec: float = 3,
         workflow_path: str | _Path | None = None,
         on_progress: Optional[Dict[str, Any] | Callable[[Dict[str, Any]], None]] = None,
 ) -> List[_Path]:
@@ -4501,22 +4517,7 @@ def fill_prompt_movie_with_ai(
         from utils import load_json, save_json  # type: ignore
         import json  # AI 응답 파싱용
 
-    # plan_segments (기존과 동일)
-    try:
-        from video_build import plan_segments  # type: ignore
-    except Exception:
-        def plan_segments(total_frames: int, base_chunk: int = 60, overlap: int = 12, pad_tail: int = 5) -> list[
-            tuple[int, int]]:
-            # (기존 plan_segments 폴백 로직)
-            if total_frames <= 0: return []
-            size = base_chunk
-            out: List[List[int]] = []
-            s = 0
-            while s < total_frames:
-                e = min(s + size, total_frames)
-                out.append([s, e])
-                s = e
-            return [(pair[0], pair[1]) for pair in out if len(pair) == 2]
+
 
     def _log(msg: str) -> None:
         if callable(log_fn):
@@ -4565,10 +4566,10 @@ def fill_prompt_movie_with_ai(
 
     # (Chunk/Overlap 값 읽기 - 기존과 동일)
     try:
-        base_chunk_val = int(movie_def.get("base_chunk", 60))
-        overlap_val = int(movie_def.get("overlap", 12))
+        base_chunk_val = int(movie_def.get("base_chunk", 41))
+        overlap_val = int(movie_def.get("overlap", 0))
     except Exception:
-        base_chunk_val, overlap_val = 60, 12
+        base_chunk_val, overlap_val = 41, 0
 
     # ── 3) 씬 루프 (구조 변경) ──────────────────────────────────
     scenes = vdoc.get("scenes") or []
@@ -4580,27 +4581,30 @@ def fill_prompt_movie_with_ai(
     changed = False
 
     # --- ▼▼▼ [수정된 AI 시스템 프롬프트 (뮤직비디오 감독)] ▼▼▼ ---
+    # --- ▼▼▼ [수정된 AI 시스템 프롬프트 (생동감/동작 강화 버전)] ▼▼▼ ---
     system_msg = (
-        "You are a creative Music Video Director.\n"
-        "Your most important goal is to create **dynamic character action** that matches the **lyrics**. Avoid static, mannequin-like images.\n\n"
+        "You are an expert Music Video Director specializing in AI video generation.\n"
+        "Your goal is to break the static nature of Image-to-Image generation by writing **action-heavy prompts**.\n"
+        "The generated video segments must show **clear physical movement**, not just camera movement.\n\n"
         "[Context Provided]\n"
-        "1. `original_vibe`: The overall theme of the entire song (e.g., 'sadness', 'joy').\n"
-        "2. `scene_lyric`: The specific lyric for THIS scene (THIS IS THE MOST IMPORTANT).\n"
-        "3. `base_visual`: The background/setting description (use this for the SETTING only, but you can change it creatively).\n"
-        "4. `characters`: The characters in THIS scene (e.g., 'female_01').\n"
-        "5. `time_structure`: The frame segments for THIS scene (e.g., [\"0-65f\", \"49-125f\"]).\n"
-        "6. `next_scene_lyric`: The lyric for the *next* scene (for transition context).\n\n"
+        "1. `original_vibe`: The overall theme (e.g., 'sadness', 'joy').\n"
+        "2. `scene_lyric`: The lyric for THIS scene (Korean).\n"
+        "3. `base_visual`: The character and background setting.\n"
+        "4. `time_structure`: The segments for THIS scene (e.g., [\"0-82f\", \"82-164f\"]).\n\n"
         "Your task is to return a JSON object ONLY: {\"segment_prompts\": [\"prompt 1\", \"prompt 2\", ...]}.\n"
         "The array length MUST exactly match the `time_structure` list length.\n\n"
         "[!! CRITICAL RULES !!]\n"
-        "1.  **New Action (Most Important):** Based on the `scene_lyric` and `original_vibe`, you MUST describe a specific, creative **new pose and action** for the `characters` in *each* segment.\n"
-        "    (Examples: \"female_01 starts walking down the autumn path\", \"female_01 stops and picks up an autumn leaf, smiling\", \"female_01 spins around, throwing leaves in the air\", \"female_01 dances\", \"female_01 runs\").\n"
-        "2.  **Background:** Use `base_visual` as the background, but change it creatively (e.g., \"The red autumn background becomes darker\").\n"
-        "3.  **Progression:** Design the actions to be continuous and logical, telling a small story that matches the lyric's emotion.\n"
-        "4.  **Camera:** Include dynamic camera work in each description (e.g., \"close up on her face\", \"camera rotates around her\", \"from a top-down view\", \"dolly zoom out\").\n"
-        "5.  **Emotion:** Describe the character's expression (e.g., \"smiling happily\", \"peaceful expression\").\n"
-        "6.  **Prohibition:** NO \"mannequins\". Every prompt must describe a **change in the character's action or pose**."
+        "1. **LANGUAGE: MUST BE ENGLISH.** Translate any Korean input into English descriptions. (NO Korean output allowed).\n"
+        "2. **FORBIDDEN:** Do NOT write 'static', 'standing still', or just 'cinematic lighting'.\n"
+        "3. **MANDATORY ACTION:** Every prompt MUST contain a strong verb describing body movement.\n"
+        "    - BAD: 'A woman standing in the rain.'\n"
+        "    - GOOD: 'She **tilts her head back** to feel the rain, **raising her hand** slowly.'\n"
+        "    - GOOD: 'She **turns around** quickly, hair whipping in the wind, expression changing to shock.'\n"
+        "4. **FOCUS ON LIMBS & HEAD:** Explicitly describe what the hands, head, or eyes are doing (e.g., 'wiping tears', 'reaching out', 'looking over shoulder').\n"
+        "5. **PROGRESSION:** Segment 1 should start an action, and Segment 2 must continue or finish it. Make a mini-story.\n"
+        "6. **CAMERA:** Use dynamic angles (low angle, dutch angle) ONLY combined with character movement."
     )
+    # --- ▲▲▲ [수정 끝] ▲▲▲ ---
     # --- ▲▲▲ [수정 끝] ▲▲▲ ---
 
     for i, sc in enumerate(scenes):
@@ -4620,7 +4624,7 @@ def fill_prompt_movie_with_ai(
         # 2. frame_segments 생성 (기존과 동일)
         segs = sc.get("frame_segments")
         if not isinstance(segs, list) or not segs:
-            pairs_tuples = plan_segments(total_frames, base_chunk=base_chunk_val, overlap=overlap_val)
+            pairs_tuples =  plan_segments_s_e(total_frames, base_chunk=base_chunk_val)
             segs_out: List[Dict[str, Any]] = []
             for s_f, e_f in pairs_tuples:
                 segs_out.append({"start_frame": int(s_f), "end_frame": int(e_f), "prompt_movie": ""})

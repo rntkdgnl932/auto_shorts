@@ -4,7 +4,7 @@
       "upscale_method": "lanczos",
       "megapixels": 1,
       "image": [
-        "11",
+        "22",
         0
       ]
     },
@@ -32,7 +32,7 @@
         0
       ],
       "vae": [
-        "10",
+        "8",
         0
       ]
     },
@@ -50,19 +50,19 @@
       "scheduler": "simple",
       "denoise": 1,
       "model": [
-        "15",
+        "12",
         0
       ],
       "positive": [
-        "8",
+        "7",
         0
       ],
       "negative": [
-        "6",
+        "5",
         0
       ],
       "latent_image": [
-        "7",
+        "6",
         0
       ]
     },
@@ -73,25 +73,13 @@
   },
   "5": {
     "inputs": {
-      "images": [
-        "3",
-        0
-      ]
-    },
-    "class_type": "PreviewImage",
-    "_meta": {
-      "title": "이미지 미리보기"
-    }
-  },
-  "6": {
-    "inputs": {
       "prompt": "",
       "clip": [
-        "9",
+        "16",
         0
       ],
       "vae": [
-        "10",
+        "8",
         0
       ],
       "image1": [
@@ -104,14 +92,14 @@
       "title": "TextEncodeQwenImageEditPlus"
     }
   },
-  "7": {
+  "6": {
     "inputs": {
       "pixels": [
         "1",
         0
       ],
       "vae": [
-        "10",
+        "8",
         0
       ]
     },
@@ -120,15 +108,15 @@
       "title": "VAE 인코드"
     }
   },
-  "8": {
+  "7": {
     "inputs": {
       "prompt": "Turn the camera to a top-down view",
       "clip": [
-        "9",
+        "16",
         0
       ],
       "vae": [
-        "10",
+        "8",
         0
       ],
       "image1": [
@@ -141,18 +129,7 @@
       "title": "TextEncodeQwenImageEditPlus"
     }
   },
-  "9": {
-    "inputs": {
-      "clip_name": "qwen\\qwen_2.5_vl_7b.safetensors",
-      "type": "stable_diffusion",
-      "device": "default"
-    },
-    "class_type": "CLIPLoader",
-    "_meta": {
-      "title": "CLIP 로드"
-    }
-  },
-  "10": {
+  "8": {
     "inputs": {
       "vae_name": "qwen\\qwen_image_vae.safetensors"
     },
@@ -161,32 +138,9 @@
       "title": "VAE 로드"
     }
   },
-  "11": {
-    "inputs": {
-      "image": "KakaoTalk_20251102_235915307_04.jpg"
-    },
-    "class_type": "LoadImage",
-    "_meta": {
-      "title": "이미지 로드"
-    }
-  },
-  "12": {
+  "9": {
     "inputs": {
       "lora_name": "qwen\\Qwen-Image-Lightning-8steps-V2.0.safetensors",
-      "strength_model": 1,
-      "model": [
-        "17",
-        0
-      ]
-    },
-    "class_type": "LoraLoaderModelOnly",
-    "_meta": {
-      "title": "LoRA 로드 (모델 전용)"
-    }
-  },
-  "13": {
-    "inputs": {
-      "lora_name": "qwen\\Qwen-Edit-2509-Multiple-anglesQwen-Edit-2509-Multiple-angles.safetensors",
       "strength_model": 1,
       "model": [
         "14",
@@ -198,12 +152,12 @@
       "title": "LoRA 로드 (모델 전용)"
     }
   },
-  "14": {
+  "10": {
     "inputs": {
-      "lora_name": "qwen\\next-scene_lora-v2-3000.safetensors",
+      "lora_name": "qwen\\Qwen-Edit-2509-Multiple-anglesQwen-Edit-2509-Multiple-angles.safetensors",
       "strength_model": 1,
       "model": [
-        "12",
+        "11",
         0
       ]
     },
@@ -212,11 +166,25 @@
       "title": "LoRA 로드 (모델 전용)"
     }
   },
-  "15": {
+  "11": {
+    "inputs": {
+      "lora_name": "qwen\\next-scene_lora-v2-3000.safetensors",
+      "strength_model": 1,
+      "model": [
+        "9",
+        0
+      ]
+    },
+    "class_type": "LoraLoaderModelOnly",
+    "_meta": {
+      "title": "LoRA 로드 (모델 전용)"
+    }
+  },
+  "12": {
     "inputs": {
       "strength": 1,
       "model": [
-        "16",
+        "13",
         0
       ]
     },
@@ -225,11 +193,11 @@
       "title": "CFGNorm"
     }
   },
-  "16": {
+  "13": {
     "inputs": {
       "shift": 3,
       "model": [
-        "13",
+        "10",
         0
       ]
     },
@@ -238,7 +206,7 @@
       "title": "모델 샘플링 (AuraFlow)"
     }
   },
-  "17": {
+  "14": {
     "inputs": {
       "unet_name": "qwen\\Qwen-Image-Edit-2509_fp8_e4m3fn.safetensors",
       "weight_dtype": "default"
@@ -248,101 +216,39 @@
       "title": "확산 모델 로드"
     }
   },
-  "999": {
+  "15": {
     "inputs": {
-      "filename_prefix": "keyframe_qwen",
       "images": [
-        "1002",
-        0
-      ]
-    },
-    "class_type": "SaveImage",
-    "_meta": {
-      "title": "Save Keyframe (API Output)"
-    }
-  },
-  "1000": {
-    "inputs": {
-      "enabled": true,
-      "swap_model": "inswapper_128.onnx",
-      "facedetection": "retinaface_resnet50",
-      "face_restore_model": "GFPGANv1.4.pth",
-      "face_restore_visibility": 1,
-      "codeformer_weight": 0.9,
-      "detect_gender_input": "no",
-      "detect_gender_source": "no",
-      "input_faces_index": "2",
-      "source_faces_index": "0",
-      "console_log_level": 1,
-      "input_image": [
         "3",
         0
-      ],
-      "source_image": [
-        "1004",
-        0
       ]
     },
-    "class_type": "ReActorFaceSwap",
+    "class_type": "PreviewImage",
     "_meta": {
-      "title": "ReActor 🌌 Fast Face Swap_2"
+      "title": "이미지 미리보기"
     }
   },
-  "1001": {
+  "16": {
     "inputs": {
-      "enabled": true,
-      "swap_model": "inswapper_128.onnx",
-      "facedetection": "retinaface_resnet50",
-      "face_restore_model": "GFPGANv1.4.pth",
-      "face_restore_visibility": 1,
-      "codeformer_weight": 0.9,
-      "detect_gender_input": "no",
-      "detect_gender_source": "no",
-      "input_faces_index": "1",
-      "source_faces_index": "0",
-      "console_log_level": 1,
-      "input_image": [
-        "1000",
-        0
-      ],
-      "source_image": [
-        "1006",
-        0
-      ]
+      "clip_name": "qwen\\qwen_2.5_vl_7b.safetensors",
+      "type": "stable_diffusion",
+      "device": "default"
     },
-    "class_type": "ReActorFaceSwap",
+    "class_type": "CLIPLoader",
     "_meta": {
-      "title": "ReActor 🌌 Fast Face Swap_1"
+      "title": "CLIP 로드"
     }
   },
-  "1002": {
+  "17": {
     "inputs": {
-      "enabled": true,
-      "swap_model": "inswapper_128.onnx",
-      "facedetection": "retinaface_resnet50",
-      "face_restore_model": "GFPGANv1.4.pth",
-      "face_restore_visibility": 1,
-      "codeformer_weight": 0.9,
-      "detect_gender_input": "no",
-      "detect_gender_source": "no",
-      "input_faces_index": "0",
-      "source_faces_index": "0",
-      "console_log_level": 1,
-      "input_image": [
-        "1001",
-        0
-      ],
-      "source_image": [
-        "1005",
-        0
-      ]
+      "image": "female_01 (1).png"
     },
-    "class_type": "ReActorFaceSwap",
+    "class_type": "LoadImage",
     "_meta": {
-      "title": "ReActor 🌌 Fast Face Swap_0"
+      "title": "이미지 로드"
     }
   },
-  "1004": {
+  "18": {
     "inputs": {
       "image": "ComfyUI_00063_.png"
     },
@@ -351,16 +257,43 @@
       "title": "이미지 로드"
     }
   },
-  "1005": {
+  "19": {
     "inputs": {
-      "image": "female_01.png"
+      "enabled": true,
+      "swap_model": "inswapper_128.onnx",
+      "facedetection": "retinaface_resnet50",
+      "face_restore_model": "codeformer-v0.1.0.pth",
+      "face_restore_visibility": 0.1,
+      "codeformer_weight": 0,
+      "detect_gender_input": "no",
+      "detect_gender_source": "no",
+      "input_faces_index": "0",
+      "source_faces_index": "0",
+      "console_log_level": 1,
+      "input_image": [
+        "23",
+        0
+      ],
+      "source_image": [
+        "17",
+        0
+      ]
+    },
+    "class_type": "ReActorFaceSwap",
+    "_meta": {
+      "title": "ReActor 🌌 Fast Face Swap_1"
+    }
+  },
+  "20": {
+    "inputs": {
+      "image": "t_006.png"
     },
     "class_type": "LoadImage",
     "_meta": {
       "title": "이미지 로드"
     }
   },
-  "1006": {
+  "21": {
     "inputs": {
       "image": "male_01.png"
     },
@@ -369,13 +302,71 @@
       "title": "이미지 로드"
     }
   },
-  "1007": {
+  "22": {
     "inputs": {
-      "model_name": "RealESRGAN_x4plus.pth"
+      "enabled": false,
+      "swap_model": "inswapper_128.onnx",
+      "facedetection": "retinaface_resnet50",
+      "face_restore_model": "codeformer-v0.1.0.pth",
+      "face_restore_visibility": 0.1,
+      "codeformer_weight": 0,
+      "detect_gender_input": "no",
+      "detect_gender_source": "no",
+      "input_faces_index": "0",
+      "source_faces_index": "0",
+      "console_log_level": 1,
+      "input_image": [
+        "19",
+        0
+      ],
+      "source_image": [
+        "21",
+        0
+      ]
     },
-    "class_type": "UpscaleModelLoader",
+    "class_type": "ReActorFaceSwap",
     "_meta": {
-      "title": "Upscaler"
+      "title": "ReActor 🌌 Fast Face Swap_0"
+    }
+  },
+  "23": {
+    "inputs": {
+      "enabled": false,
+      "swap_model": "inswapper_128.onnx",
+      "facedetection": "retinaface_resnet50",
+      "face_restore_model": "codeformer-v0.1.0.pth",
+      "face_restore_visibility": 0.1,
+      "codeformer_weight": 0,
+      "detect_gender_input": "no",
+      "detect_gender_source": "no",
+      "input_faces_index": "2",
+      "source_faces_index": "0",
+      "console_log_level": 1,
+      "input_image": [
+        "20",
+        0
+      ],
+      "source_image": [
+        "18",
+        0
+      ]
+    },
+    "class_type": "ReActorFaceSwap",
+    "_meta": {
+      "title": "ReActor 🌌 Fast Face Swap_2"
+    }
+  },
+  "24": {
+    "inputs": {
+      "filename_prefix": "2025-11-21-10-38-59",
+      "images": [
+        "3",
+        0
+      ]
+    },
+    "class_type": "SaveImage",
+    "_meta": {
+      "title": "이미지 저장"
     }
   }
 }
