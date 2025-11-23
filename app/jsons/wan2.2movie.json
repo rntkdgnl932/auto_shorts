@@ -326,7 +326,7 @@
     "inputs": {
       "model_name": "umt5-xxl-enc-bf16.safetensors",
       "precision": "bf16",
-      "positive_prompt": "walking",
+      "positive_prompt": "A woman sits down and collects maple leaves in her hands",
       "negative_prompt": "Bright tones, overexposed, static, blurred details, subtitles, style, works, paintings, images, static, overall gray, worst quality, low quality, JPEG compression residue, ugly, incomplete, extra fingers, poorly drawn hands, poorly drawn faces, deformed, disfigured, misshapen limbs, fused fingers, still picture, messy background, three legs, many people in the background, walking backwards\"",
       "quantization": "disabled",
       "use_disk_cache": true,
@@ -343,7 +343,7 @@
         "405",
         0
       ],
-      "empty_frame_level": 0.5,
+      "empty_frame_level": 0.2,
       "start_index": 0,
       "end_index": -1,
       "start_image": [
@@ -430,7 +430,7 @@
   },
   "386": {
     "inputs": {
-      "image": "gap_004.png"
+      "image": "t_001 (2).png"
     },
     "class_type": "LoadImage",
     "_meta": {
@@ -439,7 +439,7 @@
   },
   "387": {
     "inputs": {
-      "image": "t_003.png"
+      "image": "kf_1 (3).png"
     },
     "class_type": "LoadImage",
     "_meta": {
@@ -457,7 +457,7 @@
   },
   "398": {
     "inputs": {
-      "value": 480
+      "value": 720
     },
     "class_type": "INTConstant",
     "_meta": {
@@ -466,7 +466,7 @@
   },
   "399": {
     "inputs": {
-      "value": 832
+      "value": 1280
     },
     "class_type": "INTConstant",
     "_meta": {
@@ -507,7 +507,7 @@
       "pingpong": false,
       "save_output": false,
       "images": [
-        "28",
+        "477",
         0
       ]
     },
@@ -576,6 +576,20 @@
       "title": "Video Combine 🎥🅥🅗🅢"
     }
   },
+  "443": {
+    "inputs": {
+      "backend": "inductor",
+      "mode": "default",
+      "fullgraph": false,
+      "dynamic": false,
+      "dynamo_cache_size_limit": 64,
+      "dynamo_recompile_limit": 128
+    },
+    "class_type": "SeedVR2TorchCompileSettings",
+    "_meta": {
+      "title": "SeedVR2 Torch Compile Settings"
+    }
+  },
   "449": {
     "inputs": {
       "model": "ema_vae_fp16.safetensors",
@@ -588,7 +602,11 @@
       "decode_tile_overlap": 128,
       "tile_debug": "false",
       "offload_device": "cpu",
-      "cache_model": false
+      "cache_model": false,
+      "torch_compile_args": [
+        "443",
+        0
+      ]
     },
     "class_type": "SeedVR2LoadVAEModel",
     "_meta": {
@@ -635,7 +653,11 @@
       "swap_io_components": true,
       "offload_device": "cpu",
       "cache_model": false,
-      "attention_mode": "sdpa"
+      "attention_mode": "sdpa",
+      "torch_compile_args": [
+        "443",
+        0
+      ]
     },
     "class_type": "SeedVR2LoadDiTModel",
     "_meta": {
@@ -706,7 +728,7 @@
         1
       ],
       "loop_count": 0,
-      "filename_prefix": "2025-11-16-085432",
+      "filename_prefix": "2025-11-23-042307",
       "format": "video/h264-mp4",
       "pix_fmt": "yuv420p",
       "crf": 19,
@@ -737,6 +759,114 @@
     "class_type": "WanVideoBlockSwap",
     "_meta": {
       "title": "WanVideo Block Swap"
+    }
+  },
+  "475": {
+    "inputs": {
+      "enabled": true,
+      "swap_model": "inswapper_128.onnx",
+      "facedetection": "YOLOv5l",
+      "face_restore_model": "codeformer-v0.1.0.pth",
+      "face_restore_visibility": 1,
+      "codeformer_weight": 0.9,
+      "detect_gender_input": "no",
+      "detect_gender_source": "no",
+      "input_faces_index": "1",
+      "source_faces_index": "0",
+      "console_log_level": 1,
+      "input_image": [
+        "478",
+        0
+      ],
+      "source_image": [
+        "480",
+        0
+      ]
+    },
+    "class_type": "ReActorFaceSwap",
+    "_meta": {
+      "title": "ReActor 🌌 Fast Face Swap_1"
+    }
+  },
+  "477": {
+    "inputs": {
+      "enabled": false,
+      "swap_model": "inswapper_128.onnx",
+      "facedetection": "YOLOv5l",
+      "face_restore_model": "codeformer-v0.1.0.pth",
+      "face_restore_visibility": 1,
+      "codeformer_weight": 0.9,
+      "detect_gender_input": "no",
+      "detect_gender_source": "no",
+      "input_faces_index": "0",
+      "source_faces_index": "0",
+      "console_log_level": 1,
+      "input_image": [
+        "475",
+        0
+      ],
+      "source_image": [
+        "479",
+        0
+      ]
+    },
+    "class_type": "ReActorFaceSwap",
+    "_meta": {
+      "title": "ReActor 🌌 Fast Face Swap_0"
+    }
+  },
+  "478": {
+    "inputs": {
+      "enabled": false,
+      "swap_model": "inswapper_128.onnx",
+      "facedetection": "YOLOv5l",
+      "face_restore_model": "codeformer-v0.1.0.pth",
+      "face_restore_visibility": 1,
+      "codeformer_weight": 0.9,
+      "detect_gender_input": "no",
+      "detect_gender_source": "no",
+      "input_faces_index": "2",
+      "source_faces_index": "0",
+      "console_log_level": 1,
+      "input_image": [
+        "28",
+        0
+      ],
+      "source_image": [
+        "481",
+        0
+      ]
+    },
+    "class_type": "ReActorFaceSwap",
+    "_meta": {
+      "title": "ReActor 🌌 Fast Face Swap_2"
+    }
+  },
+  "479": {
+    "inputs": {
+      "image": "male_01.png"
+    },
+    "class_type": "LoadImage",
+    "_meta": {
+      "title": "이미지 로드"
+    }
+  },
+  "480": {
+    "inputs": {
+      "image": "female_01.png"
+    },
+    "class_type": "LoadImage",
+    "_meta": {
+      "title": "이미지 로드"
+    }
+  },
+  "481": {
+    "inputs": {
+      "image": "ComfyUI_00063_.png"
+    },
+    "class_type": "LoadImage",
+    "_meta": {
+      "title": "이미지 로드"
     }
   }
 }

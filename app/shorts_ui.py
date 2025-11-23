@@ -29,7 +29,6 @@ import sys
 import os
 import faulthandler
 import traceback
-import shutil  # <-- 이 줄을 추가하세요
 import functools # <-- 이 줄을 추가하세요
 import datetime
 from PyQt5 import QtCore, QtWidgets, QtGui
@@ -1118,60 +1117,162 @@ class ScenePromptEditDialog(QtWidgets.QDialog):
 
     def on_upload_image(self, scene_id: str, preview_label: QtWidgets.QLabel, upload_button: QtWidgets.QPushButton,
                         delete_image_button: QtWidgets.QPushButton, scene_data: Dict[str, Any]):
-        """(v17 수정) '업로드' 버튼 클릭 시, '이미지 삭제' 버튼 활성화"""
-        if scene_data is None: scene_data = {}
+        """(v57 최종) 파일 리사이즈 로직 완전 삭제 / 썸네일 에러 제거"""
+        import shutil
+        import requests
+        import functools
+        from pathlib import Path
+        from PyQt5 import QtWidgets, QtGui
+        # Qt 임포트 불필요
+
+        try:
+            from app.utils import load_json, run_job_with_progress_async
+            from app.settings import COMFY_HOST, JSONS_DIR, COMFY_INPUT_DIR, CHARACTER_DIR
+        except ImportError:
+            from utils import load_json, run_job_with_progress_async  # type: ignore
+            from settings import COMFY_HOST, JSONS_DIR, COMFY_INPUT_DIR, CHARACTER_DIR  # type: ignore
+
         imgs_dir = self.json_path.parent / "imgs"
         try:
             imgs_dir.mkdir(parents=True, exist_ok=True)
-        except os.error as e_mkdir:
-            QtWidgets.QMessageBox.warning(self, "업로드 오류", f"이미지 폴더를 생성할 수 없습니다:\n{e_mkdir}")
-            return
+        except:
+            pass
 
         target_path = imgs_dir / f"{scene_id}.png"
+
         src_path_str, _ = QtWidgets.QFileDialog.getOpenFileName(
             self, f"'{scene_id}' 씬 이미지 선택", str(imgs_dir), "Images (*.png *.jpg *.jpeg *.webp)"
         )
         if not src_path_str: return
 
-        try:
-            shutil.copy2(str(src_path_str), str(target_path))
-        except Exception as e_copy:
-            QtWidgets.QMessageBox.warning(self, "업로드 오류", f"파일 복사 중 오류가 발생했습니다:\n{e_copy}")
-            return
+        # 메인 UI에서 W/H 값만 읽어서 워크플로우에 전달 (파이썬 처리 X)
+        main_win = self.parent()
+        while main_win and not hasattr(main_win, "cmb_img_w"):
+            main_win = main_win.parent()
 
-        target_path_str = str(target_path)
-        scene_data["img_file"] = target_path_str
-
-        pixmap = QtGui.QPixmap(target_path_str)
-        if not pixmap.isNull():
-            pixmap_scaled = pixmap.scaled(self.THUMBNAIL_SIZE, self.THUMBNAIL_SIZE, Qt.AspectRatioMode.KeepAspectRatio,
-                                          Qt.TransformationMode.SmoothTransformation)
-            preview_label.setPixmap(pixmap_scaled)
-            preview_label.setText("")
-            preview_label.setToolTip(f"경로: {target_path_str}\n(클릭해서 크게 보기)")
-            upload_button.setText("이미지 변경")
-            delete_image_button.setEnabled(True)
-            delete_image_button.setToolTip(f"경로: {target_path_str}\n(클릭 시 이 씬의 이미지 파일을 삭제합니다.)")
-
+        target_w, target_h = 720, 1280
+        if main_win:
             try:
-                preview_label.clicked.disconnect()
-            except (TypeError, RuntimeError):
+                target_w = int(main_win.cmb_img_w.currentData())
+                target_h = int(main_win.cmb_img_h.currentData())
+            except:
                 pass
-            preview_label.clicked.connect(lambda: self.show_large_image(target_path_str))
 
-            try:
-                delete_image_button.clicked.disconnect()
-            except (TypeError, RuntimeError):
-                pass
-            delete_image_button.clicked.connect(
-                functools.partial(self.on_delete_image, Path(target_path_str), preview_label, upload_button,
-                                  delete_image_button, scene_data)
-            )
-        else:
-            preview_label.setText("[파일\n오류]")
-            preview_label.setToolTip(f"경로: {target_path_str}\n(파일을 읽을 수 없음)")
-            upload_button.setText("다시 업로드")
-            delete_image_button.setEnabled(False)
+        def job(progress_callback):
+            _log = lambda msg: progress_callback({"msg": msg})
+
+            wf_path = Path(JSONS_DIR) / "only_faceswap.json"
+            if not wf_path.exists(): raise FileNotFoundError("워크플로우 파일 없음")
+
+            workflow = load_json(wf_path)
+
+            # A. 원본 파일 그대로 업로드 (리사이즈 안 함)
+            comfy_in = Path(COMFY_INPUT_DIR)
+            src_path = Path(src_path_str)
+            temp_input_name = f"raw_{scene_id}_{src_path.name}"
+            shutil.copy2(str(src_path), comfy_in / temp_input_name)
+
+            # B. 노드 설정
+            if "2" in workflow: workflow["2"]["inputs"]["image"] = temp_input_name
+            # Node 11 (Resize): 워크플로우가 알아서 함
+            if "11" in workflow:
+                workflow["11"]["inputs"]["width"] = target_w
+                workflow["11"]["inputs"]["height"] = target_h
+
+            # C. 캐릭터 매핑
+            chars = scene_data.get("characters", [])
+            char_map = {}
+            for c in chars:
+                cid, cidx = "", 0
+                if isinstance(c, dict):
+                    cid, cidx = c.get("id", ""), int(c.get("index", 0) or 0)
+                elif isinstance(c, str):
+                    if ":" in c:
+                        p = c.split(":")
+                        cid, cidx = p[0].strip(), int(p[1].strip())
+                    else:
+                        cid, cidx = c.strip(), 0
+                if cid: char_map[cidx] = cid
+
+            reactor_setup = {0: {"r": "8", "l": "3"}, 1: {"r": "7", "l": "10"}, 2: {"r": "6", "l": "9"}}
+            char_base = Path(CHARACTER_DIR)
+            for idx, nodes in reactor_setup.items():
+                rid, lid = nodes["r"], nodes["l"]
+                if idx in char_map:
+                    char_id = char_map[idx]
+                    c_img_path = None
+                    for ext in [".png", ".jpg", ".jpeg", ".webp"]:
+                        p = char_base / f"{char_id}{ext}"
+                        if p.exists(): c_img_path = p; break
+                    if c_img_path:
+                        c_dst_name = f"char_{char_id}{c_img_path.suffix}"
+                        shutil.copy2(str(c_img_path), comfy_in / c_dst_name)
+                        if rid in workflow: workflow[rid]["inputs"]["enabled"] = True
+                        if lid in workflow: workflow[lid]["inputs"]["image"] = c_dst_name
+                    else:
+                        if rid in workflow: workflow[rid]["inputs"]["enabled"] = False
+                else:
+                    if rid in workflow: workflow[rid]["inputs"]["enabled"] = False
+
+            # D. 실행
+            if "5" in workflow: workflow["5"]["inputs"]["filename_prefix"] = f"upload_proc/{scene_id}"
+
+            _log("ComfyUI 실행 (Resize Node 11)...")
+            result = _submit_and_wait_comfy(COMFY_HOST, workflow, timeout=60, poll=0.5)
+
+            outputs = result.get("outputs", {}).get("5", {}).get("images", [])
+            if not outputs: raise RuntimeError("결과 없음")
+
+            info = outputs[0]
+            resp = requests.get(f"{COMFY_HOST}/view", params={
+                "filename": info.get("filename"), "subfolder": info.get("subfolder"), "type": "output"
+            })
+            resp.raise_for_status()
+
+            # 결과 저장 (워크플로우가 처리한 파일)
+            with open(target_path, "wb") as f:
+                f.write(resp.content)
+            return str(target_path)
+
+        def done(ok, payload, err):
+            if not ok:
+                QtWidgets.QMessageBox.critical(self, "오류", f"실패:\n{err}")
+                return
+
+            final_path = str(payload)
+            scene_data["img_file"] = final_path
+
+            # [수정] 썸네일 표시용: 복잡한 옵션 다 빼고 기본값 사용 (에러 원천 차단)
+            pixmap = QtGui.QPixmap(final_path)
+            if not pixmap.isNull():
+                # 옵션 없이 크기만 지정 -> 기본값(FastTransformation, IgnoreAspectRatio)으로 동작하여 에러 안 남
+                pixmap_scaled = pixmap.scaled(self.THUMBNAIL_SIZE, self.THUMBNAIL_SIZE)
+
+                preview_label.setPixmap(pixmap_scaled)
+                preview_label.setText("")
+                preview_label.setToolTip(f"경로: {final_path}\n(자동 처리됨)")
+
+                upload_button.setText("이미지 변경")
+                delete_image_button.setEnabled(True)
+
+                try:
+                    preview_label.clicked.disconnect()
+                except:
+                    pass
+                preview_label.clicked.connect(lambda: self.show_large_image(final_path))
+
+                try:
+                    delete_image_button.clicked.disconnect()
+                except:
+                    pass
+                delete_image_button.clicked.connect(
+                    functools.partial(self.on_delete_image, Path(final_path), preview_label, upload_button,
+                                      delete_image_button, scene_data)
+                )
+
+            QtWidgets.QMessageBox.information(self, "완료", "처리 완료")
+
+        run_job_with_progress_async(self, f"이미지 처리 ({scene_id})", job, on_done=done)
 
     def on_delete_video(self, video_path: Path, button_widget: QtWidgets.QPushButton):
         """(v17 수정) '영상삭제' 버튼 핸들러 (기능 동일)"""
@@ -3100,11 +3201,9 @@ class MainWindow(QtWidgets.QMainWindow):
         # --- 유틸 임포트 ---
         try:
             from app.utils import load_json, run_job_with_progress_async
-            from app.audio_sync import _submit_and_wait as _submit_and_wait_comfy
             from app.settings import COMFY_HOST, JSONS_DIR, COMFY_INPUT_DIR, COMFY_OUTPUT_DIR, CHARACTER_DIR
         except ImportError:
             from utils import load_json, run_job_with_progress_async  # type: ignore
-            from audio_sync import _submit_and_wait as _submit_and_wait_comfy  # type: ignore
             from settings import COMFY_HOST, JSONS_DIR, COMFY_INPUT_DIR, COMFY_OUTPUT_DIR, CHARACTER_DIR  # type: ignore
 
         btn = getattr(self, "btn_segments_img", None)
@@ -3144,13 +3243,13 @@ class MainWindow(QtWidgets.QMainWindow):
                 if isinstance(raw_obj, str):
                     parts = raw_obj.split(":", 1)
                     cid = parts[0].strip()
-                    idx = int(parts[1]) if len(parts) > 1 and parts[1].isdigit() else 0
-                    return {"id": cid, "index": idx}
+                    idxx = int(parts[1]) if len(parts) > 1 and parts[1].isdigit() else 0
+                    return {"id": cid, "index": idxx}
                 if isinstance(raw_obj, dict):
                     cid = str(raw_obj.get("id", "")).strip()
-                    idx = raw_obj.get("index")
+                    idxx = raw_obj.get("index")
                     try:
-                        idx_int = int(idx) if idx is not None else 0
+                        idx_int = int(idxx) if idxx is not None else 0
                     except:
                         idx_int = 0
                     return {"id": cid, "index": idx_int}
@@ -6688,8 +6787,8 @@ class MainWindow(QtWidgets.QMainWindow):
         self.btn_load_proj.clicked.connect(self.on_load_project)
         self.btn_show_progress.clicked.connect(self.on_show_progress)
         # --- ▼▼▼ [이 부분을 수정합니다] ▼▼▼ ---
-        # self.btn_video.clicked.connect(self.on_video) # <-- 기존 연결 주석 처리
-        self.btn_video.clicked.connect(self.on_video_wan)  # <-- [신규] 3단계 함수로 교체
+        self.btn_video.clicked.connect(self.on_video) # <-- 기존 연결 주석 처리
+        # self.btn_video.clicked.connect(self.on_video_wan)  # <-- [신규] 3단계 함수로 교체
 
         # [신규] 2단계 버튼 연결
         if hasattr(self, "btn_segments_img"):  # 버튼이 생성되었는지 확인
@@ -9511,6 +9610,51 @@ class MainWindow(QtWidgets.QMainWindow):
                     if scene_chunk_dir.exists(): shutil.rmtree(scene_chunk_dir)  # 기존 잔여물 삭제 (필수)
                     scene_chunk_dir.mkdir(parents=True, exist_ok=True)
 
+                    # 4. 이 씬의 캐릭터:인덱스 맵 (예: ["female_01:0", "male_01:1"])
+                    # 4. 이 씬의 캐릭터:인덱스 맵 (예: ["female_01:0", "male_01:1"])
+                    char_index_map: Dict[str, int] = {}
+                    chars_list = (
+                            scene.get("characters")
+                            or scene.get("character_objs")
+                            or vdoc.get("characters")
+                            or vdoc.get("character_objs")
+                            or []
+                    )
+
+                    for c in chars_list:
+                        cid = ""
+                        cidx = 0
+                        if isinstance(c, dict):
+                            cid = str(c.get("id") or c.get("name") or "").strip()
+                            try:
+                                cidx = int(c.get("index") or c.get("face_index") or 0)
+                            except Exception:
+                                cidx = 0
+                        elif isinstance(c, str):
+                            text_c = c.strip()
+                            if ":" in text_c:
+                                left, right = text_c.split(":", 1)
+                                cid = left.strip()
+                                try:
+                                    cidx = int(right.strip())
+                                except Exception:
+                                    cidx = 0
+                            else:
+                                cid = text_c
+                                cidx = 0
+                        if cid:
+                            # 같은 캐릭터가 여러 번 나오면 마지막 값으로 덮어씀
+                            char_index_map[cid] = cidx
+
+                    # wan2.2movie.json 기준 ReActor ↔ LoadImage ↔ 캐릭터ID 매핑
+                    # 475 ↔ 480(female_01), 477 ↔ 479(male_01), 478 ↔ 481(other_char/기타)
+                    reactor_map = {
+                        "475": ("480", "female_01"),
+                        "477": ("479", "male_01"),
+                        "478": ("481", "other_char"),
+                    }
+
+
                     video_chunks: list[Path] = []
                     scene_failed = False
 
@@ -9581,11 +9725,65 @@ class MainWindow(QtWidgets.QMainWindow):
                                 seg_prompt = frame_segs[idx].get("prompt_movie", "")
                             if not seg_prompt: seg_prompt = scene.get("prompt_movie", "")
 
-                            if "106" in wf: wf["106"]["inputs"]["positive_prompt"] = seg_prompt
+                            # if "106" in wf: wf["106"]["inputs"]["positive_prompt"] = seg_prompt
 
                             # 시드
                             seed = random.randint(1, 9999999999)
                             if "391" in wf: wf["391"]["inputs"]["seed"] = seed
+
+                            # --- 페이스스왑 주입 (캐릭터:인덱스 기반) ---
+
+                            # 1) GIMMVFI 입력을 ReActor 체인 출력(477)으로 변경
+                            #    28(디코드) → 478 → 475 → 477 → 455(GIMMVFI) → 450(업스케일) → 439(저장)
+                            if "455" in wf:
+                                wf["455"].setdefault("inputs", {})["images"] = ["477", 0]
+
+                            # 2) 캐릭터ID 별로 ReActor/LoadImage 세팅
+                            char_base = Path(CHARACTER_DIR)
+                            for reactor_id, (load_node_id, char_id) in reactor_map.items():
+                                node_re = wf.get(reactor_id)
+                                node_load = wf.get(load_node_id)
+                                if not isinstance(node_re, dict) or not isinstance(node_load, dict):
+                                    continue
+
+                                inputs_re = node_re.setdefault("inputs", {})
+                                face_idx = char_index_map.get(char_id)
+
+                                # 이 씬에 해당 캐릭터가 없으면 비활성화
+                                if face_idx is None:
+                                    inputs_re["enabled"] = False
+                                    continue
+
+                                # 캐릭터 이미지 찾기 (CHARACTER_DIR/female_01.png 같은 것)
+                                char_img_path = None
+                                for ext in (".png", ".jpg", ".jpeg", ".webp"):
+                                    p = char_base / f"{char_id}{ext}"
+                                    if p.exists():
+                                        char_img_path = p
+                                        break
+
+                                if char_img_path is None:
+                                    # 이미지 없으면 이 ReActor만 끔
+                                    inputs_re["enabled"] = False
+                                    continue
+
+                                dst_name = f"{char_id}{char_img_path.suffix}"
+                                try:
+                                    shutil.copy2(str(char_img_path), comfy_input_path / dst_name)
+                                except Exception:
+                                    # 복사 실패해도 일단 계속 진행
+                                    pass
+
+                                # LoadImage 노드에 소스 얼굴 이미지 주입
+                                node_load.setdefault("inputs", {})["image"] = dst_name
+
+                                # ReActor 활성화 + 인덱스 설정
+                                inputs_re["enabled"] = True
+                                inputs_re["input_faces_index"] = str(int(face_idx))
+                                # source_faces_index는 기본값(0)을 유지, 없으면 0으로
+                                if "source_faces_index" not in inputs_re:
+                                    inputs_re["source_faces_index"] = "0"
+
 
                             # 저장 (439번이 Upscaled 최종본)
                             target_save = "439"
@@ -10728,41 +10926,139 @@ class SegmentEditDialog(QtWidgets.QDialog):
     def on_upload_segment_image(self, seg_index: int, target_path: Path,
                                 preview_label: ClickableLabel, upload_button: QtWidgets.QPushButton,
                                 delete_button: QtWidgets.QPushButton):
-        """[신규] 세그먼트 키프레임 이미지 업로드"""
+        """(v57 최종) 파일 리사이즈 로직 완전 삭제 / 썸네일 에러 제거"""
+        import shutil
+        import requests
+        from pathlib import Path
+        from PyQt5 import QtWidgets, QtGui
+
+        try:
+            from app.utils import load_json, run_job_with_progress_async
+            from app.audio_sync import _submit_and_wait as _submit_and_wait_comfy
+            from app.settings import COMFY_HOST, JSONS_DIR, COMFY_INPUT_DIR, CHARACTER_DIR
+        except ImportError:
+            from utils import load_json, run_job_with_progress_async
+            from audio_sync import _submit_and_wait as _submit_and_wait_comfy
+            from settings import COMFY_HOST, JSONS_DIR, COMFY_INPUT_DIR, CHARACTER_DIR
+
+        try:
+            target_path.parent.mkdir(parents=True, exist_ok=True)
+        except:
+            pass
+
         src_path_str, _ = QtWidgets.QFileDialog.getOpenFileName(
-            self, f"'{self.scene_id}' 세그먼트 {seg_index + 1} 이미지 선택", str(target_path.parent),
+            self, f"'{self.scene_id}' 세그먼트 {seg_index + 1} 이미지", str(target_path.parent),
             "Images (*.png *.jpg *.jpeg *.webp)"
         )
         if not src_path_str: return
 
-        try:
-            target_path.parent.mkdir(parents=True, exist_ok=True)
-            shutil.copy2(str(src_path_str), str(target_path))
-        except Exception as e_copy:
-            QtWidgets.QMessageBox.warning(self, "업로드 오류", f"파일 복사 중 오류가 발생했습니다:\n{e_copy}")
-            return
+        main_win = self.parent()
+        while main_win and not hasattr(main_win, "cmb_img_w"):
+            main_win = main_win.parent()
 
-        target_path_str = str(target_path)
-        pixmap = QtGui.QPixmap(target_path_str)
-        if not pixmap.isNull():
-            pixmap_scaled = pixmap.scaled(self.THUMBNAIL_SIZE, self.THUMBNAIL_SIZE, Qt.AspectRatioMode.KeepAspectRatio,
-                                          Qt.TransformationMode.SmoothTransformation)
-            preview_label.setPixmap(pixmap_scaled)
-            preview_label.setText("")
-            preview_label.setToolTip(f"경로: {target_path_str}\n(클릭해서 크게 보기)")
-            upload_button.setText("이미지 변경")
-            delete_button.setEnabled(True)
-
+        target_w, target_h = 720, 1280
+        if main_win:
             try:
-                preview_label.clicked.disconnect()
-            except (TypeError, RuntimeError):
+                target_w = int(main_win.cmb_img_w.currentData())
+                target_h = int(main_win.cmb_img_h.currentData())
+            except:
                 pass
-            preview_label.clicked.connect(lambda: self.show_large_image(target_path_str))
-        else:
-            preview_label.setText("[파일\n오류]")
-            preview_label.setToolTip(f"경로: {target_path_str}\n(파일을 읽을 수 없음)")
-            upload_button.setText("다시 업로드")
-            delete_button.setEnabled(False)
+
+        def job(progress_callback):
+            _log = lambda msg: progress_callback({"msg": msg})
+
+            wf_path = Path(JSONS_DIR) / "only_faceswap.json"
+            if not wf_path.exists(): raise FileNotFoundError("워크플로우 없음")
+
+            workflow = load_json(wf_path)
+
+            comfy_in = Path(COMFY_INPUT_DIR)
+            src_path = Path(src_path_str)
+            tmp_name = f"raw_seg_{self.scene_id}_{seg_index}_{src_path.name}"
+            shutil.copy2(str(src_path), comfy_in / tmp_name)
+
+            if "2" in workflow: workflow["2"]["inputs"]["image"] = tmp_name
+            if "11" in workflow:
+                workflow["11"]["inputs"]["width"] = target_w
+                workflow["11"]["inputs"]["height"] = target_h
+
+            chars = self.scene_data.get("characters", [])
+            char_map = {}
+            for c in chars:
+                cid, cidx = "", 0
+                if isinstance(c, dict):
+                    cid, cidx = c.get("id", ""), int(c.get("index", 0) or 0)
+                elif isinstance(c, str):
+                    if ":" in c:
+                        p = c.split(":")
+                        cid, cidx = p[0].strip(), int(p[1].strip())
+                    else:
+                        cid, cidx = c.strip(), 0
+                if cid: char_map[cidx] = cid
+
+            reactor_setup = {0: {"r": "8", "l": "3"}, 1: {"r": "7", "l": "10"}, 2: {"r": "6", "l": "9"}}
+            char_base = Path(CHARACTER_DIR)
+            for idx, nodes in reactor_setup.items():
+                rid, lid = nodes["r"], nodes["l"]
+                if idx in char_map:
+                    char_id = char_map[idx]
+                    c_img_path = None
+                    for ext in [".png", ".jpg", ".jpeg", ".webp"]:
+                        p = char_base / f"{char_id}{ext}"
+                        if p.exists(): c_img_path = p; break
+                    if c_img_path:
+                        c_dst_name = f"char_{char_id}{c_img_path.suffix}"
+                        shutil.copy2(str(c_img_path), comfy_in / c_dst_name)
+                        if rid in workflow: workflow[rid]["inputs"]["enabled"] = True
+                        if lid in workflow: workflow[lid]["inputs"]["image"] = c_dst_name
+                    else:
+                        if rid in workflow: workflow[rid]["inputs"]["enabled"] = False
+                else:
+                    if rid in workflow: workflow[rid]["inputs"]["enabled"] = False
+
+            if "5" in workflow: workflow["5"]["inputs"]["filename_prefix"] = f"seg_proc/{self.scene_id}_{seg_index}"
+
+            _log("ComfyUI 실행...")
+            result = _submit_and_wait_comfy(COMFY_HOST, workflow, timeout=60, poll=0.5)
+
+            outputs = result.get("outputs", {}).get("5", {}).get("images", [])
+            if not outputs: raise RuntimeError("결과 없음")
+
+            info = outputs[0]
+            resp = requests.get(f"{COMFY_HOST}/view", params={
+                "filename": info.get("filename"), "subfolder": info.get("subfolder"), "type": "output"
+            })
+            resp.raise_for_status()
+
+            with open(target_path, "wb") as f:
+                f.write(resp.content)
+            return str(target_path)
+
+        def done(ok, payload, err):
+            if not ok:
+                QtWidgets.QMessageBox.critical(self, "오류", f"실패:\n{err}")
+                return
+
+            final_path = str(payload)
+            pixmap = QtGui.QPixmap(final_path)
+            if not pixmap.isNull():
+                # [수정] 옵션 없이 크기만 지정 (에러 방지 최우선)
+                pixmap_scaled = pixmap.scaled(self.THUMBNAIL_SIZE, self.THUMBNAIL_SIZE)
+                preview_label.setPixmap(pixmap_scaled)
+                preview_label.setText("")
+                preview_label.setToolTip(f"경로: {final_path}\n(자동 처리됨)")
+                upload_button.setText("이미지 변경")
+                delete_button.setEnabled(True)
+
+                try:
+                    preview_label.clicked.disconnect()
+                except:
+                    pass
+                preview_label.clicked.connect(lambda: self.show_large_image(final_path))
+
+            QtWidgets.QMessageBox.information(self, "완료", "처리 완료")
+
+        run_job_with_progress_async(self, f"세그먼트 처리 ({seg_index + 1})", job, on_done=done)
 
     def on_delete_segment_image(self, seg_index: int, image_path: Path,
                                 preview_label: ClickableLabel, upload_button: QtWidgets.QPushButton,

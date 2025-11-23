@@ -1,13 +1,4 @@
 {
-  "11": {
-    "inputs": {
-      "value": 10
-    },
-    "class_type": "JWInteger",
-    "_meta": {
-      "title": "Frame / Sec"
-    }
-  },
   "18": {
     "inputs": {
       "width": [
@@ -18,10 +9,7 @@
         "121",
         4
       ],
-      "length": [
-        "124",
-        0
-      ],
+      "length": 81,
       "batch_size": 1,
       "positive": [
         "135",
@@ -234,19 +222,6 @@
       "title": "LayerUtility: ImageScaleByAspectRatio V2"
     }
   },
-  "124": {
-    "inputs": {
-      "expression": "a*16+1",
-      "a": [
-        "11",
-        0
-      ]
-    },
-    "class_type": "MathExpression|pysssss",
-    "_meta": {
-      "title": "Math Expression 🐍"
-    }
-  },
   "125": {
     "inputs": {
       "text": "色调艳丽，过曝，静态，细节模糊不清，字幕，风格，作品，画作，画面，静止，整体发灰，最差质量，低质量，JPEG压缩残留，丑陋的，残缺的，多余的手指，画得不好的手部，画得不好的脸部，畸形的，毁容的，形态畸形的肢体，手指融合，静止不动的画面，杂乱的背景，三条腿，背景人很多，倒着走, censored, mosaic censoring, bar censor, pixelated, glowing, bloom, blurry, day, out of focus, low detail, bad anatomy, ugly, overexposed, underexposed, distorted face, extra limbs, cartoonish, 3d render artifacts, duplicate people, unnatural lighting, bad composition, missing shadows, low resolution, poorly textured, glitch, noise, grain, static, motionless, still frame, overall grayish, worst quality, low quality, JPEG compression artifacts, subtitles, stylized, artwork, painting, illustration, cluttered background, many people in background, three legs, walking backward, zoom out, zoom in, mouth speaking, moving mouth, talking, speaking, mute speaking, unnatural skin tone, discolored eyelid, red eyelids, red upper eyelids, no red eyeshadow, closed eyes, no wide-open innocent eyes, poorly drawn hands, extra fingers, fused fingers, poorly drawn face, deformed, disfigured, malformed limbs, thighs, fog, mist, voluminous eyelashes, blush,",
@@ -372,7 +347,7 @@
   },
   "150": {
     "inputs": {
-      "text": "A small glowing character, joyful movement, floating or interacting with magical elements, delicate details like flowing clothes, fluttering hair, or glowing accessories.  \n\nScene 1 (Close-up): Focus on the character, elements glowing or sparkling, smooth motion, close framing emphasizing magical details.  \nScene 2 (Lower angle): Character moving dynamically, subtle motion effects like flowing clothing or hair, gentle particle-like effects enhancing atmosphere.  \nScene 3 (Medium shot): Character rotating or turning, glowing elements interacting with character’s motion, smooth continuous movement, medium framing showing part of surrounding magical space.  \nScene 4 (Wide shot): Character performing grand motion or gesture, sparkling or glowing elements spreading, wide framing emphasizing scale and cinematic presence.  \nScene 5 (Close-up push-in): Character’s face or profile, joyful or expressive emotion, glowing elements accentuating expression, cinematic freeze-frame for dramatic impact.  \n\nCamera language: close-up, lower angle, medium, wide, push-in; smooth, slow cinematic movements, highlighting character motion and glowing elements.  \nMood: dreamy, magical, whimsical, enchanting, soft and heartwarming.  \nStyle: soft lighting, glowing line-art or magical sketch overlay, cinematic, artistic illustration style, suitable for any theme or subject.\n"
+      "text": "A small glowing character, joyful movement, floating or interacting with magical elements, delicate details like flowing clothes, fluttering hair, or glowing accessories.  \n\nScene 1 (Close-up): Focus on the character, elements glowing or sparkling, smooth motion, close framing emphasizing magical details.  \nScene 2 (Lower angle): Character moving dynamically, subtle motion effects like flowing clothing or hair, gentle particle-like effects enhancing atmosphere. \n\nCamera language: close-up, lower angle, medium, wide, push-in; smooth, slow cinematic movements, highlighting character motion and glowing elements.  \nMood: dreamy, magical, whimsical, enchanting, soft and heartwarming.  \nStyle: soft lighting, glowing line-art or magical sketch overlay, cinematic, artistic illustration style, suitable for any theme or subject.\n"
     },
     "class_type": "CLIPTextEncode",
     "_meta": {
@@ -390,7 +365,6 @@
   },
   "163": {
     "inputs": {
-      "text": "32.0",
       "anything": [
         "165",
         1

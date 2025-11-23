@@ -74,7 +74,8 @@ JSONS_DIR: Path = BASE_DIR.parent / "app" / "jsons"  # 기존 구조 유지
 JSONS_DIR.mkdir(parents=True, exist_ok=True)
 
 ACE_STEP_PROMPT_JSON: Path = JSONS_DIR / "ace_step_1_t2m.json"  # 음악 생성 프롬프트 JSON
-I2V_WORKFLOW:         Path = JSONS_DIR / "guff_movie.json"         # i2v 워크플로 JSON
+# I2V_WORKFLOW:         Path = JSONS_DIR / "guff_movie.json"         # i2v 워크플로 JSON
+I2V_WORKFLOW:         Path = JSONS_DIR / "No.48.WAN2.2-LightX2V-I2V.json"
 
 # Wan / SeedVR2 보간용 세그먼트 최대 프레임 수 (메모리 안전 상한)
 # - 0 또는 음수면 "제한 없음"

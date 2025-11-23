@@ -17,23 +17,11 @@
       "title": "이미지 로드"
     }
   },
-  "4": {
-    "inputs": {
-      "images": [
-        "2",
-        0
-      ]
-    },
-    "class_type": "PreviewImage",
-    "_meta": {
-      "title": "이미지 미리보기"
-    }
-  },
   "5": {
     "inputs": {
       "filename_prefix": "t_01",
       "images": [
-        "2",
+        "8",
         0
       ]
     },
@@ -56,7 +44,7 @@
       "source_faces_index": "0",
       "console_log_level": 1,
       "input_image": [
-        "2",
+        "11",
         0
       ],
       "source_image": [
@@ -139,6 +127,27 @@
     "class_type": "LoadImage",
     "_meta": {
       "title": "이미지 로드"
+    }
+  },
+  "11": {
+    "inputs": {
+      "width": 720,
+      "height": 1280,
+      "scale_by": 1,
+      "upscale_method": "nearest-exact",
+      "resize_mode": "pad_edge",
+      "pad_color": "#FFFFFF",
+      "crop_position": "center",
+      "divisible_by": 2,
+      "device": "cpu",
+      "image": [
+        "2",
+        0
+      ]
+    },
+    "class_type": "AILab_ImageMaskResize",
+    "_meta": {
+      "title": "이미지/마스크 리사이즈 (RMBG) 🖼️🎭"
     }
   }
 }
