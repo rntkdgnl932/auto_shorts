@@ -5,7 +5,7 @@
       1920
     ],
     "movie_fps": 16,
-    "resolution_preset": "custom",
+    "resolution_preset": "540×960",
     "t2i_steps": 6,
     "font_family": "굴림",
     "title_font_size": 55,
@@ -13,10 +13,10 @@
     "image_preset": "shorts_1080x1920",
     "image_steps": 6,
     "render_size": [
-      480,
-      720
+      540,
+      960
     ],
-    "render_preset": "custom",
+    "render_preset": "540×960",
     "render_steps": 6
   }
 }
