@@ -702,12 +702,15 @@ def build_shots_with_i2v(
     2. UI 설정(ui_width/ui_height/ui_fps/ui_steps)을 워크플로우에 반영
     3. seg.json(frame-based)와 frame_segments(프롬프트/프레임) 재사용
     4. FPS 16->32 동기화 및 정크 재사용성 확보 로직 반영
+    5. [핵심] 최종 씬 영상과 모든 세그먼트 영상이 존재해야만 씬 전체를 스킵하는 엄격한 로직 적용.
+    6. [핵심] Raw (업스케일 전) 세그먼트 파일을 씬 폴더에 영구 저장하고 다음 참조에 사용.
+    7. [핵심] 병합 시 UI 설정값이 아닌, 실제 생성된 영상의 해상도를 감지하여 적용 (업스케일 유지).
     """
     import json as json_mod
     import time
     import shutil
     import random
-    import requests  # <--- ★★★ 이 줄을 꼭 추가하세요 ★★★
+    import requests
     import subprocess
     from datetime import datetime
     from pathlib import Path
@@ -816,7 +819,6 @@ def build_shots_with_i2v(
                     time.sleep(poll)
 
     # ───────────────────────── Helper: on_progress ─────────────────────────
-    # ───────────────────────── Helper: on_progress ─────────────────────────
     start_ts = time.time()
     last_timer_ts = start_ts
 
@@ -863,12 +865,63 @@ def build_shots_with_i2v(
                 except Exception:
                     pass
 
-    try:
-        total_frames_int = int(total_frames)
-    except (TypeError, ValueError):
-        total_frames_int = -1
+    # ───────────────────────── [수정 시작] total_frames 보정 및 재계산 로직 추가 ─────────────────────────
+
+    # video.json 로드
+    video_json_path = Path(project_dir) / "video.json"
+    video_doc = _load_json_func(video_json_path, {}) or {}
+
+    # 1. total_frames 보정
+    tframes_corrected = int(total_frames)
+
+    # total_frames가 0 이하이면 video.json 기준으로 재계산 시도
+    if tframes_corrected <= 0:
+        _notify("[경고] total_frames 인자가 0 이하입니다. video.json 기준으로 재계산합니다...")
+
+        # fps
+        try:
+            fps_val_for_calc = int(video_doc.get("fps", 16))
+        except Exception:
+            fps_val_for_calc = 16
+
+        # duration
+        duration_sec = 0.0
+        try:
+            duration_sec = float(video_doc.get("duration", 0.0))
+        except Exception:
+            pass
+
+        # duration 없으면 scenes duration 합산
+        if duration_sec <= 0.0:
+            scenes_for_calc = video_doc.get("scenes") or []
+            total_d = 0.0
+            for s in scenes_for_calc:
+                if not isinstance(s, dict): continue
+                try:
+                    d = float(s.get("duration", 0.0))
+                    if d <= 0.0: d = float(s.get("end", 0.0)) - float(s.get("start", 0.0))
+                except Exception:
+                    d = 0.0
+                if d > 0: total_d += d
+            duration_sec = total_d
+
+        if duration_sec > 0.0:
+            tframes_corrected = int(round(duration_sec * max(fps_val_for_calc, 1)))
+            _notify(
+                f"[INFO] video.json 기준으로 total_frames={tframes_corrected} 으로 보정했습니다. "
+                f"(duration={duration_sec:.3f}s, fps={fps_val_for_calc})"
+            )
+        else:
+            # 최종 실패 시 최소값으로 폴백
+            tframes_corrected = max(tframes_corrected, 16 * 5)
+            _notify(f"[WARN] duration 정보 부족! 최소 {tframes_corrected} 프레임으로 가정하고 진행합니다.")
+
+    # 함수 전체에서 사용할 total_frames를 보정된 값으로 덮어씁니다.
+    total_frames_int = tframes_corrected
     if total_frames_int > 0:
         _notify(f"[I2V] build_shots_with_i2v 호출 (total_frames={total_frames_int})")
+    # ───────────────────────── [수정 끝] total_frames 보정 및 재계산 로직 추가 ─────────────────────────
+
     # ───────────────────────── Helper: ffmpeg / ffprobe ─────────────────────────
     ffmpeg_exe_val = getattr(settings_obj, "FFMPEG_EXE", "ffmpeg")
     ffprobe_exe_val = getattr(settings_obj, "FFPROBE_EXE", "ffprobe")
@@ -1015,11 +1068,13 @@ def build_shots_with_i2v(
         except Exception:
             return None
 
-    def _i2v_concat_ab(path_a: Path, path_b: Path, path_out: Path, crossfade_sec: float = 0.3) -> None:
+    def _i2v_concat_ab(path_a: Path, path_b: Path, path_out: Path, crossfade_sec: float = 0.3, width: int = 720,
+                       height: int = 1280) -> None:
         """
         두 영상 path_a, path_b를 crossfade로 이어 붙인다.
         - 교차구간은 crossfade_sec(초)
-        - ffmpeg가 실패하면, 이유(stderr)를 전부 로그에 찍는다.
+        - [수정] xfade 전에 해상도를 통일하는 scalefilter를 삽입하여 'size mismatch' 오류를 방지합니다.
+        - [수정] width, height를 인자로 받아 타겟 해상도를 명시적으로 설정합니다.
         """
 
         # 먼저 각 duration을 ffprobe로 조회
@@ -1053,12 +1108,21 @@ def build_shots_with_i2v(
                     f"[I2V][XF][ERR] 입력 영상 이상: {xp} (존재={xp.exists()}, size={xp.stat().st_size if xp.exists() else 'N/A'})")
                 raise RuntimeError(f"xfade 입력 영상이 비정상입니다: {xp}")
 
+        # --- [수정 시작] 공통 해상도 결정 (인자 사용) ---
+        # 스케일 필터 정의: 입력 스트림을 공통 해상도로 강제 변환
+        scale_filter = (
+            f"scale={width}:{height}:force_original_aspect_ratio=decrease,"
+            f"pad={width}:{height}:(ow-iw)/2:(oh-ih)/2"
+        )
+        # --- [수정 끝] 공통 해상도 결정 ---
+
         dur_a = _duration(path_a)
         dur_b = _duration(path_b)
-        _notify(f"[I2V][XF] concat '{path_a.name}'(dur={dur_a:.3f}s) + '{path_b.name}'(dur={dur_b:.3f}s)")
+        _notify(
+            f"[I2V][XF] concat '{path_a.name}'(dur={dur_a:.3f}s) + '{path_b.name}'(dur={dur_b:.3f}s) -> {width}x{height}")
 
         if dur_a <= 0:
-            # 그냥 바이너리 concat
+            # ... (기존 바이너리 concat 로직 유지)
             _notify("[I2V][XF] dur_a<=0 → 단순 concat 사용")
             with open(path_out, "wb") as cout_file:
                 for src_path in (path_a, path_b):
@@ -1071,24 +1135,37 @@ def build_shots_with_i2v(
             return
 
         offset = max(dur_a - crossfade_sec, 0.0)
-        _notify(f"[I2V][XF] crossfade_sec={crossfade_sec}, offset={offset:.3f}")
+        # _notify(f"[I2V][XF] crossfade_sec={crossfade_sec}, offset={offset:.3f}")
 
-        filter_str = (
-            f"[0:v][1:v]xfade=transition=fade:"
-            f"duration={crossfade_sec}:offset={offset}[v]"
+        # --- [수정 시작] filter_complex에 스케일링 및 포맷 통일 추가 ---
+        filter_complex_str = (
+            # Stream 0: 스케일 및 포맷 통일 -> [v0]
+            f"[0:v]{scale_filter},format=yuv420p[v0];"
+            # Stream 1: 스케일 및 포맷 통일 -> [v1]
+            f"[1:v]{scale_filter},format=yuv420p[v1];"
+            # [v0]와 [v1]을 xfade 필터에 연결 -> [v_out]
+            f"[v0][v1]xfade=transition=fade:duration={crossfade_sec}:offset={offset}[v_out]"
         )
+
         cmd_args = [
             ffmpeg_exe_val,
             "-y",
             "-i", str(path_a),
             "-i", str(path_b),
-            "-filter_complex", filter_str,
-            "-map", "[v]",
+            "-filter_complex", filter_complex_str,
+            "-map", "[v_out]",  # xfade의 최종 출력을 매핑
             "-an",
+            # 인코딩 설정 (재인코딩이 필요하므로 copy를 사용하지 않습니다)
+            "-c:v", "libx264",
+            "-crf", "18",  # 적정 품질
+            "-preset", "fast",
+            "-pix_fmt", "yuv420p",
             str(path_out),
         ]
+        # --- [수정 끝] filter_complex에 스케일링 및 포맷 통일 추가 ---
 
         try:
+            # FFMPEG 실행
             proc = subprocess.run(
                 cmd_args,
                 check=True,
@@ -1098,7 +1175,7 @@ def build_shots_with_i2v(
                 encoding="utf-8",
                 errors="ignore",
             )
-            _notify(f"[I2V][XF] xfade 성공 → {path_out.name}")
+            # _notify(f"[I2V][XF] xfade 성공 → {path_out.name}")
         except subprocess.CalledProcessError as e:
             _notify("[I2V][XF][ERR] ffmpeg xfade 실패")
             _notify(f"[I2V][XF][ERR] cmd: {' '.join(cmd_args)}")
@@ -1177,9 +1254,9 @@ def build_shots_with_i2v(
     project_dir_path = Path(project_dir)
     _ensure_dir_func(project_dir_path)
 
-    # video.json 로드
-    video_json_path = project_dir_path / "video.json"
-    video_doc = _load_json_func(video_json_path, {}) or {}
+    # video.json 로드 (이미 로드됨)
+    # video_json_path = project_dir_path / "video.json"
+    # video_doc = _load_json_func(video_json_path, {}) or {}
 
     global_ctx = dict(video_doc.get("global_context") or {})
     section_moods = dict(global_ctx.get("section_moods") or {})
@@ -1400,14 +1477,6 @@ def build_shots_with_i2v(
         scene_out_dir = clips_dir / scene_id
         _ensure_dir_func(scene_out_dir)
 
-        # ───────────────────────── [수정 시작: 최종 씬 파일 스킵 로직] ─────────────────────────
-        scene_final_clip_path = clips_dir / f"{scene_id}.mp4"
-
-        if scene_final_clip_path.exists() and scene_final_clip_path.stat().st_size > 1024:
-            _notify(f"[I2V] 씬 {scene_index}/{total_scenes} ({scene_id}) 최종 클립({scene_id}.mp4)이 존재합니다. 생성 스킵.")
-            continue  # 다음 씬으로 건너뜐
-        # ───────────────────────── [수정 끝: 최종 씬 파일 스킵 로직] ─────────────────────────
-
         # ★ 여기 추가: crossfade용 임시 폴더 (clips/xfade_work)
         xfade_work_dir = clips_dir / "xfade_work"
         _ensure_dir_func(xfade_work_dir)
@@ -1588,6 +1657,35 @@ def build_shots_with_i2v(
             f"{ {k: scene_character_specs[k] for k in sorted(scene_character_specs.keys())} }"
         )
 
+        # ───────────────────────── [핵심 수정: 씬 전체 스킵 조건 (엄격 모드)] ─────────────────────────
+        scene_final_clip_path = clips_dir / f"{scene_id}.mp4"
+
+        # 1. 최종 씬 파일이 존재하는가?
+        is_scene_final_exists = scene_final_clip_path.exists() and scene_final_clip_path.stat().st_size > 1024
+
+        # 2. 모든 세그먼트 파일이 존재하는가? (segments_list가 이 시점에 확정되었음)
+        all_segments_exist = True
+
+        # 이 루프를 한 번 돌면서 모든 세그먼트 경로를 확인합니다.
+        # segments_list의 길이는 청크의 총 개수입니다.
+        for idx in range(len(segments_list)):
+            # Final (저장 스킵 기준) 파일명 정의 (외부 노출용 고정 이름)
+            final_filename_fixed = f"{scene_id}_seg{idx + 1:02d}.mp4"
+            final_path = scene_out_dir / final_filename_fixed
+
+            if not final_path.exists() or final_path.stat().st_size <= 0:
+                all_segments_exist = False
+                break
+
+        # 엄격한 스킵 조건: 최종 씬 파일 AND 모든 세그먼트 파일이 존재해야만 스킵
+        if is_scene_final_exists and all_segments_exist:
+            _notify(
+                f"[I2V] 씬 {scene_index}/{total_scenes} ({scene_id}) 최종 클립 및 모든 세그먼트가 존재합니다. → 전체 스킵"
+            )
+            continue  # 다음 씬으로 건너뜜
+
+        # ───────────────────────── [핵심 수정 끝: 씬 전체 스킵 조건 (엄격 모드)] ─────────────────────────
+
         # ───────────────────────── 세그먼트별 i2v 실행 ─────────────────────────
         segment_index = 0
         chunk_paths: List[Path] = []
@@ -1597,10 +1695,11 @@ def build_shots_with_i2v(
             length_f = end_f - start_f
             target_chunk_duration = length_f / float(target_fps_val)
 
-            # [수정: 파일명 고정]
+            # ───────────────────────── [수정 시작] Raw 파일 경로 정의 ─────────────────────────
             # 1. Draft (Raw) 파일명 정의 (추출/합치기용 내부 고정 이름)
             raw_filename_fixed = f"{scene_id}_seg{chunk_index + 1:02d}_raw.mp4"
-            raw_path = xfade_work_dir / raw_filename_fixed
+            # ★★★ Raw 파일 경로: clips/{scene_id} 폴더 내부에 저장 ★★★
+            raw_path = scene_out_dir / raw_filename_fixed
 
             # 2. Final (저장 스킵 기준) 파일명 정의 (외부 노출용 고정 이름)
             final_filename_fixed = f"{scene_id}_seg{chunk_index + 1:02d}.mp4"
@@ -1615,6 +1714,7 @@ def build_shots_with_i2v(
                     f"정크 파일이 이미 존재합니다 -> 생성 스킵 (len={length_f})"
                 )
                 continue  # 다음 세그먼트로 건너뜜
+            # ───────────────────────── [수정 끝] Raw 파일 경로 정의 ─────────────────────────
 
             _notify(
                 f"[I2V] {scene_id} Seg{chunk_index + 1}/{len(segments_list)} 생성 시작 "
@@ -1733,7 +1833,8 @@ def build_shots_with_i2v(
                 target_time = local_frame / float(base_fps_in)  # <--- 이 부분에 base_fps_in 적용
 
                 # [수정] Raw 파일 경로 정의 시 date_prefix 제거
-                prev_raw_path = xfade_work_dir / f"{scene_id}_seg{chunk_index:02d}_raw.mp4"
+                # ★★★ 이전 청크의 Raw 파일은 clips/{scene_id} 폴더에 저장되어 있음 ★★★
+                prev_raw_path = scene_out_dir / f"{scene_id}_seg{chunk_index:02d}_raw.mp4"
                 _notify(
                     f"[I2V][IMG] Seg{chunk_index + 1}용 ref 추출 "
                     f"from={prev_raw_path.name} "
@@ -1788,19 +1889,22 @@ def build_shots_with_i2v(
                 _toggle_upscale_node(graph_chunk, enable=False)
                 if "172" in graph_chunk:
                     # [수정] filename_prefix를 고정된 이름으로 설정
+                    # Raw 파일은 ComfyUI output 폴더의 temp_raw 서브폴더에 저장됨
                     graph_chunk["172"]["inputs"][
                         "filename_prefix"] = f"temp_raw/{scene_id}_seg{chunk_index + 1:02d}_raw"
 
                 _notify(f"[I2V] {scene_id} Seg{chunk_index + 1} Draft 생성 시작")
                 try:
-                    res = _submit_and_wait_comfy_func(comfy_host, graph_chunk, timeout=1800, poll=2.0,
+                    res = _submit_and_wait_comfy_func(comfy_host, graph_chunk, timeout=10000, poll=10.0,
                                                       on_progress=lambda d: None)
-                    # 결과 다운로드 (temp_raw -> xfade_work)
+                    # 결과 다운로드 (Comfy output -> local raw_path)
                     out_node = res.get("outputs", {}).get("172", {})
                     vid_info = (out_node.get("videos") or out_node.get("gifs") or [])[0]
                     fname = vid_info['filename']
                     r = requests.get(f"{comfy_host}/view",
                                      params={"filename": fname, "subfolder": vid_info['subfolder']}, timeout=60)
+
+                    # ★★★ Raw 파일을 씬별 청크 폴더(raw_path)에 저장 ★★★
                     with open(raw_path, "wb") as f:
                         f.write(r.content)
                 except Exception as e:
@@ -1814,7 +1918,7 @@ def build_shots_with_i2v(
 
             _notify(f"[I2V] 2차 생성 (Upscale Mode)...")
             try:
-                res = _submit_and_wait_comfy_func(comfy_host, graph_chunk, timeout=1800, poll=2.0,
+                res = _submit_and_wait_comfy_func(comfy_host, graph_chunk, timeout=10000, poll=10.0,
                                                   on_progress=lambda d: None)
                 # 결과 다운로드
                 out_node = res.get("outputs", {}).get("172", {})
@@ -1843,6 +1947,25 @@ def build_shots_with_i2v(
             _notify(f"[I2V] 씬 {scene_id}의 유효한 세그먼트가 없어 병합 스킵")
             continue
 
+        # ───────────────────────── [수정] 병합 전 실제 해상도 감지 및 갱신 ─────────────────────────
+        if valid_chunk_paths:
+            # 첫 번째 청크의 실제 해상도를 확인하여 병합 타겟 해상도로 설정
+            first_chunk = valid_chunk_paths[0]
+            try:
+                cmd_res = [
+                    ffprobe_exe_val, "-v", "error", "-select_streams", "v:0",
+                    "-show_entries", "stream=width,height", "-of", "csv=s=x:p=0",
+                    str(first_chunk)
+                ]
+                res_out = subprocess.check_output(cmd_res, text=True).strip()
+                if "x" in res_out:
+                    act_w, act_h = map(int, res_out.split("x"))
+                    if act_w > 0 and act_h > 0:
+                        _notify(f"[I2V][ResUpdate] UI설정({target_w}x{target_h}) → 실제생성({act_w}x{act_h})로 병합 해상도 갱신")
+                        target_w, target_h = act_w, act_h
+            except Exception as e:
+                _notify(f"[WARN] 실제 해상도 감지 실패: {e}, UI 설정값 사용")
+
         # 1개면 그대로 복사
         if len(valid_chunk_paths) == 1:
             shutil.copy2(str(valid_chunk_paths[0]), str(scene_final_tmp))
@@ -1854,7 +1977,9 @@ def build_shots_with_i2v(
                 step_idx += 1
                 # ★ 임시 파일을 clips/xfade_work 밑에 생성
                 temp_out = xfade_work_dir / f"{scene_id}_step_{step_idx:03d}.mp4"
-                _i2v_concat_ab(current_concat, next_path, temp_out, crossfade_sec=0.3)
+                # [수정] 해상도 인자(target_w, target_h) 전달
+                _i2v_concat_ab(current_concat, next_path, temp_out, crossfade_sec=0.375, width=target_w,
+                               height=target_h)
                 current_concat = temp_out
             shutil.copy2(str(current_concat), str(scene_final_tmp))
 
@@ -2969,7 +3094,7 @@ def build_missing_images_from_story(
                 raise RuntimeError(f"{sid}: 출력 이미지 없음")
 
             # type="output" 우선 선택
-            img_output_list = [info for info in files_list if str(info.get("type") or "") == "output"]
+            img_output_list = [file_info for file_info in files_list if str(file_info.get("type") or "") == "output"]
             if img_output_list:
                 last_file_info = img_output_list[-1]
             else:

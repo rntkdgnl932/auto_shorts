@@ -9300,9 +9300,16 @@ class MainWindow(QtWidgets.QMainWindow):
             pdir = Path(proj_dir_val)
 
             # --- 백그라운드 작업 함수 정의 (콜백 인자 추가) ---
-            def _job(progress_callback: Callable[[Dict[str, Any]], None]) -> None:  # <-- 콜백 인자 명시
+            def _job(progress_callback: Callable[[Dict[str, Any]], None]) -> None:
                 """영상 생성을 수행하는 백그라운드 작업 함수."""
-                build_func_local: Optional[Callable] = None  # <-- 변수명 변경
+                build_func_local: Optional[Callable] = None
+
+                # 0) project_dir 확보
+                pdir = Path(getattr(self, "project_dir", "") or "")
+                if not pdir.is_dir():
+                    raise RuntimeError("project_dir가 설정되어 있지 않습니다.")
+
+                # 1) build_shots_with_i2v import
                 try:
                     from app.video_build import build_shots_with_i2v as build_func_imp  # type: ignore
                     build_func_local = build_func_imp
@@ -9312,8 +9319,10 @@ class MainWindow(QtWidgets.QMainWindow):
                         build_func_local = build_func_imp2
                     except (ImportError, ModuleNotFoundError, AttributeError) as e_import_vb_inner:
                         raise ImportError(
-                            f"video_build.build_shots_with_i2v 로드 실패: {e_import_vb_inner}") from e_import_vb_inner
+                            f"video_build.build_shots_with_i2v 로드 실패: {e_import_vb_inner}"
+                        ) from e_import_vb_inner
 
+                # 2) UI에서 total_frames 읽기
                 tframes = 0
                 sb_total_widget = getattr(self, "sb_total", None)
                 if sb_total_widget is not None and hasattr(sb_total_widget, "value"):
@@ -9321,42 +9330,112 @@ class MainWindow(QtWidgets.QMainWindow):
                         tframes = int(sb_total_widget.value())
                     except (TypeError, ValueError):
                         tframes = 0
+
+                # 3) 0 이하이면 video.json 기준으로 다시 계산 시도
                 if tframes <= 0:
-                    progress_callback({"msg": "[경고] total_frames가 0 이하입니다."})
+                    progress_callback({"msg": "[경고] total_frames가 0 이하입니다. video.json 기준으로 재계산합니다..."})
+
+                    # utils.load_json 안전 가져오기
+                    try:
+                        from app.utils import load_json as _load_json  # type: ignore
+                    except Exception:
+                        from utils import load_json as _load_json  # type: ignore
+
+                    video_path = pdir / "video.json"
+                    video_doc = _load_json(video_path, {}) or {}
+
+                    # fps
+                    try:
+                        fps_val = int(video_doc.get("fps", 16))
+                    except Exception:
+                        fps_val = 16
+
+                    # duration
+                    duration_sec = 0.0
+                    try:
+                        duration_sec = float(video_doc.get("duration", 0.0))
+                    except Exception:
+                        duration_sec = 0.0
+
+                    # duration 없으면 scenes duration 합산
+                    if duration_sec <= 0.0:
+                        scenes = video_doc.get("scenes") or []
+                        total_d = 0.0
+                        for s in scenes:
+                            if not isinstance(s, dict):
+                                continue
+                            try:
+                                d = float(s.get("duration", 0.0))
+                            except Exception:
+                                d = 0.0
+                            if d > 0:
+                                total_d += d
+                        duration_sec = total_d
+
+                    if duration_sec > 0.0:
+                        tframes = int(round(duration_sec * max(fps_val, 1)))
+                        progress_callback({
+                            "msg": f"[INFO] video.json 기준으로 total_frames={tframes} 으로 보정했습니다. "
+                                   f"(duration={duration_sec:.3f}s, fps={fps_val})"
+                        })
+                        # UI에도 반영
+                        if sb_total_widget is not None and hasattr(sb_total_widget, "setValue"):
+                            try:
+                                sb_total_widget.setValue(tframes)
+                            except Exception:
+                                pass
+                    else:
+                        # 진짜로 계산 불가 → 여기서 명확히 에러로 종료
+                        raise RuntimeError(
+                            "total_frames를 계산할 수 없습니다. '프로젝트 분석'을 먼저 실행해 주세요."
+                        )
+
+                # 여기까지 오면 tframes > 0.
+                ui_w = getattr(self, "sb_width", None).value() if hasattr(getattr(self, "sb_width", None),
+                                                                          "value") else None
+                ui_h = getattr(self, "sb_height", None).value() if hasattr(getattr(self, "sb_height", None),
+                                                                           "value") else None
+                ui_fps = getattr(self, "sb_fps", None).value() if hasattr(getattr(self, "sb_fps", None),
+                                                                          "value") else None
+                ui_steps = getattr(self, "sb_steps", None).value() if hasattr(getattr(self, "sb_steps", None),
+                                                                              "value") else None
 
                 try:
-                    sig_build_inner = inspect.signature(build_func_local)  # <-- 변수명 변경
+                    sig_build_inner = inspect.signature(build_func_local)
                     build_kwargs_inner: Dict[str, Any] = {
                         "project_dir": str(pdir),
                         "total_frames": tframes,
-                        "on_progress": progress_callback  # <-- 전달받은 콜백 명시적으로 사용
+                        "on_progress": progress_callback,
                     }
-                    # UI 값 인자 추가 (시그니처 확인 후, None이 아닐 때만)
-                    if "ui_width" in sig_build_inner.parameters and ui_w is not None: build_kwargs_inner[
-                        "ui_width"] = ui_w
-                    if "ui_height" in sig_build_inner.parameters and ui_h is not None: build_kwargs_inner[
-                        "ui_height"] = ui_h
-                    if "ui_fps" in sig_build_inner.parameters and ui_fps is not None: build_kwargs_inner[
-                        "ui_fps"] = ui_fps
-                    if "ui_steps" in sig_build_inner.parameters and ui_steps is not None: build_kwargs_inner[
-                        "ui_steps"] = ui_steps
 
-                    build_func_local(**build_kwargs_inner)  # <-- 변수명 변경
+                    if "ui_width" in sig_build_inner.parameters and ui_w is not None:
+                        build_kwargs_inner["ui_width"] = int(ui_w)
+                    if "ui_height" in sig_build_inner.parameters and ui_h is not None:
+                        build_kwargs_inner["ui_height"] = int(ui_h)
+                    if "ui_fps" in sig_build_inner.parameters and ui_fps is not None:
+                        build_kwargs_inner["ui_fps"] = int(ui_fps)
+                    if "ui_steps" in sig_build_inner.parameters and ui_steps is not None:
+                        build_kwargs_inner["ui_steps"] = int(ui_steps)
+
+                    build_func_local(**build_kwargs_inner)
 
                 except TypeError as e_type_build_inner:
-                    progress_callback(
-                        {"msg": f"[경고] build_shots_with_i2v 호출 시그니처 불일치 ({e_type_build_inner}), UI 값 없이 호출 시도."})
+                    progress_callback({
+                        "msg": f"[경고] build_shots_with_i2v 호출 시그니처 불일치 ({e_type_build_inner}), UI 값 없이 호출 시도."
+                    })
                     try:
-                        build_func_local(str(pdir), tframes, on_progress=progress_callback)  # <-- 변수명 변경
+                        build_func_local(str(pdir), tframes, on_progress=progress_callback)
                     except TypeError:
                         progress_callback({"msg": "[경고] on_progress 인자도 실패, 인자 없이 호출 시도."})
-                        build_func_local(str(pdir), tframes)  # type: ignore[call-arg] # <-- 변수명 변경
+                        build_func_local(str(pdir), tframes)  # type: ignore[call-arg]
                     except Exception as e_fallback_call_inner:
                         raise RuntimeError(
-                            f"build_shots_with_i2v 최종 호출 실패: {e_fallback_call_inner}") from e_fallback_call_inner
+                            f"build_shots_with_i2v 최종 호출 실패: {e_fallback_call_inner}"
+                        ) from e_fallback_call_inner
                 except Exception as e_build_other_inner:
                     raise RuntimeError(
-                        f"build_shots_with_i2v 실행 오류: {e_build_other_inner}") from e_build_other_inner
+                        f"build_shots_with_i2v 실행 오류: {e_build_other_inner}"
+                    ) from e_build_other_inner
 
             # --- 작업 완료 콜백 ---
             def _done(ok: bool, payload: Any, err: Optional[Exception]) -> None:  # <-- payload 타입 Any로
