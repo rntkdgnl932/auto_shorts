@@ -324,7 +324,6 @@
   },
   "163": {
     "inputs": {
-      "text": "32.0",
       "anything": [
         "165",
         1
@@ -416,7 +415,7 @@
       "pingpong": false,
       "save_output": false,
       "images": [
-        "166",
+        "174",
         0
       ]
     },

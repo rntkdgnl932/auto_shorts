@@ -866,6 +866,7 @@ def build_shots_with_i2v(
                     pass
 
     # ───────────────────────── [수정 시작] total_frames 보정 및 재계산 로직 추가 ─────────────────────────
+    # ★★★ 원본 코드의 재계산 로직을 그대로 유지합니다 ★★★
 
     # video.json 로드
     video_json_path = Path(project_dir) / "video.json"
@@ -1208,12 +1209,37 @@ def build_shots_with_i2v(
         ]
         subprocess.run(cmd_args, check=True)
 
+    # [추가] _i2v_extract_still_frame_by_time 함수 정의 (누락 방지)
+    def _i2v_extract_still_frame_by_time(src_video: Path, target_time_sec: float, out_dir: Path, prefix: str = "ref") -> \
+    Optional[Path]:
+        if target_time_sec < 0: return None
+        out_name = f"{src_video.stem}_{prefix}_{target_time_sec:.3f}.png"
+        out_path = out_dir / out_name
+        if out_path.exists() and out_path.stat().st_size > 0: return out_path
+        try:
+            # -ss를 앞에 두어 빠르고 정확하게 추출
+            subprocess.run(
+                [ffmpeg_exe_val, "-y", "-ss", f"{target_time_sec:.6f}", "-i", str(src_video), "-frames:v", "1", "-q:v",
+                 "2", str(out_path)], check=True, stdout=subprocess.PIPE, stderr=subprocess.STDOUT)
+            return out_path
+        except:
+            return None
+
+    def _toggle_upscale_node(graph: Dict[str, Any], enable: bool) -> None:
+        save_node_ids = ["172", "119"]
+        upscaler = graph.get("164")
+        for nid in save_node_ids:
+            if nid not in graph: continue
+            if enable and upscaler:
+                graph[nid]["inputs"]["images"] = ["164", 0]
+            else:
+                graph[nid]["inputs"]["images"] = ["166", 0]
+
     # ───────────────────────── I2V 세그먼트 공통 상수 ─────────────────────────
     CHUNK_BASE_FRAMES = 82
     OVERLAP_FRAMES = 6
     PAD_TAIL_FRAMES = 5
 
-    # ───────────────────────── Helper: segment 계산 (수정됨) ─────────────────────────
     def _i2v_plan_segments(
             frame_len_total: int,
             base_chunk: int = 82,
@@ -1291,14 +1317,9 @@ def build_shots_with_i2v(
     else:
         target_fps_val = fps_from_video
 
-    # 해상도 결정: ui_width/ui_height > 기본값(720x1280 또는 video.json defaults)
-    # 해상도 결정: ui_width/ui_height > 기본값(720x1280 또는 video.json defaults)
-    defaults_doc: Dict[str, Any] = {}
-    defaults_movie: Dict[str, Any] = {}
-
+    defaults_doc: Dict[str, Any] = video_doc.get("defaults") or {}
+    defaults_movie: Dict[str, Any] = defaults_doc.get("movie") or {}
     try:
-        defaults_doc = video_doc.get("defaults") or {}
-        defaults_movie = defaults_doc.get("movie") or {}
         default_w = int(defaults_movie.get("width", 720))
         default_h = int(defaults_movie.get("height", 1280))
     except (TypeError, ValueError, AttributeError):
@@ -1349,7 +1370,6 @@ def build_shots_with_i2v(
     base_jsons_path = Path(str(jsons_dir_conf))
     _ensure_dir_func(base_jsons_path)
 
-    # 1) settings.I2V_WORKFLOW 가 지정되어 있으면 우선
     workflow_path: Optional[Path] = None
     if i2v_workflow_conf:
         candidate_1 = Path(str(i2v_workflow_conf))
@@ -1673,14 +1693,20 @@ def build_shots_with_i2v(
             final_filename_fixed = f"{scene_id}_seg{idx + 1:02d}.mp4"
             final_path = scene_out_dir / final_filename_fixed
 
-            if not final_path.exists() or final_path.stat().st_size <= 0:
+            # Raw 파일도 함께 체크 (Raw 누락 시에도 스킵 불가)
+            raw_filename_fixed = f"{scene_id}_seg{idx + 1:02d}_raw.mp4"
+            raw_path = scene_out_dir / raw_filename_fixed
+
+            # Final 또는 Raw 중 하나라도 없으면 전체 스킵 불가
+            if (not final_path.exists() or final_path.stat().st_size <= 0) or \
+                    (not raw_path.exists() or raw_path.stat().st_size <= 0):
                 all_segments_exist = False
                 break
 
-        # 엄격한 스킵 조건: 최종 씬 파일 AND 모든 세그먼트 파일이 존재해야만 스킵
+        # 엄격한 스킵 조건: 최종 씬 파일 AND 모든 세그먼트(Raw/Final) 파일이 존재해야만 스킵
         if is_scene_final_exists and all_segments_exist:
             _notify(
-                f"[I2V] 씬 {scene_index}/{total_scenes} ({scene_id}) 최종 클립 및 모든 세그먼트가 존재합니다. → 전체 스킵"
+                f"[I2V] 씬 {scene_index}/{total_scenes} ({scene_id}) 전체 스킵 (최종본+모든세그먼트 존재)"
             )
             continue  # 다음 씬으로 건너뜜
 
@@ -1707,13 +1733,20 @@ def build_shots_with_i2v(
 
             chunk_paths.append(final_path)
 
-            # [수정: 개별 정크 스킵 복원]
+            # [수정: 개별 정크 스킵 복원 & Raw 체크]
+            # Final 파일이 있고 Raw 파일도 있으면 스킵
             if final_path.exists() and final_path.stat().st_size > 0:
-                _notify(
-                    f"[I2V] {scene_id} Seg{chunk_index + 1}/{len(segments_list)} "
-                    f"정크 파일이 이미 존재합니다 -> 생성 스킵 (len={length_f})"
-                )
-                continue  # 다음 세그먼트로 건너뜜
+                if raw_path.exists() and raw_path.stat().st_size > 0:
+                    _notify(
+                        f"[I2V] {scene_id} Seg{chunk_index + 1}/{len(segments_list)} "
+                        f"정크(Final+Raw) 존재 -> 스킵"
+                    )
+                    continue
+                else:
+                    _notify(
+                        f"[I2V][WARN] {scene_id} Seg{chunk_index + 1} Final 존재하나 Raw 누락 -> 재생성 (One-Pass)"
+                    )
+
             # ───────────────────────── [수정 끝] Raw 파일 경로 정의 ─────────────────────────
 
             _notify(
@@ -1800,7 +1833,6 @@ def build_shots_with_i2v(
             # --- ▲▲▲ UI 값 주입 확인 (DEBUG LOG) ▲▲▲ ---
 
             # ──────────────── [Step 1] 이미지 추출 및 주입 (수정 v2) ────────────────
-            # ──────────────── [Step 1] 이미지 추출 및 주입 (수정 v2) ────────────────
             if chunk_index == 0:
                 # 첫 청크: 원래 대표 이미지 사용
                 _notify(
@@ -1811,30 +1843,26 @@ def build_shots_with_i2v(
 
             else:
                 # 2번째 청크부터: 이전 Draft(Raw) 영상에서 "1정크의 82-6 프레임"을 기준으로 추출
+                # ★★★ Raw 파일 경로: scene_out_dir (위에서 정의함)
+                # prev_raw_path는 이전 청크의 Raw 파일
+                prev_raw_filename = f"{scene_id}_seg{chunk_index:02d}_raw.mp4"
+                prev_raw_path = scene_out_dir / prev_raw_filename
+
+                # 1번 청크가 0번 청크(이전)를 참조할 때: chunk_index=1 -> prev_seg=segments_list[0]
                 prev_seg = segments_list[chunk_index - 1]
                 prev_start = int(prev_seg[0])
                 prev_end = int(prev_seg[1])
 
-                # segments_list 는 (gen_start, gen_end) = 유효구간 + 패딩 기준이므로
-                # 유효 길이 = 전체 길이 - PAD_TAIL_FRAMES
                 prev_len = prev_end - prev_start
                 base_chunk_len = max(1, prev_len - PAD_TAIL_FRAMES)  # 예: 87 - 5 = 82
 
-                # 우리가 원하는 프레임 = base_chunk_len - OVERLAP_FRAMES
-                # 예: 82 - 6 = 76
                 local_frame = base_chunk_len - OVERLAP_FRAMES
-                if local_frame < 0:
-                    local_frame = 0
-                if local_frame >= prev_len:
-                    # 혹시라도 범위 넘으면 마지막 프레임 바로 앞
-                    local_frame = max(0, prev_len - 1)
+                if local_frame < 0: local_frame = 0
+                if local_frame >= prev_len: local_frame = max(0, prev_len - 1)
 
                 # [수정] target_time 계산에 base_fps_in 사용
                 target_time = local_frame / float(base_fps_in)  # <--- 이 부분에 base_fps_in 적용
 
-                # [수정] Raw 파일 경로 정의 시 date_prefix 제거
-                # ★★★ 이전 청크의 Raw 파일은 clips/{scene_id} 폴더에 저장되어 있음 ★★★
-                prev_raw_path = scene_out_dir / f"{scene_id}_seg{chunk_index:02d}_raw.mp4"
                 _notify(
                     f"[I2V][IMG] Seg{chunk_index + 1}용 ref 추출 "
                     f"from={prev_raw_path.name} "
@@ -1884,52 +1912,53 @@ def build_shots_with_i2v(
                         _notify,
                     )
 
-            # ──────────────── [Step 2] 1차 생성 (Draft, Upscale OFF) ────────────────
-            if chunk_index < len(segments_list) - 1:
-                _toggle_upscale_node(graph_chunk, enable=False)
-                if "172" in graph_chunk:
-                    # [수정] filename_prefix를 고정된 이름으로 설정
-                    # Raw 파일은 ComfyUI output 폴더의 temp_raw 서브폴더에 저장됨
-                    graph_chunk["172"]["inputs"][
-                        "filename_prefix"] = f"temp_raw/{scene_id}_seg{chunk_index + 1:02d}_raw"
+            # ──────────────── [Step 2] 통합 생성 (One-Pass: Raw + Final) ────────────────
+            # 1회 실행으로 Node 167(Raw)와 Node 172(Final) 동시 저장
 
-                _notify(f"[I2V] {scene_id} Seg{chunk_index + 1} Draft 생성 시작")
-                try:
-                    res = _submit_and_wait_comfy_func(comfy_host, graph_chunk, timeout=10000, poll=10.0,
-                                                      on_progress=lambda d: None)
-                    # 결과 다운로드 (Comfy output -> local raw_path)
-                    out_node = res.get("outputs", {}).get("172", {})
-                    vid_info = (out_node.get("videos") or out_node.get("gifs") or [])[0]
-                    fname = vid_info['filename']
-                    r = requests.get(f"{comfy_host}/view",
-                                     params={"filename": fname, "subfolder": vid_info['subfolder']}, timeout=60)
+            # 1. Raw 저장 설정 (167번)
+            if "167" in graph_chunk:
+                graph_chunk["167"]["inputs"]["filename_prefix"] = f"temp_raw/{scene_id}_seg{chunk_index + 1:02d}_raw"
 
-                    # ★★★ Raw 파일을 씬별 청크 폴더(raw_path)에 저장 ★★★
-                    with open(raw_path, "wb") as f:
-                        f.write(r.content)
-                except Exception as e:
-                    _notify(f"[ERR] 1차 생성 실패: {e}")
-
-            # ──────────────── [Step 3] 2차 생성 (Final, Upscale ON) ────────────────
-            _toggle_upscale_node(graph_chunk, enable=True)
+            # 2. Final 저장 설정 (172번)
             if "172" in graph_chunk:
-                # [수정] filename_prefix를 고정된 이름으로 설정
                 graph_chunk["172"]["inputs"]["filename_prefix"] = f"i2v/{scene_id}_seg{chunk_index + 1:02d}"
 
-            _notify(f"[I2V] 2차 생성 (Upscale Mode)...")
+            _notify(f"[I2V] {scene_id} Seg{chunk_index + 1} 통합 생성(One-Pass) 시작")
             try:
                 res = _submit_and_wait_comfy_func(comfy_host, graph_chunk, timeout=10000, poll=10.0,
                                                   on_progress=lambda d: None)
-                # 결과 다운로드
-                out_node = res.get("outputs", {}).get("172", {})
-                vid_info = (out_node.get("videos") or out_node.get("gifs") or [])[0]
-                fname = vid_info['filename']
-                r = requests.get(f"{comfy_host}/view", params={"filename": fname, "subfolder": vid_info['subfolder']},
-                                 timeout=60)
-                with open(final_path, "wb") as f:
-                    f.write(r.content)
+
+                # [Raw 다운로드] Node 167
+                out_raw = res.get("outputs", {}).get("167", {})
+                vid_raw = (out_raw.get("videos") or out_raw.get("gifs") or [])
+                if vid_raw:
+                    fname_raw = vid_raw[0]['filename']
+                    r_raw = requests.get(f"{comfy_host}/view",
+                                         params={"filename": fname_raw, "subfolder": vid_raw[0]['subfolder']},
+                                         timeout=60)
+                    with open(raw_path, "wb") as f:
+                        f.write(r_raw.content)
+                    _notify(f"[I2V] Raw 파일 저장 완료: {raw_path.name}")
+                else:
+                    _notify("[WARN] Raw 파일(Node 167) 출력을 찾을 수 없습니다.")
+
+                # [Final 다운로드] Node 172
+                out_final = res.get("outputs", {}).get("172", {})
+                vid_final = (out_final.get("videos") or out_final.get("gifs") or [])
+                if vid_final:
+                    fname_final = vid_final[0]['filename']
+                    r_final = requests.get(f"{comfy_host}/view",
+                                           params={"filename": fname_final, "subfolder": vid_final[0]['subfolder']},
+                                           timeout=60)
+                    with open(final_path, "wb") as f:
+                        f.write(r_final.content)
+                    _notify(f"[I2V] Final 파일 저장 완료: {final_path.name}")
+                else:
+                    raise RuntimeError("Final 파일(Node 172) 출력을 찾을 수 없습니다.")
+
             except Exception as e:
-                _notify(f"[I2V] {scene_id} Seg{chunk_index + 1} Upscale(Final) 생성 시작")
+                _notify(f"[ERR] 생성 실패: {e}")
+                continue
 
             # ──────────────── [Step 4] 트리밍 ────────────────
             if final_path.exists():
@@ -1977,7 +2006,7 @@ def build_shots_with_i2v(
                 step_idx += 1
                 # ★ 임시 파일을 clips/xfade_work 밑에 생성
                 temp_out = xfade_work_dir / f"{scene_id}_step_{step_idx:03d}.mp4"
-                # [수정] 해상도 인자(target_w, target_h) 전달
+                # [수정] 해상도 인자 전달 (target_w, target_h)
                 _i2v_concat_ab(current_concat, next_path, temp_out, crossfade_sec=0.375, width=target_w,
                                height=target_h)
                 current_concat = temp_out

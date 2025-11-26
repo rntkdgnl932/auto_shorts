@@ -9209,7 +9209,7 @@ class MainWindow(QtWidgets.QMainWindow):
     # ────────────── 영상 빌드(선택) ──────────────
     # shorts_ui.py 파일의 on_video 함수 전체를 이 코드로 교체하세요. (약 7076 라인)
 
-    def on_video(self, *, on_done_override: Optional[Callable] = None) -> None:  # <-- 시그니처 수정
+    def on_video(self, *, on_done_override: Optional[Callable] = None) -> None:
         try:
             self._save_ui_prefs_to_project()
         except Exception as e_save_prefs:
@@ -9273,11 +9273,13 @@ class MainWindow(QtWidgets.QMainWindow):
                 return default_val
 
             # --- ▼▼▼ [핵심 수정] "렌더 설정" 그룹의 위젯 이름으로 변경 ▼▼▼ ---
-            ui_w = _get_ui_int_value("cmb_render_w", "currentData")
-            ui_h = _get_ui_int_value("cmb_render_h", "currentData")
-            ui_fps = _get_ui_int_value("cmb_movie_fps", "currentData")  # (이름 동일, 렌더 그룹 소속)
-            ui_steps = _get_ui_int_value("spn_render_steps", "value")  # spn_t2i_steps -> spn_render_steps
+            ui_w = _get_ui_int_value("cmb_render_w", "currentData", 540) # 기본값 540
+            ui_h = _get_ui_int_value("cmb_render_h", "currentData", 960) # 기본값 960
+            ui_fps = _get_ui_int_value("cmb_movie_fps", "currentData", 30)  # (이름 동일, 렌더 그룹 소속)
+            ui_steps = _get_ui_int_value("spn_render_steps", "value", 6)  # spn_t2i_steps -> spn_render_steps
             # --- ▲▲▲ [핵심 수정] 끝 ▲▲▲ ---
+
+            print(f"[UI-DEBUG] 영상생성 요청값: W={ui_w}, H={ui_h}, FPS={ui_fps}, Steps={ui_steps}")
 
             # --- 프로젝트 경로 확인 ---
             proj_dir_val: Optional[str] = None
@@ -9391,14 +9393,9 @@ class MainWindow(QtWidgets.QMainWindow):
                         )
 
                 # 여기까지 오면 tframes > 0.
-                ui_w = getattr(self, "sb_width", None).value() if hasattr(getattr(self, "sb_width", None),
-                                                                          "value") else None
-                ui_h = getattr(self, "sb_height", None).value() if hasattr(getattr(self, "sb_height", None),
-                                                                           "value") else None
-                ui_fps = getattr(self, "sb_fps", None).value() if hasattr(getattr(self, "sb_fps", None),
-                                                                          "value") else None
-                ui_steps = getattr(self, "sb_steps", None).value() if hasattr(getattr(self, "sb_steps", None),
-                                                                              "value") else None
+                # ★★★ [수정] 여기서 위에서 읽은 ui_w, ui_h 변수를 사용합니다. ★★★
+                # 기존 코드는 여기서 다시 getattr을 호출했지만,
+                # 위에서 이미 렌더 설정값으로 ui_w, ui_h를 읽어두었으므로 그것을 그대로 씁니다.
 
                 try:
                     sig_build_inner = inspect.signature(build_func_local)
