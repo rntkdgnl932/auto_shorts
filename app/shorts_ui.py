@@ -10346,7 +10346,7 @@ def _inject_render_prefs_methods():
                 print("[경고] _create_render_widgets: settings 모듈 로드 실패, 기본값 사용")
 
                 class SettingsFallbackPrefs:
-                    IMAGE_SIZE_CHOICES = [240, 304, 480, 512, 540, 720, 832, 960, 1024, 1080, 1280, 1440, 1920, 2560]
+                    IMAGE_SIZE_CHOICES = [240, 304, 405, 480, 512, 540, 720, 832, 960, 1024, 1080, 1280, 1440, 1920, 2560]
                     DEFAULT_IMG_SIZE = (720, 1080)
                     MOVIE_FPS_CHOICES = [16, 24, 30, 60]
                     DEFAULT_MOVIE_FPS = 30
@@ -10433,7 +10433,7 @@ def _inject_render_prefs_methods():
 
         # --- [수정] 데이터 목록 준비 ---
         default_w_val, default_h_val = getattr(s_mod_prefs, "DEFAULT_IMG_SIZE", (720, 1080))
-        preset_widths = {304, 540, 720, 832, 1080, 1280, 1920, 512, 1024}
+        preset_widths = {304, 405, 540, 720, 832, 1080, 1280, 1920, 512, 1024}
         preset_heights = {540, 960, 1280, 1472, 1920, 720, 1080, 512, 1024}
         size_choices_conf = getattr(s_mod_prefs, "IMAGE_SIZE_CHOICES", [240, 304, 480, 520, 540, 720, 960, 1080, 1280, 1440])
         size_choices_set = set(int(w) for w in size_choices_conf if str(w).isdigit())
@@ -10451,7 +10451,7 @@ def _inject_render_prefs_methods():
         default_steps_val = int(getattr(s_mod_prefs, "DEFAULT_T2I_STEPS", 6))
 
         presets_data = [
-            ("Shorts 9:16 · 304×540", 304, 540, "304×540"),
+            ("Shorts 9:16 · 405×720", 405, 720, "405×720"),
             ("Shorts 9:16 · 540×960", 540, 960, "540×960"),
             ("Shorts 9:16 · 720×1280", 720, 1280, "shorts_720x1280"),
             ("Shorts 9:16 · 832×1472", 832, 1472, "shorts_832x1472"),

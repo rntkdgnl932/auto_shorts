@@ -79,7 +79,7 @@
   },
   "46": {
     "inputs": {
-      "value": 960
+      "value": 720
     },
     "class_type": "JWInteger",
     "_meta": {
@@ -295,15 +295,6 @@
       "title": "CLIP 텍스트 인코딩 (프롬프트)"
     }
   },
-  "143": {
-    "inputs": {
-      "value": 16
-    },
-    "class_type": "FloatConstant",
-    "_meta": {
-      "title": "Float Constant"
-    }
-  },
   "150": {
     "inputs": {
       "text": "A small glowing character, joyful movement, floating or interacting with magical elements, delicate details like flowing clothes, fluttering hair, or glowing accessories.  \n\nScene 1 (Close-up): Focus on the character, elements glowing or sparkling, smooth motion, close framing emphasizing magical details.  \nScene 2 (Lower angle): Character moving dynamically, subtle motion effects like flowing clothing or hair, gentle particle-like effects enhancing atmosphere. \n\nCamera language: close-up, lower angle, medium, wide, push-in; smooth, slow cinematic movements, highlighting character motion and glowing elements.  \nMood: dreamy, magical, whimsical, enchanting, soft and heartwarming.  \nStyle: soft lighting, glowing line-art or magical sketch overlay, cinematic, artistic illustration style, suitable for any theme or subject.\n"
@@ -322,98 +313,18 @@
       "title": "CLIP 텍스트 인코딩 (프롬프트)"
     }
   },
-  "163": {
-    "inputs": {
-      "anything": [
-        "165",
-        1
-      ]
-    },
-    "class_type": "easy showAnything",
-    "_meta": {
-      "title": "Show Any"
-    }
-  },
-  "164": {
-    "inputs": {
-      "seed": 1002739406,
-      "resolution": 720,
-      "max_resolution": 0,
-      "batch_size": 33,
-      "uniform_batch_size": true,
-      "color_correction": "lab",
-      "temporal_overlap": 3,
-      "prepend_frames": 0,
-      "input_noise_scale": 0,
-      "latent_noise_scale": 0,
-      "offload_device": "cpu",
-      "enable_debug": false,
-      "image": [
-        "166",
-        0
-      ],
-      "dit": [
-        "171",
-        0
-      ],
-      "vae": [
-        "168",
-        0
-      ]
-    },
-    "class_type": "SeedVR2VideoUpscaler",
-    "_meta": {
-      "title": "SeedVR2 Video Upscaler (v2.5.10)"
-    }
-  },
-  "165": {
-    "inputs": {
-      "value": "a*2",
-      "a": [
-        "143",
-        0
-      ]
-    },
-    "class_type": "SimpleMath+",
-    "_meta": {
-      "title": "🔧 Simple Math"
-    }
-  },
-  "166": {
-    "inputs": {
-      "ds_factor": 1,
-      "interpolation_factor": 2,
-      "seed": 152179025449353,
-      "output_flows": false,
-      "gimmvfi_model": [
-        "169",
-        0
-      ],
-      "images": [
-        "174",
-        0
-      ]
-    },
-    "class_type": "GIMMVFI_interpolate",
-    "_meta": {
-      "title": "GIMM-VFI Interpolate"
-    }
-  },
   "167": {
     "inputs": {
-      "frame_rate": [
-        "165",
-        1
-      ],
+      "frame_rate": 16,
       "loop_count": 0,
-      "filename_prefix": "2025-11-20-130404",
+      "filename_prefix": "2025-11-27-14-34-18",
       "format": "video/h264-mp4",
       "pix_fmt": "yuv420p",
       "crf": 19,
       "save_metadata": true,
       "trim_to_audio": false,
       "pingpong": false,
-      "save_output": false,
+      "save_output": true,
       "images": [
         "174",
         0
@@ -467,31 +378,6 @@
     "class_type": "SeedVR2LoadDiTModel",
     "_meta": {
       "title": "SeedVR2 (Down)Load DiT Model"
-    }
-  },
-  "172": {
-    "inputs": {
-      "frame_rate": [
-        "165",
-        1
-      ],
-      "loop_count": 0,
-      "filename_prefix": "Wanvace2",
-      "format": "video/h264-mp4",
-      "pix_fmt": "yuv420p",
-      "crf": 19,
-      "save_metadata": true,
-      "trim_to_audio": false,
-      "pingpong": false,
-      "save_output": true,
-      "images": [
-        "164",
-        0
-      ]
-    },
-    "class_type": "VHS_VideoCombine",
-    "_meta": {
-      "title": "Video Combine 🎥🅥🅗🅢"
     }
   },
   "173": {
