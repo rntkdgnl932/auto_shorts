@@ -5,6 +5,10 @@
       "interpolation_factor": 2,
       "seed": 152179025449353,
       "output_flows": false,
+      "gimmvfi_model": [
+        "6",
+        0
+      ],
       "images": [
         "5",
         0
@@ -42,7 +46,7 @@
       "seed": 1002739406,
       "resolution": 720,
       "max_resolution": 0,
-      "batch_size": 12,
+      "batch_size": 13,
       "uniform_batch_size": true,
       "color_correction": "lab",
       "temporal_overlap": 3,
@@ -53,6 +57,14 @@
       "enable_debug": false,
       "image": [
         "1",
+        0
+      ],
+      "dit": [
+        "7",
+        0
+      ],
+      "vae": [
+        "8",
         0
       ]
     },
@@ -75,6 +87,51 @@
     "class_type": "VHS_LoadVideo",
     "_meta": {
       "title": "Load Video (Upload) 🎥🅥🅗🅢"
+    }
+  },
+  "6": {
+    "inputs": {
+      "model": "gimmvfi_r_arb_lpips_fp32.safetensors",
+      "precision": "fp32",
+      "torch_compile": false
+    },
+    "class_type": "DownloadAndLoadGIMMVFIModel",
+    "_meta": {
+      "title": "(Down)Load GIMMVFI Model"
+    }
+  },
+  "7": {
+    "inputs": {
+      "model": "seedvr2_ema_3b-Q4_K_M.gguf",
+      "device": "cuda:0",
+      "blocks_to_swap": 32,
+      "swap_io_components": true,
+      "offload_device": "cpu",
+      "cache_model": false,
+      "attention_mode": "sdpa"
+    },
+    "class_type": "SeedVR2LoadDiTModel",
+    "_meta": {
+      "title": "SeedVR2 (Down)Load DiT Model"
+    }
+  },
+  "8": {
+    "inputs": {
+      "model": "ema_vae_fp16.safetensors",
+      "device": "cuda:0",
+      "encode_tiled": true,
+      "encode_tile_size": 512,
+      "encode_tile_overlap": 128,
+      "decode_tiled": true,
+      "decode_tile_size": 512,
+      "decode_tile_overlap": 128,
+      "tile_debug": "false",
+      "offload_device": "cpu",
+      "cache_model": false
+    },
+    "class_type": "SeedVR2LoadVAEModel",
+    "_meta": {
+      "title": "SeedVR2 (Down)Load VAE Model"
     }
   }
 }

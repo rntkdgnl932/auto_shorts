@@ -1936,7 +1936,7 @@ def raw_make_addup(
 def Interpolation_upscale(
     project_dir: str,
     total_frames: int,
-    *,  # total_frames는 현재 사용 안 하지만 시그니처 유지용
+    *,  # total_frames는 현재 사용 안 하지만 시그니처 맞추기 용
     ui_width: Optional[int] = None,
     ui_height: Optional[int] = None,
     ui_fps: Optional[int] = None,
@@ -1945,18 +1945,14 @@ def Interpolation_upscale(
 ) -> None:
     """
     [2단계] RAW 씬 영상을 Interpolation_upscale.json 으로
-    GIMMVFI + SeedVR2 업스케일하는 함수. :contentReference[oaicite:3]{index=3}
+    GIMMVFI + SeedVR2 업스케일하는 함수.
 
     입력:
-      - clips/{scene_id}_raw.mp4 (raw_make_addup 결과)
+      - clips/{scene_id}_raw.mp4 또는 clips/{scene_id}/{scene_id}_raw.mp4
     출력:
       - clips/{scene_id}.mp4 (업스케일/보간 완료본)
-
-    fps/해상도 기본값:
-      - RAW FPS를 ffprobe로 읽고, 2배 보간을 가정하여
-        VideoCombine 노드(frame_rate)를 (raw_fps * 2) 로 설정.
-      - SeedVR2 resolution 은 raw 해상도 또는 UI 값 기반.
     """
+
     import json as json_mod
     import shutil
     import requests
@@ -1998,7 +1994,6 @@ def Interpolation_upscale(
                 COMFY_OUTPUT_DIR = Path(__file__).resolve().parent / "output"
                 FFMPEG_EXE = "ffmpeg"
                 FFPROBE_EXE = "ffprobe"
-
             settings_obj = _DummySettings()  # type: ignore
 
     try:
@@ -2017,6 +2012,7 @@ def Interpolation_upscale(
                 poll: float,
                 **kwargs: Any,
             ) -> Dict:
+
                 log_func = kwargs.get("on_progress") or kwargs.get("log_func")
                 if log_func is None:
                     def log_func(msg: str) -> None:  # type: ignore
@@ -2025,6 +2021,7 @@ def Interpolation_upscale(
                 prompt_url = f"{base_url.rstrip('/')}/prompt"
                 history_url = f"{base_url.rstrip('/')}/history"
                 log_func(f"[UP] POST {prompt_url}")
+
                 try:
                     resp = _requests_local.post(
                         prompt_url,
@@ -2035,13 +2032,14 @@ def Interpolation_upscale(
                     data = resp.json()
                 except Exception as excc:
                     raise RuntimeError(f"ComfyUI prompt 제출 실패: {excc}")
+
                 prompt_id = data.get("prompt_id")
                 if not prompt_id:
                     raise RuntimeError("ComfyUI prompt_id 없음")
 
-                start_time = _time_local.time()
+                start_t = _time_local.time()
                 while True:
-                    if _time_local.time() - start_time > timeout:
+                    if _time_local.time() - start_t > timeout:
                         raise TimeoutError("ComfyUI 대기 시간 초과")
 
                     try:
@@ -2074,50 +2072,32 @@ def Interpolation_upscale(
                 pass
 
     def _probe_fps_and_size(path_obj: Path) -> Tuple[float, int, int]:
-        fps_val: float = 0.0
-        width: int = 0
-        height: int = 0
+        fps_val = 0.0
+        w = h = 0
         try:
-            cmd_fps = [
+            cmd = [
                 ffprobe_exe_val,
-                "-v",
-                "error",
-                "-select_streams",
-                "v:0",
-                "-show_entries",
-                "stream=r_frame_rate,width,height",
-                "-of",
-                "default=nokey=1:noprint_wrappers=1",
+                "-v", "error",
+                "-select_streams", "v:0",
+                "-show_entries", "stream=r_frame_rate,width,height",
+                "-of", "default=nokey=1:noprint_wrappers=1",
                 str(path_obj),
             ]
-            proc = subprocess.run(
-                cmd_fps,
-                capture_output=True,
-                text=True,
-                check=True,
-            )
-            lines = [
-                ln.strip() for ln in (proc.stdout or "").splitlines() if ln.strip()
-            ]
-            # r_frame_rate, width, height 를 순서/내용 기반으로 안전하게 파싱
+            proc = subprocess.run(cmd, capture_output=True, text=True, check=True)
+            lines = [ln.strip() for ln in (proc.stdout or "").splitlines() if ln.strip()]
+
             for ln in lines:
+                # r_frame_rate e.g. "16/1"
                 if "/" in ln and fps_val == 0.0:
+                    num, den = ln.split("/")
+                    num_f = float(num)
+                    den_f = float(den) if float(den) != 0 else 1.0
+                    fps_val = num_f / den_f
+                elif "x" in ln:
                     try:
-                        num_str, den_str = ln.split("/", 1)
-                        num = float(num_str)
-                        den = float(den_str) if float(den_str) != 0.0 else 1.0
-                        fps_val = num / den
-                    except Exception:
-                        continue
-                elif ln.isdigit() and width == 0:
-                    # width 로 간주
-                    try:
-                        width = int(ln)
-                    except Exception:
-                        pass
-                elif ln.isdigit() and width != 0 and height == 0:
-                    try:
-                        height = int(ln)
+                        w, h = ln.split("x")
+                        w = int(w)
+                        h = int(h)
                     except Exception:
                         pass
         except Exception:
@@ -2125,24 +2105,20 @@ def Interpolation_upscale(
 
         if fps_val <= 0.0:
             fps_val = 16.0
-        if width <= 0 or height <= 0:
-            width, height = 720, 1280
-        return fps_val, width, height
+        if w <= 0 or h <= 0:
+            w, h = 720, 1280
 
-    # Interpolation_upscale.json 로드
+        return fps_val, w, h
+
+    # JSON 로드
     project_dir_path = Path(project_dir).resolve()
-    jsons_dir_conf = getattr(
-        settings_obj, "JSONS_DIR", str(project_dir_path / "jsons")
-    )
-    base_jsons_path = Path(str(jsons_dir_conf))
-    interp_json_path = base_jsons_path / "Interpolation_upscale.json"
+    jsons_dir_conf = getattr(settings_obj, "JSONS_DIR", str(project_dir_path / "jsons"))
+    interp_json_path = Path(str(jsons_dir_conf)) / "Interpolation_upscale.json"
     if not interp_json_path.is_file():
-        raise FileNotFoundError(
-            f"Interpolation_upscale.json 을 찾을 수 없습니다: {interp_json_path}"
-        )
+        raise FileNotFoundError(f"Interpolation_upscale.json 없음: {interp_json_path}")
 
-    with interp_json_path.open("r", encoding="utf-8") as f_interp:
-        interp_graph_origin = json_mod.load(f_interp)
+    with interp_json_path.open("r", encoding="utf-8") as f:
+        interp_graph_origin = json_mod.load(f)
 
     video_json_path = project_dir_path / "video.json"
     video_doc = _load_json_func(video_json_path, {}) or {}
@@ -2153,121 +2129,110 @@ def Interpolation_upscale(
     clips_dir = project_dir_path / "clips"
     _ensure_dir_func(clips_dir)
 
-    # Node IDs (Interpolation_upscale.json 기준)
-    LOAD_NODE_ID = "5"
-    VFI_NODE_ID = "1"
-    UPSCALE_NODE_ID = "3"
-    COMBINE_NODE_ID = "2"
+    # Node ID
+    LOAD_NODE = "5"
+    VFI_NODE = "1"
+    UPSCALE_NODE = "3"
+    COMBINE_NODE = "2"
 
-    # ───────────────────────── 전체 씬 LOOP ─────────────────────────
     for idx, scene_item in enumerate(scenes, start=1):
         if not isinstance(scene_item, dict):
             continue
-        scene_id = str(scene_item.get("id") or f"scene_{idx:03d}")
-        scene_out_dir = clips_dir / scene_id
-        _ensure_dir_func(scene_out_dir)
 
-        raw_path = scene_out_dir / f"{scene_id}_raw.mp4"
-        if not (raw_path.exists() and raw_path.stat().st_size > 0):
-            _notify(
-                f"[UP] scene_id={scene_id} 의 RAW 파일이 없어 스킵 "
-                f"({raw_path})"
-            )
+        scene_id = str(scene_item.get("id") or f"scene_{idx:03d}")
+
+        # ------------------------------
+        # RAW 파일을 두 위치 모두 확인
+        # ------------------------------
+        raw_path_sub = clips_dir / scene_id / f"{scene_id}_raw.mp4"  # 예: clips/t_001/t_001_raw.mp4
+        raw_path_root = clips_dir / f"{scene_id}_raw.mp4"            # 예: clips/t_001_raw.mp4
+
+        if raw_path_sub.exists() and raw_path_sub.stat().st_size > 0:
+            raw_path = raw_path_sub
+        elif raw_path_root.exists() and raw_path_root.stat().st_size > 0:
+            raw_path = raw_path_root
+        else:
+            _notify(f"[UP] scene_id={scene_id} RAW 없음 → 스킵 ({raw_path_sub} / {raw_path_root})")
             continue
 
-        # 최종 업스케일 출력
+        # 최종 출력
         out_path = clips_dir / f"{scene_id}.mp4"
         if out_path.exists() and out_path.stat().st_size > 0:
-            _notify(
-                f"[UP] scene_id={scene_id} 업스케일 결과 존재 → 스킵 "
-                f"({out_path})"
-            )
+            _notify(f"[UP] scene_id={scene_id} 업스케일 이미 존재 → 스킵")
             continue
 
         _notify(f"[UP] scene_id={scene_id} 업스케일 시작")
 
-        # RAW 파일을 Comfy input 폴더로 복사
+        # RAW → Comfy input 복사
         comfy_in_name = f"{scene_id}_raw_input.mp4"
         comfy_in_path = comfy_input_dir / comfy_in_name
         shutil.copy2(str(raw_path), str(comfy_in_path))
 
-        # RAW fps / size 탐색
+        # RAW fps/size
         raw_fps, raw_w, raw_h = _probe_fps_and_size(raw_path)
-        # UI에서 fps를 수동으로 지정했다면 덮어쓰기
+
+        # UI FPS 적용
         if ui_fps and ui_fps > 0:
             raw_fps = float(ui_fps)
-        target_fps_out = raw_fps * 2.0  # 2배 보간 가정
 
-        # SeedVR2 업스케일 resolution 결정 (긴 변 기준)
+        target_fps = raw_fps * 2  # 보간 2배
+
+        # SeedVR2 resolution
         if ui_width and ui_height and ui_width > 0 and ui_height > 0:
             res_val = max(int(ui_width), int(ui_height))
         else:
             res_val = max(raw_w, raw_h, 720)
 
-        graph_up = json_mod.loads(json_mod.dumps(interp_graph_origin))
+        # 그래프 클론
+        graph = json_mod.loads(json_mod.dumps(interp_graph_origin))
 
-        # LoadVideo(5)
-        if LOAD_NODE_ID in graph_up:
-            graph_up[LOAD_NODE_ID]["inputs"]["video"] = comfy_in_name
-            graph_up[LOAD_NODE_ID]["inputs"]["force_rate"] = 0  # 원본 fps 사용
-            graph_up[LOAD_NODE_ID]["inputs"]["custom_width"] = 0
-            graph_up[LOAD_NODE_ID]["inputs"]["custom_height"] = 0
+        # LoadVideo
+        if LOAD_NODE in graph:
+            graph[LOAD_NODE]["inputs"]["video"] = comfy_in_name
+            graph[LOAD_NODE]["inputs"]["force_rate"] = 0
 
-        # VFI(1) 파라미터는 JSON 기본값 유지 (interpolation_factor=2 등)
+        # SeedVR2 업스케일
+        if UPSCALE_NODE in graph:
+            graph[UPSCALE_NODE]["inputs"]["resolution"] = int(res_val)
 
-        # SeedVR2(3)
-        if UPSCALE_NODE_ID in graph_up:
-            graph_up[UPSCALE_NODE_ID]["inputs"]["resolution"] = int(res_val)
-            # batch_size, temporal_overlap 등은 JSON 기본값 사용
+        # VideoCombine
+        if COMBINE_NODE in graph:
+            graph[COMBINE_NODE]["inputs"]["frame_rate"] = int(round(target_fps))
+            graph[COMBINE_NODE]["inputs"]["filename_prefix"] = f"up/{scene_id}"
+            graph[COMBINE_NODE]["inputs"]["save_output"] = True
 
-        # VideoCombine(2)
-        if COMBINE_NODE_ID in graph_up:
-            graph_up[COMBINE_NODE_ID]["inputs"]["frame_rate"] = int(
-                round(target_fps_out)
-            )
-            graph_up[COMBINE_NODE_ID]["inputs"]["filename_prefix"] = (
-                f"i2v_up/{scene_id}"
-            )
-            graph_up[COMBINE_NODE_ID]["inputs"]["save_output"] = True
+        _notify(f"[UP] scene={scene_id} raw_fps={raw_fps:.3f} → target_fps={target_fps:.3f}, res={res_val}")
 
-        _notify(
-            f"[UP] scene={scene_id} raw_fps={raw_fps:.3f} "
-            f"→ target_fps={target_fps_out:.3f}, SeedVR2 res={res_val}"
-        )
-
+        # 제출
         try:
             res = _submit_and_wait_comfy_func(
                 comfy_host,
-                graph_up,
+                graph,
                 timeout=10000,
                 poll=10.0,
-                on_progress=lambda _prog: None,  # 외부 d 이름 가리기 방지
+                on_progress=lambda d: None,
             )
 
-            out_node = res.get("outputs", {}).get(COMBINE_NODE_ID, {})
-            vid_list = out_node.get("videos") or out_node.get("gifs") or []
-            if not vid_list:
-                raise RuntimeError(
-                    f"VideoCombine(Node {COMBINE_NODE_ID}) 출력이 없습니다."
-                )
+            out_node = res.get("outputs", {}).get(COMBINE_NODE, {})
+            vids = out_node.get("videos") or out_node.get("gifs") or []
+            if not vids:
+                raise RuntimeError("VideoCombine 출력 없음")
 
-            fname = vid_list[0]["filename"]
+            fname = vids[0]["filename"]
             r = requests.get(
                 f"{comfy_host}/view",
-                params={
-                    "filename": fname,
-                    "subfolder": vid_list[0]["subfolder"],
-                },
+                params={"filename": fname, "subfolder": vids[0]["subfolder"]},
                 timeout=120,
             )
-            with open(out_path, "wb") as f_out:
-                f_out.write(r.content)
+            with open(out_path, "wb") as f:
+                f.write(r.content)
 
-            _notify(f"[UP] scene={scene_id} 업스케일 결과 저장 완료 → {out_path}")
+            _notify(f"[UP] scene={scene_id} 업스케일 완료 → {out_path}")
 
         except Exception as e:
-            _notify(f"[UP][ERR] scene={scene_id} 업스케일 실패: {e}")
+            _notify(f"[UP][ERR] scene={scene_id} 실패: {e}")
             continue
+
 
 
 
