@@ -1,5 +1,6 @@
 import json
 import re
+import os
 import requests
 from wordpress_xmlrpc import Client, WordPressPost
 from wordpress_xmlrpc.compat import xmlrpc_client
@@ -154,34 +155,81 @@ def life_tips_start(article, keyword):
     # === 체크포인트 3: 썸네일/본문 이미지 생성 ===
     short_slug = slugify(keyword)[:50]
 
+    # --- 썸네일 생성 ---
+    thumbnail_id = None
     thumb_media, _ = build_images_to_blog(article, "thumb", f"{final_title}", short_slug)
-    if thumb_media is None:
-        print("⚠️ 썸네일 생성 실패 → 대체 이미지 사용")
-        thumb_media = {
-            "name": "fallback_thumb.webp",
-            "type": "image/webp",
-            "caption": final_title,
-            "description": final_title,
-            "bits": xmlrpc_client.Binary(open(v_.fallback_thumb_path, "rb").read())
-        }
-    thumbnail_id = wp.call(UploadFile(thumb_media)).get("id")
 
+    if thumb_media is None:
+        print("⚠️ 썸네일 생성 실패 → 대체 이미지 사용 시도")
+        fallback_thumb = getattr(v_, "fallback_thumb_path", "") or ""
+        if fallback_thumb and os.path.exists(fallback_thumb):
+            try:
+                with open(fallback_thumb, "rb") as f:
+                    thumb_bits = xmlrpc_client.Binary(f.read())
+                thumb_media = {
+                    "name": os.path.basename(fallback_thumb) or "fallback_thumb.webp",
+                    "type": "image/webp",
+                    "caption": final_title,
+                    "description": final_title,
+                    "bits": thumb_bits,
+                }
+                print(f"✅ 대체 썸네일 사용: {fallback_thumb}")
+            except Exception as e:
+                print(f"⚠️ 대체 썸네일 읽기 실패: {e}")
+                thumb_media = None
+        else:
+            print(f"⚠️ 대체 썸네일 경로가 비어있거나 존재하지 않습니다: {fallback_thumb!r}")
+            thumb_media = None
+
+    if thumb_media is not None:
+        try:
+            thumbnail_id = wp.call(UploadFile(thumb_media)).get("id")
+        except Exception as e:
+            print(f"⚠️ 썸네일 업로드 실패: {e}")
+            thumbnail_id = None
+    else:
+        print("⚠️ 썸네일 없이 게시를 진행합니다.")
+
+    # --- 본문 이미지 생성 ---
+    scene_url = ""
     scene_media, scene_caption = build_images_to_blog(article, "scene", f"{final_title}", short_slug)
+
     if scene_media is None:
-        print("⚠️ 본문 이미지 생성 실패 → 대체 이미지 사용")
-        scene_path = v_.fallback_scene_path
-        scene_media = {
-            "name": "fallback_scene.webp",
-            "type": "image/webp",
-            "caption": final_title,
-            "description": final_title,
-            "bits": xmlrpc_client.Binary(open(scene_path, "rb").read())
-        }
-    scene_url = wp.call(UploadFile(scene_media)).get("link")
+        print("⚠️ 본문 이미지 생성 실패 → 대체 이미지 사용 시도")
+        fallback_scene = getattr(v_, "fallback_scene_path", "") or ""
+        if fallback_scene and os.path.exists(fallback_scene):
+            try:
+                with open(fallback_scene, "rb") as f:
+                    scene_bits = xmlrpc_client.Binary(f.read())
+                scene_media = {
+                    "name": os.path.basename(fallback_scene) or "fallback_scene.webp",
+                    "type": "image/webp",
+                    "caption": final_title,
+                    "description": final_title,
+                    "bits": scene_bits,
+                }
+                print(f"✅ 대체 본문 이미지 사용: {fallback_scene}")
+            except Exception as e:
+                print(f"⚠️ 대체 본문 이미지 읽기 실패: {e}")
+                scene_media = None
+        else:
+            print(f"⚠️ 대체 본문 이미지 경로가 비어있거나 존재하지 않습니다: {fallback_scene!r}")
+            scene_media = None
+
+    if scene_media is not None:
+        try:
+            scene_url = wp.call(UploadFile(scene_media)).get("link")
+        except Exception as e:
+            print(f"⚠️ 본문 이미지 업로드 실패: {e}")
+            scene_url = ""
+    else:
+        print("⚠️ 본문 이미지 없이 게시를 진행합니다.")
+        scene_url = ""
 
     # === 체크포인트 4: 메타정보 생성 ===
     plain_text_content = " ".join(
-        [s.get('title', '') + " " + s.get('content', '') for s in structured_content.get('sections', [])])
+        [s.get("title", "") + " " + s.get("content", "") for s in structured_content.get("sections", [])]
+    )
 
     meta_description = generate_meta_description(plain_text_content)
     if meta_description in ["SAFETY_BLOCKED", "API_ERROR"]:
@@ -198,15 +246,19 @@ def life_tips_start(article, keyword):
 
     # ✅ [핵심 복원] 본문 조립 로직
     body_html_parts = []
-    for section in structured_content.get('sections', []):
+    for section in structured_content.get("sections", []):
         body_html_parts.append(f"<h2>{section.get('title', '')}</h2>")
-        body_html_parts.append(markdown_to_html(section.get('content', '')))
+        body_html_parts.append(markdown_to_html(section.get("content", "")))
     body_html_parts.append(f"<p><strong>한줄요약:</strong> {structured_content.get('summary', '')}</p>")
-    body_html_parts.append(f"<p style='font-style: italic;'>개인의견: {structured_content.get('opinion', '')}</p>")
+    body_html_parts.append(
+        f"<p style='font-style: italic;'>개인의견: {structured_content.get('opinion', '')}</p>"
+    )
     final_body_html_str = "".join(body_html_parts)
 
-    soup = BeautifulSoup(final_body_html_str, 'html.parser')
+    from bs4 import BeautifulSoup as _BS4  # 기존 import와 충돌 피하려면 필요시 조정
+    soup = _BS4(final_body_html_str, "html.parser")
     toc_html = create_table_of_contents(soup)
+
     # json_ld_content 가 dict/str 섞여 올 수 있으니 안전 처리
     try:
         _json_obj = json.loads(json_ld_content) if isinstance(json_ld_content, str) else json_ld_content
@@ -216,29 +268,26 @@ def life_tips_start(article, keyword):
 
     # 구텐베르크 HTML 블록 래핑 + 개행 제거된 스크립트
     json_ld_script = (
-        '<!-- wp:html -->'
+        "<!-- wp:html -->"
         f'<script type="application/ld+json">{json_ld_min}</script>'
-        '<!-- /wp:html -->'
+        "<!-- /wp:html -->"
     )
 
-    # figcaption_html = f"<figcaption>{scene_caption}</figcaption>" if scene_caption else ""
-    # img_html = f"<figure class='wp-block-image aligncenter size-large'><img src='{scene_url}' alt='{keyword}'/>{figcaption_html}</figure>"
-    # 캡션이 없을 경우를 대비하여 final_title을 대체값으로 사용
-    final_alt_text = scene_caption if scene_caption else final_title
-    figcaption_html = f"<figcaption>{scene_caption}</figcaption>" if scene_caption else ""
-    # img_html = f"<figure class='wp-block-image aligncenter size-large'><img src='{scene_url}' alt='{final_alt_text.replace('"', '')}'/>{figcaption_html}</figure>"
+    # 이미지 HTML (scene_url이 없으면 아예 넣지 않음)
     from html import escape
 
-    safe_alt = escape((final_alt_text or "").strip(), quote=True)
-
-    img_html = (
-        '<figure class="wp-block-image aligncenter size-large">'
-        f'<img src="{scene_url}" alt="{safe_alt}"/>{figcaption_html}</figure>'
-    )
+    img_html = ""
+    if scene_url:
+        final_alt_text = scene_caption if scene_caption else final_title
+        figcaption_html = f"<figcaption>{scene_caption}</figcaption>" if scene_caption else ""
+        safe_alt = escape((final_alt_text or "").strip(), quote=True)
+        img_html = (
+            '<figure class="wp-block-image aligncenter size-large">'
+            f'<img src="{scene_url}" alt="{safe_alt}"/>{figcaption_html}</figure>'
+        )
 
     final_body_content = soup.decode_contents()
-
-    meta_attr = (meta_description or "").replace('"', ' ').strip()
+    meta_attr = (meta_description or "").replace('"', " ").strip()
 
     final_html = f"""{json_ld_script}
     <meta name="description" content="{meta_attr}">
@@ -246,13 +295,6 @@ def life_tips_start(article, keyword):
     {toc_html}
     {final_body_content}
     """.strip()
-
-    #     final_html = f"""{json_ld_script}
-# <meta name="description" content="{meta_description.replace('"', ' ')}">
-# {img_html}
-# {toc_html}
-# {final_body_content}
-# """
 
     # === 체크포인트 5: 태그 추출 ===
     auto_tags = extract_tags_from_html_with_ui(final_html, keyword)
@@ -267,11 +309,12 @@ def life_tips_start(article, keyword):
     post.excerpt = meta_description
     current_cat = getattr(v_, "my_category", "일반")
     post.terms_names = {
-        'category': [safe_term_cate(current_cat)],
-        'post_tag': list(set([safe_term_word(keyword)] + [safe_term_word(t) for t in auto_tags]))
+        "category": [safe_term_cate(current_cat)],
+        "post_tag": list(set([safe_term_word(keyword)] + [safe_term_word(t) for t in auto_tags])),
     }
-    if thumbnail_id: post.thumbnail = thumbnail_id
-    post.post_status = 'publish'
+    if thumbnail_id:
+        post.thumbnail = thumbnail_id
+    post.post_status = "publish"
 
     try:
         post_id = wp.call(NewPost(post))
@@ -282,6 +325,7 @@ def life_tips_start(article, keyword):
     except Exception as e:
         print(f"❌ 워드프레스 발행 중 오류 발생: {e}")
         return False
+
 
 def generate_impactful_titles(keyword, article_summary):
     """
