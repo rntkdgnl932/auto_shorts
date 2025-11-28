@@ -483,20 +483,21 @@ def _run_talk_job(
         who_prompt = json.load(f)
 
     # ZonosGenerate(24) speech 입력값 주입
-    import random  # (상단에 없다면 여기서 import)
-    try:
-        raw_text = text or ""
+        # ZonosGenerate(24) speech 입력값 주입
+        import random  # (상단에 없다면 여기서 import)
+        try:
+            raw_text = text or ""
 
-        # ★ 핵심 1: 사용자가 입력한 글자 앞에 "... "을 자동으로 붙여줌 (발음 씹힘 방지)
-        modified_text = "... " + raw_text
+            # ★ 핵심 1: 사용자가 입력한 글자 앞에 "... "을 자동으로 붙여줌 (발음 씹힘 방지)
+            modified_text = "... " + raw_text
 
-        who_prompt["24"]["inputs"]["speech"] = modified_text
+            who_prompt["24"]["inputs"]["speech"] = modified_text
 
-        # ★ 핵심 2: 매번 새로운 목소리를 만들기 위해 시드값 무작위 변경 (0.01초 종료 방지)
-        who_prompt["24"]["inputs"]["seed"] = random.randint(1, 9999999999)
+            # ★ 핵심 2: 매번 새로운 목소리를 만들기 위해 시드값 무작위 변경 (0.01초 종료 방지)
+            who_prompt["24"]["inputs"]["seed"] = random.randint(1, 2147483647)
 
-    except Exception:
-        pass
+        except Exception:
+            pass
 
     audio_roots = _build_audio_roots()
     before_audios = _collect_audio_files(audio_roots)

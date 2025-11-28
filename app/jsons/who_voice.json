@@ -24,14 +24,14 @@
   },
   "22": {
     "inputs": {
-      "happy": 0.8,
+      "happy": 0.5,
       "sad": 0.05,
       "disgust": 0.05,
-      "fear": 0.1,
-      "surprise": 0.35,
+      "fear": 0.05,
+      "surprise": 0.3,
       "anger": 0.05,
       "other": 0.05,
-      "neutral": 0.85
+      "neutral": 0.6
     },
     "class_type": "ZonosEmotion",
     "_meta": {
@@ -43,7 +43,7 @@
       "speech": "안녕?새롭게 태어난 목소리야.어때?? 마음에 들어?",
       "seed": 857,
       "model_type": "Zyphra/Zonos-v0.1-transformer",
-      "language": "auto",
+      "language": "ko",
       "cfg_scale": 3,
       "min_p": 0.05,
       "speed": 1.05,
