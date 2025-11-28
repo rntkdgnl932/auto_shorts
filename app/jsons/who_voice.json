@@ -1,0 +1,179 @@
+{
+  "12": {
+    "inputs": {
+      "audio": "꼬꼬 음성.m4a",
+      "audioUI": ""
+    },
+    "class_type": "LoadAudio",
+    "_meta": {
+      "title": "오디오 로드"
+    }
+  },
+  "13": {
+    "inputs": {
+      "audioUI": "",
+      "audio": [
+        "37",
+        1
+      ]
+    },
+    "class_type": "PreviewAudio",
+    "_meta": {
+      "title": "오디오 미리듣기"
+    }
+  },
+  "22": {
+    "inputs": {
+      "happy": 0.8,
+      "sad": 0.05,
+      "disgust": 0.05,
+      "fear": 0.1,
+      "surprise": 0.35,
+      "anger": 0.05,
+      "other": 0.05,
+      "neutral": 0.85
+    },
+    "class_type": "ZonosEmotion",
+    "_meta": {
+      "title": "Zonos Emotion"
+    }
+  },
+  "24": {
+    "inputs": {
+      "speech": "안녕?새롭게 태어난 목소리야.어때?? 마음에 들어?",
+      "seed": 857,
+      "model_type": "Zyphra/Zonos-v0.1-transformer",
+      "language": "auto",
+      "cfg_scale": 3,
+      "min_p": 0.05,
+      "speed": 1.05,
+      "disable_compiler": true,
+      "sample_text": "",
+      "speaker_noised": true,
+      "sample_audio": [
+        "27",
+        3
+      ],
+      "emotion": [
+        "22",
+        0
+      ]
+    },
+    "class_type": "ZonosGenerate",
+    "_meta": {
+      "title": "Zonos Generate"
+    }
+  },
+  "25": {
+    "inputs": {
+      "text": "이건 테스트에요 음성을 입력하는 곳이죠 하하하하하 잘 되었으면 좋겠네요\n오늘 날씨가 무척이나 덥네요. 요즘은 무엇을 하고 지내나요",
+      "voice": "[Korean] ko-KR SunHi",
+      "speed": 1.2,
+      "pitch": 0
+    },
+    "class_type": "EdgeTTS",
+    "_meta": {
+      "title": "Edge TTS 🔊"
+    }
+  },
+  "26": {
+    "inputs": {
+      "start_time": "13",
+      "end_time": "20",
+      "audio": [
+        "12",
+        0
+      ]
+    },
+    "class_type": "AudioCrop",
+    "_meta": {
+      "title": "AudioCrop"
+    }
+  },
+  "27": {
+    "inputs": {
+      "chunk_fade_shape": "linear",
+      "chunk_length": 10,
+      "chunk_overlap": 0.1,
+      "audio": [
+        "26",
+        0
+      ]
+    },
+    "class_type": "AudioSeparation",
+    "_meta": {
+      "title": "AudioSeparation"
+    }
+  },
+  "28": {
+    "inputs": {
+      "filename_prefix": "audio/ComfyUI",
+      "audioUI": "",
+      "audio": [
+        "37",
+        1
+      ]
+    },
+    "class_type": "SaveAudio",
+    "_meta": {
+      "title": "오디오 저장"
+    }
+  },
+  "30": {
+    "inputs": {
+      "model": "TencentGameMate/chinese-wav2vec2-base",
+      "base_precision": "fp16",
+      "load_device": "main_device"
+    },
+    "class_type": "DownloadAndLoadWav2VecModel",
+    "_meta": {
+      "title": "(Down)load Wav2Vec Model"
+    }
+  },
+  "31": {
+    "inputs": {
+      "model": "wav2vec2-chinese-base_fp16.safetensors",
+      "base_precision": "fp16",
+      "load_device": "main_device"
+    },
+    "class_type": "Wav2VecModelLoader",
+    "_meta": {
+      "title": "Wav2vec2 Model Loader"
+    }
+  },
+  "35": {
+    "inputs": {
+      "preview": "",
+      "source": [
+        "37",
+        2
+      ]
+    },
+    "class_type": "PreviewAny",
+    "_meta": {
+      "title": "now_frames"
+    }
+  },
+  "37": {
+    "inputs": {
+      "normalize_loudness": true,
+      "num_frames": 500,
+      "fps": 16,
+      "audio_scale": 1,
+      "audio_cfg_scale": 1,
+      "multi_audio_type": "para",
+      "wav2vec_model": [
+        "30",
+        0
+      ],
+      "audio_1": [
+        "24",
+        0
+      ]
+    },
+    "class_type": "MultiTalkWav2VecEmbeds",
+    "_meta": {
+      "title": "Multi/InfiniteTalk Wav2vec2 Embeds"
+    }
+  }
+}
