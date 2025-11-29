@@ -46,7 +46,7 @@
       "language": "ko",
       "cfg_scale": 3,
       "min_p": 0.05,
-      "speed": 1.00,
+      "speed": 1.05,
       "disable_compiler": true,
       "sample_text": "",
       "speaker_noised": true,
