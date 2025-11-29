@@ -25,13 +25,13 @@
   "22": {
     "inputs": {
       "happy": 0.5,
-      "sad": 0.05,
+      "sad": 0.3,
       "disgust": 0.05,
       "fear": 0.05,
-      "surprise": 0.3,
+      "surprise": 0.05,
       "anger": 0.05,
       "other": 0.05,
-      "neutral": 0.6
+      "neutral": 0.7
     },
     "class_type": "ZonosEmotion",
     "_meta": {
