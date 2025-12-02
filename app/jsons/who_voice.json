@@ -24,14 +24,14 @@
   },
   "22": {
     "inputs": {
-      "happy": 0.5,
-      "sad": 0.3,
+      "happy": 0.00,
+      "sad": 0.00,
       "disgust": 0.05,
       "fear": 0.05,
       "surprise": 0.05,
       "anger": 0.05,
       "other": 0.05,
-      "neutral": 0.7
+      "neutral": 0.8
     },
     "class_type": "ZonosEmotion",
     "_meta": {
@@ -78,7 +78,7 @@
   },
   "26": {
     "inputs": {
-      "start_time": "13",
+      "start_time": "0",
       "end_time": "20",
       "audio": [
         "12",
