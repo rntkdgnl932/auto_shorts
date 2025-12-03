@@ -1654,6 +1654,15 @@ def raw_make_addup(
                         # 바로 최종 RAW 파일로 저장 (One-Pass이므로)
                         with open(scene_raw_norm, "wb") as f:
                             f.write(r.content)
+
+                        if scene_raw_norm.exists():
+                            _notify(f"  -> [LipSync] 길이 보정: {frame_length_val} 프레임으로 자르기...")
+                            _i2v_trim_tail(
+                                scene_raw_norm,  # 입력 파일
+                                scene_raw_norm,  # 출력 파일 (덮어쓰기)
+                                int(frame_length_val),  # 목표 프레임 수 (video.json 기준)
+                                int(base_fps_in)  # FPS
+                            )
                         _notify(f"  -> [LipSync] 생성 완료: {scene_raw_norm.name}")
                         continue  # ★ 성공 시 다음 씬으로 건너뜀 (일반 모드 실행 안 함)
                     else:
