@@ -1589,9 +1589,15 @@ def raw_make_addup(
 
             # (1) 오디오 자르기 (vocal.wav -> clips/{id}/song.wav)
             scene_audio_path = scene_out_dir / "song.wav"
-            if not _slice_audio_segment(audio_source, scene_start, scene_end, scene_audio_path, ffmpeg_exe_val):
-                _notify(f"  -> [ERR] 오디오 자르기 실패. 일반 모드로 전환합니다.")
-                is_lipsync = False  # 실패 시 아래 일반 모드로 진행
+            # ▼▼▼ [수정된 로직] 파일이 이미 존재하면 자르기 스킵 ▼▼▼
+            if scene_audio_path.exists() and scene_audio_path.stat().st_size > 0:
+                _notify(f"  -> [LipSync] 기존 오디오 파일 사용 (스킵): {scene_audio_path.name}")
+            else:
+                # 파일이 없을 때만 자르기 수행
+                if not _slice_audio_segment(audio_source, scene_start, scene_end, scene_audio_path, ffmpeg_exe_val):
+                    _notify(f"  -> [ERR] 오디오 자르기 실패. 일반 모드로 전환합니다.")
+                    is_lipsync = False  # 실패 시 아래 일반 모드로 진행
+            # ▲▲▲ [수정 끝] ▲▲▲
 
             if is_lipsync:
                 # (2) 워크플로우 복제 및 파라미터 주입
