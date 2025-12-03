@@ -1603,8 +1603,24 @@ def raw_make_addup(
                 # (2) 워크플로우 복제 및 파라미터 주입
                 graph = json_mod.loads(json_mod.dumps(graph_lip))
 
-                # Node 125 (Audio): 자른 오디오 경로 (절대경로 문자열)
-                if "125" in graph: graph["125"]["inputs"]["audio"] = str(scene_audio_path)
+                # --- ▼▼▼ [수정] 오디오 파일을 ComfyUI input 폴더로 복사 및 경로 설정 ▼▼▼ ---
+                # 절대 경로 대신, ComfyUI input 폴더에 복사 후 파일명만 전달해야 안전합니다.
+                audio_filename = f"{scene_id}_song.wav"  # 씬 ID를 붙여 겹침 방지
+                comfy_audio_dst = comfy_input_dir / audio_filename
+
+                try:
+                    shutil.copy2(str(scene_audio_path), str(comfy_audio_dst))
+
+                    # Node 125 (Audio): 복사된 파일명만 전달
+                    if "125" in graph:
+                        graph["125"]["inputs"]["audio"] = audio_filename
+
+                except Exception as e:
+                    _notify(f"  -> [WARN] 오디오 파일 복사 실패(절대경로 시도): {e}")
+                    # 복사 실패 시 기존처럼 절대 경로 시도 (폴백)
+                    if "125" in graph:
+                        graph["125"]["inputs"]["audio"] = str(scene_audio_path)
+                # --- ▲▲▲ [수정 끝] ▲▲▲ ---
 
                 # Node 284 (Image): 씬 대표 이미지
                 img_name = f"{scene_id}.png"
