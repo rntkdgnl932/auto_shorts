@@ -1476,10 +1476,86 @@ class ScenePromptEditDialog(QtWidgets.QDialog):
                     char_btn_layout.addWidget(btn_del_char)
                     right_vbox.addLayout(char_btn_layout)
 
-                    # --- ▼▼▼ [신규] "세그먼트 수정" 버튼 추가 ▼▼▼ ---
                     btn_edit_segments = QtWidgets.QPushButton("세그먼트 수정")
                     btn_edit_segments.setToolTip(f"[{scene_id}] 씬의 세그먼트(키프레임) 이미지와 프롬프트를 수정합니다.")
                     right_vbox.addWidget(btn_edit_segments)  # 캐릭터 목록 아래에 추가
+
+                    # --- ▼▼▼ [신규] "립싱크 모드" 토글 버튼 (가사가 있는 경우만) ▼▼▼ ---
+                    if lyric:
+                        # -------------------------
+                        # 1. 립싱크 토글 버튼 생성
+                        # -------------------------
+                        btn_lipsync = QtWidgets.QPushButton("립싱크 모드: OFF")
+                        btn_lipsync.setCheckable(True)
+                        btn_lipsync.setToolTip("ON: lync_bool=true (립싱크 적용)\nOFF: lync_bool=false (기본)")
+
+                        # 초기 상태 로드
+                        is_lipsync_on = scene.get("lync_bool", False)
+                        btn_lipsync.setChecked(is_lipsync_on)
+
+                        # UI 업데이트 함수
+                        def update_lipsync_ui(checked, btn=btn_lipsync):
+                            if checked:
+                                btn.setText("립싱크 모드: ON")
+                                btn.setStyleSheet("background-color: #d1e7dd; color: #0f5132; font-weight: bold;")
+                            else:
+                                btn.setText("립싱크 모드: OFF")
+                                btn.setStyleSheet("")
+
+                        update_lipsync_ui(is_lipsync_on)
+
+                        # -------------------------
+                        # 2. 립싱크 프롬프트 입력창 생성
+                        # -------------------------
+                        txt_lync_prompt = QtWidgets.QLineEdit()
+                        txt_lync_prompt.setPlaceholderText("립싱크 프롬프트 (예: sing a song)")
+
+                        # 초기 값 로드 (없으면 빈 문자열)
+                        current_prompt = scene.get("lync_prompt", "")
+                        txt_lync_prompt.setText(current_prompt)
+
+                        # 텍스트 변경 시 메모리(scene dict)에 즉시 반영
+                        def on_prompt_text_changed(text, s=scene):
+                            s["lync_prompt"] = text.strip()
+
+                        txt_lync_prompt.textChanged.connect(on_prompt_text_changed)
+
+                        # -------------------------
+                        # 3. 토글 핸들러 (로직 적용 및 저장)
+                        # -------------------------
+                        def on_lipsync_toggled(checked, s=scene, b=btn_lipsync, t=txt_lync_prompt):
+                            # (1) lync_bool 상태 업데이트
+                            s["lync_bool"] = checked
+
+                            # (2) [핵심 로직] ON 할 때, 프롬프트가 비어있으면 기본값 주입
+                            if checked:
+                                current_text = t.text().strip()
+                                if not current_text:
+                                    default_val = "sing a song"
+                                    t.setText(default_val)
+                                    s["lync_prompt"] = default_val
+                            # OFF 할 때는 텍스트를 건드리지 않음 (유지)
+
+                            # (3) UI 스타일 갱신
+                            update_lipsync_ui(checked, b)
+
+                            # (4) 실시간 파일 저장
+                            try:
+                                from app.utils import save_json
+                                save_json(self.json_path, self.full_video_data)
+                                print(
+                                    f"[JSON Edit] {s.get('id')} lync_bool={checked}, prompt='{s.get('lync_prompt')}' (저장됨)")
+                            except Exception as e:
+                                print(f"[JSON Edit] 저장 실패: {e}")
+                                QtWidgets.QMessageBox.warning(self, "저장 실패", f"설정 저장 중 오류가 발생했습니다.\n{e}")
+
+                        btn_lipsync.toggled.connect(on_lipsync_toggled)
+
+                        # -------------------------
+                        # 4. 레이아웃 배치
+                        # -------------------------
+                        right_vbox.addWidget(btn_lipsync)
+                        right_vbox.addWidget(txt_lync_prompt)
                     # --- ▲▲▲ [신규] 끝 ▲▲▲ ---
 
                     right_vbox.addStretch(1)
@@ -1533,11 +1609,9 @@ class ScenePromptEditDialog(QtWidgets.QDialog):
                     btn_add_char.clicked.connect(functools.partial(self.on_add_char_to_scene, char_list_widget))
                     btn_del_char.clicked.connect(functools.partial(self.on_del_char_from_scene, char_list_widget))
 
-                    # --- ▼▼▼ [신규] "세그먼트 수정" 버튼 연결 ▼▼▼ ---
                     btn_edit_segments.clicked.connect(
                         functools.partial(self.on_open_segment_editor, scene_id, scene)
                     )
-                    # --- ▲▲▲ [신규] 끝 ▲▲▲ ---
 
                     form_layout_page.addRow(label, row_container)
                     self.widget_map.append((scene_id, text_edit))
