@@ -5721,7 +5721,59 @@ def _trim_to_frames(
     return True
 
 
+# video_build.py 맨 아래에 추가
 
+def retry_cut_audio_for_scene(project_dir: str, scene_id: str, offset: float) -> str:
+    """
+    [UI 요청] 특정 씬의 오디오를 오프셋(싱크 조절)을 적용하여 다시 자릅니다.
+    - offset > 0 : 오디오 시작 지점을 뒤로 밈 (늦게 시작)
+    - offset < 0 : 오디오 시작 지점을 앞으로 당김 (일찍 시작)
+    """
+    p_dir = Path(project_dir)
+
+    # 1. 원본 오디오(vocal) 찾기
+    src_audio = p_dir / "vocal.wav"
+    if not src_audio.exists():
+        src_audio = p_dir / "vocal.mp3"
+        if not src_audio.exists():
+            raise FileNotFoundError(f"프로젝트 폴더에 vocal.wav 또는 vocal.mp3가 없습니다: {p_dir}")
+
+    # 2. video.json에서 씬 정보 읽기
+    video_json_path = p_dir / "video.json"
+    video_data = load_json(video_json_path, {}) or {}
+    scenes = video_data.get("scenes", [])
+
+    target_scene = next((s for s in scenes if s.get("id") == scene_id), None)
+    if not target_scene:
+        raise ValueError(f"video.json에서 씬 ID '{scene_id}'를 찾을 수 없습니다.")
+
+    # 3. 시간 계산 (Start/End + Offset)
+    orig_start = float(target_scene.get("start", 0.0))
+    orig_end = float(target_scene.get("end", 0.0))
+
+    # ★ 싱크 적용 로직
+    new_start = max(0.0, orig_start + offset)  # 0초보다 작아질 수 없음
+    new_end = max(new_start + 0.1, orig_end + offset)  # 최소 길이 보장
+
+    # 4. 저장 경로 (clips/씬ID/song.wav)
+    scene_dir = p_dir / "clips" / scene_id
+    scene_dir.mkdir(parents=True, exist_ok=True)
+    out_audio = scene_dir / "song.wav"
+
+    # 5. 자르기 실행 (_slice_audio_segment 재사용)
+    # ffmpeg_exe는 전역 설정에서 가져옴
+    success = _slice_audio_segment(
+        src_audio=src_audio,
+        start_sec=new_start,
+        end_sec=new_end,
+        out_audio=out_audio,
+        ffmpeg_exe=FFMPEG_EXE
+    )
+
+    if not success:
+        raise RuntimeError(f"FFmpeg 오디오 자르기 실패 (Scene: {scene_id})")
+
+    return str(out_audio)
 
 
 

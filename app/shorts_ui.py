@@ -1558,6 +1558,89 @@ class ScenePromptEditDialog(QtWidgets.QDialog):
                         right_vbox.addWidget(txt_lync_prompt)
                     # --- ▲▲▲ [신규] 끝 ▲▲▲ ---
 
+                    # --- ▼▼▼ [신규] 오디오 오프셋 입력 & 음악 자르기 버튼 추가 ▼▼▼ ---
+                    if lyric:  # 가사가 있는 씬일 경우에만 표시
+                        layout_trim = QtWidgets.QHBoxLayout()
+                        layout_trim.setContentsMargins(0, 5, 0, 0)  # 위쪽 여백 살짝 줌
+                        layout_trim.setSpacing(5)
+
+                        # 1. 라벨
+                        lbl_offset = QtWidgets.QLabel("싱크(초):")
+                        lbl_offset.setFixedWidth(50)
+
+                        # 2. 오프셋 입력창 (DoubleSpinBox 사용: +/- 입력 용이)
+                        spn_audio_offset = QtWidgets.QDoubleSpinBox()
+                        spn_audio_offset.setRange(-5.0, 5.0)  # -5초 ~ +5초 범위
+                        spn_audio_offset.setSingleStep(0.01)  # 0.01초 단위 미세 조정
+                        spn_audio_offset.setDecimals(3)  # 소수점 3자리까지 표시
+                        spn_audio_offset.setFixedWidth(70)  # 작게 설정
+                        spn_audio_offset.setToolTip("양수(+): 시작을 늦춤 / 음수(-): 시작을 당김")
+
+                        # 데이터 로드 및 저장 연결
+                        current_offset = float(scene.get("audio_offset", 0.0))
+                        spn_audio_offset.setValue(current_offset)
+
+                        def on_offset_changed(val, s=scene):
+                            s["audio_offset"] = float(val)
+                            # (선택 사항) 즉시 저장하려면 아래 주석 해제
+                            # save_json(self.json_path, self.full_video_data)
+
+                        spn_audio_offset.valueChanged.connect(on_offset_changed)
+
+                        # 3. 음악 자르기 버튼
+                        btn_trim_music = QtWidgets.QPushButton("음악 자르기")
+                        btn_trim_music.setFixedWidth(80)
+                        btn_trim_music.setToolTip("설정된 오프셋을 적용하여 이 씬의 오디오 파일(wav)을 다시 생성합니다.")
+
+                        # 버튼 핸들러 (기능 연결용)
+                        def on_click_trim_music(s_id=scene_id, s_data=scene, off_widget=spn_audio_offset):
+                            try:
+                                # ... (내부 로직은 그대로 유지) ...
+                                # 1. 현재 입력된 오프셋 값 가져오기
+                                offset_val = off_widget.value()
+
+                                # 2. UI 데이터(video.json)에 오프셋 값 메모리 저장
+                                s_data["audio_offset"] = float(offset_val)
+
+                                # 3. 백엔드 함수 호출 (동적 임포트)
+                                from app.video_build import retry_cut_audio_for_scene
+
+                                # self.json_path는 video.json의 경로 (Path 객체)
+                                project_root_path = self.json_path.parent
+
+                                # Path 객체를 문자열(str)로 변환하여 전달
+                                out_path = retry_cut_audio_for_scene(str(project_root_path), s_id, offset_val)
+
+                                # 4. 성공 메시지
+                                from pathlib import Path
+                                file_name = Path(out_path).name
+
+                                print(f"[UI] 오디오 재성성 완료: {out_path} (Offset: {offset_val}s)")
+                                QtWidgets.QMessageBox.information(
+                                    self, "완료",
+                                    f"오디오 파일을 새로 만들었습니다.\n\n"
+                                    f"경로: {file_name}\n"
+                                    f"적용된 싱크: {offset_val:+.3f}초"
+                                )
+
+                            except Exception as e:
+                                print(f"[UI] 오디오 자르기 실패: {e}")
+                                import traceback
+                                traceback.print_exc()
+                                QtWidgets.QMessageBox.critical(self, "실패", f"오디오 자르기 중 오류가 발생했습니다:\n{e}")
+
+                        # ★ [수정] lambda를 사용하여 클릭 시그널(False) 무시
+                        btn_trim_music.clicked.connect(lambda checked: on_click_trim_music())
+
+                        # 레이아웃 배치
+                        layout_trim.addWidget(lbl_offset)
+                        layout_trim.addWidget(spn_audio_offset)
+                        layout_trim.addWidget(btn_trim_music)
+                        layout_trim.addStretch(1)  # 왼쪽 정렬
+
+                        right_vbox.addLayout(layout_trim)
+                    # --- ▲▲▲ [신규] 끝 ▲▲▲ ---
+
                     right_vbox.addStretch(1)
                     row_layout.addWidget(right_vbox_widget, 0)
                     # --- [v41] 레이아웃 수정 끝 ---
