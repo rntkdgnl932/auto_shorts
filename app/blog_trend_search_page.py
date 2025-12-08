@@ -185,6 +185,295 @@ def fetch_health_titles(limit=30):
     #fetch_health_titles()
 
 
+
+
+# ─────────────────────────────────────────
+# 네이버 쇼핑 / 네이버 뉴스 관련 신규 수집 함수
+# ─────────────────────────────────────────
+
+# ─────────────────────────────────────────
+# 네이버 쇼핑 / 네이버 뉴스 관련 신규 수집 함수 (Selenium 버전)
+# ─────────────────────────────────────────
+
+
+
+def _looks_like_product_keyword(text: str) -> bool:
+    """
+    네이버 쇼핑 BEST에서 수집한 텍스트 중
+    '상품/행사/카테고리'처럼 보이는 것만 True로 본다.
+
+    - 너무 짧은 UI 문구, 계정/설정/알림/네이버 서비스 이름 등은 전부 False.
+    - 조금 빡세게 거르는 쪽으로 설계해도 괜찮다.
+    """
+    if not isinstance(text, str):
+        return False
+
+    t = text.strip()
+
+    # 너무 짧으면 거의 메뉴/버튼 텍스트일 가능성이 큼
+    if len(t) < 6:
+        return False
+
+    # 완전 UI/서비스 이름/설정 느낌 나는 것들 먼저 컷
+    ui_bad = [
+        "본문으로 바로가기", "공유하기", "맨위로가기", "홈선택됨", "카테고리",
+        "사용자 링크", "내정보 보기", "프로필 사진 변경", "로그아웃",
+        "@naver.com", "보안설정", "내인증서", "내 페이포인트", "내 블로그",
+        "가입한 카페", "환경설정", "전체 알림", "내 알림 전체보기",
+        "서비스 더보기", "즐겨찾는 서비스", "즐겨찾기 설정", "전체 서비스 보기",
+        "바로가기 설정", "어학사전", "인기/신규서비스", "초기 설정으로 변경",
+        "NONE", "레이어 열기", "도움말 열기", "상세보기", "Best Keyword",
+        "오늘끝딜", "베스트선택됨",
+    ]
+    if t in ui_bad:
+        return False
+
+    # 1) 숫자 + %, 원, 위, 랭킹 등: 랭킹/가격/할인/세일 텍스트일 가능성
+    has_digit = any(ch.isdigit() for ch in t)
+    if has_digit and any(tok in t for tok in ["%", "원", "위", "랭킹"]):
+        return True
+
+    # 2) 할인/세일/위크/브랜드 같은 쇼핑 느낌 단어
+    if any(kw in t for kw in ["할인", "세일", "위크", "브랜드", "행사", "특가", "딜", "데이"]):
+        # 단, "쿠폰", "혜택"만 단독으로 있는 건 버림
+        if t in ["쿠폰", "쿠폰함", "쿠폰혜택", "혜택"]:
+            return False
+        return True
+
+    # 3) 카테고리/상품군 느낌 (선글라스/패딩/이어폰/키보드 등)
+    category_keywords = [
+        "선글라스", "안경테", "패딩", "점퍼", "맨투맨", "후드",
+        "코트", "자켓", "원피스", "셔츠", "블라우스", "팬츠", "바지", "스커트",
+        "운동화", "스니커즈", "슬리퍼", "샌들",
+        "이어폰", "헤드폰", "노트북", "모니터", "키보드", "마우스",
+        "청소기", "에어컨", "공기청정기", "냉장고", "세탁기",
+        "에센스", "세럼", "크림", "토너", "마스크팩",
+        "사료", "간식", "고양이", "강아지",
+    ]
+    if any(kw in t for kw in category_keywords):
+        return True
+
+    # 4) 괄호 안에 브랜드/옵션 + 숫자가 섞여 있으면 대충 상품 타이틀 느낌
+    if "(" in t and ")" in t and has_digit:
+        return True
+
+    # 그 외는 상품/행사 키워드로 보지 않음
+    return False
+
+
+
+def get_naver_shopping_best_topics(limit: int = 50):
+    """
+    Selenium + BeautifulSoup으로 네이버 쇼핑 BEST에서
+    화면에 보이는 텍스트 중 '상품/키워드'로 보이는 문자열만 추출한다.
+
+    - 페이지 전체에서 a/span/strong을 긁되,
+    - _looks_like_product_keyword() 로 '상품/행사/카테고리 같은 것'만 남긴다.
+    """
+    from selenium import webdriver
+    from selenium.webdriver.chrome.service import Service
+    from selenium.webdriver.chrome.options import Options
+    from selenium.webdriver.common.by import By
+    from selenium.webdriver.support.ui import WebDriverWait
+    from selenium.webdriver.support import expected_conditions as EC
+    from webdriver_manager.chrome import ChromeDriverManager
+    from bs4 import BeautifulSoup
+
+    url = "https://shopping.naver.com/ns/home/best"
+
+    options = Options()
+    options.add_argument("--headless")
+    options.add_argument("--no-sandbox")
+    options.add_argument("--disable-dev-shm-usage")
+    options.add_argument(
+        "user-agent=Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+        "AppleWebKit/537.36 (KHTML, like Gecko) "
+        "Chrome/120.0 Safari/537.36"
+    )
+
+    driver = None
+    titles: list[str] = []
+
+    try:
+        driver = webdriver.Chrome(
+            service=Service(ChromeDriverManager().install()),
+            options=options
+        )
+        driver.get(url)
+
+        # 페이지 로딩 대기
+        try:
+            WebDriverWait(driver, 15).until(
+                EC.presence_of_all_elements_located(
+                    (By.CSS_SELECTOR, "body")
+                )
+            )
+        except Exception:
+            # body만 기다리되, 실제 텍스트는 page_source에서 파싱
+            pass
+
+        html = driver.page_source
+        soup = BeautifulSoup(html, "html.parser")
+
+        candidates: list[str] = []
+
+        # 1차: a/span/strong 태그에서 텍스트 수집
+        for tag in soup.find_all(["a", "span", "strong"]):
+            text = (tag.get_text() or "").strip()
+            if not text:
+                continue
+            # 너무 짧거나 너무 길면 제외
+            if len(text) < 2 or len(text) > 80:
+                continue
+
+            # 네이버 공통 UI/메뉴/푸터 텍스트 빠르게 컷
+            bad_keywords = [
+                "네이버", "로그인", "쇼핑", "장바구니", "고객센터",
+                "마이쿠폰", "오늘 본 상품", "검색", "입점문의", "이용약관",
+                "개인정보처리방침", "본문 바로가기", "닫기", "서비스", "설정",
+                "프로필", "알림", "추가해 보세요", "즐겨찾기", "전체보기",
+            ]
+            if any(bad in text for bad in bad_keywords):
+                continue
+
+            candidates.append(text)
+
+        # 디버그용: 후보 개수 찍기
+        print(f"🔍 [NAVER SHOPPING BEST] RAW 후보 개수: {len(candidates)}")
+
+        # 2차: 중복 제거 + '상품/행사처럼 보이는 것'만 남기고 상위 limit개
+        seen = set()
+        for t in candidates:
+            if t in seen:
+                continue
+            seen.add(t)
+
+            # 🔹 상품/행사/카테고리 느낌이 아니면 과감히 버림
+            if not _looks_like_product_keyword(t):
+                continue
+
+            titles.append(t)
+            if len(titles) >= limit:
+                break
+
+        print(f"✅ [NAVER SHOPPING BEST] 필터 후 추출: {len(titles)}개")
+
+    except Exception as e:
+        print(f"⚠ 네이버 쇼핑 BEST Selenium 크롤링 오류: {e}")
+
+    finally:
+        if driver is not None:
+            driver.quit()
+
+    return titles
+
+
+
+def _extract_naver_news_titles_common(url: str, limit: int = 50):
+    """
+    Selenium + BeautifulSoup 기반 네이버 뉴스 공통 파서.
+    - 랭킹/리스트 페이지에서 기사 제목 a[href*='/read?']를 추출한다.
+    """
+    from selenium import webdriver
+    from selenium.webdriver.chrome.service import Service
+    from selenium.webdriver.chrome.options import Options
+    from selenium.webdriver.common.by import By
+    from selenium.webdriver.support.ui import WebDriverWait
+    from selenium.webdriver.support import expected_conditions as EC
+    from webdriver_manager.chrome import ChromeDriverManager
+    from bs4 import BeautifulSoup
+
+    options = Options()
+    options.add_argument("--headless")
+    options.add_argument("--no-sandbox")
+    options.add_argument("--disable-dev-shm-usage")
+    options.add_argument(
+        "user-agent=Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+        "AppleWebKit/537.36 (KHTML, like Gecko) "
+        "Chrome/120.0 Safari/537.36"
+    )
+
+    driver = None
+    result: list[str] = []
+
+    try:
+        driver = webdriver.Chrome(
+            service=Service(ChromeDriverManager().install()),
+            options=options
+        )
+        driver.get(url)
+
+        # 기사 링크가 등장할 때까지 대기 (대략적인 조건)
+        try:
+            WebDriverWait(driver, 15).until(
+                EC.presence_of_all_elements_located(
+                    (By.CSS_SELECTOR, "a[href*='/read?']")
+                )
+            )
+        except Exception:
+            # 그래도 page_source 전체에서 한 번 더 시도
+            pass
+
+        html = driver.page_source
+        soup = BeautifulSoup(html, "html.parser")
+
+        anchors = soup.select("a[href*='/read?']")
+        titles_raw: list[str] = []
+        for a in anchors:
+            text = (a.get_text() or "").strip()
+            if not text:
+                continue
+            if len(text) < 8 or len(text) > 80:
+                continue
+            titles_raw.append(text)
+
+        # 중복 제거 + limit
+        seen = set()
+        for t in titles_raw:
+            if t in seen:
+                continue
+            seen.add(t)
+            result.append(t)
+            if len(result) >= limit:
+                break
+
+        print(f"✅ [NAVER NEWS] {url} 제목 {len(result)}개 추출")
+
+    except Exception as e:
+        print(f"⚠ 네이버 뉴스 Selenium 크롤링 오류 ({url}): {e}")
+
+    finally:
+        if driver is not None:
+            driver.quit()
+
+    return result
+
+
+def get_naver_news_ranking_titles(limit: int = 50):
+    """
+    네이버 뉴스 랭킹 (인기 기사)에서 제목을 수집한다.
+    https://news.naver.com/main/ranking/popularDay.naver?mid=etc&sid1=111
+    """
+    url = "https://news.naver.com/main/ranking/popularDay.naver?mid=etc&sid1=111"
+    return _extract_naver_news_titles_common(url, limit=limit)
+
+
+def get_naver_news_economy_titles(limit: int = 50):
+    """
+    네이버 경제 섹션 리스트에서 최신 기사 제목을 수집한다.
+    https://news.naver.com/main/list.naver?mode=LSD&mid=sec&sid1=101
+    """
+    url = "https://news.naver.com/main/list.naver?mode=LSD&mid=sec&sid1=101"
+    return _extract_naver_news_titles_common(url, limit=limit)
+
+
+
+
+
+
+
+
+
 def collect_all_topics():
     topic_list = []
 

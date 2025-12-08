@@ -1,7 +1,16 @@
 # -*- coding: utf-8 -*-
+# -*- coding: utf-8 -*-
 from __future__ import annotations
 
 from PyQt5 import QtWidgets, QtCore, QtGui
+
+# 진행창 유틸 (blog_ui와 동일 패턴)
+try:
+    from app.utils import run_job_with_progress_async
+except Exception:
+    from utils import run_job_with_progress_async  # type: ignore
+
+
 
 
 class ShoppingWidget(QtWidgets.QWidget):
@@ -12,18 +21,11 @@ class ShoppingWidget(QtWidgets.QWidget):
       - 상단: 키워드 + 카테고리 + 검색 버튼
       - 중앙: 좌측 상품 리스트 / 우측 선택 상품 상세
       - 우측 하단 버튼:
-          [1단계: 리스트가져오기] → 이후 "이슈+트렌드 기반 상품 50개 리스트" 가져오는 트리거
+          [테스트] → 네이버 기반 이슈 리스트 JSON 저장 테스트
+          [1단계: 리스트가져오기] → 나중에 전체 1단계 파이프라인(네이버+기존 이슈)을 실행
           [쇼츠 스크립트 만들기 (준비중)]
           [인포크링크 텍스트 생성 (준비중)]
       - 하단: 로그창
-
-    실제 로직:
-      - 지금은 더미 데이터/로그만 넣어둔 상태.
-      - 나중에:
-        1) issue_list/{날짜}/{시분초}.json 생성
-        2) AI가 쿠팡 아이템 50개 선정
-        3) 쇼츠/쇼핑 탭과 연동
-      쪽으로 확장 예정.
     """
 
     def __init__(self, parent=None):
@@ -75,7 +77,6 @@ class ShoppingWidget(QtWidgets.QWidget):
 
         # 2) 중앙 영역: 좌(상품 리스트) / 우(상세 미리보기)
         center_splitter = QtWidgets.QSplitter(self)
-        # noinspection PyUnresolvedReferences
         center_splitter.setOrientation(QtCore.Qt.Horizontal)
 
         # 2-1) 상품 리스트 테이블 (좌측)
@@ -117,14 +118,11 @@ class ShoppingWidget(QtWidgets.QWidget):
         self.lbl_thumbnail = QtWidgets.QLabel(thumb_group)
         self.lbl_thumbnail.setFixedSize(180, 180)
         self.lbl_thumbnail.setFrameShape(QtWidgets.QFrame.Box)
-        # noinspection PyUnresolvedReferences
         self.lbl_thumbnail.setAlignment(QtCore.Qt.AlignCenter)
         self.lbl_thumbnail.setText("이미지 없음")
 
         info_form = QtWidgets.QFormLayout()
-        # noinspection PyUnresolvedReferences
         info_form.setLabelAlignment(QtCore.Qt.AlignRight)
-        # noinspection PyUnresolvedReferences
         info_form.setFormAlignment(QtCore.Qt.AlignLeft | QtCore.Qt.AlignTop)
 
         self.le_title = QtWidgets.QLineEdit(thumb_group)
@@ -150,7 +148,6 @@ class ShoppingWidget(QtWidgets.QWidget):
         # 링크 및 설명
         link_group = QtWidgets.QGroupBox("링크 / 설명", right_widget)
         link_layout = QtWidgets.QFormLayout(link_group)
-        # noinspection PyUnresolvedReferences
         link_layout.setLabelAlignment(QtCore.Qt.AlignRight)
 
         self.le_product_url = QtWidgets.QLineEdit(link_group)
@@ -169,14 +166,18 @@ class ShoppingWidget(QtWidgets.QWidget):
         btn_row.setSpacing(6)
         btn_row.addStretch(1)
 
-        # ✅ 새 버튼: 1단계 리스트 가져오기
+        # 🔹 새 버튼: 테스트 (네이버 이슈 리스트 저장)
+        self.btn_test = QtWidgets.QPushButton("테스트(네이버 이슈리스트 저장)", right_widget)
+
+        # ✅ 1단계 버튼: 나중에 전체 파이프라인(네이버+기존 이슈)로 확장 예정
         self.btn_load_list = QtWidgets.QPushButton("1단계: 리스트가져오기", right_widget)
 
         # 기존 버튼들
         self.btn_make_script = QtWidgets.QPushButton("쇼츠 스크립트 만들기 (준비중)", right_widget)
         self.btn_make_infok = QtWidgets.QPushButton("인포크링크 텍스트 생성 (준비중)", right_widget)
 
-        # 순서: [1단계 버튼] → [쇼츠 스크립트] → [인포크 텍스트]
+        # 순서: [테스트] → [1단계] → [쇼츠 스크립트] → [인포크 텍스트]
+        btn_row.addWidget(self.btn_test)
         btn_row.addWidget(self.btn_load_list)
         btn_row.addWidget(self.btn_make_script)
         btn_row.addWidget(self.btn_make_infok)
@@ -216,7 +217,10 @@ class ShoppingWidget(QtWidgets.QWidget):
         self.btn_search_popular.clicked.connect(self.on_search_popular)
         self.table_items.itemSelectionChanged.connect(self.on_item_selected)
 
-        # 새 1단계 버튼
+        # 새 테스트 버튼
+        self.btn_test.clicked.connect(self.on_test_clicked)
+
+        # 1단계 버튼
         self.btn_load_list.clicked.connect(self.on_load_list_clicked)
 
         self.btn_make_script.clicked.connect(self.on_make_script_clicked)
@@ -276,11 +280,74 @@ class ShoppingWidget(QtWidgets.QWidget):
 
         self.append_log(f"✅ 상품 선택: {title}")
 
-    # ✅ 새 슬롯: 1단계 리스트 가져오기
+    # 🔹 새 슬롯: 테스트 버튼 (네이버 JSON 저장만 실행)
+    # 🔹 새 슬롯: 테스트 버튼 (네이버 JSON 저장을 비동기 + 진행창으로 실행)
+    def on_test_clicked(self):
+        """
+        테스트:
+        - 네이버 쇼핑/뉴스 이슈를 수집해서
+        - issue_list_builder.save_issue_list_for_shopping_naver() 실행
+        - 결과 JSON 경로를 로그에 남긴다.
+        (실제 크롤링은 run_job_with_progress_async로 별도 스레드에서 실행)
+        """
+        self.append_log("🧪 [테스트] 네이버 이슈리스트 저장 비동기 작업 시작...")
+
+        # 이미 실행 중이라면 중복 실행 방지 (원하면 플래그로 막을 수도 있음)
+        if getattr(self, "_naver_issue_running", False):
+            self.append_log("↪ 네이버 이슈 수집이 이미 실행 중입니다.")
+            return
+        self._naver_issue_running = True
+
+        def job(progress):
+            """
+            progress: Dict -> run_job_with_progress_async에서 주는 콜백
+            """
+            from issue_list_builder import save_issue_list_for_shopping_naver
+
+            # issue_list_builder 안에서 on_progress를 받아서 세부 단계 로그를 넘긴다.
+            def _inner_progress(info: dict):
+                # 진행창 갱신
+                try:
+                    progress(info)
+                except Exception:
+                    pass
+
+                # 쇼핑 탭 로그에도 간단히 남김
+                msg = info.get("msg") or ""
+                if msg:
+                    self.append_log(f"[네이버] {msg}")
+
+            path = save_issue_list_for_shopping_naver(on_progress=_inner_progress)
+            return {"path": str(path)}
+
+        def done(ok, payload, err):
+            self._naver_issue_running = False
+
+            if ok:
+                # payload는 job에서 반환한 dict
+                path = None
+                if isinstance(payload, dict):
+                    path = payload.get("path")
+                else:
+                    path = str(payload)
+
+                self.append_log(f"✅ [테스트] 네이버 이슈리스트 저장 완료: {path}\n")
+            else:
+                self.append_log(f"❌ [테스트] 네이버 이슈리스트 저장 실패: {err}\n")
+
+        # 진행창 띄우고 비동기로 실행
+        run_job_with_progress_async(
+            owner=self,
+            title="네이버 이슈리스트 저장 (테스트)",
+            job=job,
+            on_done=done,
+        )
+
+    # ✅ 1단계 버튼 (지금은 계획 설명만, 나중에 전체 파이프라인 연결 예정)
     def on_load_list_clicked(self):
         """
         1단계: 이슈/트렌드 + 쇼핑 데이터 수집 → issue_list/{날짜}/{시분초}.json 생성
-        지금은 아직 설계 단계라, 로그만 남겨둠.
+        지금은 아직 설계 단계라, 나중에 통합 파이프라인을 여기에 붙일 예정.
         """
         self.append_log("🧩 [1단계] 리스트 가져오기 트리거 도착.")
         self.append_log("    → 앞으로 여기에서:")
@@ -324,7 +391,6 @@ class ShoppingWidget(QtWidgets.QWidget):
         for row, (img, title, price, disc, rate) in enumerate(dummy):
             # 이미지 셀은 나중에 QIcon 세팅
             icon_item = QtWidgets.QTableWidgetItem()
-            # noinspection PyUnresolvedReferences
             icon_item.setFlags(icon_item.flags() ^ QtCore.Qt.ItemIsEditable)
             self.table_items.setItem(row, 0, icon_item)
 
