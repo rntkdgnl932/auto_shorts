@@ -43,6 +43,16 @@ except ImportError:
         lay.addWidget(QtWidgets.QLabel("유튜브 분석 UI (파일 없음)"))
         return w
 
+# 5) shopping UI 위젯 (쇼핑 자동화)
+try:
+    from shopping import create_shopping_widget
+except ImportError:
+    def create_shopping_widget(parent=None):
+        w = QtWidgets.QWidget(parent)
+        lay = QtWidgets.QVBoxLayout(w)
+        lay.addWidget(QtWidgets.QLabel("쇼핑 자동화 UI (shopping.py 없음)"))
+        return w
+
 
 class AllMain(QtWidgets.QMainWindow):
     def __init__(self):
@@ -67,9 +77,13 @@ class AllMain(QtWidgets.QMainWindow):
         talk_page = create_talk_widget(self)
         tabs.addTab(talk_page, "Talk")
 
-        # youtube 탭 (추가됨)
+        # youtube 탭
         youtube_page = create_youtube_widget(self)
         tabs.addTab(youtube_page, "Youtube")
+
+        # shopping 탭 (새로 추가)
+        shopping_page = create_shopping_widget(self)
+        tabs.addTab(shopping_page, "Shopping")
 
 
 def main():

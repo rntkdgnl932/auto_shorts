@@ -191,6 +191,7 @@ def life_tips_start(article, keyword):
         print("⚠️ 썸네일 없이 게시를 진행합니다.")
 
     # --- 본문 이미지 생성 ---
+    # --- 본문 이미지 생성 ---
     scene_url = ""
     scene_media, scene_caption = build_images_to_blog(article, "scene", f"{final_title}", short_slug)
 
@@ -218,7 +219,10 @@ def life_tips_start(article, keyword):
 
     if scene_media is not None:
         try:
-            scene_url = wp.call(UploadFile(scene_media)).get("link")
+            resp = wp.call(UploadFile(scene_media))
+            # 워드프레스 XML-RPC는 보통 'url' 키에 실제 이미지 URL을 넣어줌
+            scene_url = resp.get("url") or resp.get("link") or ""
+            print(f"✅ 본문 이미지 업로드 성공: {scene_url}")
         except Exception as e:
             print(f"⚠️ 본문 이미지 업로드 실패: {e}")
             scene_url = ""

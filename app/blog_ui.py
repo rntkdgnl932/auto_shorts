@@ -9,7 +9,8 @@ try:
 except Exception:
     pass
 
-from blog_start import suggest_life_tip_topic, issue_start
+from blog_start import suggest_life_tip_topic, issue_start, life_tips_keyword
+
 
 try:
     from app.utils import run_job_with_progress_async
@@ -139,6 +140,20 @@ class BlogMainWidget(QtWidgets.QWidget):
 
         root.addLayout(top)
 
+        # ── 키워드 직접 입력 후 1회 생성 영역
+        keyword_row = QtWidgets.QHBoxLayout()
+        lbl_keyword = QtWidgets.QLabel("키워드 입력")
+        self.le_keyword = QtWidgets.QLineEdit()
+        self.le_keyword.setPlaceholderText("예: 청년 전세자금 대출 정리")
+
+        self.btn_keyword_blog = QtWidgets.QPushButton("키워드 블로그 생성")
+
+        keyword_row.addWidget(lbl_keyword)
+        keyword_row.addWidget(self.le_keyword, 1)
+        keyword_row.addWidget(self.btn_keyword_blog)
+
+        root.addLayout(keyword_row)
+
         # ── 중간: 프롬프트 편집 영역 (카테고리 따라 my_topic / my_issue 세트 바뀜)
         gb = QtWidgets.QGroupBox("프롬프트 / 시스템 / 사용자 조건")
         form = QtWidgets.QFormLayout(gb)
@@ -170,6 +185,7 @@ class BlogMainWidget(QtWidgets.QWidget):
         self.btn_suggest.clicked.connect(self.on_suggest)
         self.btn_issue.clicked.connect(self.on_issue)
         self.btn_save_prompt.clicked.connect(self._save_current_prompt)
+        self.btn_keyword_blog.clicked.connect(self.on_keyword_blog)
 
     # ─────────────────────
     # 프롬프트 로드/저장 관련
@@ -355,6 +371,63 @@ class BlogMainWidget(QtWidgets.QWidget):
             job=job,
             on_done=done,
         )
+
+    # ─────────────────────
+    # 키워드 1회 블로그 생성
+    # ─────────────────────
+    def on_keyword_blog(self):
+        keyword = self.le_keyword.text().strip()
+        if not keyword:
+            self.log.appendPlainText("⚠ 키워드를 입력해 주세요.")
+            return
+
+        if getattr(self, "_keyword_running", False):
+            self.log.appendPlainText("↪ 키워드 글 생성이 이미 실행 중입니다.")
+            return
+
+        self._keyword_running = True
+
+        selected_cat = self.combo_category.currentText().strip()
+        self.log.appendPlainText(
+            f"⏱ 키워드 글 생성 트리거 도착 (카테고리: {selected_cat}, 키워드: {keyword})"
+        )
+
+        def job(progress):
+            progress({"msg": f"[{selected_cat}] 키워드 '{keyword}'로 블로그 글 생성 중..."})
+            ret = life_tips_keyword(keyword)
+            progress({"msg": f"끝: {ret}"})
+            return {"result": ret, "keyword": keyword, "category": selected_cat}
+
+        def done(ok, payload, err):
+            kw = keyword
+            cat = selected_cat
+            result_text = None
+
+            if isinstance(payload, dict):
+                kw = payload.get("keyword", keyword)
+                cat = payload.get("category", selected_cat)
+                result_text = payload.get("result")
+            else:
+                result_text = payload
+
+            if ok:
+                self.log.appendPlainText(
+                    f"✅ 키워드 블로그 생성 완료 (카테고리: {cat}, 키워드: {kw}) → {result_text}"
+                )
+            else:
+                self.log.appendPlainText(
+                    f"❌ 키워드 블로그 생성 실패 (키워드: {kw}): {err}"
+                )
+
+            self._keyword_running = False
+
+        run_job_with_progress_async(
+            owner=self,
+            title="키워드 블로그 생성",
+            job=job,
+            on_done=done,
+        )
+
 
     def _heartbeat(self):
         msg_parts = []

@@ -4,13 +4,10 @@ import google.api_core.exceptions as gax
 import random
 from typing import Any, Optional, TypedDict, Tuple
 import time
-import json
 import re
-from io import BytesIO
 import settings
 
 import requests
-from PIL import Image
 from xmlrpc import client as xmlrpc_client
 
 class RespOut(TypedDict):
@@ -253,99 +250,7 @@ def sleep_with_exact(seconds: float, label: Optional[str] = None) -> None:
     elapsed = time.monotonic() - start
     print(f"⏱️ 실제 대기: {elapsed:.2f}s", flush=True)
 
-def stable_diffusion(article: str, filename: str, description: str, slug: str):
-    """
-    [개선]
-    - Gemini 응답: 엄격 JSON + parts 없음 대응 + 실패 시 대체 프롬프트
-    - SD 호출: 재시도/백오프/타임아웃 + 응답 검증
-    - 진행 로그 및 캡션 후처리
-    """
-    try:
-        print(f"▶ Gemini로 [{filename}] 이미지 프롬프트/캡션 생성 요청...", flush=True)
 
-        style_guideline = _make_style_guideline(filename)
-        meta_prompt = _build_meta_prompt(article, description, style_guideline)
-
-        # Gemini 호출 (is_json=True)
-        response_text = call_gemini(meta_prompt, temperature=0.6, is_json=True)
-
-        # 프롬프트/캡션 파싱 + 실패 시 대체
-        short_prompt: Optional[str] = None
-        image_caption: Optional[str] = None
-
-        try:
-            if response_text in ("SAFETY_BLOCKED", "API_ERROR") or not response_text:
-                raise ValueError(f"Gemini 실패: {response_text}")
-
-            parsed = json.loads(response_text)
-            short_prompt = (parsed.get("image_prompt") or "").strip()
-            image_caption = (parsed.get("caption") or "").strip()
-
-            # 필수 키 확인
-            if not short_prompt or not image_caption:
-                raise ValueError("JSON에 image_prompt/caption 누락")
-
-        except Exception as exc:
-            print(f"⚠️ AI 프롬프트/캡션 생성 실패: {exc} → 대체 프롬프트 사용", flush=True)
-            short_prompt, image_caption = _fallback_prompt(description)
-
-        # 공통 네거티브(텍스트/워터마크 강력 억제 포함)
-        negative = (
-            "(text, logo, watermark:1.5), (deformed, distorted, disfigured:1.2), poorly drawn, bad anatomy, "
-            "blurry, lowres, nsfw, nude, extra fingers, mutated hands"
-            "deformed, distorted, disfigured:1.3), poorly drawn, bad anatomy, ugly, blurry, (text, watermark, signature, username, logo:1.4), (mutated hands and fingers:1.5), morbid, mutilated, extra limbs"
-        )
-
-        # 최종 프롬프트 구성(너무 장황하면 품질이 흔들리므로 핵심만)
-        base_quality = "masterpiece, best quality, ultra-detailed, high resolution, 8k, ultra high res, cinematic photo, soft light"
-        final_prompt = f"{base_quality}, {short_prompt}"
-
-        # 로그
-        print(f"🖼 prompt: {final_prompt}", flush=True)
-        print(f"✍️ caption: {image_caption}", flush=True)
-
-        # Stable Diffusion 호출 (768x512가 블로그 썸네일/본문에 무난)
-        b = _sd_txt2img(
-            prompt=final_prompt,
-            negative_prompt=negative,
-            width=768 if filename == "scene" else 640,
-            height=512,
-            steps=28 if filename == "scene" else 24,
-            cfg_scale=7.0,
-            sampler_index="Euler a",
-            seed=None,  # 필요시 고정값 지정
-            timeout=200,
-            max_retries=3,
-        )
-
-        if not b:
-            raise RuntimeError("Stable Diffusion에서 이미지를 받지 못했습니다.")
-
-        # 후처리(웹 최적화 WEBP)
-        img = Image.open(BytesIO(b)).convert("RGB")
-        buf = BytesIO()
-        img.save(buf, format="WEBP", quality=85)
-        webp_bytes = buf.getvalue()
-
-        image_file = BytesIO(webp_bytes)
-        image_file.name = f"{slug}_{filename}.webp"
-        image_file.seek(0)
-
-        # 캡션 정리
-        safe_caption = _clean_caption(image_caption)
-
-        media = {
-            "name": image_file.name,
-            "type": "image/webp",
-            "caption": safe_caption,
-            "description": (description or "").strip(),
-            "bits": xmlrpc_client.Binary(image_file.read()),
-        }
-        return media, safe_caption
-
-    except Exception as e:
-        print(f"⚠️ Stable Diffusion 처리 중 예외: {type(e).__name__}: {e}", flush=True)
-        return None, None
 
 def _make_style_guideline(filename: str) -> str:
     if filename == "thumb":
@@ -380,135 +285,7 @@ def _fallback_prompt(description: str) -> Tuple[str, str]:
     caption = _clean_caption(desc or "관련 주제 이미지")
     return short_prompt, caption
 
-def _sd_txt2img(
-    prompt: str,
-    negative_prompt: str,
-    width: int = 512,
-    height: int = 512,
-    steps: int = 28,
-    cfg_scale: float = 7.0,
-    sampler_index: str = "Euler a",
-    seed: Optional[int] = None,
-    endpoint: str = "http://127.0.0.1:7890/sdapi/v1/txt2img",
-    timeout: int = 180,
-    max_retries: int = 3,
-) -> Optional[bytes]:
-    import json, base64, requests
-    from requests.adapters import HTTPAdapter
-    from urllib3.util.retry import Retry
 
-    # --- endpoint 정규화 ---
-    base = endpoint.split("/sdapi/", 1)[0] if "/sdapi/" in endpoint else endpoint
-    txt2img_url = f"{base}/sdapi/v1/txt2img"
-    models_url  = f"{base}/sdapi/v1/sd-models"
-
-    # --- 로컬 통신 전용 세션: 프록시/환경변수 무시 + keep-alive 해제 ---
-    sess = requests.Session()
-    sess.trust_env = False                     # ← HTTP(S)_PROXY 등 무시
-    sess.proxies = {"http": "", "https": ""}
-    sess.headers.update({"User-Agent": "AutoBlog/1.21", "Connection": "close"})
-
-    # 네트워크 안정화(재시도)
-    retry = Retry(
-        total=2, connect=2, read=2,
-        backoff_factor=0.4,
-        status_forcelist=[429, 500, 502, 503, 504],
-        allowed_methods=frozenset(["GET","POST"]),
-    )
-    adapter = HTTPAdapter(max_retries=retry, pool_connections=10, pool_maxsize=10)
-    sess.mount("http://", adapter)
-    sess.mount("https://", adapter)  # 혹시 모를 https 호출 대비
-
-    # --- payload 구성 ---
-    payload = {
-        "prompt": prompt,
-        "negative_prompt": negative_prompt,
-        "steps": steps,
-        "width": width,
-        "height": height,
-        "sampler_index": sampler_index,
-        "cfg_scale": cfg_scale,
-        "override_settings": {
-            "sd_model_checkpoint": "xxmix9realistic_v40.safetensors [18ed2b6c48]"
-        },
-        "override_settings_restore_afterwards": True,
-    }
-    if seed is not None:
-        payload["seed"] = seed
-
-    # --- Preflight: 모델 존재 확인 (실패해도 진행) ---
-    try:
-        r = sess.get(models_url, timeout=10)
-        if r.status_code == 200 and r.headers.get("content-type","").startswith("application/json"):
-            desired = payload["override_settings"]["sd_model_checkpoint"]
-            models = r.json() or []
-            titles = {m.get("title") or "" for m in models}
-            hashes = {(m.get("hash") or "").strip() for m in models}
-            names  = {m.get("model_name") or "" for m in models}
-            bracket_hash = desired.split("[",1)[1].split("]",1)[0].strip() if "[" in desired and "]" in desired else ""
-            if not (desired in titles or desired in names or (bracket_hash and bracket_hash in hashes)):
-                print(f"⚠️ 지정 모델 미탐지 → override_settings 제거: {desired}", flush=True)
-                payload.pop("override_settings", None)
-        else:
-            print(f"⚠️ SD 모델 목록 조회 실패: HTTP {r.status_code} @ {models_url}", flush=True)
-    except Exception as exc:
-        print(f"⚠️ Preflight 예외({type(exc).__name__}): {exc} → 그대로 진행", flush=True)
-
-    # --- 요청 루프 ---
-    for attempt in range(max_retries):
-        try:
-            print(
-                f"🎨 SD 요청 {attempt+1}/{max_retries} | {width}x{height}, steps={steps}, cfg={cfg_scale}, sampler={sampler_index} → {txt2img_url}",
-                flush=True,
-            )
-            # r = sess.post(txt2img_url, json=payload, timeout=timeout)
-            import httpx  # requests 대신 httpx 추천(더 탄탄)
-            transport = httpx.HTTPTransport(retries=0)  # 재시도는 우리 코드에서 관리
-            with httpx.Client(transport=transport, timeout=timeout, headers={"Connection": "close"}) as cli:
-                r = cli.post(txt2img_url, json=payload)
-
-            try:
-                r.raise_for_status()
-            except requests.HTTPError as http_exc:
-                status = r.status_code
-                body_preview = r.text[:300].replace("\n", " ")
-                print(f"⚠️ SD HTTP {status}: {http_exc} | Body≈ {body_preview}", flush=True)
-                if status == 404:
-                    print("👉 /sdapi/v1 경로 없음: WebUI를 '--api'로 실행했는지/포트 확인", flush=True)
-                if status == 500 and "override_settings" in payload:
-                    print("👉 모델 스위치가 원인일 수 있어 override_settings 제거 후 즉시 재시도", flush=True)
-                    payload.pop("override_settings", None)
-                    continue
-                raise
-
-            # JSON 파싱
-            try:
-                data = r.json()
-            except json.JSONDecodeError:
-                snippet = r.text[:300].replace("\n", " ")
-                raise ValueError(f"JSON 파싱 실패(CT={r.headers.get('content-type')}) Body≈ {snippet}")
-
-            imgs = data.get("images")
-            if not imgs:
-                raise ValueError("SD 응답에 'images' 키가 없거나 비었습니다.")
-            return base64.b64decode(imgs[0])
-
-        except requests.exceptions.SSLError as exc:  # ← 여기서 TLS EOF 잡힘
-            print(f"❗ SSLError(로컬 호출에 TLS 관여): {exc}", flush=True)
-            print("   → 프록시/보안SW 개입 가능성. 세션은 proxies 무시/Connection: close로 설정됨.", flush=True)
-        except requests.exceptions.ProxyError as exc:
-            print(f"❗ ProxyError: {exc} (환경변수 프록시 무시 중)", flush=True)
-        except Exception as exc:
-            print(f"⚠️ SD 예외[{type(exc).__name__}]: {exc}", flush=True)
-
-        if attempt < max_retries - 1:
-            wait = _backoff(attempt, base=1.0, cap=10.0)
-            _sleep_exact(wait, label=f"SD retry {attempt+1}→{attempt+2}")
-        else:
-            print("🚫 SD 재시도 소진", flush=True)
-            return None
-
-    return None
 
 def _clean_caption(text: str, max_len: int = 140) -> str:
     # 줄바꿈/공백 정리, 따옴표 과다 제거, 길이 제한
@@ -600,16 +377,21 @@ def build_images_to_blog(
 
         base_url = str(comfy_host).rstrip("/")
 
+        # 워크플로우 선택 로직: 이제부터는 Z-Image-lora.json만 사용
         if workflow_path is not None:
+            # 호출하는 쪽에서 직접 경로를 넘겨준 경우 그대로 사용
             wf_path = Path(workflow_path)
         else:
+            wf_name = "Z-Image-lora.json"
             if jsons_dir:
-                wf_path = Path(jsons_dir) / "nunchaku_qwen_image_swap.json"
+                wf_path = Path(jsons_dir) / wf_name
             else:
-                wf_path = Path("nunchaku_qwen_image_swap.json")
+                wf_path = Path(wf_name)
 
         if not wf_path.exists():
-            raise FileNotFoundError(f"ComfyUI 워크플로 파일을 찾을 수 없습니다: {wf_path}")
+            raise FileNotFoundError(
+                f"ComfyUI 워크플로 파일을 찾을 수 없습니다: {wf_path}"
+            )
 
         with open(wf_path, "r", encoding="utf-8") as f:
             graph = json.load(f)
