@@ -754,6 +754,187 @@ def search_web_for_keyword(keyword: str, num_results: int = 3) -> list[dict] | b
 
 
 
+# ─────────────────────────────────────
+# 네이버 뉴스 다중 카테고리(사회/생활/IT) 이슈 추출
+# ─────────────────────────────────────
+
+def get_naver_news_multi_category_topics(
+    max_items_per_category: int = 30,
+) -> list[dict]:
+    """
+    네이버 뉴스에서 '사회/생활·문화/IT·과학' 카테고리의 최신 기사 제목을 추출한다.
+
+    반환 형식:
+    [
+        {"source": "naver_news_society", "title": "...", "rank": 1, "url": "https://..."},
+        {"source": "naver_news_life", "title": "...", "rank": 1, "url": "https://..."},
+        ...
+    ]
+    """
+    import requests
+    from bs4 import BeautifulSoup
+
+    # 네이버 카테고리: sid1 값
+    category_map = {
+        "naver_news_society": "102",  # 사회
+        "naver_news_life": "103",     # 생활/문화
+        "naver_news_it": "105",       # IT/과학
+    }
+
+    headers = {
+        "User-Agent": (
+            "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+            "AppleWebKit/537.36 (KHTML, like Gecko) "
+            "Chrome/120.0 Safari/537.36"
+        )
+    }
+
+    base_url = "https://news.naver.com/main/list.naver?mode=LSD&mid=sec&sid1={sid}"
+
+    all_topics: list[dict] = []
+    session = requests.Session()
+
+    for source, sid in category_map.items():
+        url = base_url.format(sid=sid)
+        try:
+            resp = session.get(url, headers=headers, timeout=10)
+            resp.encoding = "utf-8"
+        except Exception as e:
+            print(f"⚠ 네이버 카테고리 요청 실패 [{source}]: {e}")
+            continue
+
+        soup = BeautifulSoup(resp.text, "html.parser")
+
+        # 네이버 기사 링크 패턴: /read?oid=...&aid=...
+        raw_items: list[tuple[str, str]] = []
+        for a in soup.select("a[href*='/read?']"):
+            title = (a.get_text() or "").strip()
+            if not title:
+                continue
+            if len(title) < 8 or len(title) > 80:
+                continue
+
+            href = a.get("href") or ""
+            if href.startswith("/"):
+                href = "https://news.naver.com" + href
+
+            raw_items.append((title, href))
+
+        # 중복 제거 + 상한 조절
+        seen_titles: set[str] = set()
+        rank = 1
+        for title, link in raw_items:
+            if title in seen_titles:
+                continue
+            seen_titles.add(title)
+
+            all_topics.append(
+                {
+                    "source": source,
+                    "title": title,
+                    "rank": rank,
+                    "url": link,
+                }
+            )
+            rank += 1
+            if rank > max_items_per_category:
+                break
+
+        print(
+            f"✅ [NAVER MULTI] {source} ({sid}) → {rank - 1}개 수집"
+        )
+
+    return all_topics
+
+
+# ─────────────────────────────────────
+# 연합뉴스 트렌드/인기/생활/경제/IT 뉴스 추출
+# ─────────────────────────────────────
+
+def get_yonhap_news_trend_topics(
+    max_items_per_category: int = 30,
+) -> list[dict]:
+    """
+    연합뉴스에서 인기/핫뉴스/생활/경제/산업(IT·과학 포함) 기사 제목을 추출한다.
+
+    반환 형식:
+    [
+        {"source": "yonhap_popular", "title": "...", "rank": 1, "url": "https://..."},
+        {"source": "yonhap_hotnews", "title": "...", "rank": 1, "url": "https://..."},
+        ...
+    ]
+    """
+    import requests
+    from bs4 import BeautifulSoup
+
+    headers = {
+        "User-Agent": (
+            "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+            "AppleWebKit/537.36 (KHTML, like Gecko) "
+            "Chrome/120.0 Safari/537.36"
+        )
+    }
+
+    # 연합뉴스 주요 트렌드/라이프 카테고리
+    url_map = {
+        "yonhap_popular": "https://www.yna.co.kr/theme/popular?site=navi_popular",
+        "yonhap_hotnews": "https://www.yna.co.kr/theme/hotnews",
+        "yonhap_life": "https://www.yna.co.kr/lifestyle/all",
+        "yonhap_economy": "https://www.yna.co.kr/economy/all",
+        "yonhap_it_science": "https://www.yna.co.kr/industry/common",
+    }
+
+    all_topics: list[dict] = []
+    session = requests.Session()
+
+    for source, url in url_map.items():
+        try:
+            resp = session.get(url, headers=headers, timeout=10)
+            resp.encoding = "utf-8"
+        except Exception as e:
+            print(f"⚠ 연합뉴스 요청 실패 [{source}]: {e}")
+            continue
+
+        soup = BeautifulSoup(resp.text, "html.parser")
+
+        # 연합뉴스 기사 링크 패턴: /view/연도...
+        raw_items: list[tuple[str, str]] = []
+        for a in soup.select("a[href*='/view/']"):
+            title = (a.get_text() or "").strip()
+            if not title:
+                continue
+            # 너무 짧거나 긴 제목은 제외
+            if len(title) < 8 or len(title) > 80:
+                continue
+
+            href = a.get("href") or ""
+            if href.startswith("/"):
+                href = "https://www.yna.co.kr" + href
+
+            raw_items.append((title, href))
+
+        seen_titles: set[str] = set()
+        rank = 1
+        for title, link in raw_items:
+            if title in seen_titles:
+                continue
+            seen_titles.add(title)
+
+            all_topics.append(
+                {
+                    "source": source,
+                    "title": title,
+                    "rank": rank,
+                    "url": link,
+                }
+            )
+            rank += 1
+            if rank > max_items_per_category:
+                break
+
+        print(f"✅ [YONHAP] {source} → {rank - 1}개 수집")
+
+    return all_topics
 
 
 

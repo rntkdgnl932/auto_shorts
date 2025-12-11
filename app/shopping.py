@@ -166,8 +166,8 @@ class ShoppingWidget(QtWidgets.QWidget):
         btn_row.setSpacing(6)
         btn_row.addStretch(1)
 
-        # 🔹 새 버튼: 테스트 (네이버 이슈 리스트 저장)
-        self.btn_test = QtWidgets.QPushButton("테스트(네이버 이슈리스트 저장)", right_widget)
+        # 🔹 공용 테스트 버튼: 1단계(이슈 수집) + 나중에 2단계(쇼핑 키워드)까지 같이 실행할 예정
+        self.btn_test = QtWidgets.QPushButton("테스트", right_widget)
 
         # ✅ 1단계 버튼: 나중에 전체 파이프라인(네이버+기존 이슈)로 확장 예정
         self.btn_load_list = QtWidgets.QPushButton("1단계: 리스트가져오기", right_widget)
@@ -280,65 +280,55 @@ class ShoppingWidget(QtWidgets.QWidget):
 
         self.append_log(f"✅ 상품 선택: {title}")
 
-    # 🔹 새 슬롯: 테스트 버튼 (네이버 JSON 저장만 실행)
-    # 🔹 새 슬롯: 테스트 버튼 (네이버 JSON 저장을 비동기 + 진행창으로 실행)
     def on_test_clicked(self):
         """
-        테스트:
-        - 네이버 쇼핑/뉴스 이슈를 수집해서
-        - issue_list_builder.save_issue_list_for_shopping_naver() 실행
-        - 결과 JSON 경로를 로그에 남긴다.
-        (실제 크롤링은 run_job_with_progress_async로 별도 스레드에서 실행)
+        테스트 버튼 (1단계: 쇼핑 이슈 전체 수집)
+
+        - issue_list_builder.save_issue_list_for_shopping_all() 을
+          run_job_with_progress_async 로 비동기 실행한다.
+        - 네이버 + 유튜브 + Reddit + 쿠팡 스텁까지 한 번에 수집하여
+          C:\\my_games\\shorts_make\\issue_list\\YYYYMMDD\\HHMMSS.json 으로 저장.
         """
-        self.append_log("🧪 [테스트] 네이버 이슈리스트 저장 비동기 작업 시작...")
+        self.append_log("🧪 [테스트] 쇼핑 이슈 전체 수집 시작...")
 
-        # 이미 실행 중이라면 중복 실행 방지 (원하면 플래그로 막을 수도 있음)
-        if getattr(self, "_naver_issue_running", False):
-            self.append_log("↪ 네이버 이슈 수집이 이미 실행 중입니다.")
+        try:
+            # 전체 소스(네이버+유튜브+Reddit+쿠팡 스텁)를 저장하는 함수
+            from issue_list_builder import save_issue_list_for_shopping_all
+        except Exception as e:
+            self.append_log(f"❌ issue_list_builder 임포트 실패: {e}")
             return
-        self._naver_issue_running = True
 
+        # 실제 작업(백그라운드에서 돌아갈 함수)
         def job(progress):
             """
-            progress: Dict -> run_job_with_progress_async에서 주는 콜백
+            progress: run_job_with_progress_async 에서 주는 콜백.
+            - 이 콜백을 그대로 issue_list_builder 쪽 on_progress 에 넘겨서
+              진행 상황을 진행창에 표시한다.
             """
-            from issue_list_builder import save_issue_list_for_shopping_naver
-
-            # issue_list_builder 안에서 on_progress를 받아서 세부 단계 로그를 넘긴다.
-            def _inner_progress(info: dict):
-                # 진행창 갱신
-                try:
-                    progress(info)
-                except Exception:
-                    pass
-
-                # 쇼핑 탭 로그에도 간단히 남김
-                msg = info.get("msg") or ""
-                if msg:
-                    self.append_log(f"[네이버] {msg}")
-
-            path = save_issue_list_for_shopping_naver(on_progress=_inner_progress)
+            path = save_issue_list_for_shopping_all(on_progress=progress)
+            # run_job_with_progress_async 는 payload 를 dict 나 기타 오브젝트로 넘길 수 있으니
+            # 나중에 done() 에서 path 를 꺼내 쓸 수 있도록 dict 로 감싼다.
             return {"path": str(path)}
 
+        # 작업 종료 후 UI 업데이트
         def done(ok, payload, err):
-            self._naver_issue_running = False
+            if not ok or err is not None:
+                self.append_log(f"❌ 쇼핑 이슈 수집 실패: {err}")
+                return
 
-            if ok:
-                # payload는 job에서 반환한 dict
-                path = None
-                if isinstance(payload, dict):
-                    path = payload.get("path")
-                else:
-                    path = str(payload)
+            path_str = None
+            if isinstance(payload, dict):
+                path_str = payload.get("path")
 
-                self.append_log(f"✅ [테스트] 네이버 이슈리스트 저장 완료: {path}\n")
+            if not path_str:
+                self.append_log("⚠ 쇼핑 이슈 수집은 끝났지만, 결과 경로를 알 수 없습니다.")
             else:
-                self.append_log(f"❌ [테스트] 네이버 이슈리스트 저장 실패: {err}\n")
+                self.append_log(f"✅ 쇼핑 이슈 리스트 저장 완료: {path_str}")
 
-        # 진행창 띄우고 비동기로 실행
+        # 진행창 + 백그라운드 실행
         run_job_with_progress_async(
             owner=self,
-            title="네이버 이슈리스트 저장 (테스트)",
+            title="쇼핑 이슈 수집 (네이버+유튜브+해외+쿠팡 스텁)",
             job=job,
             on_done=done,
         )
