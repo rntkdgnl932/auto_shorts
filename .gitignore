@@ -1,11 +1,23 @@
-.idea
-.venv
+# IDE / 환경
+.idea/
+.venv/
+venv/
+env/
+
+# 파이썬 캐시
+__pycache__/
+
 character/
 comfy_input/
 maked_title/
 app/blog_setting
 playwright_profile
-dist
+
+# 빌드 산출물
+build/
+dist/
+_internal/
+
 mysettings
 asd.png
 error_screenshot
