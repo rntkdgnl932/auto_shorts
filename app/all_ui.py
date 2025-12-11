@@ -53,6 +53,15 @@ except ImportError:
         lay.addWidget(QtWidgets.QLabel("쇼핑 자동화 UI (shopping.py 없음)"))
         return w
 
+# 6) [새로 추가] Update UI 위젯
+try:
+    from update_ui import create_update_widget
+except ImportError:
+    def create_update_widget(parent=None):
+        w = QtWidgets.QWidget(parent)
+        lay = QtWidgets.QVBoxLayout(w)
+        lay.addWidget(QtWidgets.QLabel("업데이트 UI (update_ui.py 없음)"))
+        return w
 
 class AllMain(QtWidgets.QMainWindow):
     def __init__(self):
@@ -84,6 +93,10 @@ class AllMain(QtWidgets.QMainWindow):
         # shopping 탭 (새로 추가)
         shopping_page = create_shopping_widget(self)
         tabs.addTab(shopping_page, "Shopping")
+
+        # [새로 추가] Update 탭
+        update_page = create_update_widget(self)
+        tabs.addTab(update_page, "Update")
 
 
 def main():
