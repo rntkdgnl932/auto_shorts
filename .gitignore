@@ -2,6 +2,8 @@
 .idea/
 .venv/
 venv/
+app/json/
+app/.env
 env/
 
 # 파이썬 캐시
@@ -9,7 +11,10 @@ __pycache__/
 
 character/
 comfy_input/
+comfy_output/
 maked_title/
+maked_talk/
+issue_list/
 app/blog_setting
 playwright_profile
 
