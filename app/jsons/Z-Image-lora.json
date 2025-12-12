@@ -1,0 +1,185 @@
+{
+  "3": {
+    "inputs": {
+      "seed": [
+        "106",
+        0
+      ],
+      "steps": 10,
+      "cfg": 1,
+      "sampler_name": "euler",
+      "scheduler": "simple",
+      "denoise": 1,
+      "model": [
+        "87",
+        0
+      ],
+      "positive": [
+        "6",
+        0
+      ],
+      "negative": [
+        "92",
+        0
+      ],
+      "latent_image": [
+        "13",
+        0
+      ]
+    },
+    "class_type": "KSampler",
+    "_meta": {
+      "title": "KSampler"
+    }
+  },
+  "6": {
+    "inputs": {
+      "text": "A beautiful Korean woman in her early 17s lies comfortably on her fresh, softly lit bed in a calm, modern bedroom. Warm light from the Edison-bulb lamp blends with the cool-blue glow of her white smartphone, softly illuminating her relaxed features and loosely tousled dark hair. She rests slightly angled against textured throw pillows in terracotta, charcoal, and cream. \n\n",
+      "clip": [
+        "18",
+        0
+      ]
+    },
+    "class_type": "CLIPTextEncode",
+    "_meta": {
+      "title": "CLIP Text Encode (Positive Prompt)"
+    }
+  },
+  "8": {
+    "inputs": {
+      "samples": [
+        "3",
+        0
+      ],
+      "vae": [
+        "17",
+        0
+      ]
+    },
+    "class_type": "VAEDecode",
+    "_meta": {
+      "title": "VAE 디코드"
+    }
+  },
+  "13": {
+    "inputs": {
+      "width": 832,
+      "height": 1536,
+      "batch_size": 1
+    },
+    "class_type": "EmptySD3LatentImage",
+    "_meta": {
+      "title": "빈 잠재 이미지 (SD3)"
+    }
+  },
+  "17": {
+    "inputs": {
+      "vae_name": "flux\\ae.safetensors"
+    },
+    "class_type": "VAELoader",
+    "_meta": {
+      "title": "VAE 로드"
+    }
+  },
+  "18": {
+    "inputs": {
+      "clip_name": "qwen_3_4b.safetensors",
+      "type": "lumina2",
+      "device": "default"
+    },
+    "class_type": "CLIPLoader",
+    "_meta": {
+      "title": "CLIP 로드"
+    }
+  },
+  "41": {
+    "inputs": {
+      "images": [
+        "8",
+        0
+      ]
+    },
+    "class_type": "PreviewImage",
+    "_meta": {
+      "title": "이미지 미리보기"
+    }
+  },
+  "52": {
+    "inputs": {
+      "purge_cache": true,
+      "purge_models": true,
+      "anything": [
+        "8",
+        0
+      ]
+    },
+    "class_type": "LayerUtility: PurgeVRAM",
+    "_meta": {
+      "title": "LayerUtility: Purge VRAM"
+    }
+  },
+  "84": {
+    "inputs": {
+      "grain_intensity": 0.012,
+      "saturation_mix": 0.3,
+      "batch_size": 4
+    },
+    "class_type": "FastFilmGrain",
+    "_meta": {
+      "title": "🎞️ Fast Film Grain"
+    }
+  },
+  "85": {
+    "inputs": {
+      "strength": 0.4
+    },
+    "class_type": "FastLaplacianSharpen",
+    "_meta": {
+      "title": "🌀 Fast Laplacian Sharpen"
+    }
+  },
+  "87": {
+    "inputs": {
+      "lora_name": "z_image\\qinglong_detailedeye_z-imageV2%28comfy%29.safetensors",
+      "strength_model": 1.0000000000000002,
+      "model": [
+        "208",
+        0
+      ]
+    },
+    "class_type": "LoraLoaderModelOnly",
+    "_meta": {
+      "title": "LoRA 로드 (모델 전용)"
+    }
+  },
+  "92": {
+    "inputs": {
+      "conditioning": [
+        "6",
+        0
+      ]
+    },
+    "class_type": "ConditioningZeroOut",
+    "_meta": {
+      "title": "조건 (0으로 출력)"
+    }
+  },
+  "106": {
+    "inputs": {
+      "seed": 3535235
+    },
+    "class_type": "Seed (rgthree)",
+    "_meta": {
+      "title": "Seed (rgthree)"
+    }
+  },
+  "208": {
+    "inputs": {
+      "unet_name": "z_image\\z_image_turbo-Q8_0.gguf"
+    },
+    "class_type": "UnetLoaderGGUF",
+    "_meta": {
+      "title": "Unet Loader (GGUF)"
+    }
+  }
+}

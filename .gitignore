@@ -2,7 +2,6 @@
 .idea/
 .venv/
 venv/
-app/json/
 app/.env
 env/
 

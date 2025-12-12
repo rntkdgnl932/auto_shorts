@@ -1,0 +1,372 @@
+{
+  "1": {
+    "inputs": {
+      "upscale_method": "lanczos",
+      "megapixels": 1,
+      "image": [
+        "22",
+        0
+      ]
+    },
+    "class_type": "ImageScaleToTotalPixels",
+    "_meta": {
+      "title": "총 픽셀 수에 맞춰 이미지 크기 조정"
+    }
+  },
+  "2": {
+    "inputs": {
+      "image": [
+        "1",
+        0
+      ]
+    },
+    "class_type": "easy imageSize",
+    "_meta": {
+      "title": "ImageSize"
+    }
+  },
+  "3": {
+    "inputs": {
+      "samples": [
+        "4",
+        0
+      ],
+      "vae": [
+        "8",
+        0
+      ]
+    },
+    "class_type": "VAEDecode",
+    "_meta": {
+      "title": "VAE 디코드"
+    }
+  },
+  "4": {
+    "inputs": {
+      "seed": 836831215355684,
+      "steps": 8,
+      "cfg": 1,
+      "sampler_name": "euler",
+      "scheduler": "simple",
+      "denoise": 1,
+      "model": [
+        "12",
+        0
+      ],
+      "positive": [
+        "7",
+        0
+      ],
+      "negative": [
+        "5",
+        0
+      ],
+      "latent_image": [
+        "6",
+        0
+      ]
+    },
+    "class_type": "KSampler",
+    "_meta": {
+      "title": "KSampler"
+    }
+  },
+  "5": {
+    "inputs": {
+      "prompt": "",
+      "clip": [
+        "16",
+        0
+      ],
+      "vae": [
+        "8",
+        0
+      ],
+      "image1": [
+        "1",
+        0
+      ]
+    },
+    "class_type": "TextEncodeQwenImageEditPlus",
+    "_meta": {
+      "title": "TextEncodeQwenImageEditPlus"
+    }
+  },
+  "6": {
+    "inputs": {
+      "pixels": [
+        "1",
+        0
+      ],
+      "vae": [
+        "8",
+        0
+      ]
+    },
+    "class_type": "VAEEncode",
+    "_meta": {
+      "title": "VAE 인코드"
+    }
+  },
+  "7": {
+    "inputs": {
+      "prompt": "Turn the camera to a top-down view",
+      "clip": [
+        "16",
+        0
+      ],
+      "vae": [
+        "8",
+        0
+      ],
+      "image1": [
+        "1",
+        0
+      ]
+    },
+    "class_type": "TextEncodeQwenImageEditPlus",
+    "_meta": {
+      "title": "TextEncodeQwenImageEditPlus"
+    }
+  },
+  "8": {
+    "inputs": {
+      "vae_name": "qwen\\qwen_image_vae.safetensors"
+    },
+    "class_type": "VAELoader",
+    "_meta": {
+      "title": "VAE 로드"
+    }
+  },
+  "9": {
+    "inputs": {
+      "lora_name": "qwen\\Qwen-Image-Lightning-8steps-V2.0.safetensors",
+      "strength_model": 1,
+      "model": [
+        "14",
+        0
+      ]
+    },
+    "class_type": "LoraLoaderModelOnly",
+    "_meta": {
+      "title": "LoRA 로드 (모델 전용)"
+    }
+  },
+  "10": {
+    "inputs": {
+      "lora_name": "qwen\\Qwen-Edit-2509-Multiple-anglesQwen-Edit-2509-Multiple-angles.safetensors",
+      "strength_model": 1,
+      "model": [
+        "11",
+        0
+      ]
+    },
+    "class_type": "LoraLoaderModelOnly",
+    "_meta": {
+      "title": "LoRA 로드 (모델 전용)"
+    }
+  },
+  "11": {
+    "inputs": {
+      "lora_name": "qwen\\next-scene_lora-v2-3000.safetensors",
+      "strength_model": 1,
+      "model": [
+        "9",
+        0
+      ]
+    },
+    "class_type": "LoraLoaderModelOnly",
+    "_meta": {
+      "title": "LoRA 로드 (모델 전용)"
+    }
+  },
+  "12": {
+    "inputs": {
+      "strength": 1,
+      "model": [
+        "13",
+        0
+      ]
+    },
+    "class_type": "CFGNorm",
+    "_meta": {
+      "title": "CFGNorm"
+    }
+  },
+  "13": {
+    "inputs": {
+      "shift": 3,
+      "model": [
+        "10",
+        0
+      ]
+    },
+    "class_type": "ModelSamplingAuraFlow",
+    "_meta": {
+      "title": "모델 샘플링 (AuraFlow)"
+    }
+  },
+  "14": {
+    "inputs": {
+      "unet_name": "qwen\\Qwen-Image-Edit-2509_fp8_e4m3fn.safetensors",
+      "weight_dtype": "default"
+    },
+    "class_type": "UNETLoader",
+    "_meta": {
+      "title": "확산 모델 로드"
+    }
+  },
+  "15": {
+    "inputs": {
+      "images": [
+        "3",
+        0
+      ]
+    },
+    "class_type": "PreviewImage",
+    "_meta": {
+      "title": "이미지 미리보기"
+    }
+  },
+  "16": {
+    "inputs": {
+      "clip_name": "qwen\\qwen_2.5_vl_7b.safetensors",
+      "type": "stable_diffusion",
+      "device": "default"
+    },
+    "class_type": "CLIPLoader",
+    "_meta": {
+      "title": "CLIP 로드"
+    }
+  },
+  "17": {
+    "inputs": {
+      "image": "female_01 (1).png"
+    },
+    "class_type": "LoadImage",
+    "_meta": {
+      "title": "이미지 로드"
+    }
+  },
+  "18": {
+    "inputs": {
+      "image": "ComfyUI_00063_.png"
+    },
+    "class_type": "LoadImage",
+    "_meta": {
+      "title": "이미지 로드"
+    }
+  },
+  "19": {
+    "inputs": {
+      "enabled": true,
+      "swap_model": "inswapper_128.onnx",
+      "facedetection": "retinaface_resnet50",
+      "face_restore_model": "codeformer-v0.1.0.pth",
+      "face_restore_visibility": 0.1,
+      "codeformer_weight": 0,
+      "detect_gender_input": "no",
+      "detect_gender_source": "no",
+      "input_faces_index": "0",
+      "source_faces_index": "0",
+      "console_log_level": 1,
+      "input_image": [
+        "23",
+        0
+      ],
+      "source_image": [
+        "17",
+        0
+      ]
+    },
+    "class_type": "ReActorFaceSwap",
+    "_meta": {
+      "title": "ReActor 🌌 Fast Face Swap_1"
+    }
+  },
+  "20": {
+    "inputs": {
+      "image": "t_006.png"
+    },
+    "class_type": "LoadImage",
+    "_meta": {
+      "title": "이미지 로드"
+    }
+  },
+  "21": {
+    "inputs": {
+      "image": "male_01.png"
+    },
+    "class_type": "LoadImage",
+    "_meta": {
+      "title": "이미지 로드"
+    }
+  },
+  "22": {
+    "inputs": {
+      "enabled": false,
+      "swap_model": "inswapper_128.onnx",
+      "facedetection": "retinaface_resnet50",
+      "face_restore_model": "codeformer-v0.1.0.pth",
+      "face_restore_visibility": 0.1,
+      "codeformer_weight": 0,
+      "detect_gender_input": "no",
+      "detect_gender_source": "no",
+      "input_faces_index": "0",
+      "source_faces_index": "0",
+      "console_log_level": 1,
+      "input_image": [
+        "19",
+        0
+      ],
+      "source_image": [
+        "21",
+        0
+      ]
+    },
+    "class_type": "ReActorFaceSwap",
+    "_meta": {
+      "title": "ReActor 🌌 Fast Face Swap_0"
+    }
+  },
+  "23": {
+    "inputs": {
+      "enabled": false,
+      "swap_model": "inswapper_128.onnx",
+      "facedetection": "retinaface_resnet50",
+      "face_restore_model": "codeformer-v0.1.0.pth",
+      "face_restore_visibility": 0.1,
+      "codeformer_weight": 0,
+      "detect_gender_input": "no",
+      "detect_gender_source": "no",
+      "input_faces_index": "2",
+      "source_faces_index": "0",
+      "console_log_level": 1,
+      "input_image": [
+        "20",
+        0
+      ],
+      "source_image": [
+        "18",
+        0
+      ]
+    },
+    "class_type": "ReActorFaceSwap",
+    "_meta": {
+      "title": "ReActor 🌌 Fast Face Swap_2"
+    }
+  },
+  "24": {
+    "inputs": {
+      "filename_prefix": "2025-11-21-10-38-59",
+      "images": [
+        "3",
+        0
+      ]
+    },
+    "class_type": "SaveImage",
+    "_meta": {
+      "title": "이미지 저장"
+    }
+  }
+}
