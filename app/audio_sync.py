@@ -2507,8 +2507,13 @@ def generate_music_with_acestep(
                         if not fn or fn.startswith("ComfyUI_temp_"):
                             continue
                         sf_norm = sf.replace("\\", "/").lstrip("/")
-                        if not sf_norm.startswith(subfolder_path):
-                            continue
+
+                        # [수정] 엄격한 서브폴더 검사 비활성화
+                        # SaveAudio 노드 종류에 따라 subfolder가 비어서 오거나 경로가 다를 수 있음.
+                        # 해당 prompt_id에 대한 결과이므로 무조건 다운로드 시도.
+                        # if not sf_norm.startswith(subfolder_path):
+                        #     continue
+
                         try:
                             dl_file = _download_output_file(base_host, fn, sf_norm, out_dir=proj)
                             if isinstance(dl_file, Path) and dl_file.exists() and dl_file.stat().st_size > 0:
