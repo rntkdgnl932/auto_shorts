@@ -1,0 +1,22 @@
+{
+  "BASE_DIR": "C:\\my_games\\shorts_make\\maked_title",
+  "COMFY_HOST": "http://127.0.0.1:8188",
+  "DEFAULT_HOST_CANDIDATES": [
+    "http://127.0.0.1:8188",
+    "http://localhost:8188",
+    "http://127.0.0.1:8189",
+    "http://localhost:8189",
+    "http://127.0.0.1:8187",
+    "http://localhost:8187"
+  ],
+  "FFMPEG_EXE": "ffmpeg",
+  "USE_HWACCEL": true,
+  "FINAL_OUT": "C:\\my_games\\shorts_make\\maked_title\\[title]",
+  "AUDIO_SAVE_FORMAT": "mp3",
+  "DEFAULT_CHUNK": 300,
+  "DEFAULT_OVERLAP": 12,
+  "DEFAULT_INPUT_FPS": 60,
+  "DEFAULT_TARGET_FPS": 60,
+  "ACE_STEP_PROMPT_JSON": "C:\\my_games\\shorts_make\\app\\jsons\\ace_step_1_t2m.json",
+  "I2V_WORKFLOW": "C:/my_games/shorts_make/app/jsons/No.48.WAN2.2-LightX2V-I2V.json"
+}
