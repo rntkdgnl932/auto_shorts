@@ -5,7 +5,11 @@ from __future__ import annotations
 from PyQt5 import QtWidgets, QtCore, QtGui
 from app.utils import run_job_with_progress_async
 
-from app.issue_list_builder import save_issue_list_for_shopping_all
+from app.issue_list_builder import (
+    save_issue_list_for_shopping_all,
+    save_issue_list_for_shopping_ai_b_from_a,
+)
+
 
 
 class ShoppingWidget(QtWidgets.QWidget):
@@ -166,7 +170,7 @@ class ShoppingWidget(QtWidgets.QWidget):
 
         # ✅ 1단계 버튼: 나중에 전체 파이프라인(네이버+기존 이슈)로 확장 예정
         self.btn_load_list = QtWidgets.QPushButton("1단계: 리스트가져오기", right_widget)
-
+        self.btn_load_b = QtWidgets.QPushButton("리스트불러오기", right_widget)
         # 기존 버튼들
         self.btn_make_script = QtWidgets.QPushButton("쇼츠 스크립트 만들기 (준비중)", right_widget)
         self.btn_make_infok = QtWidgets.QPushButton("인포크링크 텍스트 생성 (준비중)", right_widget)
@@ -174,6 +178,7 @@ class ShoppingWidget(QtWidgets.QWidget):
         # 순서: [테스트] → [1단계] → [쇼츠 스크립트] → [인포크 텍스트]
         btn_row.addWidget(self.btn_test)
         btn_row.addWidget(self.btn_load_list)
+        btn_row.addWidget(self.btn_load_b)
         btn_row.addWidget(self.btn_make_script)
         btn_row.addWidget(self.btn_make_infok)
 
@@ -220,6 +225,8 @@ class ShoppingWidget(QtWidgets.QWidget):
 
         self.btn_make_script.clicked.connect(self.on_make_script_clicked)
         self.btn_make_infok.clicked.connect(self.on_make_infok_clicked)
+
+        self.btn_load_b.clicked.connect(self.on_load_b_clicked)
 
     # ────────────────────────────────────────
     # 공통 로그 함수
@@ -277,48 +284,35 @@ class ShoppingWidget(QtWidgets.QWidget):
 
     def on_test_clicked(self):
         """
-        테스트 버튼 (1단계: 쇼핑 이슈 전체 수집)
-
-        - issue_list_builder.save_issue_list_for_shopping_all() 을
-          run_job_with_progress_async 로 비동기 실행한다.
-        - 네이버 + 유튜브 + Reddit + 쿠팡 스텁까지 한 번에 수집하여
-          C:\\my_games\\shorts_make\\issue_list\\YYYYMMDD\\HHMMSS.json 으로 저장.
+        테스트 버튼:
+        - 최신 _a.json의 title들을 AI에게 한 번에 전달
+        - 판매 가능 상품 후보를 뽑아
+        - issue_list/YYYYMMDD/HHMMSS_b.json 저장
         """
-        self.append_log("🧪 [테스트] 쇼핑 이슈 전체 수집 시작...")
+        self.append_log("🧪 [테스트] AI로 판매 가능 상품 후보(_b) 생성 시작...")
 
-
-
-        # 실제 작업(백그라운드에서 돌아갈 함수)
         def job(progress):
-            """
-            progress: run_job_with_progress_async 에서 주는 콜백.
-            - 이 콜백을 그대로 issue_list_builder 쪽 on_progress 에 넘겨서
-              진행 상황을 진행창에 표시한다.
-            """
-            path = save_issue_list_for_shopping_all(on_progress=progress)
-            # run_job_with_progress_async 는 payload 를 dict 나 기타 오브젝트로 넘길 수 있으니
-            # 나중에 done() 에서 path 를 꺼내 쓸 수 있도록 dict 로 감싼다.
+            progress({"msg": "[테스트] AI 분석 중... (_a -> _b)"})
+            path = save_issue_list_for_shopping_ai_b_from_a(on_progress=progress)
             return {"path": str(path)}
 
-        # 작업 종료 후 UI 업데이트
         def done(ok, payload, err):
-            if not ok or err is not None:
-                self.append_log(f"❌ 쇼핑 이슈 수집 실패: {err}")
+            if (not ok) or (err is not None):
+                self.append_log(f"❌ [테스트] AI 후보 생성 실패: {err}")
                 return
 
-            path_str = None
+            path_str = ""
             if isinstance(payload, dict):
-                path_str = payload.get("path")
+                path_str = (payload.get("path") or "").strip()
 
-            if not path_str:
-                self.append_log("⚠ 쇼핑 이슈 수집은 끝났지만, 결과 경로를 알 수 없습니다.")
+            if path_str:
+                self.append_log(f"✅ [테스트] _b 저장 완료: {path_str}")
             else:
-                self.append_log(f"✅ 쇼핑 이슈 리스트 저장 완료: {path_str}")
+                self.append_log("⚠ [테스트] 완료됐지만 결과 경로를 확인하지 못했습니다.")
 
-        # 진행창 + 백그라운드 실행
         run_job_with_progress_async(
             owner=self,
-            title="쇼핑 이슈 수집 (네이버+유튜브+해외+쿠팡 스텁)",
+            title="AI 상품 후보 생성 (테스트: _a -> _b)",
             job=job,
             on_done=done,
         )
@@ -335,6 +329,43 @@ class ShoppingWidget(QtWidgets.QWidget):
         self.append_log("       2) AI로 쿠팡에 올릴 만한 후보 아이템 50개 선정")
         self.append_log("       3) C:\\my_games\\shorts_make\\issue_list\\{날짜}\\{시분초}.json 저장")
         self.append_log("    까지를 한 번에 수행하게 만들 예정.\n")
+        self._run_stage1_collect_issue_list(trigger_label="1단계버튼")
+
+        # 추후 상세내용 파악해서 추출하기.
+
+    def _run_stage1_collect_issue_list(self, trigger_label: str):
+        """
+        1단계(실행): 쇼핑 이슈 전체 수집 → issue_list/날짜/시분초.json 저장
+        - save_issue_list_for_shopping_all()가 실제 수집/저장 수행
+        - 성공 시 payload = {"path": "<저장경로>"} 형태로 done()에 전달
+        """
+        self.append_log(f"🧩 [1단계] ({trigger_label}) 쇼핑 이슈 전체 수집 시작...")
+
+        def job(progress):
+            progress({"msg": f"[1단계/{trigger_label}] 쇼핑 이슈 수집 중..."})
+            path = save_issue_list_for_shopping_all(on_progress=progress)
+            return {"path": str(path) if path is not None else ""}
+
+        def done(ok, payload, err):
+            if (not ok) or (err is not None):
+                self.append_log(f"❌ [1단계/{trigger_label}] 쇼핑 이슈 수집 실패: {err}")
+                return
+
+            path_str = ""
+            if isinstance(payload, dict):
+                path_str = (payload.get("path") or "").strip()
+
+            if path_str:
+                self.append_log(f"✅ [1단계/{trigger_label}] 쇼핑 이슈 리스트 저장 완료: {path_str}")
+            else:
+                self.append_log(f"⚠ [1단계/{trigger_label}] 수집은 끝났지만, 결과 경로를 알 수 없습니다.")
+
+        run_job_with_progress_async(
+            owner=self,
+            title=f"쇼핑 이슈 수집 (1단계/{trigger_label})",
+            job=job,
+            on_done=done,
+        )
 
     def on_make_script_clicked(self):
         title = self.le_title.text().strip()
@@ -381,7 +412,261 @@ class ShoppingWidget(QtWidgets.QWidget):
 
         self.append_log(f"ℹ 더미 상품 {len(dummy)}개 로드 (실제 연동 전까지 테스트용).")
 
+    def on_load_b_clicked(self):
+        """
+        리스트불러오기:
+        - _b.json을 선택해서 불러오거나(파일 선택)
+        - 취소 시 최신 _b.json 자동 로드 시도
+        - 새 창에서 클릭 가능한 리스트로 표시
+        """
+        import json
+        from pathlib import Path
+
+        default_dir = str(Path(r"C:\my_games\shorts_make\issue_list"))
+
+        path, _ = QtWidgets.QFileDialog.getOpenFileName(
+            self,
+            "리스트 불러오기 (_b.json)",
+            default_dir,
+            "JSON Files (*.json);;All Files (*.*)"
+        )
+
+        items = None
+
+        def _load_json(p: str):
+            try:
+                txt = Path(p).read_text(encoding="utf-8")
+                obj = json.loads(txt)
+                return obj if isinstance(obj, list) else None
+            except Exception:
+                return None
+
+        if path:
+            items = _load_json(path)
+            if items is None:
+                QtWidgets.QMessageBox.warning(self, "실패", "JSON 로드 실패 또는 리스트 구조가 아닙니다.")
+                return
+            dlg = IssueListViewerDialog(items, parent=self, title=f"리스트 보기: {Path(path).name}")
+            dlg.exec_()
+            return
+
+        # 파일 선택 취소 → 최신 _b 자동 시도 (간단 로직)
+        root = Path(default_dir)
+        latest = None
+        try:
+            if root.exists():
+                date_dirs = sorted([d for d in root.iterdir() if d.is_dir()], key=lambda x: x.name, reverse=True)
+                for d in date_dirs:
+                    cand = sorted(d.glob("*_b.json"), key=lambda x: x.name, reverse=True)
+                    if cand:
+                        latest = cand[0]
+                        break
+        except Exception:
+            latest = None
+
+        if not latest:
+            QtWidgets.QMessageBox.information(self, "안내", "불러올 _b.json이 없습니다. 먼저 테스트 버튼으로 _b를 생성하세요.")
+            return
+
+        items = _load_json(str(latest))
+        if items is None:
+            QtWidgets.QMessageBox.warning(self, "실패", f"최신 _b.json 로드 실패: {latest}")
+            return
+
+        dlg = IssueListViewerDialog(items, parent=self, title=f"리스트 보기: {latest.name}")
+        dlg.exec_()
 
 # all_ui.py에서 사용하기 위한 팩토리 함수
 def create_shopping_widget(parent=None) -> QtWidgets.QWidget:
     return ShoppingWidget(parent)
+
+
+
+
+class IssueListViewerDialog(QtWidgets.QDialog):
+    def __init__(self, items, parent=None, title="리스트 보기"):
+        super().__init__(parent)
+        self.setWindowTitle(title)
+        self.resize(980, 600)
+
+        self._items = items or []
+
+        root = QtWidgets.QVBoxLayout(self)
+
+        # ✅ 3분할 스플리터(좌: 제목, 중: reason, 우: products)
+        splitter = QtWidgets.QSplitter(QtCore.Qt.Horizontal, self)
+        root.addWidget(splitter, 1)
+
+        # ---------------------------
+        # LEFT: title list
+        # ---------------------------
+        left_wrap = QtWidgets.QWidget(self)
+        left_lay = QtWidgets.QVBoxLayout(left_wrap)
+        left_lay.setContentsMargins(8, 8, 8, 8)
+
+        left_title = QtWidgets.QLabel("제목(Title)", left_wrap)
+        left_lay.addWidget(left_title)
+
+        self.listw = QtWidgets.QListWidget(left_wrap)
+        self.listw.setSelectionMode(QtWidgets.QAbstractItemView.SingleSelection)
+        left_lay.addWidget(self.listw, 1)
+
+        splitter.addWidget(left_wrap)
+
+        # ---------------------------
+        # MIDDLE: reason
+        # ---------------------------
+        mid_wrap = QtWidgets.QWidget(self)
+        mid_lay = QtWidgets.QVBoxLayout(mid_wrap)
+        mid_lay.setContentsMargins(8, 8, 8, 8)
+
+        mid_title = QtWidgets.QLabel("사유(Reason)", mid_wrap)
+        mid_lay.addWidget(mid_title)
+
+        self.te_reason = QtWidgets.QTextEdit(mid_wrap)
+        self.te_reason.setReadOnly(True)
+        self.te_reason.setPlaceholderText("왼쪽에서 항목을 선택하면 reason이 표시됩니다.")
+        mid_lay.addWidget(self.te_reason, 1)
+
+        splitter.addWidget(mid_wrap)
+
+        # ---------------------------
+        # RIGHT: products list
+        # ---------------------------
+        right_wrap = QtWidgets.QWidget(self)
+        right_lay = QtWidgets.QVBoxLayout(right_wrap)
+        right_lay.setContentsMargins(8, 8, 8, 8)
+
+        right_title = QtWidgets.QLabel("상품(Products)", right_wrap)
+        right_lay.addWidget(right_title)
+
+        self.list_products = QtWidgets.QListWidget(right_wrap)
+        self.list_products.setSelectionMode(QtWidgets.QAbstractItemView.SingleSelection)
+        right_lay.addWidget(self.list_products, 1)
+
+        splitter.addWidget(right_wrap)
+
+        # 초기 비율(원하면 조절)
+        splitter.setStretchFactor(0, 3)
+        splitter.setStretchFactor(1, 4)
+        splitter.setStretchFactor(2, 3)
+
+        # 하단 힌트/버튼
+        hint = QtWidgets.QLabel("더블클릭: URL 있으면 열기 / 없으면 제목 복사", self)
+        root.addWidget(hint)
+
+        btns = QtWidgets.QHBoxLayout()
+        btns.addStretch(1)
+        self.btn_copy = QtWidgets.QPushButton("선택 제목 복사", self)
+        self.btn_close = QtWidgets.QPushButton("닫기", self)
+        btns.addWidget(self.btn_copy)
+        btns.addWidget(self.btn_close)
+        root.addLayout(btns)
+
+        self.btn_close.clicked.connect(self.close)
+        self.btn_copy.clicked.connect(self._copy_selected)
+
+        # ✅ 선택 변화 시 중앙/우측 갱신
+        self.listw.currentItemChanged.connect(self._on_item_changed)
+        self.listw.itemDoubleClicked.connect(self._open_or_copy)
+
+        self._populate()
+
+        # 첫 항목 자동 선택(있으면)
+        if self.listw.count() > 0:
+            self.listw.setCurrentRow(0)
+
+    def _populate(self):
+        self.listw.clear()
+        for it in self._items:
+            if not isinstance(it, dict):
+                continue
+
+            title = (it.get("title") or "").strip()
+            if not title:
+                continue
+
+            rank = it.get("rank", "")
+            src = (it.get("source") or "").strip()
+            url = it.get("url")
+
+            extra = it.get("extra") if isinstance(it.get("extra"), dict) else {}
+            # products 키는 케이스 다양성을 조금 허용
+            products = extra.get("products")
+            if products is None:
+                products = extra.get("related_products")
+
+            data = {
+                "title": title,
+                "url": url,
+                "extra": extra,
+                "reason": extra.get("reason") or "",
+                "products": products,
+            }
+
+            text = f"[{rank}] {title}  ({src})"
+            item = QtWidgets.QListWidgetItem(text)
+            item.setData(QtCore.Qt.UserRole, data)
+            self.listw.addItem(item)
+
+    def _on_item_changed(self, current, previous):
+        self.te_reason.clear()
+        self.list_products.clear()
+
+        if not current:
+            return
+
+        data = current.data(QtCore.Qt.UserRole) or {}
+        reason = (data.get("reason") or "").strip()
+
+        if not reason:
+            # extra 자체를 reason 대신 보여주고 싶으면 여기서 확장 가능
+            reason = "reason 정보가 없습니다."
+        self.te_reason.setPlainText(reason)
+
+        products = data.get("products")
+
+        # products 형태 정규화
+        prod_list = []
+        if isinstance(products, list):
+            prod_list = [str(x).strip() for x in products if str(x).strip()]
+        elif isinstance(products, str) and products.strip():
+            # "A, B, C" 같은 문자열도 지원
+            if "," in products:
+                prod_list = [p.strip() for p in products.split(",") if p.strip()]
+            else:
+                prod_list = [products.strip()]
+        elif isinstance(products, dict):
+            # dict면 key/value 펼쳐서라도 보여줌
+            for k, v in products.items():
+                s = f"{k}: {v}"
+                if s.strip():
+                    prod_list.append(s)
+
+        if not prod_list:
+            self.list_products.addItem("(products 없음)")
+        else:
+            for p in prod_list:
+                self.list_products.addItem(p)
+
+    def _copy_selected(self):
+        item = self.listw.currentItem()
+        if not item:
+            return
+        data = item.data(QtCore.Qt.UserRole) or {}
+        title = data.get("title") or ""
+        if title:
+            QtWidgets.QApplication.clipboard().setText(title)
+
+    def _open_or_copy(self, item):
+        data = item.data(QtCore.Qt.UserRole) or {}
+        url = data.get("url")
+        title = data.get("title") or ""
+
+        if url:
+            QtGui.QDesktopServices.openUrl(QtCore.QUrl(str(url)))
+        else:
+            if title:
+                QtWidgets.QApplication.clipboard().setText(title)
+
+
