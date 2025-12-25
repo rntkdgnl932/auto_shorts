@@ -1,0 +1,9 @@
+
+pip freeze > requirements.txt
+
+powershell
+
+cd C:\my_games\shorts_make
+python -m venv .venv
+.\.venv\Scripts\activate
+pip install -r requirements.txt

@@ -2,11 +2,11 @@
 
 
 a = Analysis(
-    ['main.py'],
+    ['run.py'],
     pathex=[],
     binaries=[],
     datas=[('icon.ico', '.')],
-    hiddenimports=['PyQt5'],
+    hiddenimports=[],
     hookspath=[],
     hooksconfig={},
     runtime_hooks=[],
@@ -26,7 +26,7 @@ exe = EXE(
     bootloader_ignore_signals=False,
     strip=False,
     upx=True,
-    console=True,
+    console=False,
     disable_windowed_traceback=False,
     argv_emulation=False,
     target_arch=None,

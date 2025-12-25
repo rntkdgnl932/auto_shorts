@@ -19,10 +19,8 @@ playwright_profile
 
 # 빌드 산출물
 build/
-_internal/
 dist/
 app/lyrics_gen.log
-shorts_make.exe
 
 mysettings
 asd.png

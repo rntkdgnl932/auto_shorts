@@ -35,3 +35,15 @@ def main():
 
 if __name__ == "__main__":
     main()
+
+
+
+# python -m PyInstaller `
+#    --noconfirm `
+#    --clean `
+#    --onedir `
+#    --name "shorts_make" `
+#    --icon "icon.ico" `
+#    --add-data "icon.ico;." `
+#    --windowed `
+#    run.py
