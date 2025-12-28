@@ -722,7 +722,7 @@ class AIConfig:
 
     # (옵션) Gemini
     gemini_api_key: Optional[str] = None
-    gemini_model: str = "gemini-2.5-pro"
+    gemini_model: str = "gemini-1.5-flash"
 
     def resolved(self) -> "AIConfig":
         def pick(*cands):
@@ -767,7 +767,7 @@ class AIConfig:
                 self.gemini_model,
                 getattr(S, "GEMINI_MODEL", None) if S else None,
                 os.getenv("GEMINI_MODEL"),
-                "gemini-2.5-pro",
+                "gemini-1.5-flash",
             ),
         )
 
@@ -781,7 +781,7 @@ class AI:
         self._init_clients()
 
         self.default_prefer = os.getenv("AI_PREFER", "openai").lower()  # "openai" / "gemini"
-        self.gemini_model = getattr(self.cfg, "gemini_model", None) or os.getenv("GEMINI_MODEL", "gemini-2.5-pro")
+        self.gemini_model = getattr(self.cfg, "gemini_model", None) or os.getenv("GEMINI_MODEL", "gemini-1.5-flash")
         self._gemini_configured = False
 
     def _init_clients(self):
@@ -922,7 +922,7 @@ class AI:
             ggen.configure(api_key=api_key)
             self._gemini_configured = True
 
-        model_name = self.gemini_model or "gemini-2.5-pro"
+        model_name = self.gemini_model or "gemini-1.5-flash"
         model = ggen.GenerativeModel(model_name)
 
         # JSON을 더 잘 내도록 하고 싶으면 mime_type을 application/json으로 바꿔도 됨
@@ -1015,7 +1015,7 @@ class AI:
                         continue
                     raise
             else:
-                model_name = self.gemini_model or "gemini-2.5-pro"
+                model_name = self.gemini_model or "gemini-1.5-flash"
                 _t("gemini", "request", f"model={model_name}")
                 try:
                     out = self._ask_gemini(system, user, **kwargs)
