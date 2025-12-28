@@ -4,6 +4,8 @@ pip freeze > requirements.txt
 powershell
 
 cd C:\my_games\shorts_make
+Remove-Item -Recurse -Force .venv
 python -m venv .venv
-.\.venv\Scripts\activate
-pip install -r requirements.txt
+.\.venv\Scripts\python.exe -m pip install -r requirements.txt
+
+.\.venv\Scripts\pip list

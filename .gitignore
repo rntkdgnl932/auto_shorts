@@ -21,6 +21,7 @@ playwright_profile
 build/
 dist/
 app/lyrics_gen.log
+products/
 
 mysettings
 asd.png

@@ -4,7 +4,8 @@ from __future__ import annotations
 import os
 import json
 from pathlib import Path
-
+from dotenv import load_dotenv
+load_dotenv()
 # ───────── 기본값 (하드코어 디폴트) ─────────
 # 가사 분석 관련
 # ===== Whisper / Sync 기본값 =====
@@ -39,6 +40,12 @@ OPENAI_MIN_BALANCE_USD: float = float(os.getenv("OPENAI_MIN_BALANCE_USD", "5"))
 OPENAI_BALANCE_USD_ENV: str | None = os.getenv("OPENAI_BALANCE_USD")  # 선택: 수동 입력용
 GEMINI_API_KEY: str = os.getenv("GEMINI_API_KEY", "")
 GEMINI_MODEL: str = os.getenv("GEMINI_MODEL", "gemini-2.0-flash")
+
+# 쿠팡 관련
+COUPANG_ACCESS_KEY = os.getenv("COUPANG_ACCESS_KEY")
+COUPANG_SECRET_KEY = os.getenv("COUPANG_SECRET_KEY")
+COUPANG_PARTNER_ID = os.getenv("COUPANG_PARTNER_ID")
+COUPANG_SUB_ID = os.getenv("COUPANG_SUB_ID", "")
 
 # 프로젝트 루트
 BASE_DIR: Path = Path(r"C:\my_games\shorts_make\maked_title")

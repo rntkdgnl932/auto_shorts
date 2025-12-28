@@ -26,7 +26,7 @@ def call_gemini(prompt, temperature=0.6, is_json=False, max_retries=5):
       - SAFETY 차단: "SAFETY_BLOCKED"
       - 실패: "API_ERROR"
     """
-    model_name = "gemini-2.5-pro"
+    model_name = "gemini-1.5-flash"
     safety_settings = {
         "HARM_CATEGORY_HARASSMENT": "BLOCK_NONE",
         "HARM_CATEGORY_HATE_SPEECH": "BLOCK_NONE",
@@ -38,7 +38,7 @@ def call_gemini(prompt, temperature=0.6, is_json=False, max_retries=5):
         response_mime_type="application/json" if is_json else "text/plain",
         candidate_count=1,
         # 필요시 최대 토큰 제한:
-        # max_output_tokens=1024,
+        max_output_tokens=4000,
         # top_p=0.9,
     )
     request_options = RequestOptions(timeout=300)
