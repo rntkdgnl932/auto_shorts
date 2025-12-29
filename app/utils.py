@@ -722,7 +722,7 @@ class AIConfig:
 
     # (옵션) Gemini
     gemini_api_key: Optional[str] = None
-    gemini_model: str = "gemini-1.5-flash"
+    gemini_model: str = "gemini-1.5-flash-002"
 
     def resolved(self) -> "AIConfig":
         def pick(*cands):
@@ -767,7 +767,7 @@ class AIConfig:
                 self.gemini_model,
                 getattr(S, "GEMINI_MODEL", None) if S else None,
                 os.getenv("GEMINI_MODEL"),
-                "gemini-1.5-flash",
+                "gemini-1.5-flash-002",
             ),
         )
 
@@ -781,7 +781,7 @@ class AI:
         self._init_clients()
 
         self.default_prefer = os.getenv("AI_PREFER", "openai").lower()  # "openai" / "gemini"
-        self.gemini_model = getattr(self.cfg, "gemini_model", None) or os.getenv("GEMINI_MODEL", "gemini-1.5-flash")
+        self.gemini_model = getattr(self.cfg, "gemini_model", None) or os.getenv("GEMINI_MODEL", "gemini-1.5-flash-002")
         self._gemini_configured = False
 
     def _init_clients(self):
@@ -922,7 +922,7 @@ class AI:
             ggen.configure(api_key=api_key)
             self._gemini_configured = True
 
-        model_name = self.gemini_model or "gemini-1.5-flash"
+        model_name = self.gemini_model or "gemini-1.5-flash-002"
         model = ggen.GenerativeModel(model_name)
 
         # JSON을 더 잘 내도록 하고 싶으면 mime_type을 application/json으로 바꿔도 됨
@@ -1015,7 +1015,7 @@ class AI:
                         continue
                     raise
             else:
-                model_name = self.gemini_model or "gemini-1.5-flash"
+                model_name = self.gemini_model or "gemini-1.5-flash-002"
                 _t("gemini", "request", f"model={model_name}")
                 try:
                     out = self._ask_gemini(system, user, **kwargs)
@@ -1469,7 +1469,7 @@ class AI:
                 try:
                     import google.generativeai as ggen  # type: ignore
                     ggen.configure(api_key=os.getenv("GOOGLE_API_KEY"))
-                    model = ggen.GenerativeModel("gemini-1.5-flash")
+                    model = ggen.GenerativeModel("gemini-1.5-flash-002")
                     prompt = (
                         "다음 한국어 가사를 의미 전달 단위로만 나눠줘. "
                         "각 조각은 원문 그대로 보존하고, 불필요한 수정/삭제/치환 금지. "

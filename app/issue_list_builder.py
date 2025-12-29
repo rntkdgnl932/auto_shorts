@@ -519,7 +519,7 @@ def save_issue_list_for_shopping_ai_b_from_a(
     a_path: Optional[str] = None,
     max_titles: int = 220,
     provider: str = "gemini",
-    model: str = "gemini-1.5-flash",
+    model: str = "gemini-1.5-flash-002",
 ) -> Path:
     """
     최신(또는 지정한) _a.json에서 title들을 모아 AI에게 전달하고,
