@@ -19,16 +19,17 @@ _wp_client = None
 
 # $ 제목 정하기 (메인 실행 함수)
 def suggest_life_tip_topic():
-    print("▶ 새로운 주제 추천 요청 (중복 검사 강화됨)")
+    print("▶ 새로운 주제 20개 추천 요청 (중복 검사 강화됨)")
     result_titles = load_existing_titles()
 
-    # 최대 3번까지 재요청 (무한 루프 방지)
+    # 최대 3번까지 재요청 (20개 다 중복이면 다시 뽑음)
     max_retries = 3
 
     for attempt in range(max_retries):
-        # 1. 주제 추천 받기
         system_prompt = v_.my_topic_system if hasattr(v_,
                                                       'my_topic_system') else f"당신은 '{v_.my_topic}' 주제에 특화된 전문 블로그 기획자입니다."
+
+        # ▼▼ 여기가 20개로 바뀐 부분 ▼▼
         user_prompt = f"""
         {v_.my_topic_user if hasattr(v_, 'my_topic_user') else ''}
 
@@ -36,9 +37,9 @@ def suggest_life_tip_topic():
         {result_titles}
 
         [주제 선정 조건]
-        - 위 목록과 **겹치지 않는 새로운 주제**20해주세요.
+        - 위 목록과 **겹치지 않는 새로운 주제** 20개를 추천해주세요.
         - 검색 수요가 높은 구체적인 정보 위주로 제시해주세요.
-        - 출력은 반드시 JSON 배열 형식이어야 합니다. 예: ["주제1", "주제2"]
+        - 출력은 반드시 JSON 배열 형식이어야 합니다. 예: ["주제1", "주제2", ... "주제20"]
         """
 
         prompt = f"{system_prompt}\n\n{user_prompt}"
@@ -55,34 +56,35 @@ def suggest_life_tip_topic():
             print(f"❌ 파싱 실패, 재시도합니다.")
             continue
 
-        print(f"🆕 [{attempt + 1}/{max_retries}] 추천 키워드들:", suggested_keywords)
+        print(f"🆕 [{attempt + 1}/{max_retries}] 추천된 20개 키워드 검사 시작...")
 
-        # 2. 하나씩 중복 검사
+        # 20개를 하나씩 검사
         for kw in suggested_keywords:
             score = is_similar_topic(kw, result_titles)
 
-            # 60점 이상이면 중복으로 간주하고 패스
+            # 60점 미만(안 비슷함)이면 합격!
             if score < 60:
                 print(f"✅ 주제 선정 완료: '{kw}' (유사도 안전: {score}%)")
-                # 바로 글쓰기 시작
+                # 글쓰기 시작 (하나 찾으면 바로 종료)
                 return life_tips_keyword(kw)
             else:
-                print(f"⚠️ [중복 필터링] '{kw}' (유사도: {score}%) -> 건너뜀")
+                print(f"⚠️ [중복 필터링] '{kw}' (유사도: {score}%) -> 탈락")
 
-        print(f"🔄 추천된 10개가 모두 중복입니다. 다시 요청합니다... ({attempt + 1}/{max_retries})")
+        print(f"🔄 20개가 전부 중복이거나 별로입니다. 다시 요청합니다... ({attempt + 1}/{max_retries})")
         time.sleep(2)
 
-    print("❌ 3번 재시도했으나 쓸만한 주제를 못 찾았습니다. 종료.")
+    print("❌ 3번(총 60개) 시도했으나 쓸만한 주제를 못 찾았습니다. 종료.")
     return False
 
 def load_existing_titles():
-    print("📌 최신 글 20개 제목을 가져옵니다. gas")
-    url = f"{v_.domain_adress}/wp-json/wp/v2/posts?per_page=20&page=1&orderby=date&order=desc"
+    print("📌 최신 글 50개 제목을 가져옵니다. (중복 방지 강화)")
+    # per_page=20 -> 50으로 늘림
+    url = f"{v_.domain_adress}/wp-json/wp/v2/posts?per_page=50&page=1&orderby=date&order=desc"
     try:
         resp = requests.get(url, timeout=10)
         resp.raise_for_status()
         titles = [post['title']['rendered'] for post in resp.json()]
-        print(f"✅ {len(titles)}개의 제목 로드 완료.")
+        print(f"✅ {len(titles)}개의 기존 제목 로드 완료.")
         return titles
     except requests.RequestException as e:
         print(f"❌ 제목 가져오기 실패: {e}")
@@ -93,16 +95,15 @@ def is_similar_topic(new_topic, existing_titles):
     if not existing_titles:
         return 0
 
-    # 1. 완전 똑같은 제목이 있는지 확인 (100% 일치)
+    # 완전히 똑같은 제목이 있으면 100점
     if new_topic in existing_titles:
         return 100
 
-    # 2. difflib으로 유사도 검사 (0~100점)
-    # get_close_matches는 가장 비슷한 것들을 찾아줌. cutoff=0.6은 60% 이상 비슷한 것만 찾음.
+    # difflib으로 비슷한 제목 찾기 (60% 이상 비슷한 것만)
     matches = difflib.get_close_matches(new_topic, existing_titles, n=1, cutoff=0.6)
 
     if matches:
-        # 가장 비슷한 제목과 비교해서 유사도 점수 계산
+        # 가장 비슷한 놈이랑 점수 계산 (0~100)
         matcher = difflib.SequenceMatcher(None, new_topic, matches[0])
         score = int(matcher.ratio() * 100)
         print(f"   🔍 유사도 검사: '{new_topic}' vs '{matches[0]}' = {score}점")
