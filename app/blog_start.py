@@ -2,6 +2,8 @@ import json
 import os
 import requests
 import difflib
+import random
+import time
 from wordpress_xmlrpc import Client, WordPressPost
 from wordpress_xmlrpc.compat import xmlrpc_client
 from wordpress_xmlrpc.methods.posts import NewPost
@@ -13,67 +15,79 @@ from app.blog_trend_search_page import collect_all_topics, filter_topics_by_cate
 from html import escape
 import re
 from bs4 import BeautifulSoup
-from bs4 import BeautifulSoup as _BS4  # 기존 import와 충돌 피하려면 필요시 조정
+from bs4 import BeautifulSoup as _BS4
 import variable as v_
+
 _wp_client = None
+
 
 # $ 제목 정하기 (메인 실행 함수)
 def suggest_life_tip_topic():
-    print("▶ 새로운 주제 20개 추천 요청 (중복 검사 강화됨)")
-    result_titles = load_existing_titles()
+    print("▶ 주제 선정 프로세스 시작 (확실한 중복 배제)")
 
-    # 최대 3번까지 재요청 (20개 다 중복이면 다시 뽑음)
+    # 1. 기존 글 제목 50개 로드
+    existing_titles = load_existing_titles()
+
     max_retries = 3
-
     for attempt in range(max_retries):
+
+        # 2. Gemini에게 20개 추천 요청
+        print(f"   ↳ [AI 요청 {attempt + 1}/{max_retries}] 새로운 주제 20개 생성 중...")
+
         system_prompt = v_.my_topic_system if hasattr(v_,
                                                       'my_topic_system') else f"당신은 '{v_.my_topic}' 주제에 특화된 전문 블로그 기획자입니다."
-
-        # ▼▼ 여기가 20개로 바뀐 부분 ▼▼
         user_prompt = f"""
         {v_.my_topic_user if hasattr(v_, 'my_topic_user') else ''}
 
-        [이미 다룬 블로그 제목 목록 (절대 피할 것)]
-        {result_titles}
+        [최근 작성한 글 목록 (중복 절대 금지)]
+        {existing_titles[:20]} ... (생략)
 
-        [주제 선정 조건]
-        - 위 목록과 **겹치지 않는 새로운 주제** 20개를 추천해주세요.
+        [지시사항]
+        - 위 목록에 없는 **완전히 새로운 키워드** 20개를 추천해라.
         - 검색 수요가 높은 구체적인 정보 위주로 제시해주세요.
-        - 출력은 반드시 JSON 배열 형식이어야 합니다. 예: ["주제1", "주제2", ... "주제20"]
+        - 출력은 오직 JSON 배열 포맷으로만: ["키워드1", "키워드2", ...]
         """
 
-        prompt = f"{system_prompt}\n\n{user_prompt}"
-        response_text = call_gemini(prompt, temperature=0.8, is_json=True)
-
-        if not response_text or response_text in ["API_ERROR", "SAFETY_BLOCKED"]:
-            print("❌ 주제 추천 API 호출 실패")
-            return False
+        # 프롬프트 결합
+        full_prompt = f"{system_prompt}\n\n{user_prompt}"
+        response_text = call_gemini(full_prompt, temperature=0.8, is_json=True)
 
         try:
-            suggested_keywords = json.loads(response_text)
-            if not isinstance(suggested_keywords, list): raise ValueError()
+            candidates = json.loads(response_text)
+            if not isinstance(candidates, list):
+                candidates = []
         except:
-            print(f"❌ 파싱 실패, 재시도합니다.")
+            print("   ⚠️ AI 응답 파싱 실패, 재시도.")
             continue
 
-        print(f"🆕 [{attempt + 1}/{max_retries}] 추천된 20개 키워드 검사 시작...")
+        if not candidates:
+            continue
 
-        # 20개를 하나씩 검사
-        for kw in suggested_keywords:
-            score = is_similar_topic(kw, result_titles)
+        print(f"   ✅ AI가 제안한 후보 {len(candidates)}개 도착. 필터링 시작...")
 
-            # 60점 미만(안 비슷함)이면 합격!
-            if score < 60:
-                print(f"✅ 주제 선정 완료: '{kw}' (유사도 안전: {score}%)")
-                # 글쓰기 시작 (하나 찾으면 바로 종료)
-                return life_tips_keyword(kw)
-            else:
-                print(f"⚠️ [중복 필터링] '{kw}' (유사도: {score}%) -> 탈락")
+        # 3. [핵심 로직] 여기서 중복을 싹 다 걸러내고 '살아남은 녀석들'만 모음
+        valid_keywords = []
+        for kw in candidates:
+            # 새로 만든 강력한 검사 함수를 사용
+            if not is_topic_already_covered(kw, existing_titles):
+                valid_keywords.append(kw)
 
-        print(f"🔄 20개가 전부 중복이거나 별로입니다. 다시 요청합니다... ({attempt + 1}/{max_retries})")
-        time.sleep(2)
+        # 4. 살아남은 게 없으면? -> 재시도
+        if not valid_keywords:
+            print(f"   🧨 [전멸] 20개 모두 이미 다룬 내용입니다. 다시 요청합니다.")
+            time.sleep(2)
+            continue
 
-    print("❌ 3번(총 60개) 시도했으나 쓸만한 주제를 못 찾았습니다. 종료.")
+        # 5. 살아남은 게 있으면? -> 여기서 랜덤 선택
+        print(f"   ✨ 생존한 키워드 {len(valid_keywords)}개: {valid_keywords}")
+
+        # 랜덤으로 하나 뽑기 (항상 1번만 뽑히는 편향 방지)
+        final_choice = random.choice(valid_keywords)
+
+        print(f"   🚀 최종 결정: '{final_choice}' -> 글 작성 시작")
+        return life_tips_keyword(final_choice)
+
+    print("❌ 3번 재시도(총 60개 검사)했으나 쓸만한 신규 주제가 없습니다. 종료.")
     return False
 
 def load_existing_titles():
@@ -91,25 +105,41 @@ def load_existing_titles():
         return []
 
 
-def is_similar_topic(new_topic, existing_titles):
+def is_topic_already_covered(keyword, existing_titles):
+    """
+    키워드가 기존 제목들에 이미 포함되어 있는지 강력하게 검사합니다.
+    True = 중복됨(쓰지 마), False = 안전함(써도 됨)
+    """
     if not existing_titles:
-        return 0
+        return False
 
-    # 완전히 똑같은 제목이 있으면 100점
-    if new_topic in existing_titles:
-        return 100
+    # 공백 제거 및 소문자화 (LH 청약 -> lh청약)
+    def normalize(text):
+        return str(text).replace(" ", "").lower().strip()
 
-    # difflib으로 비슷한 제목 찾기 (60% 이상 비슷한 것만)
-    matches = difflib.get_close_matches(new_topic, existing_titles, n=1, cutoff=0.6)
+    target_kw = normalize(keyword)
 
-    if matches:
-        # 가장 비슷한 놈이랑 점수 계산 (0~100)
-        matcher = difflib.SequenceMatcher(None, new_topic, matches[0])
-        score = int(matcher.ratio() * 100)
-        print(f"   🔍 유사도 검사: '{new_topic}' vs '{matches[0]}' = {score}점")
-        return score
+    for title in existing_titles:
+        target_title = normalize(title)
 
-    return 0
+        # 1. 키워드가 제목 안에 "쏙" 들어있는가? (가장 확실)
+        # 예: 키워드 'lh청약'이 제목 '2025년lh청약플러스가이드' 안에 있으면 중복!
+        if target_kw in target_title:
+            print(f"   ⛔ [필터링] 키워드 포함됨: '{keyword}' ⊂ '{title}'")
+            return True
+
+        # 2. 반대로 제목이 키워드 안에 들어있는가? (제목이 아주 짧을 때)
+        if target_title in target_kw:
+            print(f"   ⛔ [필터링] 제목이 키워드에 포함됨: '{title}' ⊂ '{keyword}'")
+            return True
+
+        # 3. 유사도 검사 (오타 방어용, 60% 이상 일치 시 중복)
+        matcher = difflib.SequenceMatcher(None, target_kw, target_title)
+        if matcher.ratio() >= 0.6:
+            print(f"   ⛔ [필터링] 유사도 높음({int(matcher.ratio() * 100)}%): '{keyword}' vs '{title}'")
+            return True
+
+    return False
 
 # $ 주제 선정 및 초안 생성
 def life_tips_keyword(keyword):
@@ -733,12 +763,9 @@ def safe_term_word(term):
 
 
 
+
 # 이슈 스타트
-import time
-
 def issue_start():
-
-
     topic_list = collect_all_topics()
     filtered_topics = filter_topics_by_category(topic_list)
 
@@ -748,6 +775,7 @@ def issue_start():
 
     if filtered_topics:
         for topic in filtered_topics:
+            # 수정된 이슈 처리 함수 호출
             result_suggest = suggest_life_tip_topic_issue(topic)
             print("result_suggest", result_suggest)
 
@@ -768,12 +796,7 @@ def issue_start():
     }
 
 
-
-
 def suggest_life_tip_topic_issue(kw):
-
-
-
     suggest__ = False
 
     if "none" in v_.wd_id:
@@ -793,13 +816,13 @@ def suggest_life_tip_topic_issue(kw):
         # 기존 제목 가져오기
         result_titles = load_existing_titles()
 
-        # 중복 주제 여부 판단
-        score = is_similar_topic(kw, result_titles)
-        if score < 70:
-            print(f"✅ 주제 선정: '{kw}' (유사도: {score}%)")
-            return life_tips_keyword(kw)
-            # return True  # 포스팅 1개 작성 후 종료
-        else:
-            print(f"⚠️ 유사 주제 건너뛰기: '{kw}' (유사도: {score}%)")
+        # [수정됨] 강력한 중복 검사 함수(is_topic_already_covered) 사용
+        if is_topic_already_covered(kw, result_titles):
+            print(f"⚠️ [중복 이슈] 이미 다룬 내용입니다: '{kw}' -> 건너뜀")
+            return False
+
+        # 중복이 아니면 글 작성 시작
+        print(f"✅ 새로운 이슈 주제 선정: '{kw}'")
+        return life_tips_keyword(kw)
 
     return suggest__
