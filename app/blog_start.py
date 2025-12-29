@@ -1,6 +1,7 @@
 import json
 import os
 import requests
+import difflib
 from wordpress_xmlrpc import Client, WordPressPost
 from wordpress_xmlrpc.compat import xmlrpc_client
 from wordpress_xmlrpc.methods.posts import NewPost
@@ -18,49 +19,60 @@ _wp_client = None
 
 # $ 제목 정하기 (메인 실행 함수)
 def suggest_life_tip_topic():
-    print("▶ 새로운 주제 추천 요청")
+    print("▶ 새로운 주제 추천 요청 (중복 검사 강화됨)")
     result_titles = load_existing_titles()
 
-    # ✅ 사용자 정의 역할(System)과 주제(User)를 동적으로 반영
-    system_prompt = v_.my_topic_system if hasattr(v_,
-                                                  'my_topic_system') else f"당신은 '{v_.my_topic}' 주제에 특화된 전문 블로그 기획자입니다."
-    user_prompt = f"""
-    {v_.my_topic_user if hasattr(v_, 'my_topic_user') else ''}
+    # 최대 3번까지 재요청 (무한 루프 방지)
+    max_retries = 3
 
-    [이미 다룬 블로그 제목 목록]
-    {result_titles}
+    for attempt in range(max_retries):
+        # 1. 주제 추천 받기
+        system_prompt = v_.my_topic_system if hasattr(v_,
+                                                      'my_topic_system') else f"당신은 '{v_.my_topic}' 주제에 특화된 전문 블로그 기획자입니다."
+        user_prompt = f"""
+        {v_.my_topic_user if hasattr(v_, 'my_topic_user') else ''}
 
-    [주제 선정 조건]
-    - 위 목록과 **겹치지 않는 새로운 주제** 10개를 추천해주세요.
-    - 검색 수요가 높은 구체적인 정보 위주로 제시해주세요. (예: '여름철 건강관리' ❌ → '폭염 속 전기요금 할인제도 신청방법' ✅)
-    - 출력은 반드시 JSON 배열 형식이어야 합니다. 예: ["주제1", "주제2"]
-    """
+        [이미 다룬 블로그 제목 목록 (절대 피할 것)]
+        {result_titles}
 
-    prompt = f"{system_prompt}\n\n{user_prompt}"
+        [주제 선정 조건]
+        - 위 목록과 **겹치지 않는 새로운 주제**20해주세요.
+        - 검색 수요가 높은 구체적인 정보 위주로 제시해주세요.
+        - 출력은 반드시 JSON 배열 형식이어야 합니다. 예: ["주제1", "주제2"]
+        """
 
-    response_text = call_gemini(prompt, temperature=0.8, is_json=True)
-    if not response_text:
-        print("❌ 주제 추천을 받지 못했습니다.")
-        return False
+        prompt = f"{system_prompt}\n\n{user_prompt}"
+        response_text = call_gemini(prompt, temperature=0.8, is_json=True)
 
-    try:
-        suggested_keywords = json.loads(response_text)
-        if not isinstance(suggested_keywords, list): raise ValueError()
-    except (json.JSONDecodeError, ValueError):
-        print(f"❌ 추천 주제 파싱 실패:\n{response_text}")
-        return False
+        if not response_text or response_text in ["API_ERROR", "SAFETY_BLOCKED"]:
+            print("❌ 주제 추천 API 호출 실패")
+            return False
 
-    print("🆕 추천 키워드들:", suggested_keywords)
-    for kw in suggested_keywords:
-        score = is_similar_topic(kw, result_titles)
-        if score < 70:
-            print(f"✅ 주제 선정: '{kw}' (유사도: {score}%)")
-            return life_tips_keyword(kw)
-            # return True  # 포스팅 1개 작성 후 종료
-        else:
-            print(f"⚠️ 유사 주제 건너뛰기: '{kw}' (유사도: {score}%)")
+        try:
+            suggested_keywords = json.loads(response_text)
+            if not isinstance(suggested_keywords, list): raise ValueError()
+        except:
+            print(f"❌ 파싱 실패, 재시도합니다.")
+            continue
 
-    print("✅ 모든 추천 주제가 기존 글과 유사하여 종료합니다.")
+        print(f"🆕 [{attempt + 1}/{max_retries}] 추천 키워드들:", suggested_keywords)
+
+        # 2. 하나씩 중복 검사
+        for kw in suggested_keywords:
+            score = is_similar_topic(kw, result_titles)
+
+            # 60점 이상이면 중복으로 간주하고 패스
+            if score < 60:
+                print(f"✅ 주제 선정 완료: '{kw}' (유사도 안전: {score}%)")
+                # 바로 글쓰기 시작
+                return life_tips_keyword(kw)
+            else:
+                print(f"⚠️ [중복 필터링] '{kw}' (유사도: {score}%) -> 건너뜀")
+
+        print(f"🔄 추천된 10개가 모두 중복입니다. 다시 요청합니다... ({attempt + 1}/{max_retries})")
+        time.sleep(2)
+
+    print("❌ 3번 재시도했으나 쓸만한 주제를 못 찾았습니다. 종료.")
     return False
 
 def load_existing_titles():
@@ -76,14 +88,27 @@ def load_existing_titles():
         print(f"❌ 제목 가져오기 실패: {e}")
         return []
 
+
 def is_similar_topic(new_topic, existing_titles):
-    if not existing_titles: return 0
-    prompt = f"새 주제 '{new_topic}'이 기존 제목 목록 {existing_titles}과 얼마나 유사한지 0~100점 사이의 숫자로만 평가해줘."
-    result = call_gemini(prompt, temperature=0.1)
-    try:
-        return int(re.search(r'\d+', result).group()) if result else 0
-    except (ValueError, AttributeError):
+    if not existing_titles:
         return 0
+
+    # 1. 완전 똑같은 제목이 있는지 확인 (100% 일치)
+    if new_topic in existing_titles:
+        return 100
+
+    # 2. difflib으로 유사도 검사 (0~100점)
+    # get_close_matches는 가장 비슷한 것들을 찾아줌. cutoff=0.6은 60% 이상 비슷한 것만 찾음.
+    matches = difflib.get_close_matches(new_topic, existing_titles, n=1, cutoff=0.6)
+
+    if matches:
+        # 가장 비슷한 제목과 비교해서 유사도 점수 계산
+        matcher = difflib.SequenceMatcher(None, new_topic, matches[0])
+        score = int(matcher.ratio() * 100)
+        print(f"   🔍 유사도 검사: '{new_topic}' vs '{matches[0]}' = {score}점")
+        return score
+
+    return 0
 
 # $ 주제 선정 및 초안 생성
 def life_tips_keyword(keyword):
