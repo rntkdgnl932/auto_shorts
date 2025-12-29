@@ -39,7 +39,7 @@ AUDIO_PRE_HIGHPASS_HZ = 0         # 0=끄기, 80~120 권장
 OPENAI_MIN_BALANCE_USD: float = float(os.getenv("OPENAI_MIN_BALANCE_USD", "5"))
 OPENAI_BALANCE_USD_ENV: str | None = os.getenv("OPENAI_BALANCE_USD")  # 선택: 수동 입력용
 GEMINI_API_KEY: str = os.getenv("GEMINI_API_KEY", "")
-GEMINI_MODEL: str = os.getenv("GEMINI_MODEL", "gemini-1.5-flash-002")
+GEMINI_MODEL: str = os.getenv("GEMINI_MODEL", "gemini-2.0-flash")
 
 # 쿠팡 관련
 COUPANG_ACCESS_KEY = os.getenv("COUPANG_ACCESS_KEY")

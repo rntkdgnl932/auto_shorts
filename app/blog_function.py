@@ -26,7 +26,7 @@ def call_gemini(prompt, temperature=0.6, is_json=False, max_retries=5):
       - SAFETY 차단: "SAFETY_BLOCKED"
       - 실패: "API_ERROR"
     """
-    model_name = "gemini-1.5-flash-002"
+    model_name = "gemini-2.0-flash"
     safety_settings = {
         "HARM_CATEGORY_HARASSMENT": "BLOCK_NONE",
         "HARM_CATEGORY_HATE_SPEECH": "BLOCK_NONE",
