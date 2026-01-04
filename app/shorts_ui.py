@@ -41,7 +41,7 @@ from PyQt5.QtCore import Qt
 from PyQt5.QtWidgets import QPlainTextEdit, QTextEdit, QFontComboBox
 
 from app.audio_sync import generate_music_with_acestep, sync_lyrics_with_whisper_pro, build_story_json
-from app.utils import _submit_and_wait as _submit_and_wait_comfy
+from app.audio_sync import _submit_and_wait as _submit_and_wait_comfy
 import re
 _CANON_RE = re.compile(r"[^a-z0-9]+")
 

@@ -34,14 +34,14 @@ from app.shopping_video_build import ShoppingVideoJsonBuilder, VideoShoppingBuil
 class VideoBuildDialog(QtWidgets.QDialog):
     """
     '영상제작' 버튼 클릭 시 열리는 창.
-    - video_shopping.json 생성/갱신
-    - 이미지/영상 생성은 현재 스켈레톤(추후 ComfyUI/I2V 연동)
+    - 탭1: video_shopping.json 생성 및 확인
+    - 탭2: 이미지/영상 생성 및 합치기 (개별 테스트 버튼 + 전체 실행)
     """
 
     def __init__(self, product_dir: str, product_data: dict, parent=None):
         super().__init__(parent)
         self.setWindowTitle(f"영상 제작 - {product_data.get('product_name', '')}")
-        self.resize(980, 720)
+        self.resize(1000, 750)
 
         self.product_dir = str(product_dir)
         self.product_data = product_data or {}
@@ -49,14 +49,15 @@ class VideoBuildDialog(QtWidgets.QDialog):
 
         root = QtWidgets.QVBoxLayout(self)
 
-        # 탭
+        # 탭 위젯
         self.tabs = QtWidgets.QTabWidget(self)
         root.addWidget(self.tabs, 1)
 
-        # ── 탭1: Video JSON ─────────────────────────
+        # ── 탭1: 시나리오 (JSON) ─────────────────────────
         tab1 = QtWidgets.QWidget(self)
         t1 = QtWidgets.QVBoxLayout(tab1)
 
+        # 옵션 행
         opt_row = QtWidgets.QHBoxLayout()
         t1.addLayout(opt_row)
 
@@ -81,12 +82,16 @@ class VideoBuildDialog(QtWidgets.QDialog):
 
         opt_row.addStretch(1)
 
+        # JSON 관련 버튼
         btn_row = QtWidgets.QHBoxLayout()
         t1.addLayout(btn_row)
 
-        self.btn_build_json = QtWidgets.QPushButton("video_shopping.json 생성/갱신", tab1)
+        self.btn_build_json = QtWidgets.QPushButton("1. video_shopping.json 생성/갱신", tab1)
+        self.btn_build_json.setStyleSheet("color: blue; font-weight: bold;")
+
         self.btn_open_product_dir = QtWidgets.QPushButton("상품 폴더 열기", tab1)
-        self.btn_open_video_json = QtWidgets.QPushButton("video_shopping.json 열기", tab1)
+        self.btn_open_video_json = QtWidgets.QPushButton("JSON 파일 열기", tab1)
+
         btn_row.addWidget(self.btn_build_json)
         btn_row.addWidget(self.btn_open_product_dir)
         btn_row.addWidget(self.btn_open_video_json)
@@ -94,61 +99,84 @@ class VideoBuildDialog(QtWidgets.QDialog):
 
         self.te_preview = QtWidgets.QPlainTextEdit(tab1)
         self.te_preview.setReadOnly(True)
-        self.te_preview.setPlaceholderText("여기에 생성된 video_shopping.json 미리보기가 표시됩니다.")
+        self.te_preview.setPlaceholderText("여기에 생성된 JSON 내용이 표시됩니다.")
         t1.addWidget(self.te_preview, 1)
 
-        self.tabs.addTab(tab1, "Video JSON 만들기")
+        self.tabs.addTab(tab1, "1. 시나리오(JSON)")
 
-        # ── 탭2: 이미지 생성 ─────────────────────────
+        # ── 탭2: 제작 패널 (이미지/영상/합치기) ─────────────────────────
         tab2 = QtWidgets.QWidget(self)
         t2 = QtWidgets.QVBoxLayout(tab2)
 
-        self.cb_img_skip = QtWidgets.QCheckBox("이미 존재하면 스킵", tab2)
+        # 설정 행
+        chk_row = QtWidgets.QHBoxLayout()
+        self.cb_img_skip = QtWidgets.QCheckBox("이미지: 존재하면 스킵", tab2)
         self.cb_img_skip.setChecked(True)
-        t2.addWidget(self.cb_img_skip)
-
-        row2 = QtWidgets.QHBoxLayout()
-        self.btn_gen_images = QtWidgets.QPushButton("이미지 생성 시작(스켈레톤)", tab2)
-        self.btn_open_imgs = QtWidgets.QPushButton("imgs 폴더 열기", tab2)
-        row2.addWidget(self.btn_gen_images)
-        row2.addWidget(self.btn_open_imgs)
-        row2.addStretch(1)
-        t2.addLayout(row2)
-
-        self.tabs.addTab(tab2, "이미지 만들기")
-
-        # ── 탭3: 영상 생성 ─────────────────────────
-        tab3 = QtWidgets.QWidget(self)
-        t3 = QtWidgets.QVBoxLayout(tab3)
-
-        self.cb_mov_skip = QtWidgets.QCheckBox("이미 존재하면 스킵", tab3)
+        self.cb_mov_skip = QtWidgets.QCheckBox("영상: 존재하면 스킵", tab2)
         self.cb_mov_skip.setChecked(True)
-        t3.addWidget(self.cb_mov_skip)
 
-        row3 = QtWidgets.QHBoxLayout()
-        row3.addWidget(QtWidgets.QLabel("FPS:", tab3))
-        self.sp_fps = QtWidgets.QSpinBox(tab3)
+        chk_row.addWidget(self.cb_img_skip)
+        chk_row.addSpacing(15)
+        chk_row.addWidget(self.cb_mov_skip)
+        chk_row.addSpacing(15)
+        chk_row.addWidget(QtWidgets.QLabel("FPS:", tab2))
+        self.sp_fps = QtWidgets.QSpinBox(tab2)
         self.sp_fps.setRange(8, 60)
-        self.sp_fps.setValue(16)
-        row3.addWidget(self.sp_fps)
+        self.sp_fps.setValue(24)
+        chk_row.addWidget(self.sp_fps)
+        chk_row.addStretch(1)
+        t2.addLayout(chk_row)
 
-        self.btn_gen_movies = QtWidgets.QPushButton("영상 생성 시작(스켈레톤)", tab3)
-        self.btn_open_clips = QtWidgets.QPushButton("clips 폴더 열기", tab3)
-        row3.addWidget(self.btn_gen_movies)
-        row3.addWidget(self.btn_open_clips)
-        row3.addStretch(1)
-        t3.addLayout(row3)
+        t2.addSpacing(20)
 
-        self.tabs.addTab(tab3, "영상 만들기")
+        # ★ [개별 단계 실행 그룹] ★
+        grp_actions = QtWidgets.QGroupBox("개별 단계 실행 (테스트용)", tab2)
+        lay_actions = QtWidgets.QHBoxLayout(grp_actions)
+        lay_actions.setSpacing(10)
+
+        self.btn_gen_images = QtWidgets.QPushButton("2. 누락이미지 생성 (Z-Image)", tab2)
+        self.btn_gen_images.setMinimumHeight(40)
+        self.btn_gen_images.setToolTip("video_shopping.json을 읽어 imgs 폴더에 없는 이미지를 생성합니다.")
+
+        self.btn_gen_movies = QtWidgets.QPushButton("3. 영상 생성 (I2V)", tab2)
+        self.btn_gen_movies.setMinimumHeight(40)
+        self.btn_gen_movies.setToolTip("imgs의 이미지를 이용해 clips 폴더에 영상을 생성합니다.")
+
+        self.btn_merge = QtWidgets.QPushButton("4. 영상 합치기 (Merge)", tab2)
+        self.btn_merge.setMinimumHeight(40)
+        self.btn_merge.setToolTip("clips 폴더의 영상을 모아 하나로 합칩니다.")
+
+        lay_actions.addWidget(self.btn_gen_images)
+        lay_actions.addWidget(self.btn_gen_movies)
+        lay_actions.addWidget(self.btn_merge)
+
+        t2.addWidget(grp_actions)
+
+        # 폴더 열기 편의 버튼
+        t2.addSpacing(10)
+        row_folders = QtWidgets.QHBoxLayout()
+        self.btn_open_imgs = QtWidgets.QPushButton("imgs 폴더 열기", tab2)
+        self.btn_open_clips = QtWidgets.QPushButton("clips 폴더 열기", tab2)
+        row_folders.addWidget(self.btn_open_imgs)
+        row_folders.addWidget(self.btn_open_clips)
+        row_folders.addStretch(1)
+        t2.addLayout(row_folders)
+
+        t2.addStretch(1)
+        self.tabs.addTab(tab2, "2. 제작(이미지/영상)")
 
         # ── 하단: 전체 실행 + 로그 ─────────────────────────
         bottom_row = QtWidgets.QHBoxLayout()
         root.addLayout(bottom_row)
 
-        self.btn_run_all = QtWidgets.QPushButton("전체 실행( JSON → 이미지 → 영상 )", self)
+        self.btn_run_all = QtWidgets.QPushButton("🚀 전체 실행 (1~4 단계 일괄 수행)", self)
+        self.btn_run_all.setStyleSheet("background-color: #d4f7d4; font-weight: bold; font-size: 14px; padding: 8px;")
+        self.btn_run_all.setMinimumHeight(50)
+
         self.btn_close = QtWidgets.QPushButton("닫기", self)
-        bottom_row.addWidget(self.btn_run_all)
-        bottom_row.addStretch(1)
+        self.btn_close.setMinimumHeight(50)
+
+        bottom_row.addWidget(self.btn_run_all, 1)
         bottom_row.addWidget(self.btn_close)
 
         self.log = QtWidgets.QPlainTextEdit(self)
@@ -156,21 +184,24 @@ class VideoBuildDialog(QtWidgets.QDialog):
         self.log.setMaximumBlockCount(1000)
         root.addWidget(self.log, 0)
 
-        # 시그널 연결
+        # ── 시그널 연결 ─────────────────────────
         self.btn_close.clicked.connect(self.close)
         self.btn_open_product_dir.clicked.connect(lambda: self._open_path(self.product_dir))
         self.btn_open_imgs.clicked.connect(lambda: self._open_path(str(Path(self.product_dir) / "imgs")))
         self.btn_open_clips.clicked.connect(lambda: self._open_path(str(Path(self.product_dir) / "clips")))
         self.btn_open_video_json.clicked.connect(lambda: self._open_path(self.video_json_path))
 
+        # 기능 버튼 (비동기 처리 함수 연결)
         self.btn_build_json.clicked.connect(self.on_build_json_clicked)
         self.btn_gen_images.clicked.connect(self.on_gen_images_clicked)
         self.btn_gen_movies.clicked.connect(self.on_gen_movies_clicked)
+        self.btn_merge.clicked.connect(self.on_merge_clicked)
         self.btn_run_all.clicked.connect(self.on_run_all_clicked)
 
-        # 초기 미리보기
+        # 초기 로드
         self._refresh_preview_if_exists()
 
+    # ── 헬퍼 함수들 ─────────────────────────
     def _append_log(self, msg: str):
         self.log.appendPlainText(msg)
 
@@ -179,12 +210,8 @@ class VideoBuildDialog(QtWidgets.QDialog):
         if not p.exists():
             self._append_log(f"⚠ 경로 없음: {p}")
             return
-        # 폴더면 열고, 파일이면 선택해서 열기
         try:
-            if p.is_dir():
-                os.startfile(str(p))
-            else:
-                os.startfile(str(p))
+            os.startfile(str(p))
         except Exception as e:
             self._append_log(f"⚠ 열기 실패: {e}")
 
@@ -203,75 +230,103 @@ class VideoBuildDialog(QtWidgets.QDialog):
                 txt = p.read_text(encoding="utf-8")
                 self.te_preview.setPlainText(txt)
             except Exception as e:
-                self.te_preview.setPlainText(f"미리보기 실패: {e}")
+                self.te_preview.setPlainText(f"읽기 실패: {e}")
+
+    # ── 비동기 작업 핸들러 (run_job_with_progress_async 사용) ─────────────────────────
 
     def on_build_json_clicked(self):
+        """1단계: JSON 생성"""
+
         def job(progress):
-            progress("[video] video_shopping.json 생성 시작 (Gemini)...")
+            progress("[JSON] 생성 시작...")
             builder = ShoppingVideoJsonBuilder(on_progress=progress)
             out_path = builder.build(
                 product_dir=self.product_dir,
                 product_data=self.product_data,
                 options=self._options(),
             )
-            progress(f"[video] 완료: {out_path}")
+            progress(f"[JSON] 완료: {out_path}")
             return str(out_path)
 
-        def done(result_path: str):
-            self._append_log(f"[video] DONE: {result_path}")
-            self._refresh_preview_if_exists()
-
-        def fail(err: str):
-            self._append_log(f"❌ video_shopping.json 생성 실패: {err}")
-
-        def _done(ok, payload, err):
+        def done(ok, res, err):
             if ok:
-                # payload = job()의 리턴값
-                done(str(payload))
+                self._append_log(f"✅ JSON 생성 성공")
+                self._refresh_preview_if_exists()
             else:
-                fail(str(err))
-        run_job_with_progress_async(
-            self,  # owner (positional)
-            "video_shopping.json 생성/갱신",  # title (positional)
-            job,  # job (positional)
-            on_done=_done,
-        )
+                self._append_log(f"❌ JSON 생성 실패: {err}")
+
+        run_job_with_progress_async(self, "JSON 생성", job, on_done=done)
 
     def on_gen_images_clicked(self):
-        # video_shopping.json이 없으면 먼저 생성
+        """2단계: 누락 이미지 생성 (비동기)"""
         if not Path(self.video_json_path).exists():
-            self._append_log("⚠ video_shopping.json이 없습니다. 먼저 생성합니다.")
-            self.on_build_json_clicked()
+            self._append_log("⚠ video_shopping.json이 없습니다. 1단계를 먼저 실행하세요.")
+            return
 
-        try:
-            self._append_log("[img] 이미지 생성(스켈레톤) 시작...")
-            gen = ShoppingImageGenerator(on_progress=self._append_log)
-            gen.generate_images(self.video_json_path, skip_if_exists=bool(self.cb_img_skip.isChecked()))
-            self._append_log("[img] 종료")
-        except Exception as e:
-            self._append_log(f"❌ 이미지 생성 실패: {e}")
+        def job(progress):
+            progress("[Image] 이미지 생성 시작...")
+            gen = ShoppingImageGenerator(on_progress=progress)
+            gen.generate_images(self.video_json_path, skip_if_exists=self.cb_img_skip.isChecked())
+            return "OK"
+
+        def done(ok, res, err):
+            if ok:
+                self._append_log("✅ 이미지 생성 완료")
+            else:
+                self._append_log(f"❌ 이미지 생성 실패: {err}")
+
+        run_job_with_progress_async(self, "이미지 생성", job, on_done=done)
 
     def on_gen_movies_clicked(self):
+        """3단계: 영상 생성 (비동기)"""
         if not Path(self.video_json_path).exists():
-            self._append_log("⚠ video_shopping.json이 없습니다. 먼저 생성합니다.")
-            self.on_build_json_clicked()
+            self._append_log("⚠ video_shopping.json이 없습니다.")
+            return
 
-        try:
-            self._append_log("[mov] 영상 생성(스켈레톤) 시작...")
-            gen = ShoppingMovieGenerator(on_progress=self._append_log)
+        def job(progress):
+            progress("[Movie] I2V 영상 생성 시작...")
+            gen = ShoppingMovieGenerator(on_progress=progress)
             gen.generate_movies(
                 self.video_json_path,
-                skip_if_exists=bool(self.cb_mov_skip.isChecked()),
-                fps=int(self.sp_fps.value()),
+                skip_if_exists=self.cb_mov_skip.isChecked(),
+                fps=int(self.sp_fps.value())
             )
-            self._append_log("[mov] 종료")
-        except Exception as e:
-            self._append_log(f"❌ 영상 생성 실패: {e}")
+            return "OK"
+
+        def done(ok, res, err):
+            if ok:
+                self._append_log("✅ 영상 생성 완료")
+            else:
+                self._append_log(f"❌ 영상 생성 실패: {err}")
+
+        run_job_with_progress_async(self, "영상 생성", job, on_done=done)
+
+    def on_merge_clicked(self):
+        """4단계: 영상 합치기 (비동기)"""
+        if not Path(self.video_json_path).exists():
+            self._append_log("⚠ video_shopping.json이 없습니다.")
+            return
+
+        def job(progress):
+            progress("[Merge] 영상 합치기 시작...")
+            gen = ShoppingMovieGenerator(on_progress=progress)
+            gen.merge_movies(self.video_json_path)
+            return "OK"
+
+        def done(ok, res, err):
+            if ok:
+                self._append_log("✅ 영상 합치기 완료")
+            else:
+                self._append_log(f"❌ 영상 합치기 실패: {err}")
+
+        run_job_with_progress_async(self, "영상 합치기", job, on_done=done)
 
     def on_run_all_clicked(self):
-        try:
-            self._append_log("[pipe] 전체 실행 시작...")
-            pipe = ShoppingShortsPipeline(on_progress=self._append_log)
+        """전체 파이프라인 일괄 실행 (비동기)"""
+
+        def job(progress):
+            progress("[All] 전체 파이프라인 시작...")
+            pipe = ShoppingShortsPipeline(on_progress=progress)
             pipe.run_all(
                 product_dir=self.product_dir,
                 product_data=self.product_data,
@@ -279,12 +334,19 @@ class VideoBuildDialog(QtWidgets.QDialog):
                 build_json=True,
                 build_images=True,
                 build_movies=True,
+                merge=True,
                 skip_if_exists=True,
             )
-            self._append_log("[pipe] 전체 실행 종료")
-            self._refresh_preview_if_exists()
-        except Exception as e:
-            self._append_log(f"❌ 전체 실행 실패: {e}")
+            return "OK"
+
+        def done(ok, res, err):
+            if ok:
+                self._append_log("✅ 전체 실행 완료!")
+                self._refresh_preview_if_exists()
+            else:
+                self._append_log(f"❌ 전체 실행 실패: {err}")
+
+        run_job_with_progress_async(self, "전체 실행", job, on_done=done)
 
 
 class ShoppingWidget(QtWidgets.QWidget):

@@ -9,7 +9,7 @@ import os
 from app.utils import ensure_dir, load_json
 from app.settings import BASE_DIR, I2V_WORKFLOW, FFMPEG_EXE, USE_HWACCEL, FINAL_OUT, COMFY_HOST
 # music_gen에 있는 견고한 함수들을 우선 재사용 (가능할 때)
-from app.utils import _submit_and_wait as _submit_and_wait_comfy_func
+from app.audio_sync import _submit_and_wait as _submit_and_wait_comfy_func
 try:
     from app.audio_sync import (
         _http_get as _http_get_audio,
