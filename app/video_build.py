@@ -9,15 +9,14 @@ import os
 from app.utils import ensure_dir, load_json
 from app.settings import BASE_DIR, I2V_WORKFLOW, FFMPEG_EXE, USE_HWACCEL, FINAL_OUT, COMFY_HOST
 # music_gen에 있는 견고한 함수들을 우선 재사용 (가능할 때)
+from app.utils import _submit_and_wait as _submit_and_wait_comfy_func
 try:
     from app.audio_sync import (
-        _submit_and_wait as _submit_and_wait_comfy,
         _http_get as _http_get_audio,
         _load_workflow_graph as _load_workflow_graph_audio,
         _find_nodes_by_class_contains as _find_nodes_by_class_contains_audio,
     )
 except Exception:  # 단독 실행/상대 경로일 수도 있으니 폴백 제공
-    _submit_and_wait_comfy = None
     _http_get_audio = None
     _load_workflow_graph_audio = None
     _find_nodes_by_class_contains_audio = None
@@ -29,11 +28,12 @@ from typing import Dict, List, Tuple, Optional, Any, Callable, Union, SupportsFl
 from textwrap import dedent
 import re
 import json
-from app.audio_sync import _submit_and_wait as _submit_and_wait_comfy_func
+
 from app.utils import (
     load_json as _load_json_func,
     ensure_dir as _ensure_dir_func,
 )
+
 from app.settings import JSONS_DIR
 from pathlib import Path
 
@@ -45,7 +45,7 @@ import shutil
 import requests
 import random as _img_seed_random
 from app import settings as settings_obj
-from app.audio_sync import _submit_and_wait as _wait_core
+
 from app.settings import CHARACTER_DIR, COMFY_INPUT_DIR
 
 from app.utils import load_json, save_json
@@ -103,36 +103,8 @@ def _find_nodes_by_class_contains(graph: dict, needle: str) -> List[Tuple[str, d
             out.append((str(nid), node))
     return out
 
-# ── Comfy 제출/폴링(폴백) ────────────────────────────────────────────────────
-def _submit_and_wait(base_url: str, graph: Dict[str, Any], *, timeout: float, poll: float, on_progress=None) -> Dict[str, Any]:
-    # 기존 모듈에 동일 함수가 있으면 그걸 사용하세요.
-    # 없을 때만 이 간이 구현을 사용합니다.
-    import urllib.request
-    import urllib.error
-
-    def _log(stage: str, msg: str) -> None:
-        if on_progress:
-            on_progress({"stage": stage, "msg": msg})
-
-    data_bytes = json.dumps({"prompt": graph}).encode("utf-8")
-    req = urllib.request.Request(f"{base_url}/prompt", data=data_bytes, headers={"Content-Type": "application/json"})
-    _log("post", "POST /prompt")
-    try:
-        with urllib.request.urlopen(req) as resp:
-            resp.read()
-    except urllib.error.HTTPError as e:
-        raise RuntimeError(f"Comfy POST 실패: {e}") from e
-
-    # 파일 생성 폴링은 호출부에서 실제 png 경로를 감시하므로 여기선 대기만
-    elapsed = 0.0
-    while elapsed < float(timeout):
-        time.sleep(float(poll))
-        elapsed += float(poll)
-        _log("wait", f"elapsed={int(elapsed)}s")
-    return {}  # history placeholder
 
 
-# [추가] 오디오 자르기 헬퍼 함수
 # [수정] 오디오 자르기 헬퍼 함수 (정확도 우선 모드 - Output Seeking)
 def _slice_audio_segment(
         src_audio: Path,
@@ -3051,7 +3023,7 @@ def build_missing_images_from_story(
             except (RuntimeError, ValueError, TypeError) as e_relay_callback:
                 print(f"[WARN] _relay_progress callback failed: {e_relay_callback}", flush=True)
 
-        return _wait_core(url, gdict, timeout=timeout, poll=poll, on_progress=_relay_progress)
+        return _submit_and_wait_comfy_func(url, gdict, timeout=timeout, poll=poll, on_progress=_relay_progress)
 
     # --- [5. 씬 루프] ---
     created: List[_Path] = []
