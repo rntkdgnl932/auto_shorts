@@ -10,20 +10,22 @@ import random
 import requests
 import time
 import uuid
+import subprocess
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any, Callable, Dict, List, Optional, Tuple
+from typing import Any, Callable, Dict, List, Optional
 
-# 유틸리티 임포트 (외부 의존성 최소화)
+# 유틸리티 임포트
 from app.utils import (
     AI,
     load_json,
     save_json,
-    ensure_dir
+    ensure_dir,
+    audio_duration_sec
 )
 from app import settings
 
-# [중요] 영상 생성/병합 관련 함수는 video_build.py의 것을 사용
+# 영상 생성/병합 관련 함수
 from app.video_build import (
     build_shots_with_i2v,
     concatenate_scene_clips,
@@ -34,24 +36,8 @@ def _now_str() -> str:
     return datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
 
 
-def _sanitize_name(name: str) -> str:
-    name = (name or "").strip()
-    name = re.sub(r"[\\/:*?\"<>|]", "_", name).strip()
-    if len(name) > 120:
-        name = name[:120].rstrip("_")
-    return name or "untitled"
-
-
-def _ensure_dirs(product_dir: Path) -> Dict[str, Path]:
-    imgs = product_dir / "imgs"
-    clips = product_dir / "clips"
-    imgs.mkdir(parents=True, exist_ok=True)
-    clips.mkdir(parents=True, exist_ok=True)
-    return {"imgs": imgs, "clips": clips}
-
-
 # -----------------------------------------------------------------------------
-# [New] ComfyUI 제출 및 대기 함수 (이 파일 전용 독립 구현)
+# [New] ComfyUI 제출 및 대기 함수 (독립형)
 # -----------------------------------------------------------------------------
 def _submit_and_wait_local(
         base_url: str,
@@ -60,53 +46,124 @@ def _submit_and_wait_local(
         poll: float = 2.0,
         on_progress: Optional[Callable[[Dict[str, Any]], None]] = None
 ) -> dict:
-    """
-    ComfyUI에 워크플로우를 제출하고 완료될 때까지 기다립니다.
-    utils.py의 _dlog에 의존하지 않고 독립적으로 동작합니다.
-    """
+    """ComfyUI 워크플로우 제출 및 대기"""
     client_id = str(uuid.uuid4())
     payload = {"prompt": graph, "client_id": client_id}
 
-    # 1. 제출 (/prompt)
     try:
         resp = requests.post(f"{base_url}/prompt", json=payload, timeout=30)
         resp.raise_for_status()
-        res_json = resp.json()
-        prompt_id = res_json.get("prompt_id")
-        if not prompt_id:
-            raise RuntimeError(f"프롬프트 ID를 받지 못했습니다: {res_json}")
+        prompt_id = resp.json().get("prompt_id")
     except Exception as e:
         raise RuntimeError(f"ComfyUI 제출 실패: {e}")
 
-    # 2. 대기 (/history)
     start_t = time.time()
-
     while True:
         elapsed = time.time() - start_t
         if elapsed > timeout:
             raise TimeoutError(f"ComfyUI 시간 초과 ({elapsed:.1f}s)")
 
-        # 히스토리 확인 (완료 여부)
         try:
             h_resp = requests.get(f"{base_url}/history/{prompt_id}", timeout=10)
             if h_resp.status_code == 200:
                 h_data = h_resp.json()
-                # history에 prompt_id가 키로 존재하면 완료된 것
                 if prompt_id in h_data:
                     return h_data[prompt_id]
         except Exception:
-            pass  # 일시적 네트워크 오류 등은 무시하고 계속 대기
-
-        # 진행률 로깅 (선택)
-        if on_progress and int(elapsed) % 5 == 0:
-            # 너무 빈번한 호출 방지
             pass
-
         time.sleep(poll)
 
 
 # -----------------------------------------------------------------------------
-# 1. Shopping 전용 이미지 생성 함수 (Z-Image 워크플로우 독립 실행)
+# 1. Zonos TTS 생성 함수
+# -----------------------------------------------------------------------------
+def generate_tts_zonos(
+        text: str,
+        out_path: Path,
+        ref_audio: Path,
+        comfy_host: str = "http://127.0.0.1:8188"
+) -> bool:
+    """
+    Zonos 워크플로우(who_voice.json)를 사용하여 TTS 생성
+    """
+    if not text:
+        return False
+
+    wf_path = Path(settings.JSONS_DIR) / "who_voice.json"
+    if not wf_path.exists():
+        # 폴백 경로
+        wf_path = Path(r"C:\my_games\shorts_make\app\jsons\who_voice.json")
+
+    if not wf_path.exists():
+        print(f"❌ TTS 워크플로우 없음: {wf_path}")
+        return False
+
+    try:
+        with open(wf_path, "r", encoding="utf-8") as f:
+            graph = json.load(f)
+    except Exception as e:
+        print(f"❌ 워크플로우 로드 실패: {e}")
+        return False
+
+    # 참조 오디오 준비
+    if not ref_audio.exists():
+        print(f"❌ 참조 오디오 없음: {ref_audio}")
+        return False
+
+    comfy_input_dir = Path(settings.COMFY_INPUT_DIR)
+    comfy_input_dir.mkdir(parents=True, exist_ok=True)
+
+    # 중복 방지 파일명
+    ref_copy_name = f"ref_{uuid.uuid4().hex[:8]}{ref_audio.suffix}"
+    dst_ref = comfy_input_dir / ref_copy_name
+    shutil.copy2(ref_audio, dst_ref)
+
+    # 노드 값 주입 (who_voice.json 구조 가정)
+    # Node 24: Zonos Generate, Node 12: Load Audio
+    if "24" in graph:
+        graph["24"]["inputs"]["speech"] = text
+        graph["24"]["inputs"]["seed"] = random.randint(1, 2 ** 32)
+    else:
+        # ID가 다를 경우 class_type으로 찾기
+        for nid, node in graph.items():
+            if "Zonos" in node.get("class_type", ""):
+                node["inputs"]["speech"] = text
+                node["inputs"]["seed"] = random.randint(1, 2 ** 32)
+                break
+
+    if "12" in graph:
+        graph["12"]["inputs"]["audio"] = ref_copy_name
+    else:
+        for nid, node in graph.items():
+            if node.get("class_type") == "LoadAudio":
+                node["inputs"]["audio"] = ref_copy_name
+                break
+
+    # 실행 및 다운로드
+    try:
+        res = _submit_and_wait_local(comfy_host, graph, timeout=300)
+
+        outputs = res.get("outputs", {})
+        for nid, out_d in outputs.items():
+            if "audio" in out_d:
+                for item in out_d["audio"]:
+                    fname = item["filename"]
+                    params = {"filename": fname, "subfolder": item.get("subfolder", ""),
+                              "type": item.get("type", "output")}
+                    resp = requests.get(f"{comfy_host}/view", params=params)
+                    if resp.status_code == 200:
+                        ensure_dir(out_path.parent)
+                        with open(out_path, "wb") as f:
+                            f.write(resp.content)
+                        return True
+        return False
+    except Exception as e:
+        print(f"TTS 생성 실패: {e}")
+        return False
+
+
+# -----------------------------------------------------------------------------
+# 2. 이미지 생성 함수 (Z-Image)
 # -----------------------------------------------------------------------------
 def build_shopping_images_z_image(
         video_json_path: str | Path,
@@ -114,203 +171,98 @@ def build_shopping_images_z_image(
         ui_width: int = 720,
         ui_height: int = 1280,
         steps: int = 28,
-        timeout_sec: int = 900,
-        poll_sec: float = 2.0,
-        workflow_path: str | Path | None = None,
-        on_progress: Optional[Callable[[Dict[str, Any]], None]] = None,
+        on_progress: Optional[Callable[[Dict], None]] = None
 ) -> List[Path]:
-    """
-    shopping_video_build.py 내부에 정의된 쇼핑 전용 이미지 생성 함수.
-    - video_shopping.json을 읽음
-    - Z-Image-lora.json 워크플로우 사용
-    - PreviewImage -> SaveImage 자동 변환 처리 포함
-    - _submit_and_wait_local 사용으로 외부 의존성 제거
-    """
-
-    # 1. 경로 설정 및 JSON 로드
-    vpath = Path(video_json_path).resolve()
+    vpath = Path(video_json_path)
     product_dir = vpath.parent
     imgs_dir = ensure_dir(product_dir / "imgs")
 
-    if not vpath.exists():
-        raise FileNotFoundError(f"JSON 파일이 없습니다: {vpath}")
-
-    video_doc = load_json(vpath, {}) or {}
+    video_doc = load_json(vpath, {})
     scenes = video_doc.get("scenes", [])
-    if not scenes:
-        if on_progress:
-            try:
-                on_progress({"msg": "⚠ 생성할 씬(scenes)이 없습니다."})
-            except:
-                pass
+
+    wf_path = Path(settings.JSONS_DIR) / "Z-Image-lora.json"
+    if not wf_path.exists():
+        wf_path = Path(r"C:\my_games\shorts_make\app\jsons\Z-Image-lora.json")
+
+    if not wf_path.exists():
+        if on_progress: on_progress({"msg": f"❌ 워크플로우 파일 없음: {wf_path}"})
         return []
 
-    # 2. 워크플로우 로드
-    if workflow_path:
-        wf_path = Path(workflow_path)
-    else:
-        # 기본값: app/jsons/Z-Image-lora.json
-        wf_path = Path(settings.JSONS_DIR) / "Z-Image-lora.json"
-        if not wf_path.exists():
-            # 폴백 경로 체크
-            fallback = Path(r"C:\my_games\shorts_make\app\jsons\Z-Image-lora.json")
-            if fallback.exists():
-                wf_path = fallback
-            else:
-                raise FileNotFoundError(f"워크플로우 파일을 찾을 수 없습니다: {wf_path}")
+    with open(wf_path, "r", encoding="utf-8") as f:
+        graph_origin = json.load(f)
 
-    try:
-        with open(wf_path, "r", encoding="utf-8") as f:
-            graph_origin = json.load(f)
-    except Exception as e:
-        raise RuntimeError(f"워크플로우 로드 실패: {e}")
-
-    # 3. ComfyUI 설정
     comfy_host = getattr(settings, "COMFY_HOST", "http://127.0.0.1:8188").rstrip("/")
-    base_url = comfy_host
+    created = []
 
-    # 진행률 알림 헬퍼
-    def _notify(msg):
-        if on_progress:
-            try:
-                on_progress({"msg": msg})
-            except:
-                pass
+    for sc in scenes:
+        sid = sc.get("id")
+        target_file = imgs_dir / f"{sid}.png"
 
-    _notify(f"[Img] 워크플로우: {wf_path.name}")
-    _notify(f"[Img] 대상 씬: {len(scenes)}개")
-
-    created_files = []
-
-    # 4. 씬 루프
-    for i, sc in enumerate(scenes):
-        scene_id = sc.get("id", f"{i:03d}")
-
-        # 목표 파일 경로
-        target_file_name = f"{scene_id}.png"
-        target_path = imgs_dir / target_file_name
-
-        # 이미 존재하면 스킵 (video.json에 기록된 경로 혹은 파일 존재 여부 확인)
-        existing_file = sc.get("img_file")
-        if existing_file and Path(existing_file).exists():
-            _notify(f"[Img] 스킵(이미 존재): {scene_id}")
-            continue
-        if target_path.exists() and target_path.stat().st_size > 0:
-            _notify(f"[Img] 스킵(파일 있음): {target_path.name}")
-            # JSON 업데이트
-            sc["img_file"] = str(target_path)
+        # 파일 있으면 스킵
+        if target_file.exists() and target_file.stat().st_size > 0:
+            if on_progress: on_progress({"msg": f"[Img] 스킵(존재): {sid}"})
+            sc["img_file"] = str(target_file)
             continue
 
-        _notify(f"[Img] 생성 시작: {scene_id} ...")
+        prompt = sc.get("prompt_img") or sc.get("prompt", "")
+        neg = sc.get("prompt_negative", "")
 
-        # 워크플로우 복제
+        if not prompt:
+            if on_progress: on_progress({"msg": f"[Img] 프롬프트 없음(스킵): {sid}"})
+            continue
+
+        if on_progress: on_progress({"msg": f"[Img] 생성 요청: {sid}..."})
+
         graph = json.loads(json.dumps(graph_origin))
 
-        # (A) 프롬프트 주입
-        # 쇼핑 데이터는 'prompt_img' 혹은 'prompt'를 사용
-        prompt_text = sc.get("prompt_img") or sc.get("prompt") or ""
-        neg_text = sc.get("prompt_negative") or ""
-
-        # 노드 찾기 및 값 주입
         for nid, node in graph.items():
             ctype = node.get("class_type", "")
             inputs = node.get("inputs", {})
-            meta_title = str(node.get("_meta", {}).get("title", "")).lower()
+            title = str(node.get("_meta", {}).get("title", "")).lower()
 
-            # 텍스트 입력 노드 (CLIPTextEncode)
             if ctype == "CLIPTextEncode":
-                # Z-Image-lora.json 구조상 6번이 Positive, 92번이 Negative일 가능성이 높음
                 if nid == "6":
-                    inputs["text"] = prompt_text
-                elif nid == "92" or "negative" in meta_title:
-                    inputs["text"] = neg_text
-                elif "positive" in meta_title:
-                    inputs["text"] = prompt_text
+                    inputs["text"] = prompt
+                elif nid == "92" or "negative" in title:
+                    inputs["text"] = neg
+                elif "positive" in title:
+                    inputs["text"] = prompt
 
-            # (B) 해상도 주입 (EmptySD3LatentImage or EmptyLatentImage)
             if "LatentImage" in ctype:
-                if "width" in inputs: inputs["width"] = int(ui_width)
-                if "height" in inputs: inputs["height"] = int(ui_height)
+                if "width" in inputs: inputs["width"] = ui_width
+                if "height" in inputs: inputs["height"] = ui_height
 
-            # (C) 시드 주입 (KSampler)
             if ctype == "KSampler" and "seed" in inputs:
-                inputs["seed"] = random.randint(1, 9999999999)
-                if "steps" in inputs: inputs["steps"] = int(steps)
+                inputs["seed"] = random.randint(1, 10 ** 9)
+                if "steps" in inputs: inputs["steps"] = steps
 
-        # (D) 저장 노드 처리 (PreviewImage -> SaveImage 변환)
-        save_node_found = False
-        # 딕셔너리 크기가 변하지 않도록 list(items) 사용
-        for nid, node in list(graph.items()):
-            ctype = node.get("class_type", "")
-
-            if ctype == "SaveImage":
-                save_node_found = True
-                node["inputs"]["filename_prefix"] = "ShopImg"
-
-            elif ctype == "PreviewImage":
-                # PreviewImage를 SaveImage로 변환
+            if ctype == "PreviewImage":
                 node["class_type"] = "SaveImage"
                 node.setdefault("inputs", {})["filename_prefix"] = "ShopImg"
-                save_node_found = True
 
-        if not save_node_found:
-            _notify("⚠ 저장 노드(SaveImage)를 찾을 수 없어 생성 실패 가능성 있음.")
-
-        # 5. ComfyUI 요청 및 대기 (로컬 함수 사용)
         try:
-            # 여기서 _submit_and_wait_local 사용 -> _dlog 에러 방지
-            res = _submit_and_wait_local(
-                base_url,
-                graph,
-                timeout=timeout_sec,
-                poll=poll_sec,
-                on_progress=on_progress
-            )
-
-            # 6. 결과 다운로드
+            res = _submit_and_wait_local(comfy_host, graph, on_progress=on_progress)
             outputs = res.get("outputs", {})
-            file_saved = False
-
-            for nid, out_data in outputs.items():
-                images = out_data.get("images", [])
-                for img_info in images:
-                    fname = img_info.get("filename")
-                    sfolder = img_info.get("subfolder", "")
-                    itype = img_info.get("type", "output")
-
-                    # 이미지 다운로드
-                    params = {"filename": fname, "subfolder": sfolder, "type": itype}
-                    resp = requests.get(f"{base_url}/view", params=params)
-
-                    if resp.status_code == 200:
-                        with open(target_path, "wb") as f:
-                            f.write(resp.content)
-                        file_saved = True
-                        break  # 하나만 저장하면 됨
-                if file_saved:
+            for _, out_d in outputs.items():
+                for img in out_d.get("images", []):
+                    fname = img["filename"]
+                    resp = requests.get(f"{comfy_host}/view", params={"filename": fname, "type": img["type"]})
+                    with open(target_file, "wb") as f:
+                        f.write(resp.content)
+                    sc["img_file"] = str(target_file)
+                    created.append(target_file)
                     break
-
-            if file_saved:
-                _notify(f"[Img] 저장 완료: {target_file_name}")
-                sc["img_file"] = str(target_path)
-                created_files.append(target_path)
-            else:
-                _notify(f"[Img] ❌ 생성 실패 (결과물 못 찾음): {scene_id}")
-
+                break
         except Exception as e:
-            _notify(f"[Img] ❌ 에러 발생: {e}")
-            continue
+            if on_progress: on_progress({"msg": f"❌ 생성 에러({sid}): {e}"})
 
-    # 7. JSON 저장 (이미지 경로 업데이트)
     save_json(vpath, video_doc)
-    _notify(f"[Img] 전체 완료. 생성된 이미지: {len(created_files)}장")
-    return created_files
+    return created
 
 
 # -----------------------------------------------------------------------------
-# 2. 클래스 정의
+# 3. 옵션 데이터 클래스
 # -----------------------------------------------------------------------------
-
 @dataclass
 class BuildOptions:
     scene_count: int = 6
@@ -320,21 +272,265 @@ class BuildOptions:
     allow_fallback_rule: bool = True
 
 
-class ShoppingImageGenerator:
-    """
-    쇼핑 전용 이미지 생성기
-    - build_shopping_images_z_image 함수를 호출합니다.
-    """
+# -----------------------------------------------------------------------------
+# 4. JSON 빌더 (AI 기획 + 음성 생성 + 프롬프트 상세화)
+# -----------------------------------------------------------------------------
+class ShoppingVideoJsonBuilder:
+    def __init__(self, on_progress: Optional[Callable[[str], None]] = None):
+        self.on_progress = on_progress or (lambda msg: None)
+        self.ai = AI()
 
+    def create_draft(self, product_dir: str | Path, product_data: Dict[str, Any], options: BuildOptions) -> Path:
+        """[1단계] 기획 초안 (성별 판단 및 4요소 시나리오)"""
+        p_dir = Path(product_dir)
+        vpath = p_dir / "video_shopping.json"
+
+        product_name = product_data.get("product_name", "상품명 없음")
+        desc = product_data.get("description") or product_data.get("summary_source") or ""
+
+        self.on_progress(f"[Draft] AI 기획 시작 (상품: {product_name})...")
+
+        system_prompt = (
+            "당신은 숏폼 커머스 영상 기획 전문가입니다. "
+            "상품 정보를 분석하여 **내레이션 성우의 성별(male/female)**을 결정하고, "
+            "시각(화면), 청각(내레이션), 자막이 유기적으로 연결된 기획안을 작성하세요.\n"
+            "결과는 오직 **JSON 포맷**으로만 출력해야 합니다."
+        )
+
+        user_prompt = f"""
+        [상품 정보]
+        - 상품명: {product_name}
+        - 설명: {desc}
+
+        [제작 가이드]
+        1. 총 장면 수: {options.scene_count}개
+        2. 스타일: {options.style}
+        3. 후크 강도: {options.hook_level}/5
+
+        [성별 판단 기준]
+        - 여성(female): 뷰티, 패션, 육아, 주방, 감성, 부드러운 톤
+        - 남성(male): IT, 자동차, 공구, 운동, 신뢰/뉴스 톤, 웅장함
+
+        [출력 포맷 (JSON)]
+        {{
+            "meta": {{ 
+                "title": "영상 제목", 
+                "voice_gender": "male 또는 female", 
+                "tone": "전체적인 톤앤매너" 
+            }},
+            "scenes": [
+                {{
+                    "id": "001",
+                    "banner": "상단 배너 문구 (없으면 null)",
+                    "prompt": "화면 묘사 (AI가 그림을 그릴 수 있게 구체적으로)",
+                    "narration": "성우 내레이션 대본 (구어체)",
+                    "subtitle": "화면 하단 핵심 자막"
+                }},
+                ...
+            ]
+        }}
+        """
+
+        try:
+            resp_text = self.ai.ask_smart(system_prompt, user_prompt, prefer="openai")
+            data = self._safe_json_parse(resp_text)
+        except Exception as e:
+            self.on_progress(f"❌ 초안 생성 실패: {e}")
+            raise
+
+        # JSON 구조 조립
+        final_json = {
+            "schema": "shopping_shorts_v2",
+            "style": options.style,
+            "product": product_data,
+            "meta": data.get("meta", {}),
+            "defaults": {"image": {"width": 720, "height": 1280}, "movie": {"fps": options.fps}},
+            "audit": {"created_at": _now_str(), "step": "draft"},
+            "scenes": []
+        }
+
+        # 폴더 준비
+        imgs_dir = p_dir / "imgs"
+        clips_dir = p_dir / "clips"
+        voice_dir = p_dir / "voice"
+
+        imgs_dir.mkdir(parents=True, exist_ok=True)
+        clips_dir.mkdir(parents=True, exist_ok=True)
+        voice_dir.mkdir(parents=True, exist_ok=True)
+
+        for idx, sc in enumerate(data.get("scenes", [])):
+            sid = sc.get("id") or f"{idx + 1:03d}"
+            new_scene = {
+                "id": sid,
+                "banner": sc.get("banner"),
+                "prompt": sc.get("prompt", ""),
+                "narration": sc.get("narration", ""),
+                "subtitle": sc.get("subtitle", ""),
+                "seconds": 0,  # 상세화 단계에서 채움
+                "prompt_img": "",
+                "prompt_movie": "",
+                "prompt_negative": "",
+                "img_file": str(imgs_dir / f"{sid}.png"),
+                "movie_file": str(clips_dir / f"{sid}.mp4"),
+                "voice_file": str(voice_dir / f"{sid}.wav")
+            }
+            final_json["scenes"].append(new_scene)
+
+        save_json(vpath, final_json)
+        self.on_progress(f"[Draft] 초안 완료. 성별: {final_json['meta'].get('voice_gender', 'unknown')}")
+        return vpath
+
+    def enrich_video_json(self, video_json_path: str | Path, product_data: Dict[str, Any]) -> Path:
+        """
+        [3단계] 상세화 (Enrich)
+        1. 내레이션 생성 (TTS) -> seconds 확정
+        2. 총 시간 계산 -> meta['total_duration']
+        3. 비주얼 프롬프트 및 BGM 태그 생성 (AI)
+        """
+        vpath = Path(video_json_path)
+        p_dir = vpath.parent
+        voice_dir = ensure_dir(p_dir / "voice")
+
+        data = load_json(vpath, {})
+        scenes = data.get("scenes", [])
+
+        # 1. 성별에 따른 참조 음성 선택
+        gender = data.get("meta", {}).get("voice_gender", "female").lower()
+        if gender == "male":
+            ref_voice = Path(r"C:\my_games\shorts_make\voice\남자성우1.mp3")
+        else:
+            ref_voice = Path(r"C:\my_games\shorts_make\voice\꼬꼬 음성.m4a")
+
+        if not ref_voice.exists():
+            self.on_progress(f"⚠️ 참조 음성 파일 없음: {ref_voice} (기본값 사용 주의)")
+
+        self.on_progress(f"[Enrich] 1/2단계: 음성 생성 ({gender}) 및 시간 측정...")
+        comfy_host = getattr(settings, "COMFY_HOST", "http://127.0.0.1:8188")
+
+        total_dur = 0.0
+
+        for sc in scenes:
+            sid = sc["id"]
+            narr = sc.get("narration", "").strip()
+            v_path = Path(sc.get("voice_file") or str(voice_dir / f"{sid}.wav"))
+
+            # 내레이션 없으면 기본 3초
+            if not narr:
+                sc["seconds"] = 3
+                total_dur += 3
+                continue
+
+            # 파일이 없거나 0바이트면 생성 시도
+            if not v_path.exists() or v_path.stat().st_size == 0:
+                self.on_progress(f"   🎙️ Scene {sid} 음성 생성...")
+                success = generate_tts_zonos(narr, v_path, ref_voice, comfy_host)
+                if not success:
+                    sc["seconds"] = 4
+                    total_dur += 4
+                    continue
+
+            # 길이 측정
+            dur = audio_duration_sec(v_path)
+            if dur > 0:
+                sc["seconds"] = round(dur + 0.5, 2)  # 0.5초 여유
+            else:
+                sc["seconds"] = 4
+
+            sc["voice_file"] = str(v_path)
+            total_dur += sc["seconds"]
+
+        # 총 시간 저장
+        data.setdefault("meta", {})["total_duration"] = round(total_dur, 2)
+        save_json(vpath, data)
+
+        # 2. 프롬프트 및 BGM 태그 상세화
+        self.on_progress("[Enrich] 2/2단계: 비주얼 프롬프트 및 BGM 태그 작성...")
+
+        scene_texts = []
+        for sc in scenes:
+            scene_texts.append(f"- Scene {sc['id']} ({sc['seconds']}초): {sc.get('prompt')}")
+
+        sys_p = (
+            "당신은 ComfyUI 영상 및 오디오 기획 전문가입니다. "
+            "주어진 시나리오를 바탕으로 **비주얼 프롬프트**와 **Ace-Step BGM 태그**를 작성하세요.\n"
+            "**시간(seconds)은 이미 확정되었으니 수정하지 마세요.**\n"
+            "반드시 JSON 포맷으로 출력해야 합니다."
+        )
+
+        user_p = f"""
+        [작업 요청]
+        1. 각 장면의 `prompt_img` (실사, 8k, 구체적 묘사)와 `prompt_movie` (카메라 무빙)를 작성하세요.
+        2. 전체 영상 분위기에 어울리는 **BGM 태그(bgm_tags)**를 3~5개 선정하여 `meta`에 추가하세요.
+           (선택지: electronic, pop, rock, cinematic, emotional, fast tempo, slow tempo, piano, happy, dark 등)
+
+        [입력 시나리오]
+        {chr(10).join(scene_texts)}
+
+        [출력 포맷 (JSON)]
+        {{
+            "meta": {{
+                "bgm_tags": ["tag1", "tag2", "tag3"]
+            }},
+            "scenes": [
+                {{
+                    "id": "001",
+                    "prompt_img": "...",
+                    "prompt_movie": "...",
+                    "prompt_negative": "..."
+                }},
+                ...
+            ]
+        }}
+        """
+
+        try:
+            resp = self.ai.ask_smart(sys_p, user_p, prefer="openai")
+            enriched = self._safe_json_parse(resp)
+        except Exception as e:
+            self.on_progress(f"❌ 상세화 AI 실패: {e}")
+            raise
+
+        # 결과 병합
+        if "meta" in enriched and "bgm_tags" in enriched["meta"]:
+            data["meta"]["bgm_tags"] = enriched["meta"]["bgm_tags"]
+
+        en_map = {s["id"]: s for s in enriched.get("scenes", [])}
+        for sc in scenes:
+            if sc["id"] in en_map:
+                tgt = en_map[sc["id"]]
+                sc["prompt_img"] = tgt.get("prompt_img", "")
+                sc["prompt_movie"] = tgt.get("prompt_movie", "")
+                sc["prompt_negative"] = tgt.get("prompt_negative", "")
+                # seconds는 덮어쓰지 않음 (오디오 기준 유지)
+
+        data["audit"]["enriched_at"] = _now_str()
+        data["audit"]["step"] = "enriched"
+
+        save_json(vpath, data)
+        self.on_progress(f"[Enrich] 상세화 완료. (총 길이: {total_dur:.1f}초)")
+        return vpath
+
+    def _safe_json_parse(self, text: str) -> Dict:
+        try:
+            text = re.sub(r"```json", "", text, flags=re.I).replace("```", "")
+            return json.loads(text)
+        except:
+            s, e = text.find("{"), text.rfind("}")
+            if s != -1 and e != -1:
+                return json.loads(text[s:e + 1])
+            raise ValueError("Invalid JSON response")
+
+
+# -----------------------------------------------------------------------------
+# 5. 이미지 생성기
+# -----------------------------------------------------------------------------
+class ShoppingImageGenerator:
     def __init__(self, on_progress: Optional[Callable[[str], None]] = None):
         self.on_progress = on_progress or (lambda msg: None)
 
     def generate_images(self, video_json_path: str | Path, skip_if_exists: bool = True) -> None:
-        # 진행률 콜백 래퍼
-        def _prog_cb(d: dict):
-            msg = d.get("msg", "")
-            if msg:
-                self.on_progress(msg)
+        def _cb(d):
+            self.on_progress(d.get("msg", ""))
 
         try:
             build_shopping_images_z_image(
@@ -342,73 +538,45 @@ class ShoppingImageGenerator:
                 ui_width=720,
                 ui_height=1280,
                 steps=28,
-                on_progress=_prog_cb
+                on_progress=_cb
             )
         except Exception as e:
-            self.on_progress(f"❌ 이미지 생성 중 오류: {e}")
+            self.on_progress(f"❌ 이미지 생성 오류: {e}")
             raise e
 
 
+# -----------------------------------------------------------------------------
+# 6. 영상 생성/병합기
+# -----------------------------------------------------------------------------
 class ShoppingMovieGenerator:
-    """
-    쇼핑 전용 영상(I2V) 생성 및 병합기
-    - video_build.build_shots_with_i2v는 폴더 내 'video.json'을 자동으로 찾습니다.
-    - 따라서 'video_shopping.json'을 'video.json'으로 잠시 복사해두고 작업을 수행합니다.
-    - [중요] duration이 없거나 0인 경우 강제로 4.0초를 할당하여 스킵되지 않도록 함
-    """
-
     def __init__(self, on_progress: Optional[Callable[[str], None]] = None):
         self.on_progress = on_progress or (lambda msg: None)
 
     def generate_movies(self, video_json_path: str | Path, skip_if_exists: bool = True, fps: int = 24) -> None:
         vpath = Path(video_json_path)
         project_dir = vpath.parent
-
-        # 호환성을 위한 임시 파일 경로 (video.json)
         temp_video_json = project_dir / "video.json"
 
-        self.on_progress(f"[Movie] 준비: {vpath.name} -> video.json 복사 (호환성 확보)")
+        self.on_progress(f"[Movie] I2V 준비: {vpath.name} -> video.json 복사")
+
+        data = load_json(vpath, {})
+        # duration 보정 (없으면 seconds 사용)
+        for sc in data.get("scenes", []):
+            if float(sc.get("duration", 0)) <= 0:
+                sc["duration"] = float(sc.get("seconds", 4.0))
+
+        save_json(temp_video_json, data)
+
+        def _cb(d):
+            self.on_progress(d.get("msg", ""))
 
         try:
-            # 1. JSON 로드
-            data = load_json(vpath, {})
-
-            # 2. duration 보정 (없으면 4초로 강제 설정)
-            scenes = data.get("scenes", [])
-            for sc in scenes:
-                dur = float(sc.get("duration", 0))
-                if dur <= 0:
-                    sc["duration"] = 4.0
-
-            # 3. video.json으로 저장 (shutil.copy 대신 수정된 데이터 저장)
-            save_json(temp_video_json, data)
-
-            # 4. 진행률 콜백 래퍼
-            def _prog_cb(d: dict):
-                msg = d.get("msg", "")
-                if msg:
-                    self.on_progress(msg)
-
-            # 5. I2V 실행 (video_build.py 함수 이용)
-            self.on_progress(f"[Movie] 영상 생성(I2V) 시작 (FPS: {fps})...")
-
-            build_shots_with_i2v(
-                project_dir=str(project_dir),
-                total_frames=0,
-                ui_fps=fps,
-                on_progress=_prog_cb
-            )
-            self.on_progress("[Movie] 영상 생성 완료.")
-
-        except Exception as e:
-            self.on_progress(f"❌ 영상 생성 중 오류: {e}")
-            raise e
+            build_shots_with_i2v(str(project_dir), total_frames=0, ui_fps=fps, on_progress=_cb)
+            self.on_progress("[Movie] 생성 완료")
         finally:
-            # 6. 임시 파일 정리
             if temp_video_json.exists():
                 try:
                     os.remove(temp_video_json)
-                    self.on_progress("[Movie] 임시 video.json 정리 완료.")
                 except:
                     pass
 
@@ -417,43 +585,32 @@ class ShoppingMovieGenerator:
         project_dir = vpath.parent
         clips_dir = project_dir / "clips"
 
-        try:
-            data = load_json(vpath, {})
-            scenes = data.get("scenes", [])
-            if not scenes:
-                self.on_progress("⚠ 합칠 씬이 없습니다 (JSON에 scenes 비어있음).")
-                return
+        # ※ 오디오 병합(Muxing) 기능은 concatenate_scene_clips 함수 내부 혹은 별도 로직 필요.
+        # 현재는 비디오만 병합하는 것으로 호출.
+        # (추후 4단계 병합 로직 개선 시, 여기서 voice_file들을 함께 넘겨서 처리해야 함)
 
-            clip_paths = []
-            for sc in scenes:
-                sid = sc.get("id")
-                cpath = clips_dir / f"{sid}.mp4"
-                if cpath.exists() and cpath.stat().st_size > 0:
-                    clip_paths.append(cpath)
-                else:
-                    self.on_progress(f"⚠ 클립 누락(스킵): {sid}.mp4")
+        self.on_progress("[Merge] 영상 합치기...")
+        data = load_json(vpath, {})
+        clip_paths = []
+        for sc in data.get("scenes", []):
+            cpath = clips_dir / f"{sc['id']}.mp4"
+            if cpath.exists():
+                clip_paths.append(cpath)
 
-            if not clip_paths:
-                self.on_progress("❌ 병합할 유효한 클립이 하나도 없습니다.")
-                return
+        if not clip_paths:
+            self.on_progress("❌ 병합할 클립 없음")
+            return
 
-            out_path = project_dir / "final_shopping_video.mp4"
-            self.on_progress(f"[Merge] {len(clip_paths)}개 클립 병합 시작 -> {out_path.name}")
+        out_path = project_dir / "final_shopping_video.mp4"
+        ffmpeg_exe = getattr(settings, "FFMPEG_EXE", "ffmpeg")
 
-            ffmpeg_exe = getattr(settings, "FFMPEG_EXE", "ffmpeg")
-
-            concatenate_scene_clips(
-                clip_paths=clip_paths,
-                out_path=out_path,
-                ffmpeg_exe=ffmpeg_exe
-            )
-            self.on_progress(f"✅ 병합 완료: {out_path}")
-
-        except Exception as e:
-            self.on_progress(f"❌ 병합 중 오류: {e}")
-            raise e
+        concatenate_scene_clips(clip_paths, out_path, ffmpeg_exe)
+        self.on_progress(f"✅ 병합 완료: {out_path.name}")
 
 
+# -----------------------------------------------------------------------------
+# 7. 파이프라인
+# -----------------------------------------------------------------------------
 class ShoppingShortsPipeline:
     def __init__(self, on_progress: Optional[Callable[[str], None]] = None):
         self.on_progress = on_progress or (lambda msg: None)
@@ -470,66 +627,27 @@ class ShoppingShortsPipeline:
             skip_if_exists: bool = True,
     ) -> Path:
         options = options or BuildOptions()
-
-        # ShoppingVideoJsonBuilder는 같은 파일 내에 있거나 순환 참조를 피해 임포트 필요
-        from app.shopping_video_build import ShoppingVideoJsonBuilder
-
         vpath = Path(product_dir) / "video_shopping.json"
+
+        builder = ShoppingVideoJsonBuilder(self.on_progress)
 
         if build_json:
-            self.on_progress("[Pipeline] 1단계: JSON 시나리오 생성...")
-            builder = ShoppingVideoJsonBuilder(on_progress=self.on_progress)
-            vpath = builder.build(product_dir=product_dir, product_data=product_data, options=options)
+            # 1. 초안
+            if not vpath.exists():
+                vpath = builder.create_draft(product_dir, product_data, options)
+            # 2. 상세화 (음성+프롬프트+BGM태그)
+            builder.enrich_video_json(vpath, product_data)
 
         if build_images:
-            self.on_progress("[Pipeline] 2단계: 이미지 생성...")
-            img_gen = ShoppingImageGenerator(on_progress=self.on_progress)
-            img_gen.generate_images(vpath, skip_if_exists=skip_if_exists)
+            img_gen = ShoppingImageGenerator(self.on_progress)
+            img_gen.generate_images(vpath, skip_if_exists)
 
         if build_movies:
-            self.on_progress("[Pipeline] 3단계: 영상 생성 (I2V)...")
-            mov_gen = ShoppingMovieGenerator(on_progress=self.on_progress)
-            mov_gen.generate_movies(vpath, skip_if_exists=skip_if_exists, fps=int(options.fps))
+            mov_gen = ShoppingMovieGenerator(self.on_progress)
+            mov_gen.generate_movies(vpath, skip_if_exists, fps=options.fps)
 
         if merge:
-            self.on_progress("[Pipeline] 4단계: 영상 합치기...")
-            mov_gen = ShoppingMovieGenerator(on_progress=self.on_progress)
+            mov_gen = ShoppingMovieGenerator(self.on_progress)
             mov_gen.merge_movies(vpath)
 
-        self.on_progress("[Pipeline] 전체 작업 완료!")
-        return vpath
-
-
-# -----------------------------------------------------------------------------
-# 3. JSON 빌더 관련 클래스 (기존 코드 유지용)
-# -----------------------------------------------------------------------------
-@dataclass
-class VideoShoppingBuildInput:
-    product_name: str
-    product_price: str
-    summary_text: str
-    image_paths: List[str]
-
-
-class ShoppingVideoJsonBuilder:
-    def __init__(self, on_progress: Optional[Callable[[str], None]] = None):
-        self.on_progress = on_progress or (lambda msg: None)
-
-    def build(self, product_dir: str | Path, product_data: Dict[str, Any], options: BuildOptions) -> Path:
-        self.on_progress("[JSON] (기존 로직 수행 가정) video_shopping.json 생성 중...")
-        vpath = Path(product_dir) / "video_shopping.json"
-
-        # [수정] 더미 데이터 생성 시 duration을 명시적으로 넣어줍니다.
-        if not vpath.exists():
-            dummy_data = {
-                "scenes": [
-                    {"id": "001", "prompt": "test scene 1", "duration": 5.0},
-                    {"id": "002", "prompt": "test scene 2", "duration": 5.0},
-                    {"id": "003", "prompt": "test scene 3", "duration": 5.0},
-                    {"id": "004", "prompt": "test scene 4", "duration": 5.0},
-                    {"id": "005", "prompt": "test scene 5", "duration": 5.0},
-                    {"id": "006", "prompt": "test scene 6", "duration": 5.0}
-                ]
-            }
-            save_json(vpath, dummy_data)
         return vpath

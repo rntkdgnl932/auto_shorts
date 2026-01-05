@@ -10,14 +10,18 @@ import re
 from pathlib import Path
 from PyQt5 import QtWidgets, QtCore, QtGui
 
-from app.utils import run_job_with_progress_async, sanitize_title
+from app.utils import (
+    run_job_with_progress_async,
+    sanitize_title,
+    load_json,   # <─ 추가
+    save_json    # <─ 추가
+)
 
 from app.issue_list_builder import (
     save_issue_list_for_shopping_all,
     save_issue_list_for_shopping_ai_b_from_a,
 )
 
-from app.utils import sanitize_title
 
 
 from app.shopping_video_build import (
@@ -28,14 +32,419 @@ from app.shopping_video_build import (
     BuildOptions,
 )
 
-from app.shopping_video_build import ShoppingVideoJsonBuilder, VideoShoppingBuildInput
+
+# [shopping.py] VideoBuildDialog 클래스 위쪽에 추가
+
+class SceneEditDialog(QtWidgets.QDialog):
+    """
+    video_shopping.json의 각 씬별 기획 4요소(Banner, Prompt, Narration, Subtitle)를 수정하는 창
+    """
+
+    def __init__(self, json_path: str, parent=None):
+        super().__init__(parent)
+        self.setWindowTitle("시나리오 초안 수정 (기획 4요소)")
+        self.resize(850, 700)
+        self.json_path = Path(json_path)
+
+        # JSON 로드
+        self.data = load_json(self.json_path, {})
+        self.scenes = self.data.get("scenes", [])
+
+        # 메인 레이아웃
+        layout = QtWidgets.QVBoxLayout(self)
+
+        # 안내 문구
+        lbl_info = QtWidgets.QLabel(
+            "각 장면(Scene)의 구성을 수정하세요.\n"
+            "여기서 작성된 '내레이션'은 음성 합성(TTS)에, '자막'은 영상 오버레이에 사용됩니다."
+        )
+        lbl_info.setStyleSheet(
+            "color: #333; font-weight: bold; margin-bottom: 5px; background: #f0f0f0; padding: 10px; border-radius: 5px;")
+        layout.addWidget(lbl_info)
+
+        # 스크롤 영역 (씬이 많으므로 필수)
+        scroll = QtWidgets.QScrollArea(self)
+        scroll.setWidgetResizable(True)
+        layout.addWidget(scroll, 1)
+
+        container = QtWidgets.QWidget()
+        self.form_layout = QtWidgets.QVBoxLayout(container)
+        self.form_layout.setSpacing(20)
+        scroll.setWidget(container)
+
+        self.editors = []  # 저장 시 참조할 위젯들 보관
+
+        # 씬별 에디터 생성 루프
+        for idx, sc in enumerate(self.scenes):
+            sid = sc.get("id", f"{idx + 1:03d}")
+
+            # JSON 데이터 가져오기 (없으면 빈 문자열)
+            banner = str(sc.get("banner") or "")
+            prompt = str(sc.get("prompt") or "")  # 화면 묘사
+            narr = str(sc.get("narration") or "")  # 내레이션
+            subtitle = str(sc.get("subtitle") or "")  # 자막
+
+            # 그룹박스 디자인
+            group = QtWidgets.QGroupBox(f"🎬 Scene {sid}", container)
+            group.setStyleSheet(
+                "QGroupBox { font-weight: bold; border: 1px solid #ccc; margin-top: 10px; background-color: #ffffff; } "
+                "QGroupBox::title { subcontrol-origin: margin; left: 10px; padding: 0 5px; background-color: #ffffff; }")
+            g_layout = QtWidgets.QFormLayout(group)
+            g_layout.setLabelAlignment(QtCore.Qt.AlignRight)
+            g_layout.setContentsMargins(15, 15, 15, 15)
+
+            # 1. 배너 (Banner) - 한 줄 입력
+            le_banner = QtWidgets.QLineEdit(banner)
+            le_banner.setPlaceholderText("(선택) 화면 상단에 띄울 속보/강조 문구 (예: 속보, 긴급)")
+            g_layout.addRow("🚩 배너(Banner):", le_banner)
+
+            # 2. 화면 설명 (Prompt) - 여러 줄 입력
+            te_prompt = QtWidgets.QPlainTextEdit(prompt)
+            te_prompt.setMinimumHeight(60)
+            te_prompt.setPlaceholderText("AI가 그릴 화면 상황을 구체적으로 묘사하세요.")
+            g_layout.addRow("🖼️ 화면설명(Visual):", te_prompt)
+
+            # 3. 내레이션 (Narration) - 여러 줄 입력 (강조색)
+            te_narr = QtWidgets.QPlainTextEdit(narr)
+            te_narr.setMinimumHeight(60)
+            te_narr.setStyleSheet("background-color: #fdfae8;")  # 살짝 노란 배경으로 오디오 대본임을 강조
+            te_narr.setPlaceholderText("성우가 읽을 대본입니다.")
+            g_layout.addRow("🎙️ 내레이션(Audio):", te_narr)
+
+            # 4. 자막 (Subtitle) - 한 줄 입력
+            le_sub = QtWidgets.QLineEdit(subtitle)
+            le_sub.setPlaceholderText("화면 하단에 표시될 핵심 자막 텍스트입니다.")
+            g_layout.addRow("💬 자막(Text):", le_sub)
+
+            self.form_layout.addWidget(group)
+
+            # 저장 버튼 클릭 시 읽어올 위젯들 저장
+            self.editors.append({
+                "sc": sc,
+                "banner": le_banner,
+                "prompt": te_prompt,
+                "narration": te_narr,
+                "subtitle": le_sub
+            })
+
+        # 하단 버튼 (저장/취소)
+        btn_box = QtWidgets.QHBoxLayout()
+
+        btn_save = QtWidgets.QPushButton("💾 저장 및 닫기", self)
+        btn_save.setMinimumHeight(45)
+        btn_save.setCursor(QtCore.Qt.PointingHandCursor)
+        btn_save.setStyleSheet("""
+            QPushButton {
+                font-weight: bold; 
+                font-size: 14px; 
+                color: white; 
+                background-color: #0078d7; 
+                border-radius: 6px;
+                padding: 5px;
+            }
+            QPushButton:hover { background-color: #005a9e; }
+        """)
+
+        btn_cancel = QtWidgets.QPushButton("취소", self)
+        btn_cancel.setMinimumHeight(45)
+        btn_cancel.setCursor(QtCore.Qt.PointingHandCursor)
+
+        btn_save.clicked.connect(self.on_save)
+        btn_cancel.clicked.connect(self.reject)
+
+        btn_box.addStretch(1)
+        btn_box.addWidget(btn_save, 2)  # 저장 버튼을 더 크게
+        btn_box.addWidget(btn_cancel, 1)
+
+        layout.addLayout(btn_box)
+
+    def on_save(self):
+        """UI 내용을 JSON 데이터에 반영하고 파일 저장"""
+        changed_count = 0
+
+        for item in self.editors:
+            sc = item["sc"]
+
+            # UI에서 텍스트 읽기
+            new_banner = item["banner"].text().strip()
+            new_prompt = item["prompt"].toPlainText().strip()
+            new_narr = item["narration"].toPlainText().strip()
+            new_sub = item["subtitle"].text().strip()
+
+            # 변경사항 체크 (하나라도 다르면 업데이트)
+            if (str(sc.get("banner") or "") != new_banner or
+                    str(sc.get("prompt") or "") != new_prompt or
+                    str(sc.get("narration") or "") != new_narr or
+                    str(sc.get("subtitle") or "") != new_sub):
+                sc["banner"] = new_banner
+                sc["prompt"] = new_prompt
+                sc["narration"] = new_narr
+                sc["subtitle"] = new_sub
+                changed_count += 1
+
+        if changed_count > 0:
+            try:
+                save_json(self.json_path, self.data)
+                QtWidgets.QMessageBox.information(self, "저장 완료", f"총 {changed_count}개의 장면 내용이 수정되었습니다.")
+                self.accept()
+            except Exception as e:
+                QtWidgets.QMessageBox.critical(self, "저장 실패", f"파일 저장 중 오류가 발생했습니다:\n{e}")
+        else:
+            # 변경사항 없으면 그냥 닫기
+            self.accept()
+
+
+class MediaEditDialog(QtWidgets.QDialog):
+    """
+    [3.5단계] 이미지/영상 수정 및 검수 다이얼로그
+    - 좌측: 씬 정보, 이미지 미리보기, 변경/삭제, 영상 삭제 기능
+    - 우측: 프롬프트(이미지/영상/부정) 수정 기능
+    """
+
+    def __init__(self, json_path: str, product_dir: str, parent=None):
+        super().__init__(parent)
+        self.setWindowTitle("이미지 및 영상 수정/검수")
+        self.resize(1200, 800)
+        self.json_path = Path(json_path)
+        self.product_dir = Path(product_dir)
+        self.imgs_dir = self.product_dir / "imgs"
+        self.clips_dir = self.product_dir / "clips"
+
+        # JSON 로드
+        self.data = load_json(self.json_path, {})
+        self.scenes = self.data.get("scenes", [])
+
+        # 메인 레이아웃
+        layout = QtWidgets.QVBoxLayout(self)
+
+        # 안내 문구
+        lbl_info = QtWidgets.QLabel(
+            "생성된 이미지와 프롬프트를 검수하는 공간입니다.\n"
+            "이미지를 변경하면 '{id}.png'로 덮어씌워지며, 영상을 삭제하면 다음 '영상 생성' 단계에서 해당 컷만 다시 생성됩니다."
+        )
+        lbl_info.setStyleSheet("background: #f0f0f0; padding: 10px; font-weight: bold; border-radius: 5px;")
+        layout.addWidget(lbl_info)
+
+        # 스크롤 영역
+        scroll = QtWidgets.QScrollArea(self)
+        scroll.setWidgetResizable(True)
+        layout.addWidget(scroll, 1)
+
+        container = QtWidgets.QWidget()
+        self.container_layout = QtWidgets.QVBoxLayout(container)
+        self.container_layout.setSpacing(20)
+        scroll.setWidget(container)
+
+        self.editors = []  # 저장 시 참조할 위젯들 보관
+
+        # 씬별 UI 생성
+        for idx, sc in enumerate(self.scenes):
+            self._add_scene_widget(idx, sc, container)
+
+        # 하단 버튼 (전체 저장)
+        btn_box = QtWidgets.QHBoxLayout()
+        btn_save = QtWidgets.QPushButton("💾 변경사항(프롬프트) 저장 및 닫기", self)
+        btn_save.setMinimumHeight(50)
+        btn_save.setStyleSheet("font-weight: bold; font-size: 14px; background-color: #0078d7; color: white;")
+
+        btn_close = QtWidgets.QPushButton("닫기", self)
+        btn_close.setMinimumHeight(50)
+
+        btn_save.clicked.connect(self.on_save)
+        btn_close.clicked.connect(self.reject)
+
+        btn_box.addStretch(1)
+        btn_box.addWidget(btn_save, 2)
+        btn_box.addWidget(btn_close, 1)
+        layout.addLayout(btn_box)
+
+    def _add_scene_widget(self, idx, sc, parent_widget):
+        sid = sc.get("id", f"{idx + 1:03d}")
+
+        # 그룹박스 프레임
+        group = QtWidgets.QGroupBox(f"Scene {sid}", parent_widget)
+        group.setStyleSheet("QGroupBox { border: 2px solid #ccc; margin-top: 10px; background: white; } "
+                            "QGroupBox::title { subcontrol-origin: margin; left: 10px; padding: 0 5px; font-weight: bold; }")
+        row_layout = QtWidgets.QHBoxLayout(group)
+
+        # ─── [좌측] 미디어 관리 (이미지/영상/정보) ───
+        left_widget = QtWidgets.QWidget()
+        left_layout = QtWidgets.QVBoxLayout(left_widget)
+        left_widget.setFixedWidth(320)  # 좌측 고정 너비
+
+        # 1. 정보 표시
+        narr_short = (sc.get("narration") or "")[:30] + "..." if len(sc.get("narration") or "") > 30 else sc.get(
+            "narration")
+        info_txt = f"⏱ 시간: {sc.get('seconds', 0)}초\n🎙 내레이션: {narr_short}"
+        lbl_info = QtWidgets.QLabel(info_txt)
+        lbl_info.setStyleSheet("color: #555; margin-bottom: 5px;")
+        left_layout.addWidget(lbl_info)
+
+        # 2. 이미지 미리보기
+        lbl_img = QtWidgets.QLabel()
+        lbl_img.setFixedSize(300, 300)
+        lbl_img.setStyleSheet("background-color: #eee; border: 1px solid #aaa;")
+        lbl_img.setAlignment(QtCore.Qt.AlignCenter)
+        self._refresh_preview(sid, lbl_img)  # 이미지 로드
+        left_layout.addWidget(lbl_img)
+
+        # 3. 버튼들
+        btn_change_img = QtWidgets.QPushButton("📂 이미지 변경 (불러오기)")
+        btn_del_img = QtWidgets.QPushButton("🗑 이미지 삭제")
+        btn_del_mov = QtWidgets.QPushButton("❌ 영상 삭제 (재생성용)")
+
+        btn_change_img.clicked.connect(lambda: self.on_change_image(sid, lbl_img))
+        btn_del_img.clicked.connect(lambda: self.on_delete_image(sid, lbl_img))
+        btn_del_mov.clicked.connect(lambda: self.on_delete_movie(sid))
+
+        left_layout.addWidget(btn_change_img)
+        left_layout.addWidget(btn_del_img)
+        left_layout.addWidget(btn_del_mov)
+        left_layout.addStretch(1)
+
+        row_layout.addWidget(left_widget)
+
+        # ─── [우측] 프롬프트 수정 ───
+        right_widget = QtWidgets.QWidget()
+        right_layout = QtWidgets.QFormLayout(right_widget)
+        right_layout.setLabelAlignment(QtCore.Qt.AlignRight)
+
+        # 데이터 가져오기
+        p_img = str(sc.get("prompt_img") or "")
+        p_mov = str(sc.get("prompt_movie") or "")
+        p_neg = str(sc.get("prompt_negative") or "")
+
+        # 에디터 생성
+        te_p_img = QtWidgets.QPlainTextEdit(p_img)
+        te_p_img.setPlaceholderText("이미지 프롬프트 (Positive)")
+        te_p_img.setMinimumHeight(80)
+
+        te_p_mov = QtWidgets.QPlainTextEdit(p_mov)
+        te_p_mov.setPlaceholderText("영상 무빙 프롬프트")
+        te_p_mov.setMinimumHeight(60)
+
+        te_p_neg = QtWidgets.QPlainTextEdit(p_neg)
+        te_p_neg.setPlaceholderText("부정 프롬프트 (Negative)")
+        te_p_neg.setMinimumHeight(60)
+
+        right_layout.addRow("🖼️ Img Prompt:", te_p_img)
+        right_layout.addRow("🎥 Mov Prompt:", te_p_mov)
+        right_layout.addRow("🚫 Negative:", te_p_neg)
+
+        row_layout.addWidget(right_widget, 1)  # 우측은 늘어남
+
+        self.container_layout.addWidget(group)
+
+        # 저장 목록에 추가
+        self.editors.append({
+            "sc": sc,
+            "p_img": te_p_img,
+            "p_mov": te_p_mov,
+            "p_neg": te_p_neg
+        })
+
+    def _refresh_preview(self, sid: str, label: QtWidgets.QLabel):
+        """이미지 미리보기 갱신"""
+        img_path = self.imgs_dir / f"{sid}.png"
+        if img_path.exists():
+            pix = QtGui.QPixmap(str(img_path))
+            if not pix.isNull():
+                label.setPixmap(pix.scaled(label.size(), QtCore.Qt.KeepAspectRatio, QtCore.Qt.SmoothTransformation))
+                label.setText("")
+            else:
+                label.setText("이미지 로드 실패")
+        else:
+            label.clear()
+            label.setText("이미지 없음")
+
+    def on_change_image(self, sid: str, label: QtWidgets.QLabel):
+        """1. 이미지 변경: 외부 파일 선택 -> {id}.png로 복사/덮어쓰기"""
+        path, _ = QtWidgets.QFileDialog.getOpenFileName(
+            self, "변경할 이미지 선택", "", "Images (*.png *.jpg *.jpeg *.webp)"
+        )
+        if not path:
+            return
+
+        try:
+            target_path = self.imgs_dir / f"{sid}.png"
+            # shutil.copy2로 복사 (덮어쓰기)
+            shutil.copy2(path, target_path)
+
+            # 미리보기 갱신
+            self._refresh_preview(sid, label)
+            QtWidgets.QMessageBox.information(self, "완료", f"이미지가 변경되었습니다.\n{target_path.name}")
+        except Exception as e:
+            QtWidgets.QMessageBox.critical(self, "오류", f"이미지 변경 실패: {e}")
+
+    def on_delete_image(self, sid: str, label: QtWidgets.QLabel):
+        """2. 이미지 삭제"""
+        target_path = self.imgs_dir / f"{sid}.png"
+        if not target_path.exists():
+            return
+
+        reply = QtWidgets.QMessageBox.question(
+            self, "삭제 확인", "정말 이 이미지를 삭제하시겠습니까?",
+            QtWidgets.QMessageBox.Yes | QtWidgets.QMessageBox.No
+        )
+        if reply == QtWidgets.QMessageBox.Yes:
+            try:
+                os.remove(target_path)
+                self._refresh_preview(sid, label)
+            except Exception as e:
+                QtWidgets.QMessageBox.critical(self, "오류", f"삭제 실패: {e}")
+
+    def on_delete_movie(self, sid: str):
+        """3. 영상 삭제: clips/{id}.mp4 삭제"""
+        target_path = self.clips_dir / f"{sid}.mp4"
+        if not target_path.exists():
+            QtWidgets.QMessageBox.information(self, "알림", "삭제할 영상 파일이 없습니다.")
+            return
+
+        reply = QtWidgets.QMessageBox.question(
+            self, "영상 삭제",
+            f"Scene {sid}의 영상을 삭제하시겠습니까?\n삭제 후 '영상 생성'을 다시 실행하면 이 컷만 다시 생성됩니다.",
+            QtWidgets.QMessageBox.Yes | QtWidgets.QMessageBox.No
+        )
+        if reply == QtWidgets.QMessageBox.Yes:
+            try:
+                os.remove(target_path)
+                QtWidgets.QMessageBox.information(self, "완료", "영상이 삭제되었습니다.")
+            except Exception as e:
+                QtWidgets.QMessageBox.critical(self, "오류", f"삭제 실패: {e}")
+
+    def on_save(self):
+        """4. 프롬프트 수정 사항 JSON 저장"""
+        changed_count = 0
+        for item in self.editors:
+            sc = item["sc"]
+            new_p_img = item["p_img"].toPlainText().strip()
+            new_p_mov = item["p_mov"].toPlainText().strip()
+            new_p_neg = item["p_neg"].toPlainText().strip()
+
+            if (sc.get("prompt_img") != new_p_img or
+                    sc.get("prompt_movie") != new_p_mov or
+                    sc.get("prompt_negative") != new_p_neg):
+                sc["prompt_img"] = new_p_img
+                sc["prompt_movie"] = new_p_mov
+                sc["prompt_negative"] = new_p_neg
+                changed_count += 1
+
+        if changed_count > 0:
+            try:
+                save_json(self.json_path, self.data)
+                QtWidgets.QMessageBox.information(self, "저장 완료", f"{changed_count}개 장면의 프롬프트가 수정되었습니다.")
+                self.accept()
+            except Exception as e:
+                QtWidgets.QMessageBox.critical(self, "저장 실패", f"JSON 저장 중 오류: {e}")
+        else:
+            self.accept()
 
 
 class VideoBuildDialog(QtWidgets.QDialog):
     """
     '영상제작' 버튼 클릭 시 열리는 창.
-    - 탭1: video_shopping.json 생성 및 확인
-    - 탭2: 이미지/영상 생성 및 합치기 (개별 테스트 버튼 + 전체 실행)
+    - 탭1: 시나리오(JSON) 관리 (1.초안 -> 2.수정 -> 3.상세화)
+    - 탭2: 제작(이미지/영상) -> (검수) -> 합치기
     """
 
     def __init__(self, product_dir: str, product_data: dict, parent=None):
@@ -82,24 +491,42 @@ class VideoBuildDialog(QtWidgets.QDialog):
 
         opt_row.addStretch(1)
 
-        # JSON 관련 버튼
-        btn_row = QtWidgets.QHBoxLayout()
-        t1.addLayout(btn_row)
+        # JSON 관련 3단계 버튼 그룹
+        btn_group = QtWidgets.QGroupBox("1단계: 시나리오 작업 순서", tab1)
+        btn_layout = QtWidgets.QHBoxLayout(btn_group)
 
-        self.btn_build_json = QtWidgets.QPushButton("1. video_shopping.json 생성/갱신", tab1)
-        self.btn_build_json.setStyleSheet("color: blue; font-weight: bold;")
+        # 1. 초안 생성
+        self.btn_draft = QtWidgets.QPushButton("1. 초안 생성 (Draft)", tab1)
+        self.btn_draft.setToolTip("AI가 상품정보를 분석해 '기획의도'와 '한글 대본' 초안을 작성합니다.")
 
+        # 2. 초안 수정 (파일 열기)
+        self.btn_edit_json = QtWidgets.QPushButton("2. 초안 수정 (편집)", tab1)
+        self.btn_edit_json.setToolTip("생성된 JSON 파일을 열어 한글 대본을 수정합니다.")
+
+        # 3. AI 상세화
+        self.btn_enrich = QtWidgets.QPushButton("3. AI 상세화 (최종 변환)", tab1)
+        self.btn_enrich.setStyleSheet("color: blue; font-weight: bold;")
+        self.btn_enrich.setToolTip("확정된 한글 대본을 바탕으로 영문 프롬프트, 시간 등을 생성합니다.")
+
+        btn_layout.addWidget(self.btn_draft)
+        btn_layout.addWidget(self.btn_edit_json)
+        btn_layout.addWidget(self.btn_enrich)
+
+        t1.addWidget(btn_group)
+
+        # 유틸 버튼
+        util_row = QtWidgets.QHBoxLayout()
         self.btn_open_product_dir = QtWidgets.QPushButton("상품 폴더 열기", tab1)
-        self.btn_open_video_json = QtWidgets.QPushButton("JSON 파일 열기", tab1)
+        self.btn_refresh_view = QtWidgets.QPushButton("화면 새로고침", tab1)
 
-        btn_row.addWidget(self.btn_build_json)
-        btn_row.addWidget(self.btn_open_product_dir)
-        btn_row.addWidget(self.btn_open_video_json)
-        btn_row.addStretch(1)
+        util_row.addStretch(1)
+        util_row.addWidget(self.btn_refresh_view)
+        util_row.addWidget(self.btn_open_product_dir)
+        t1.addLayout(util_row)
 
         self.te_preview = QtWidgets.QPlainTextEdit(tab1)
         self.te_preview.setReadOnly(True)
-        self.te_preview.setPlaceholderText("여기에 생성된 JSON 내용이 표시됩니다.")
+        self.te_preview.setPlaceholderText("여기에 JSON 내용이 표시됩니다.")
         t1.addWidget(self.te_preview, 1)
 
         self.tabs.addTab(tab1, "1. 시나리오(JSON)")
@@ -129,25 +556,28 @@ class VideoBuildDialog(QtWidgets.QDialog):
 
         t2.addSpacing(20)
 
-        # ★ [개별 단계 실행 그룹] ★
+        # 개별 단계 실행 그룹
         grp_actions = QtWidgets.QGroupBox("개별 단계 실행 (테스트용)", tab2)
         lay_actions = QtWidgets.QHBoxLayout(grp_actions)
         lay_actions.setSpacing(10)
 
-        self.btn_gen_images = QtWidgets.QPushButton("2. 누락이미지 생성 (Z-Image)", tab2)
+        self.btn_gen_images = QtWidgets.QPushButton("2. 이미지 생성 (Z-Image)", tab2)
         self.btn_gen_images.setMinimumHeight(40)
-        self.btn_gen_images.setToolTip("video_shopping.json을 읽어 imgs 폴더에 없는 이미지를 생성합니다.")
 
         self.btn_gen_movies = QtWidgets.QPushButton("3. 영상 생성 (I2V)", tab2)
         self.btn_gen_movies.setMinimumHeight(40)
-        self.btn_gen_movies.setToolTip("imgs의 이미지를 이용해 clips 폴더에 영상을 생성합니다.")
+
+        # [New] 3.5단계 수정/검수 버튼
+        self.btn_media_edit = QtWidgets.QPushButton("3.5 이미지/영상 수정 (검수)", tab2)
+        self.btn_media_edit.setMinimumHeight(40)
+        self.btn_media_edit.setStyleSheet("color: #d32f2f; font-weight: bold;")
 
         self.btn_merge = QtWidgets.QPushButton("4. 영상 합치기 (Merge)", tab2)
         self.btn_merge.setMinimumHeight(40)
-        self.btn_merge.setToolTip("clips 폴더의 영상을 모아 하나로 합칩니다.")
 
         lay_actions.addWidget(self.btn_gen_images)
         lay_actions.addWidget(self.btn_gen_movies)
+        lay_actions.addWidget(self.btn_media_edit)  # 추가됨
         lay_actions.addWidget(self.btn_merge)
 
         t2.addWidget(grp_actions)
@@ -186,15 +616,20 @@ class VideoBuildDialog(QtWidgets.QDialog):
 
         # ── 시그널 연결 ─────────────────────────
         self.btn_close.clicked.connect(self.close)
+
+        self.btn_draft.clicked.connect(self.on_draft_clicked)
+        self.btn_edit_json.clicked.connect(self.on_edit_json_clicked)
+        self.btn_enrich.clicked.connect(self.on_enrich_clicked)
+
+        self.btn_refresh_view.clicked.connect(self._refresh_preview_if_exists)
+
         self.btn_open_product_dir.clicked.connect(lambda: self._open_path(self.product_dir))
         self.btn_open_imgs.clicked.connect(lambda: self._open_path(str(Path(self.product_dir) / "imgs")))
         self.btn_open_clips.clicked.connect(lambda: self._open_path(str(Path(self.product_dir) / "clips")))
-        self.btn_open_video_json.clicked.connect(lambda: self._open_path(self.video_json_path))
 
-        # 기능 버튼 (비동기 처리 함수 연결)
-        self.btn_build_json.clicked.connect(self.on_build_json_clicked)
         self.btn_gen_images.clicked.connect(self.on_gen_images_clicked)
         self.btn_gen_movies.clicked.connect(self.on_gen_movies_clicked)
+        self.btn_media_edit.clicked.connect(self.on_media_edit_clicked)  # 연결
         self.btn_merge.clicked.connect(self.on_merge_clicked)
         self.btn_run_all.clicked.connect(self.on_run_all_clicked)
 
@@ -231,36 +666,71 @@ class VideoBuildDialog(QtWidgets.QDialog):
                 self.te_preview.setPlainText(txt)
             except Exception as e:
                 self.te_preview.setPlainText(f"읽기 실패: {e}")
+        else:
+            self.te_preview.setPlainText("(아직 파일이 없습니다. '초안 생성'을 먼저 진행하세요)")
 
-    # ── 비동기 작업 핸들러 (run_job_with_progress_async 사용) ─────────────────────────
+    # ── 핸들러들 ─────────────────────────
 
-    def on_build_json_clicked(self):
-        """1단계: JSON 생성"""
+    def on_draft_clicked(self):
+        """1단계: 초안(Draft) JSON 생성"""
 
         def job(progress):
-            progress("[JSON] 생성 시작...")
+            progress("[Draft] 초안 생성 시작...")
             builder = ShoppingVideoJsonBuilder(on_progress=progress)
-            out_path = builder.build(
+            out_path = builder.create_draft(
                 product_dir=self.product_dir,
                 product_data=self.product_data,
                 options=self._options(),
             )
-            progress(f"[JSON] 완료: {out_path}")
             return str(out_path)
 
         def done(ok, res, err):
             if ok:
-                self._append_log(f"✅ JSON 생성 성공")
+                self._append_log(f"✅ 초안 생성 완료: {res}")
                 self._refresh_preview_if_exists()
             else:
-                self._append_log(f"❌ JSON 생성 실패: {err}")
+                self._append_log(f"❌ 초안 생성 실패: {err}")
 
-        run_job_with_progress_async(self, "JSON 생성", job, on_done=done)
+        run_job_with_progress_async(self, "초안 생성", job, on_done=done)
+
+    def on_edit_json_clicked(self):
+        """1단계: 초안 수정 (SceneEditDialog 호출)"""
+        if not Path(self.video_json_path).exists():
+            self._append_log("⚠ 수정할 파일이 없습니다. 먼저 '초안 생성'을 하세요.")
+            return
+
+        dlg = SceneEditDialog(self.video_json_path, parent=self)
+        if dlg.exec_() == QtWidgets.QDialog.Accepted:
+            self._append_log("📝 초안 수정이 완료되었습니다.")
+            self._refresh_preview_if_exists()
+
+    def on_enrich_clicked(self):
+        """1단계: AI 상세화 (Draft -> Final)"""
+        if not Path(self.video_json_path).exists():
+            self._append_log("⚠ 수정할 JSON 파일이 없습니다. '초안 생성'을 먼저 하세요.")
+            return
+
+        def job(progress):
+            progress("[Enrich] AI 상세화 작업 시작...")
+            builder = ShoppingVideoJsonBuilder(on_progress=progress)
+            out_path = builder.enrich_video_json(
+                video_json_path=self.video_json_path,
+                product_data=self.product_data
+            )
+            return str(out_path)
+
+        def done(ok, res, err):
+            if ok:
+                self._append_log(f"✅ AI 상세화 완료!")
+                self._refresh_preview_if_exists()
+            else:
+                self._append_log(f"❌ AI 상세화 실패: {err}")
+
+        run_job_with_progress_async(self, "AI 상세화", job, on_done=done)
 
     def on_gen_images_clicked(self):
-        """2단계: 누락 이미지 생성 (비동기)"""
         if not Path(self.video_json_path).exists():
-            self._append_log("⚠ video_shopping.json이 없습니다. 1단계를 먼저 실행하세요.")
+            self._append_log("⚠ video_shopping.json이 없습니다.")
             return
 
         def job(progress):
@@ -277,8 +747,17 @@ class VideoBuildDialog(QtWidgets.QDialog):
 
         run_job_with_progress_async(self, "이미지 생성", job, on_done=done)
 
+    # [New] 3.5단계 핸들러 추가
+    def on_media_edit_clicked(self):
+        if not Path(self.video_json_path).exists():
+            self._append_log("⚠ video_shopping.json이 없습니다.")
+            return
+
+        dlg = MediaEditDialog(self.video_json_path, self.product_dir, parent=self)
+        dlg.exec_()
+        self._append_log("🔧 미디어 수정/검수 창을 닫았습니다.")
+
     def on_gen_movies_clicked(self):
-        """3단계: 영상 생성 (비동기)"""
         if not Path(self.video_json_path).exists():
             self._append_log("⚠ video_shopping.json이 없습니다.")
             return
@@ -302,7 +781,6 @@ class VideoBuildDialog(QtWidgets.QDialog):
         run_job_with_progress_async(self, "영상 생성", job, on_done=done)
 
     def on_merge_clicked(self):
-        """4단계: 영상 합치기 (비동기)"""
         if not Path(self.video_json_path).exists():
             self._append_log("⚠ video_shopping.json이 없습니다.")
             return
@@ -322,16 +800,18 @@ class VideoBuildDialog(QtWidgets.QDialog):
         run_job_with_progress_async(self, "영상 합치기", job, on_done=done)
 
     def on_run_all_clicked(self):
-        """전체 파이프라인 일괄 실행 (비동기)"""
+        """전체 파이프라인 일괄 실행 (ShoppingShortsPipeline 활용)"""
 
         def job(progress):
             progress("[All] 전체 파이프라인 시작...")
+
             pipe = ShoppingShortsPipeline(on_progress=progress)
+
             pipe.run_all(
                 product_dir=self.product_dir,
                 product_data=self.product_data,
                 options=self._options(),
-                build_json=True,
+                build_json=False,
                 build_images=True,
                 build_movies=True,
                 merge=True,
