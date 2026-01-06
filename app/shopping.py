@@ -37,32 +37,60 @@ from app.shopping_video_build import (
 
 class SceneEditDialog(QtWidgets.QDialog):
     """
-    video_shopping.json의 각 씬별 기획 4요소(Banner, Prompt, Narration, Subtitle)를 수정하는 창
+    [수정됨] 씬별 기획 + 캐릭터/성별 수정 (상단 배치)
     """
 
     def __init__(self, json_path: str, parent=None):
         super().__init__(parent)
-        self.setWindowTitle("시나리오 초안 수정 (기획 4요소)")
-        self.resize(850, 700)
+        self.setWindowTitle("시나리오 초안 및 캐릭터 설정 수정")
+        self.resize(950, 850)
         self.json_path = Path(json_path)
 
-        # JSON 로드
         self.data = load_json(self.json_path, {})
+        self.meta = self.data.get("meta", {})
         self.scenes = self.data.get("scenes", [])
 
-        # 메인 레이아웃
         layout = QtWidgets.QVBoxLayout(self)
+
+        # ─── 상단: 캐릭터 & 성별 설정 (AI가 초안에서 제안한 값 표시/수정) ───
+        char_group = QtWidgets.QGroupBox("👤 메인 캐릭터 & 성별 설정 (AI 제안값 수정)", self)
+        char_group.setStyleSheet(
+            "QGroupBox { font-weight: bold; border: 2px solid #0078d7; margin-top: 10px; background-color: #f0f8ff; } "
+            "QGroupBox::title { subcontrol-origin: margin; left: 10px; padding: 0 5px; color: #0078d7; }")
+        char_layout = QtWidgets.QFormLayout(char_group)
+
+        # 1. 성별 선택
+        self.cb_gender = QtWidgets.QComboBox()
+        self.cb_gender.addItems(["Female", "Male"])
+        current_gender = str(self.meta.get("voice_gender", "female")).capitalize()
+        # AI가 잡아준 성별을 기본으로 선택
+        if "Male" in current_gender:
+            self.cb_gender.setCurrentText("Male")
+        else:
+            self.cb_gender.setCurrentText("Female")
+        char_layout.addRow("성별 (Voice & Visual):", self.cb_gender)
+
+        # 2. 캐릭터 컨셉
+        char_val = self.meta.get("character_prompt", "")
+        self.le_char = QtWidgets.QLineEdit(char_val)
+        self.le_char.setPlaceholderText("예: Stylish 30s urban news anchor")
+        self.le_char.setStyleSheet("background-color: white; padding: 5px; font-weight: bold;")
+
+        char_layout.addRow("캐릭터 컨셉 (EN):", self.le_char)
+        char_layout.addRow(QtWidgets.QLabel("* AI가 제안한 캐릭터가 마음에 들지 않으면 여기서 수정하세요. 모든 장면에 적용됩니다."))
+
+        layout.addWidget(char_group)
 
         # 안내 문구
         lbl_info = QtWidgets.QLabel(
-            "각 장면(Scene)의 구성을 수정하세요.\n"
-            "여기서 작성된 '내레이션'은 음성 합성(TTS)에, '자막'은 영상 오버레이에 사용됩니다."
+            "아래에서 각 장면별(Scene) 세부 내용과 프롬프트를 수정하세요.\n"
+            "이미지 생성은 [Step 1: 배경/모델] -> [Step 2: 제품 합성]으로 진행됩니다."
         )
         lbl_info.setStyleSheet(
-            "color: #333; font-weight: bold; margin-bottom: 5px; background: #f0f0f0; padding: 10px; border-radius: 5px;")
+            "color: #333; font-weight: bold; margin: 10px 0; background: #f0f0f0; padding: 10px; border-radius: 5px;")
         layout.addWidget(lbl_info)
 
-        # 스크롤 영역 (씬이 많으므로 필수)
+        # 스크롤 영역
         scroll = QtWidgets.QScrollArea(self)
         scroll.setWidgetResizable(True)
         layout.addWidget(scroll, 1)
@@ -72,19 +100,11 @@ class SceneEditDialog(QtWidgets.QDialog):
         self.form_layout.setSpacing(20)
         scroll.setWidget(container)
 
-        self.editors = []  # 저장 시 참조할 위젯들 보관
+        self.editors = []
 
-        # 씬별 에디터 생성 루프
         for idx, sc in enumerate(self.scenes):
             sid = sc.get("id", f"{idx + 1:03d}")
 
-            # JSON 데이터 가져오기 (없으면 빈 문자열)
-            banner = str(sc.get("banner") or "")
-            prompt = str(sc.get("prompt") or "")  # 화면 묘사
-            narr = str(sc.get("narration") or "")  # 내레이션
-            subtitle = str(sc.get("subtitle") or "")  # 자막
-
-            # 그룹박스 디자인
             group = QtWidgets.QGroupBox(f"🎬 Scene {sid}", container)
             group.setStyleSheet(
                 "QGroupBox { font-weight: bold; border: 1px solid #ccc; margin-top: 10px; background-color: #ffffff; } "
@@ -93,117 +113,114 @@ class SceneEditDialog(QtWidgets.QDialog):
             g_layout.setLabelAlignment(QtCore.Qt.AlignRight)
             g_layout.setContentsMargins(15, 15, 15, 15)
 
-            # 1. 배너 (Banner) - 한 줄 입력
-            le_banner = QtWidgets.QLineEdit(banner)
-            le_banner.setPlaceholderText("(선택) 화면 상단에 띄울 속보/강조 문구 (예: 속보, 긴급)")
-            g_layout.addRow("🚩 배너(Banner):", le_banner)
-
-            # 2. 화면 설명 (Prompt) - 여러 줄 입력
-            te_prompt = QtWidgets.QPlainTextEdit(prompt)
+            le_banner = QtWidgets.QLineEdit(str(sc.get("banner") or ""))
+            te_prompt = QtWidgets.QPlainTextEdit(str(sc.get("prompt") or ""))
             te_prompt.setMinimumHeight(60)
-            te_prompt.setPlaceholderText("AI가 그릴 화면 상황을 구체적으로 묘사하세요.")
-            g_layout.addRow("🖼️ 화면설명(Visual):", te_prompt)
-
-            # 3. 내레이션 (Narration) - 여러 줄 입력 (강조색)
-            te_narr = QtWidgets.QPlainTextEdit(narr)
+            te_narr = QtWidgets.QPlainTextEdit(str(sc.get("narration") or ""))
             te_narr.setMinimumHeight(60)
-            te_narr.setStyleSheet("background-color: #fdfae8;")  # 살짝 노란 배경으로 오디오 대본임을 강조
-            te_narr.setPlaceholderText("성우가 읽을 대본입니다.")
-            g_layout.addRow("🎙️ 내레이션(Audio):", te_narr)
+            te_narr.setStyleSheet("background-color: #fdfae8;")
+            le_sub = QtWidgets.QLineEdit(str(sc.get("subtitle") or ""))
 
-            # 4. 자막 (Subtitle) - 한 줄 입력
-            le_sub = QtWidgets.QLineEdit(subtitle)
-            le_sub.setPlaceholderText("화면 하단에 표시될 핵심 자막 텍스트입니다.")
-            g_layout.addRow("💬 자막(Text):", le_sub)
+            g_layout.addRow("🚩 배너:", le_banner)
+            g_layout.addRow("🖼️ 화면설명(KR):", te_prompt)
+            g_layout.addRow("🎙️ 내레이션:", te_narr)
+            g_layout.addRow("💬 자막:", le_sub)
+
+            line = QtWidgets.QFrame()
+            line.setFrameShape(QtWidgets.QFrame.HLine)
+            line.setFrameShadow(QtWidgets.QFrame.Sunken)
+            g_layout.addRow(line)
+
+            p1_val = str(sc.get("prompt_img_1") or sc.get("prompt_img") or "")
+            te_p1 = QtWidgets.QPlainTextEdit(p1_val)
+            te_p1.setPlaceholderText("Step 1: 배경 및 모델 묘사")
+            te_p1.setMinimumHeight(60)
+
+            p2_val = str(sc.get("prompt_img_2") or "")
+            te_p2 = QtWidgets.QPlainTextEdit(p2_val)
+            te_p2.setPlaceholderText("Step 2: 제품 합성 지시")
+            te_p2.setMinimumHeight(60)
+
+            g_layout.addRow("✨ Base Prompt:", te_p1)
+            g_layout.addRow("🔗 Merge Prompt:", te_p2)
 
             self.form_layout.addWidget(group)
 
-            # 저장 버튼 클릭 시 읽어올 위젯들 저장
             self.editors.append({
                 "sc": sc,
-                "banner": le_banner,
-                "prompt": te_prompt,
-                "narration": te_narr,
-                "subtitle": le_sub
+                "banner": le_banner, "prompt": te_prompt, "narration": te_narr, "subtitle": le_sub,
+                "p1": te_p1, "p2": te_p2
             })
 
-        # 하단 버튼 (저장/취소)
         btn_box = QtWidgets.QHBoxLayout()
-
         btn_save = QtWidgets.QPushButton("💾 저장 및 닫기", self)
         btn_save.setMinimumHeight(45)
-        btn_save.setCursor(QtCore.Qt.PointingHandCursor)
-        btn_save.setStyleSheet("""
-            QPushButton {
-                font-weight: bold; 
-                font-size: 14px; 
-                color: white; 
-                background-color: #0078d7; 
-                border-radius: 6px;
-                padding: 5px;
-            }
-            QPushButton:hover { background-color: #005a9e; }
-        """)
+        btn_save.setStyleSheet(
+            "font-weight: bold; font-size: 14px; color: white; background-color: #0078d7; border-radius: 6px;")
 
         btn_cancel = QtWidgets.QPushButton("취소", self)
         btn_cancel.setMinimumHeight(45)
-        btn_cancel.setCursor(QtCore.Qt.PointingHandCursor)
 
         btn_save.clicked.connect(self.on_save)
         btn_cancel.clicked.connect(self.reject)
 
         btn_box.addStretch(1)
-        btn_box.addWidget(btn_save, 2)  # 저장 버튼을 더 크게
+        btn_box.addWidget(btn_save, 2)
         btn_box.addWidget(btn_cancel, 1)
-
         layout.addLayout(btn_box)
 
     def on_save(self):
-        """UI 내용을 JSON 데이터에 반영하고 파일 저장"""
-        changed_count = 0
+        # 1. 메인 설정 저장 (성별 & 캐릭터)
+        self.meta["voice_gender"] = self.cb_gender.currentText().lower()
 
+        new_char = self.le_char.text().strip()
+        if new_char:
+            self.meta["character_prompt"] = new_char
+
+        # 2. 씬별 내용 저장
+        changed_count = 0
         for item in self.editors:
             sc = item["sc"]
-
-            # UI에서 텍스트 읽기
             new_banner = item["banner"].text().strip()
             new_prompt = item["prompt"].toPlainText().strip()
             new_narr = item["narration"].toPlainText().strip()
             new_sub = item["subtitle"].text().strip()
+            new_p1 = item["p1"].toPlainText().strip()
+            new_p2 = item["p2"].toPlainText().strip()
 
-            # 변경사항 체크 (하나라도 다르면 업데이트)
             if (str(sc.get("banner") or "") != new_banner or
                     str(sc.get("prompt") or "") != new_prompt or
                     str(sc.get("narration") or "") != new_narr or
-                    str(sc.get("subtitle") or "") != new_sub):
+                    str(sc.get("subtitle") or "") != new_sub or
+                    str(sc.get("prompt_img_1") or "") != new_p1 or
+                    str(sc.get("prompt_img_2") or "") != new_p2):
                 sc["banner"] = new_banner
                 sc["prompt"] = new_prompt
                 sc["narration"] = new_narr
                 sc["subtitle"] = new_sub
+                sc["prompt_img_1"] = new_p1
+                sc["prompt_img_2"] = new_p2
+                sc["prompt_img"] = new_p1
                 changed_count += 1
 
-        if changed_count > 0:
-            try:
-                save_json(self.json_path, self.data)
-                QtWidgets.QMessageBox.information(self, "저장 완료", f"총 {changed_count}개의 장면 내용이 수정되었습니다.")
-                self.accept()
-            except Exception as e:
-                QtWidgets.QMessageBox.critical(self, "저장 실패", f"파일 저장 중 오류가 발생했습니다:\n{e}")
-        else:
-            # 변경사항 없으면 그냥 닫기
+        try:
+            save_json(self.json_path, self.data)
+            QtWidgets.QMessageBox.information(self, "저장 완료", f"캐릭터 설정 및 {changed_count}개 장면이 수정되었습니다.")
             self.accept()
+        except Exception as e:
+            QtWidgets.QMessageBox.critical(self, "저장 실패", f"파일 저장 중 오류가 발생했습니다:\n{e}")
 
 
 class MediaEditDialog(QtWidgets.QDialog):
     """
-    [3.5단계] 이미지/영상 수정 및 검수 다이얼로그
+    [수정됨] 3.5단계 이미지/영상 수정 및 검수 다이얼로그 (2-Step 프롬프트 적용)
     - 좌측: 씬 정보, 이미지 미리보기, 변경/삭제, 영상 삭제 기능
-    - 우측: 프롬프트(이미지/영상/부정) 수정 기능
+    - 우측: Base Prompt, Merge Prompt, Movie Prompt, Negative Prompt 수정
     """
 
     def __init__(self, json_path: str, product_dir: str, parent=None):
         super().__init__(parent)
-        self.setWindowTitle("이미지 및 영상 수정/검수")
+        self.setWindowTitle("이미지 및 영상 수정/검수 (2-Step)")
         self.resize(1200, 800)
         self.json_path = Path(json_path)
         self.product_dir = Path(product_dir)
@@ -220,7 +237,8 @@ class MediaEditDialog(QtWidgets.QDialog):
         # 안내 문구
         lbl_info = QtWidgets.QLabel(
             "생성된 이미지와 프롬프트를 검수하는 공간입니다.\n"
-            "이미지를 변경하면 '{id}.png'로 덮어씌워지며, 영상을 삭제하면 다음 '영상 생성' 단계에서 해당 컷만 다시 생성됩니다."
+            "이미지 생성은 [Step 1: 베이스] -> [Step 2: 합성]으로 진행되므로 프롬프트가 2개입니다.\n"
+            "이미지를 수동으로 변경하면 '{id}.png'로 덮어씌워집니다."
         )
         lbl_info.setStyleSheet("background: #f0f0f0; padding: 10px; font-weight: bold; border-radius: 5px;")
         layout.addWidget(lbl_info)
@@ -304,30 +322,36 @@ class MediaEditDialog(QtWidgets.QDialog):
 
         row_layout.addWidget(left_widget)
 
-        # ─── [우측] 프롬프트 수정 ───
+        # ─── [우측] 프롬프트 수정 (2-Step 적용) ───
         right_widget = QtWidgets.QWidget()
         right_layout = QtWidgets.QFormLayout(right_widget)
         right_layout.setLabelAlignment(QtCore.Qt.AlignRight)
 
         # 데이터 가져오기
-        p_img = str(sc.get("prompt_img") or "")
+        p1 = str(sc.get("prompt_img_1") or sc.get("prompt_img") or "")  # Prompt 1 (Base)
+        p2 = str(sc.get("prompt_img_2") or "")  # Prompt 2 (Merge)
         p_mov = str(sc.get("prompt_movie") or "")
         p_neg = str(sc.get("prompt_negative") or "")
 
         # 에디터 생성
-        te_p_img = QtWidgets.QPlainTextEdit(p_img)
-        te_p_img.setPlaceholderText("이미지 프롬프트 (Positive)")
-        te_p_img.setMinimumHeight(80)
+        te_p1 = QtWidgets.QPlainTextEdit(p1)
+        te_p1.setPlaceholderText("✨ Step 1: Base Prompt (Background/Model)")
+        te_p1.setMinimumHeight(60)
+
+        te_p2 = QtWidgets.QPlainTextEdit(p2)
+        te_p2.setPlaceholderText("🔗 Step 2: Merge Prompt (Product Synthesis)")
+        te_p2.setMinimumHeight(60)
 
         te_p_mov = QtWidgets.QPlainTextEdit(p_mov)
-        te_p_mov.setPlaceholderText("영상 무빙 프롬프트")
-        te_p_mov.setMinimumHeight(60)
+        te_p_mov.setPlaceholderText("🎥 Movie Prompt (Camera movement)")
+        te_p_mov.setMinimumHeight(50)
 
         te_p_neg = QtWidgets.QPlainTextEdit(p_neg)
-        te_p_neg.setPlaceholderText("부정 프롬프트 (Negative)")
-        te_p_neg.setMinimumHeight(60)
+        te_p_neg.setPlaceholderText("🚫 Negative Prompt")
+        te_p_neg.setMinimumHeight(50)
 
-        right_layout.addRow("🖼️ Img Prompt:", te_p_img)
+        right_layout.addRow("✨ Base Prompt:", te_p1)
+        right_layout.addRow("🔗 Merge Prompt:", te_p2)
         right_layout.addRow("🎥 Mov Prompt:", te_p_mov)
         right_layout.addRow("🚫 Negative:", te_p_neg)
 
@@ -338,9 +362,8 @@ class MediaEditDialog(QtWidgets.QDialog):
         # 저장 목록에 추가
         self.editors.append({
             "sc": sc,
-            "p_img": te_p_img,
-            "p_mov": te_p_mov,
-            "p_neg": te_p_neg
+            "p1": te_p1, "p2": te_p2,
+            "p_mov": te_p_mov, "p_neg": te_p_neg
         })
 
     def _refresh_preview(self, sid: str, label: QtWidgets.QLabel):
@@ -367,10 +390,7 @@ class MediaEditDialog(QtWidgets.QDialog):
 
         try:
             target_path = self.imgs_dir / f"{sid}.png"
-            # shutil.copy2로 복사 (덮어쓰기)
             shutil.copy2(path, target_path)
-
-            # 미리보기 갱신
             self._refresh_preview(sid, label)
             QtWidgets.QMessageBox.information(self, "완료", f"이미지가 변경되었습니다.\n{target_path.name}")
         except Exception as e:
@@ -417,14 +437,18 @@ class MediaEditDialog(QtWidgets.QDialog):
         changed_count = 0
         for item in self.editors:
             sc = item["sc"]
-            new_p_img = item["p_img"].toPlainText().strip()
+            new_p1 = item["p1"].toPlainText().strip()
+            new_p2 = item["p2"].toPlainText().strip()
             new_p_mov = item["p_mov"].toPlainText().strip()
             new_p_neg = item["p_neg"].toPlainText().strip()
 
-            if (sc.get("prompt_img") != new_p_img or
+            if (sc.get("prompt_img_1") != new_p1 or
+                    sc.get("prompt_img_2") != new_p2 or
                     sc.get("prompt_movie") != new_p_mov or
                     sc.get("prompt_negative") != new_p_neg):
-                sc["prompt_img"] = new_p_img
+                sc["prompt_img_1"] = new_p1
+                sc["prompt_img_2"] = new_p2
+                sc["prompt_img"] = new_p1  # 호환성 동기화
                 sc["prompt_movie"] = new_p_mov
                 sc["prompt_negative"] = new_p_neg
                 changed_count += 1
