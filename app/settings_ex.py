@@ -102,23 +102,40 @@ FFPROBE_EXE:  str = os.environ.get("FFPROBE_EXE", "")
 USE_HWACCEL: bool = True
 
 
-# ───────── I2V (Image-to-Video) 생성 상수 (Wan 2.2 / ComfyUI) ─────────
-# 영상 분할 생성 시 프레임 제어 상수
-I2V_CHUNK_BASE_FRAMES = 82    # 기본 청크 길이 (유효 구간)
-I2V_OVERLAP_FRAMES = 6        # 세그먼트 간 겹침/루프백 길이 (Cross-fade용)
-I2V_PAD_TAIL_FRAMES = 5       # 생성 안정성을 위한 끝부분 여유분 (잘라낼 부분)
 
+# 1) 이미지 기본 크기 (가로, 세로)
+#    예: (832, 1472)는 9:16 세로형에 가깝습니다. (w, h)
+DEFAULT_IMG_SIZE: tuple[int, int] = (720, 1080)
 
-# ───────── 사용자 정의 UI 기본값 설정 ─────────
+# 드롭다운 후보(원하는 값 추가/삭제 가능)
+IMAGE_SIZE_CHOICES: list[int] = [240, 480, 520, 720, 960, 1080, 1280, 1440, 1920]
 
-# 1. 렌더링 FPS (예: 24, 30, 60)
-DEFAULT_MOVIE_FPS = 16
+# 2) 렌더 FPS 기본/후보 (24 또는 60 선택)
+DEFAULT_MOVIE_FPS: int = 30
+MOVIE_FPS_CHOICES: list[int] = [16, 24, 30, 60]
 
-# 2. 이미지/영상 해상도 (가로, 세로)
-DEFAULT_IMG_SIZE = (405, 720)
+# 3) 청크 오버랩(프레임) — i2v를 여러 덩어리로 만들 때 경계 끊김을 줄이기 위해
+#    앞/뒤 청크가 겹치는 프레임 수. 60fps에서 12프레임은 약 0.2초.
+DEFAULT_MOVIE_OVERLAP: int = 5
 
-# 3. 이미지 생성 품질 (스텝 수)
-DEFAULT_T2I_STEPS = 6
+# 4) 최소 장면 길이(초) — 분석/보정 시 너무 짧은 컷을 '삭제'가 아니라
+#    '최소 길이로 승격'하는 기준값. (삭제로 바꾸고 싶으면 알려주세요.)
+MIN_SCENE_SEC_DEFAULT: float = 0.20
+
+# 5) 시간 반올림 자릿수 — start/end/duration을 소수점 몇 자리까지 반올림할지
+ROUND_SEC_DEFAULT: int = 3
+
+# 6) 전역 네거티브 프롬프트 — 품질 저하 요소를 한 번에 관리
+NEGATIVE_BANK_DEFAULT: str = (
+    "text, letters, typography, watermark, logo, signature, caption, subtitles, closed captions, "
+    "korean letters, hangul, hangeul, handwriting, calligraphy, "
+    "텍스트, 글자, 글씨, 문구, 활자, 자막, 캡션, 로고, 워터마크, 서명, 낙관, 표지판, 간판, 스티커, "
+    "low quality, worst quality, lowres, jpeg artifacts, noise, grainy, overexposed, underexposed, "
+    "artifact, compression artifacts, deformed hands, extra fingers, fused fingers, long fingers, "
+    "mutated hands, deformed face, distorted face, ugly face, asymmetry, "
+    "nsfw, nude, nudity, sexual content"
+)
+
 
 # ───────── 로컬 오버라이드 파일 ─────────
 _SETTINGS_DIR: Path = BASE_DIR.parent / "app" / "_local"

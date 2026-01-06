@@ -739,18 +739,25 @@ class ShoppingImageGenerator:
         def _cb(d):
             self.on_progress(d.get("msg", ""))
 
+        # 1. 해상도 가져오기 (기본값 안전장치 포함)
+        img_size = settings.DEFAULT_IMG_SIZE
+        width_val = img_size[0]  # 가로
+        height_val = img_size[1]  # 세로
+
+        # 2. 스텝 수 가져오기
+        steps_val = settings.DEFAULT_T2I_STEPS
+
         try:
             build_shopping_images_2step(
                 video_json_path=video_json_path,
-                ui_width=720,
-                ui_height=1280,
-                steps=28,
+                ui_width=width_val,  # settings에서 가져온 가로값
+                ui_height=height_val,  # settings에서 가져온 세로값
+                steps=steps_val,  # settings에서 가져온 스텝 수
                 on_progress=_cb
             )
         except Exception as e:
             self.on_progress(f"❌ 이미지 생성 오류: {e}")
             raise e
-
 
 # -----------------------------------------------------------------------------
 # 6. 영상 생성/병합기
@@ -760,29 +767,39 @@ class ShoppingMovieGenerator:
         self.on_progress = on_progress or (lambda msg: None)
 
     def generate_movies(self, video_json_path: str | Path, skip_if_exists: bool = True, fps: int = 24) -> None:
-        vpath = Path(video_json_path)
+        vpath = Path(video_json_path)  # 이것은 video_shopping.json 입니다.
         project_dir = vpath.parent
-        temp_video_json = project_dir / "video_shopping"
+
+        # [중요] I2V 엔진(build_shots_with_i2v)은 무조건 'video.json'을 찾습니다.
+        # 따라서 video_shopping.json 내용을 복사한 '임시 파일'을 만들어야 합니다.
+        temp_video_json = project_dir / "video.json"
 
         self.on_progress(f"[Movie] I2V 준비: {vpath.name}")
 
+        # 1. video_shopping.json 내용을 읽음
         data = load_json(vpath, {})
+
+        # 2. duration 안전장치 (0이면 기본값 부여)
         for sc in data.get("scenes", []):
             if float(sc.get("duration", 0)) <= 0:
                 sc["duration"] = float(sc.get("seconds", 4.0))
 
+        # 3. 임시 파일(video.json)로 저장 -> 엔진이 이걸 읽음
         save_json(temp_video_json, data)
 
         def _cb(d):
             self.on_progress(d.get("msg", ""))
 
         try:
+            # 4. 엔진 실행 (엔진은 폴더 내의 video.json을 자동으로 찾음)
             build_shots_with_i2v(str(project_dir), total_frames=0, ui_fps=fps, on_progress=_cb)
             self.on_progress("[Movie] 생성 완료")
         finally:
+            # 5. [필수] 작업이 끝나면 임시 파일(video.json)은 헷갈리지 않게 삭제
             if temp_video_json.exists():
                 try:
                     os.remove(temp_video_json)
+                    # self.on_progress("ℹ️ 임시 파일 정리 완료")
                 except:
                     pass
 

@@ -46,7 +46,7 @@ import requests
 import random as _img_seed_random
 from app import settings as settings_obj
 
-from app.settings import CHARACTER_DIR, COMFY_INPUT_DIR
+from app.settings import CHARACTER_DIR, COMFY_INPUT_DIR, I2V_CHUNK_BASE_FRAMES, I2V_OVERLAP_FRAMES, I2V_PAD_TAIL_FRAMES
 
 from app.utils import load_json, save_json
 
@@ -57,7 +57,9 @@ WF_SWAP_2 = JSONS_DIR / "nunchaku-t2i_swap_2.json"
 WF_SWAP_3 = JSONS_DIR / "nunchaku-t2i_swap_3.json"  # 3명은 옵션
 WF_LIPSYNC = JSONS_DIR / "wanvideo_I2V_InfiniteTalk_song.json"
 
-
+CHUNK_BASE_FRAMES = I2V_CHUNK_BASE_FRAMES
+OVERLAP_FRAMES = I2V_OVERLAP_FRAMES
+PAD_TAIL_FRAMES = I2V_PAD_TAIL_FRAMES
 
 # ── 공용 HTTP 유틸 ──────────────────────────────────────────────────────────
 _KOR_KEEP = re.compile(r"[^가-힣ㄱ-ㅎㅏ-ㅣ .,!?~…·\-_/]+")
@@ -1131,9 +1133,11 @@ def raw_make_addup(
         subprocess.run(cmd_args, check=True)
 
     # ───────────────────────── I2V 세그먼트 공통 상수 ─────────────────────────
-    CHUNK_BASE_FRAMES = 82
-    OVERLAP_FRAMES = 6
-    PAD_TAIL_FRAMES = 5
+    # CHUNK_BASE_FRAMES = 82
+    # OVERLAP_FRAMES = 6
+    # PAD_TAIL_FRAMES = 5
+    #
+
 
     def _i2v_plan_segments(
         frame_len_total: int,
