@@ -248,7 +248,7 @@ def _apply_overrides(graph: dict, overrides: Dict[str, Any]) -> None:
 import subprocess
 
 
-
+# real_use
 def build_and_merge_full_video(project_dir: str,
                                on_progress: Callable[[Dict[str, Any]], None]) -> str:
     """
@@ -392,7 +392,7 @@ def mux_video_and_audio(video_in_path: Path, audio_in_path: Path, out_path: Path
     if result.returncode != 0:
         raise RuntimeError(f"FFMPEG 오디오/비디오 병합 실패:\n{result.stderr}")
 
-
+# real_use
 def add_subtitles_with_ffmpeg(video_in_path: Path,
                              video_json_path: Path,
                              out_path: Path,
@@ -781,6 +781,7 @@ def _toggle_upscale_node(graph: Dict[str, Any], enable: bool) -> None:
 # ─────────────────────────────────────────────────────────────────────────────
 # [메인 실행 래퍼] — 원클릭: RAW 전체 생성 → 전체 보간/업스케일
 # ─────────────────────────────────────────────────────────────────────────────
+# real_use
 def build_shots_with_i2v(
     project_dir: str,
     total_frames: int,
@@ -832,6 +833,7 @@ def build_shots_with_i2v(
 # ─────────────────────────────────────────────────────────────────────────────
 # [1단계] Raw 생성 및 병합 (기능 삭제 없음: 프롬프트, ReActor, Xfade 모두 포함)
 # ─────────────────────────────────────────────────────────────────────────────
+# real_use
 def raw_make_addup(
     project_dir: str,
     total_frames: int,
@@ -1970,7 +1972,7 @@ def raw_make_addup(
 # ─────────────────────────────────────────────────────────────────────────────
 # [2단계] 보간 및 업스케일 (별도 워크플로우 사용)
 # ─────────────────────────────────────────────────────────────────────────────
-
+# real_use
 def Interpolation_upscale(
     project_dir: str,
     total_frames: int,
@@ -2855,7 +2857,7 @@ def xfade_concat(
 
     print(f"[XC-DONE] out_path={out_path}")
     return Path(out_path)
-
+# real_use
 def build_missing_images_from_story(
         story_path: str | _Path,
         *,

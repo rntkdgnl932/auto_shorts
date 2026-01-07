@@ -763,7 +763,7 @@ def _gpt_prompt_for_scene(
         return ""
 
 
-##########
+# real_use
 def analyze_project(
     project_dir: str | Path = "",
     *,
@@ -957,6 +957,7 @@ def analyze_project(
     }
 
 # ───────────────────────── story.json 빌더 ─────────────────────────
+# real_use ( 제이슨 만드는 함수인데 엉뚱한 곳에 있음 )
 def build_story_json(
     *,
     audio_file: str,
@@ -1498,7 +1499,7 @@ def _probe_duration_librosa(path: str) -> float:
         return dur if math.isfinite(dur) and dur > 0 else 0.0
     except Exception:
         return 0.0
-
+# real_use
 def get_audio_duration(path: str) -> float:
     p = str(path or "").strip()
     if not p or not os.path.isfile(p):
@@ -1531,6 +1532,7 @@ def get_audio_duration(path: str) -> float:
 # ─────────────────────────────────────────────────────────────
 # 1) 온셋 검출(없으면 빈 리스트)
 # ─────────────────────────────────────────────────────────────
+# real_use
 def detect_onsets_seconds(
     path: str,
     *,
@@ -2079,7 +2081,7 @@ def _choose_host() -> str:
 # audio_sync.py 파일의 _collect_effective_tags 함수를 교체하세요. (약 722 라인 근처)
 
 # C:\my_games\shorts_make\app\audio_sync.py
-
+# real_use
 def _collect_effective_tags(meta: dict) -> List[str]:
     """
     [수정 v15] project.json에서 실제 주입할 태그 리스트:
@@ -2123,8 +2125,7 @@ def _collect_effective_tags(meta: dict) -> List[str]:
     return unique_tags
 
 
-# audio_sync.py 파일의 generate_music_with_acestep 함수 전체를 교체하세요.
-
+# real_use
 def generate_music_with_acestep(
         project_dir: str,
         *,
@@ -2930,7 +2931,7 @@ def demucs_vocals_drums(src: str) -> dict:
 #######################테스트중##################################
 ###################################################################
 
-
+# real_use
 def sync_lyrics_with_whisper_pro(
         audio_path: str,
         lyrics_text: str,
@@ -4139,6 +4140,7 @@ def _finalize_audio_and_update_time(
 # ───────────────────────────── 제출/폴링 ──────────────────────────────────────
 
 # ACE-step 음악 생성 시에도 사용되지만, 본질적으로는 ComfyUI 서버에 프롬프트(JSON)를 전달하고 작업 완료를 기다리는 범용 엔진
+# real_use
 def _submit_and_wait(
     base: str,
     wf_graph: dict,

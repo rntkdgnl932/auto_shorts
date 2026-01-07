@@ -16,7 +16,8 @@ _DEBUG_DIR = _Path(_BASE) / "_debug"
 _DEBUG_DIR.mkdir(parents=True, exist_ok=True)
 _DEBUG_LOG = _DEBUG_DIR / "lyrics_debug.log"
 
-def _dlog(msg: str):
+# real_use
+def _dlog(msg: str): # real_use
     """콘솔 + 파일에 동시에 남김"""
     line = f"[LYRICS_DEBUG] {msg}"
     try:
@@ -115,7 +116,7 @@ NOTE_LINE = re.compile(
 )
 
 # lyrics_gen.py
-
+# real_use
 def _ensure_intro_in_lyrics(text: str, *, total_seconds: int) -> str:
     """
     총 길이가 60초 이상인데 [intro] 블록이 없으면 맨 앞에 삽입.
@@ -134,7 +135,7 @@ def _ensure_intro_in_lyrics(text: str, *, total_seconds: int) -> str:
 
 
 
-
+# real_use
 def normalize_sections(lyrics: str) -> str:
     """
     섹션/가사 정규화.
@@ -209,22 +210,16 @@ def normalize_sections(lyrics: str) -> str:
     return "\n".join(out)
 
 
-
-
-# ───────── 공개 API ─────────
-
-# lyrics_gen.py 파일에서 이 함수를 찾아 아래 내용으로 전체를 교체하세요.
-
 def generate_title_lyrics_tags(
-    *,
-    prompt: str,
-    duration_min: int,
-    title_in: str = "",
-    allowed_tags=None,
-    duration_sec: int | None = None,
-    trace=None,
-    prefer: str | None = None,          # "openai" | "gemini"
-    allow_fallback: bool | None = None, # True/False
+        *,
+        prompt: str,
+        duration_min: int,
+        title_in: str = "",
+        allowed_tags=None,
+        duration_sec: int | None = None,
+        trace=None,
+        prefer: str | None = None,  # "openai" | "gemini"
+        allow_fallback: bool | None = None,  # True/False
 ) -> dict:
     """
     가사 생성:
@@ -234,7 +229,6 @@ def generate_title_lyrics_tags(
       - 변환 '최종본'을 BASE_DIR/_debug/lyrics_gen.log 에 기록
     출력: {"title":".", "lyrics":".", "tags":[...], "tags_pick":[...]}
     """
-
 
     def emit(ev: str, msg: str) -> None:
         if callable(trace):
@@ -293,16 +287,17 @@ def generate_title_lyrics_tags(
         sys_msg += "ALLOWED_TAGS: " + ", ".join(sorted(set(allowed_tags))) + "\n"
 
     user_msg = (
-        "[TASK]\n"
-        "- Write natural Korean lyrics with the above constraints.\n"
-        "- Title may be short and poetic.\n\n"
-        "[PROMPT]\n" + (prompt or "")
+            "[TASK]\n"
+            "- Write natural Korean lyrics with the above constraints.\n"
+            "- Title may be short and poetic.\n\n"
+            "[PROMPT]\n" + (prompt or "")
     )
 
     # ---- 모델 호출 ----
     prefer_opt = "openai" if prefer is None else str(prefer)
     allow_opt = (allow_fallback if allow_fallback is not None else (prefer_opt == "openai"))
-    emit("ai:prepare", f"prefer={prefer_opt}, allow_fallback={allow_opt}, sec={sec_val}, lines={min_lines}-{max_lines}")
+    emit("ai:prepare",
+         f"prefer={prefer_opt}, allow_fallback={allow_opt}, sec={sec_val}, lines={min_lines}-{max_lines}")
 
     ai = AI()
     raw_reply = ai.ask_smart(sys_msg, user_msg, prefer=prefer_opt, allow_fallback=allow_opt, trace=trace)
@@ -405,11 +400,10 @@ def generate_title_lyrics_tags(
 
     lyrics_out = "\n".join(final_lines_generate)
 
-
     # ---- 디버그 로그(최종본 기록) ----
     try:
 
-        base_dir = Path(getattr(settings_mod, "BASE_DIR", "."))
+        base_dir = Path(_BASE)
         dbg_dir = base_dir / "_debug"
         dbg_dir.mkdir(parents=True, exist_ok=True)
         with (dbg_dir / "lyrics_gen.log").open("a", encoding="utf-8") as fp:
@@ -435,15 +429,9 @@ def generate_title_lyrics_tags(
 
 
 
-
-
-
-
-
-
 # lyrics_gen.py (또는 create_project_files가 있는 파일)
 
-
+# real_use
 def create_project_files(title: str, lyrics: str, prompt: str) -> str:
     project_dir = ensure_project_dir(title)
     date = today_str()
@@ -483,8 +471,8 @@ def create_project_files(title: str, lyrics: str, prompt: str) -> str:
     save_json(project_dir / "project.json", meta)
     (project_dir / "clips").mkdir(exist_ok=True)
     return str(project_dir)
-
-def _ensure_intro_outro_headers(text: str) -> str:
+# real_use
+def _ensure_intro_outro_headers(text: str) -> str: # real_use
     """가사에 [intro]와 [outro] 헤더를 반드시 포함시키되, 그 아래에는 가사 줄을 두지 않는다."""
     lines = (text or "").splitlines()
     has_intro = any(ln.strip().lower().startswith("[intro]") for ln in lines)

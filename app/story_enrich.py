@@ -38,7 +38,7 @@ def _equal_chunks_by_words(text: str, n: int) -> List[str]:
     out.append(' '.join(tokens[i:]).strip())
     return out
 
-
+# real_use
 def _merge_global_context(s: dict, g: dict) -> None:
     """AI가 준 전역 컨텍스트를 story에 병합한다."""
     if not isinstance(g, dict):
@@ -356,9 +356,7 @@ def _build_korean_prompts(scene: dict, styles: Dict[str, str]) -> tuple[str, str
     return prompt_img, prompt_movie
 
 
-# story_enrich.py 파일의 apply_gpt_to_story_v11 함수 전체를 교체하세요.
-# (파일 상단의 import os, re, json, ... 등은 그대로 둡니다)
-
+# real_use
 def apply_gpt_to_story_v11(
         story: dict,
         *,
@@ -1793,6 +1791,7 @@ BAN_TEXT = [
   "가사 원문 인용 금지", "문자 텍스트 삽입 금지"
 ]
 
+# real_use
 def normalize_prompts(story: dict) -> dict:
     # @global → 실제 문자열 치환
     global_neg = (story.get("defaults", {}).get("image", {}) or {}).get("negative") or ""

@@ -47,6 +47,8 @@ except Exception:
     class BadRequestError(Exception):
         pass
 
+from app.settings import BASE_DIR
+
 
 # --- 한글→영문 매핑 ---
 _KO2EN_CHAR: Dict[str, str] = {
@@ -200,8 +202,6 @@ def _extract_char_tags(char_id: str, style_str: str) -> List[str]:
             uniq.append(t); seen.add(t)
     return uniq
 
-# utils.py 파일의 save_story_overwrite_with_prompts 함수 *내부*에 있는
-# _build_scene_prompts 함수를 찾아 아래 코드로 전체를 교체하세요.
 
 def _build_scene_prompts(scene: Dict[str, Any], story: Dict[str, Any]) -> Tuple[str, str]:
     """
@@ -277,7 +277,7 @@ def _build_scene_prompts(scene: Dict[str, Any], story: Dict[str, Any]) -> Tuple[
     return img_prompt, movie_prompt
 
 
-
+# real_use
 def save_story_overwrite_with_prompts(story_path: Path) -> Path:
     """
     [수정됨 v2] story.json을 읽어 audit 정보만 추가하고 같은 파일에 덮어쓴다.
@@ -287,7 +287,6 @@ def save_story_overwrite_with_prompts(story_path: Path) -> Path:
     """
     print(f"[PROMPTS_SAVE] load → {story_path}", flush=True)
     try:
-        # load_json 함수를 사용하여 안전하게 로드 시도
         story_raw = load_json(story_path, None)
         if not isinstance(story_raw, dict):
              # 로드 실패 또는 형식이 dict가 아니면 오류 발생
@@ -336,6 +335,7 @@ def ensure_dir(p: os.PathLike | str) -> Path:
     d.mkdir(parents=True, exist_ok=True)
     return d
 
+# real_use
 def load_json(p: os.PathLike | str, default: Optional[Any] = None) -> Union[Dict[str, Any], List[Any], None]:
     """
     JSON 파일을 로드합니다. 객체(dict) 또는 배열(list)을 반환할 수 있습니다.
@@ -370,8 +370,7 @@ def load_json(p: os.PathLike | str, default: Optional[Any] = None) -> Union[Dict
         print(f"[ERROR] load_json 중 예상치 못한 오류 ({path.name}): {type(e_unexpected).__name__}. 기본값 반환.")
         return default
 
-# utils.py 파일에서 save_json 함수를 찾아 아래 내용으로 전체를 교체하세요.
-
+# real_use
 def save_json(p: os.PathLike | str, obj: Any) -> Path:
     """
     JSON 객체(dict 또는 list)를 파일에 저장합니다.
@@ -383,6 +382,7 @@ def save_json(p: os.PathLike | str, obj: Any) -> Path:
         json.dump(obj, f, ensure_ascii=False, indent=2)
     return path
 
+# real_use
 def write_text(p: os.PathLike | str, text: str) -> Path:
     path = Path(p)
     ensure_parent(path)
@@ -392,17 +392,19 @@ def write_text(p: os.PathLike | str, text: str) -> Path:
 
 # ─────────────────────────────────────────────────────────────────────────────
 # 문자열/날짜
+# real_use
 def sanitize_title(s: str) -> str:
     """윈도우 금지문자 제거 + 공백 정돈"""
     bad = r'\/:*?"<>|'
     out = "".join(c for c in (s or "").strip() if c not in bad)
     out = " ".join(out.split())
     return out or "untitled"
-
+# real_use
 def now_kr(fmt: str = "%Y-%m-%d %H:%M:%S") -> str:
     kst = timezone(timedelta(hours=9))
     return datetime.now(tz=kst).strftime(fmt)
 
+# real_use
 def today_str(fmt: str = "%Y-%m-%d") -> str:
     return datetime.now().strftime(fmt)
 
@@ -429,6 +431,7 @@ def _normalize_maked_title_root(base: Path) -> Path:
     first = idxs[0]
     return Path(*parts[:first + 1])
 
+# real_use
 def ensure_project_dir(title: str) -> Path:
     """
     프로젝트 폴더를 반환(없으면 생성). 항상:
@@ -461,7 +464,7 @@ def _wav_duration_sec(path: Path) -> float:
     with wave.open(str(path), "rb") as w:
         frames, rate = w.getnframes(), w.getframerate()
         return 0.0 if rate <= 0 else frames / float(rate)
-
+# real_use
 def audio_duration_sec(path: os.PathLike | str) -> float:
     p = Path(path)
     if not p.exists() or not p.is_file():
@@ -772,6 +775,7 @@ class AIConfig:
         )
 
 # ── 본체 ─────────────────────────────────────────────────────────────
+# real_use
 class AI:
     def __init__(self, cfg: AIConfig | None = None):
         self.cfg = (cfg or AIConfig()).resolved()
@@ -969,6 +973,7 @@ class AI:
         except Exception:
             return ""
 
+    # real_use
     def ask_smart(
             self,
             system: str,
@@ -1099,109 +1104,213 @@ class AI:
         return self._ask(system_rules, prompt_template)
 
     # ---------- 제목/가사/태그 생성 ----------
+    # 가사생성 (lyrics_gen.py) 여기에 같은 이름 있음 추후 확인해야함
     def generate_title_lyrics_tags(
-            self,
             *,
             prompt: str,
             duration_min: int,
             title_in: str = "",
-            allowed_tags: Sequence[str] = (),
-            language: str = "ko",
+            allowed_tags=None,
             duration_sec: int | None = None,
-            trace: Optional[Any] = None,
-    ) -> Dict[str, Any]:
-        # ── 길이 스펙 결정 ──
-        # 우선순위: duration_sec 인자 > 프롬프트 내 '20초' 등 힌트 > duration_min*60
-        seconds_hint = (
-            int(duration_sec) if duration_sec else
-            (self._extract_seconds_hint(prompt) or (int(duration_min) * 60 if duration_min else 60))
-        )
-        # 기존 분(min) 스펙(60/120/180)은 그대로 유지
-        dur_spec: Dict[int, Dict[str, str]] = {
-            1: dict(
-                target="~60s",
-                structure=(
-                    "[verse] 8–10 lines → [chorus] 6–8 lines → [bridge] 4–6 lines → [chorus] 6–8 lines\n"
-                    "- Chorus twice, total ~24–32 lines"
-                ),
-            ),
-            2: dict(
-                target="~120s",
-                structure=(
-                    "[verse] 8–10 lines → [chorus] 6–8 lines → [verse] 8–10 lines → [chorus] 6–8 lines\n"
-                    "- Chorus twice, total ~32–40 lines"
-                ),
-            ),
-            3: dict(
-                target="~180s",
-                structure=(
-                    "[verse] 8–10 lines → [chorus] 6–8 lines → [verse] 8–10 lines → "
-                    "[chorus] 6–8 lines → [bridge] 4–6 lines → [chorus] 6–8 lines → [outro] 2–4 lines\n"
-                    "- Chorus three times (last chorus can repeat), total ~44–56 lines"
-                ),
-            ),
-        }
-        # seconds_hint에 따라 요약 스펙
-        if seconds_hint <= 30:
-            spec = dict(target="≤30s", structure="[verse] 2–3 lines → [chorus] 2–3 lines (total 4–6 lines).")
-        elif seconds_hint <= 60:
-            spec = dict(target="31–60s", structure="[verse] 4–6 lines → [chorus] 4–6 lines (total 8–12 lines).")
+            trace=None,
+            prefer: str | None = None,  # "openai" | "gemini"
+            allow_fallback: bool | None = None,  # True/False
+    ) -> dict:
+        """
+        가사 생성:
+          - 1줄≈5초 기준으로 '본문 줄수(헤더 제외)' 가이드를 제시
+          - 허용 섹션: [verse], [bridge] (그 외 헤더는 제거/치환)
+          - 본문 라인에 [ko]/[en] 언어 태그를 붙이지 않음
+          - 변환 '최종본'을 BASE_DIR/_debug/lyrics_gen.log 에 기록
+        출력: {"title":".", "lyrics":".", "tags":[...], "tags_pick":[...]}
+        """
+
+        def emit(ev: str, msg: str) -> None:
+            if callable(trace):
+                try:
+                    trace(ev, msg)
+                except (TypeError, ValueError):
+                    pass
+
+        allowed_tags = allowed_tags or []
+
+        # ---- 목표 초 계산(초 우선) ----
+        sec_val = None
+        if duration_sec is not None:
+            try:
+                sec_val = int(duration_sec)
+            except (TypeError, ValueError):
+                sec_val = None
+        if sec_val is None and isinstance(prompt, str):
+            match_sec = re.search(r"(\d{1,3})\s*(초|s|sec|secs|second|seconds)\b", prompt, flags=re.I)
+            if match_sec:
+                try:
+                    sec_val = int(match_sec.group(1))
+                except (TypeError, ValueError):
+                    sec_val = None
+        if sec_val is None or sec_val <= 0:
+            try:
+                duration_min_val = int(duration_min)
+            except (TypeError, ValueError):
+                duration_min_val = 2
+            duration_min_val = max(1, min(3, duration_min_val))
+            sec_val = duration_min_val * 60
+
+        # ---- 1줄≈5초: '본문 줄수' 가이드(헤더 제외) ----
+        base_lines = max(1, round(sec_val / 5))
+        if sec_val <= 35:
+            min_lines, max_lines = 6, 8
+        elif sec_val <= 75:
+            min_lines, max_lines = 10, 12
+        elif sec_val <= 150:
+            min_lines, max_lines = max(8, base_lines - 2), base_lines + 2
         else:
-            spec = dur_spec.get(max(1, min(3, int(duration_min or 2))), dur_spec[2])
+            min_lines, max_lines = max(10, base_lines - 2), base_lines + 3
 
-        allowed_str = ", ".join(sorted({t for t in allowed_tags})) if allowed_tags else ""
-
-        sys_rule = (
+        sys_msg = (
             "You are a Korean lyricist and music director. Return ONE JSON object only:\n"
-            '{"title":"...", "lyrics":"...", "tags":["...", "..."], "tags_pick":["...", "..."]}\n'
-            "- `lyrics` MUST use ONLY these headers: [verse], [chorus], [bridge], [outro].\n"
-            f"- Target duration: {spec['target']}. Structure guideline:\n{spec['structure']}\n"
-            "- Writing style: concise, singable Korean lines (natural prosody), everyday words.\n"
-            "- TAGS MUST BE ENGLISH (ACE-Step style), 4–8 items.\n"
-            "- If ALLOWED_TAGS are provided, pick 4–10 items ONLY from them that best match mood/instrumentation "
-            "and put them in `tags_pick`.\n"
-            "- Do NOT include any extra text outside the JSON."
+            '{"title":".", "lyrics_ko":".", "tags":[".", "."], "tags_pick":[".", "."]}\n'
+            "- Allowed headers: [verse], [bridge]\n"
+            f"- Body line budget (EXCLUDING headers): {min_lines}–{max_lines}\n"
+            "- IMPORTANT:\n"
+            "  1) Do NOT use [intro], [outro], [chorus], pre/post-chorus, hook, etc.\n"
+            "  2) Keep lyric lines only under [verse]/[bridge].\n"
+            "  3) No production notes or metadata.\n"
+            f"- Target duration: ~{sec_val}s (≈5s per line)\n"
         )
-        if allowed_str:
-            sys_rule += f"\nALLOWED_TAGS: {allowed_str}\n"
-
-        user_req = {
-            "prompt": prompt,
-            "duration_min": duration_min,
-            "title_hint": title_in,
-            "language": language
-        }
-        ask = (
-            "Generate title, lyrics, and tags for the request below. Output JSON ONLY, no code block.\n\n"
-            f"[REQUEST]\n{json.dumps(user_req, ensure_ascii=False)}"
-        )
-
-        # prefer=None을 전달하지 않고 호출 (Optional 인자 제거로 타입 경고 해소)
-        out = self.ask_smart(sys_rule, ask, trace=trace)
-        data = self._safe_json(out)
-
-        # ── 안전 보정 + 형식 정리 ──
-        data["title"] = self._enforce_title(data.get("title", ""), prompt)
-        raw_lyrics = str(data.get("lyrics", "")).strip()
-
-        # 1) 헤더가 같은 줄에 붙은 경우 분리
-        raw_lyrics = self._fix_inline_headers(raw_lyrics)
-        # 2) 허용 헤더만 정상화
-        raw_lyrics = self._normalize_sections(raw_lyrics)
-        # 3) 파싱 → 길이 기반 섹션/줄수 강제 컷
-        sections = self._parse_sections(raw_lyrics)
-        sections = self._enforce_duration_structure(sections, seconds_hint)
-        data["lyrics"] = self._format_sections(sections)
-
-        # 태그 정리
-        data["tags"] = self._normalize_tags(data.get("tags"))
-        picks_raw = self._normalize_tags(data.get("tags_pick"))
         if allowed_tags:
-            allowed_set = {t.lower() for t in allowed_tags}
-            picks_raw = [t for t in picks_raw if t.lower() in allowed_set]
-        data["tags_pick"] = list(dict.fromkeys(picks_raw))[:12]
+            sys_msg += "ALLOWED_TAGS: " + ", ".join(sorted(set(allowed_tags))) + "\n"
 
-        return data
+        user_msg = (
+                "[TASK]\n"
+                "- Write natural Korean lyrics with the above constraints.\n"
+                "- Title may be short and poetic.\n\n"
+                "[PROMPT]\n" + (prompt or "")
+        )
+
+        # ---- 모델 호출 ----
+        prefer_opt = "openai" if prefer is None else str(prefer)
+        allow_opt = (allow_fallback if allow_fallback is not None else (prefer_opt == "openai"))
+        emit("ai:prepare",
+             f"prefer={prefer_opt}, allow_fallback={allow_opt}, sec={sec_val}, lines={min_lines}-{max_lines}")
+
+        ai = AI()
+        raw_reply = ai.ask_smart(sys_msg, user_msg, prefer=prefer_opt, allow_fallback=allow_opt, trace=trace)
+        reply_text = str(raw_reply or "").strip()
+        if not reply_text:
+            raise RuntimeError("빈 응답입니다.")
+
+        # ---- JSON 파싱(관대한 추출) ----
+        emit("parse:begin", f"text_len={len(reply_text)}")
+        try:
+            a_pos = reply_text.find("{")
+            b_pos = reply_text.rfind("}")
+            if a_pos == -1 or b_pos == -1 or b_pos <= a_pos:
+                data_obj = json.loads(reply_text)
+            else:
+                data_obj = json.loads(reply_text[a_pos:b_pos + 1])
+        except json.JSONDecodeError:
+            data_obj = {"title": title_in or "untitled", "lyrics_ko": reply_text}
+        emit("parse:end", "ok")
+
+        # ---- 필드 보정 ----
+        title = str(data_obj.get("title", "")).strip() or (title_in or "untitled")
+        lyrics_src = str(data_obj.get("lyrics_ko", "") or data_obj.get("lyrics", "")).strip()
+
+        # ---- 금지 섹션 제거/치환 ----
+        ban_head_pat = re.compile(
+            r"^\s*\[(?:chorus|pre[- ]?chorus|post[- ]?chorus|hook|coda|break|tag|interlude|intro|outro)(?:\s+\d+)?]\s*$",
+            re.IGNORECASE,
+        )
+        tmp_lines: List[str] = []
+        for ln in lyrics_src.splitlines():
+            s = ln.strip()
+            if ban_head_pat.match(s):
+                tmp_lines.append("[verse]")
+            else:
+                tmp_lines.append(ln)
+        lyrics_mid = "\n".join(tmp_lines)
+
+        # ---- 기본 노이즈 정리 ----
+        keep_head_pat = re.compile(r"^\s*\[(?:verse|bridge)(?:\s+\d+)?]\s*$", re.IGNORECASE)
+        paren_only_pat = re.compile(r"^\s*\(.+?\)\s*$")
+        cleaned: List[str] = []
+        for ln in lyrics_mid.splitlines():
+            s = ln.strip()
+            if not s:
+                continue
+            if keep_head_pat.match(s):
+                cleaned.append(s)
+                continue
+            if paren_only_pat.match(s):
+                continue
+            cleaned.append(s)
+
+        # 중복 제거
+        uniq: List[str] = []
+        seen = set()
+        for s in cleaned:
+            if s not in seen:
+                uniq.append(s)
+                seen.add(s)
+
+        lyrics_body = "\n".join(uniq).strip()
+        if not lyrics_body:
+            raise RuntimeError("가사 내용이 비어 있습니다.")
+
+        # ---- 태그 정규화 ----
+        def _norm_tags(tags_in) -> List[str]:
+            if isinstance(tags_in, str):
+                parts = [p.strip() for p in re.split(r"[,\n/;]+", tags_in) if p.strip()]
+            elif isinstance(tags_in, list):
+                parts = [str(p).strip() for p in tags_in if str(p).strip()]
+            else:
+                parts = []
+            base = [
+                "clean vocals", "natural articulation", "warm emotional tone",
+                "studio reverb light", "clear diction", "balanced mixing",
+            ]
+            if len(parts) < 5:
+                parts = list(dict.fromkeys(parts + base))
+            return parts[:12]
+
+        tags = _norm_tags(data_obj.get("tags"))
+        picks_raw = _norm_tags(data_obj.get("tags_pick"))
+        if allowed_tags:
+            allow_set = {str(t).lower() for t in allowed_tags}
+            picks = [t for t in picks_raw if t.lower() in allow_set][:10]
+        else:
+            picks = picks_raw[:10]
+
+        # ---- 가사 라인 정리 (언어 태그 없이) ----
+        final_lines_generate: List[str] = []
+        for line_item in lyrics_body.splitlines():
+            # [verse], [bridge] 같은 섹션 헤더는 소문자로 통일하여 그대로 유지합니다.
+            stripped_line = line_item.strip()
+            if keep_head_pat.match(stripped_line):
+                final_lines_generate.append(stripped_line.lower())
+            # 나머지 가사 라인은 원본을 그대로 추가합니다.
+            else:
+                final_lines_generate.append(line_item)
+
+        lyrics_out = "\n".join(final_lines_generate)
+
+        # ---- 디버그 로그(최종본 기록) ----
+        try:
+
+            base_dir = Path(BASE_DIR)
+            dbg_dir = base_dir / "_debug"
+            dbg_dir.mkdir(parents=True, exist_ok=True)
+            with (dbg_dir / "lyrics_gen.log").open("a", encoding="utf-8") as fp:
+                fp.write("\n===== LYRICS GENERATED (no lang tags) =====\n")
+                fp.write(f"title: {title}\n")
+                fp.write(lyrics_out + "\n")
+        except (OSError, ValueError, TypeError, ImportError):
+            pass
+
+        emit("normalize:done", "lyrics generated without language tags")
+
+        return {"title": title, "lyrics": lyrics_out, "tags": tags, "tags_pick": picks}
 
     # ---------- JSON/정규화 유틸 ----------
     @staticmethod
@@ -1540,6 +1649,8 @@ DOCK_BOTTOM = _qt_get("Qt", "BottomDockWidgetArea") or _qt_get("Qt", "DockWidget
 
 TailT = Optional[Union[str, PathLike[str]]]
 
+
+# real_use
 class ProgressLogDialog(QtWidgets.QDialog):
     def __init__(self, parent=None, title="작업 진행"):
         super().__init__(parent)
@@ -1737,7 +1848,6 @@ class _Tailer(QtCore.QObject):
         except Exception:
             pass
 
-# (여기에 ProgressLogDialog 클래스가 먼저 옴)
 
 def _mk_progress(owner: QtWidgets.QWidget, title: str, tail_file: TailT = None):
     tail_str = os.fspath(tail_file) if tail_file is not None else None
@@ -1827,32 +1937,32 @@ def _mk_progress(owner: QtWidgets.QWidget, title: str, tail_file: TailT = None):
     return on_progress, finalize, dlg
 
 
-
-def run_job_with_progress(
-    owner: QtWidgets.QWidget,
-    title: str,
-    job: Callable[[Callable[[Dict[str, Any]], None]], Any],
-    *,
-    tail_file: TailT = None,
-    on_done: Optional[Callable[[bool, Any, Optional[BaseException]], None]] = None,
-) -> None:
-    """동기 실행(간단 작업용)"""
-    on_progress, finalize, _dlg = _mk_progress(owner, title, tail_file=tail_file)
-    ok = True
-    payload: Any = None
-    err: Optional[BaseException] = None
-    try:
-        payload = job(on_progress)
-    except BaseException as exc:
-        ok = False
-        err = exc
-    finally:
-        finalize(ok, payload, err)
-        if on_done:
-            try:
-                on_done(ok, payload, err)
-            except Exception:
-                pass
+#
+# def run_job_with_progress(
+#     owner: QtWidgets.QWidget,
+#     title: str,
+#     job: Callable[[Callable[[Dict[str, Any]], None]], Any],
+#     *,
+#     tail_file: TailT = None,
+#     on_done: Optional[Callable[[bool, Any, Optional[BaseException]], None]] = None,
+# ) -> None:
+#     """동기 실행(간단 작업용)"""
+#     on_progress, finalize, _dlg = _mk_progress(owner, title, tail_file=tail_file)
+#     ok = True
+#     payload: Any = None
+#     err: Optional[BaseException] = None
+#     try:
+#         payload = job(on_progress)
+#     except BaseException as exc:
+#         ok = False
+#         err = exc
+#     finally:
+#         finalize(ok, payload, err)
+#         if on_done:
+#             try:
+#                 on_done(ok, payload, err)
+#             except Exception:
+#                 pass
 
 def connect_worker_with_progress(
     owner: QtWidgets.QWidget,
@@ -1921,10 +2031,7 @@ class _JobWorker(QtCore.QObject):
             info = {"msg": str(info)}
         self.progress.emit(info)
 
-# progress.py (하단에 추가 또는 기존 함수 교체)
-
-# progress.py  ── 전체 교체
-
+# real_use
 def run_job_with_progress_async(
     owner: QtWidgets.QWidget,
     title: str,
@@ -2082,7 +2189,6 @@ def run_job_with_progress_async(
 
 
 
-# ───────── 백업 ProgressLogDialog (없을 때만) ─────────
 class _FallbackProgressDialog(QtWidgets.QDialog):
     def __init__(self, parent=None, title: str = "진행", tail_file: Optional[str] = None):
         super().__init__(parent)

@@ -27,6 +27,7 @@ import sys
 import faulthandler
 import datetime
 from app.utils import sanitize_title as _sanitize_title_fn, normalize_tags_to_english, audio_duration_sec, AI, save_story_overwrite_with_prompts, _normalize_maked_title_root, sanitize_title
+from app.utils import AI
 from app.utils import load_json as _lj, save_json as _sj
 from app.utils import load_json as _load_json
 from app.utils import sanitize_title as _sanitize
@@ -117,7 +118,7 @@ except Exception:
 # ==== /CRASH LOGGER ====
 
 
-AUDIO_EXTS = (".mp3", ".wav", ".opus", ".flac", ".m4a", ".aac", ".ogg", ".wma")
+# AUDIO_EXTS = (".mp3", ".wav", ".opus", ".flac", ".m4a", ".aac", ".ogg", ".wma")
 
 def _sanitize_title_for_path(title: str) -> str:
     t = (title or "").strip()
@@ -174,7 +175,7 @@ class Worker(QtCore.QObject):
 # ───────────────────────── 음악 전용 Worker (QThread) ─────────────────────────
 
 
-
+# real_use
 class MusicWorker(QtCore.QThread):
     progress = QtCore.pyqtSignal(str)
     finished = QtCore.pyqtSignal(bool, str)
@@ -329,7 +330,7 @@ class ClickableLabel(QtWidgets.QLabel):
             self.clicked.emit()
         super().mousePressEvent(event)
 
-
+# real_use
 class ScenePromptEditDialog(QtWidgets.QDialog):
     """
     [수정됨 v36] (사용자 요청 사항이 모두 통합된 최종본)
@@ -649,117 +650,8 @@ class ScenePromptEditDialog(QtWidgets.QDialog):
                 self._add_character_style_row(char_id, style_text)
         return group
 
-    def old_on_ai_request(self):
-        """(v17 수정) 'AI 요청' 버튼 핸들러 (기능 동일)"""
-        scenes_to_process: List[Tuple[Dict[str, Any], str]] = []
-        scenes_map = {scene.get("id"): scene for scene in self.scenes_data if isinstance(scene, dict) and "id" in scene}
 
-        for scene_id, text_edit_widget in self.widget_map:
-            if scene_id in scenes_map:
-                direct_prompt_text = text_edit_widget.toPlainText().strip()
-                if direct_prompt_text:
-                    scenes_to_process.append((scenes_map[scene_id], direct_prompt_text))
 
-        if not scenes_to_process:
-            QtWidgets.QMessageBox.information(self, "알림",
-                                              "AI로 요청할 'direct_prompt' 내용이 없습니다.\n먼저 'direct_prompt' 텍스트창에 내용을 입력하세요.")
-            return
-
-        self.btn_ai_request.setEnabled(False)
-        self.btn_update.setEnabled(False)
-        self.btn_cancel.setEnabled(False)
-
-        def job(progress_callback: Callable[[dict], None]):
-            _log = lambda msg: progress_callback({"msg": msg})
-            _log(f"총 {len(scenes_to_process)}개의 씬에 대해 3개 필드(prompt, prompt_img, prompt_movie) 생성을 요청합니다...")
-
-            system_prompt = (
-                "You are an AI assistant for video prompt generation. "
-                "The user will provide core keywords. "
-                "Return a JSON object with 3 keys: "
-                "1. `prompt_ko`: A single, vivid scene description in Korean based on the keywords. "
-                "2. `prompt_img_base`: A comma-separated list of English keywords (5-10 tags) for the scene's background, mood, and subject. "
-                "3. `motion_hint`: A single, short English motion tag (e.g., 'slow zoom in', 'camera pan left', 'subtle eye blink'). If no motion, return an empty string \"\". "
-                "Respond ONLY with the JSON object."
-            )
-
-            updated_count = 0
-            quality_tags = self._AI_QUALITY_TAGS
-            default_negative_tags = self._AI_DEFAULT_NEGATIVE_TAGS
-
-            for scene_dict, dp_text in scenes_to_process:
-                current_scene_id = scene_dict.get("id", "Unknown")
-                _log(f"[{current_scene_id}] 요청 중... (Keywords: {dp_text[:30]}...)")
-                user_prompt = f"Keywords: {dp_text}\n\nJSON Response:"
-
-                try:
-                    ai_response_str = self.ai_instance.ask_smart(system_prompt, user_prompt, prefer="gemini",
-                                                                 allow_fallback=True)
-                    json_start = ai_response_str.find("{")
-                    json_end = ai_response_str.rfind("}") + 1
-
-                    if 0 <= json_start < json_end:
-                        json_str = ai_response_str[json_start:json_end]
-                        try:
-                            ai_json_data = json.loads(json_str)
-                            if not isinstance(ai_json_data, dict): raise json.JSONDecodeError("Not a dict", json_str, 0)
-                        except json.JSONDecodeError as e_json:
-                            _log(f"[{current_scene_id}] AI 응답 JSON 파싱 실패: {e_json}\n응답: {ai_response_str[:50]}...")
-                            continue
-                    else:
-                        _log(f"[{current_scene_id}] AI가 JSON 응답을 반환하지 않았습니다.")
-                        continue
-
-                    prompt_ko = (ai_json_data.get("prompt_ko") or "").strip().replace('"', '').replace("'", "")
-                    prompt_img_base = (ai_json_data.get("prompt_img_base") or "").strip()
-                    motion_hint = (ai_json_data.get("motion_hint") or "").strip()
-
-                    if prompt_ko and prompt_img_base:
-                        scene_dict["prompt"] = prompt_ko
-                        scene_dict["prompt_img"] = f"{prompt_img_base}, {quality_tags}"
-                        scene_dict[
-                            "prompt_movie"] = f"{prompt_img_base}, {quality_tags}, motion: {motion_hint}" if motion_hint else \
-                        scene_dict["prompt_img"]
-                        scene_dict["prompt_negative"] = default_negative_tags
-                        updated_count += 1
-                        _log(f"[{current_scene_id}] 3개 필드 완료: {prompt_ko[:30]}...")
-                    else:
-                        _log(f"[{current_scene_id}] AI가 필수 필드(prompt_ko, prompt_img_base)를 반환하지 않았습니다.")
-
-                except Exception as e_ai_call:
-                    _log(f"[{current_scene_id}] AI 요청 실패 ({type(e_ai_call).__name__}): {e_ai_call}")
-
-            if updated_count > 0:
-                _log(f"총 {updated_count}개 씬의 프롬프트를 갱신했습니다. video.json 파일에 저장합니다...")
-                self.full_video_data["scenes"] = self.scenes_data
-                try:
-                    save_json(self.json_path, self.full_video_data)
-                except (IOError, OSError, Exception) as save_e:
-                    _log(f"[ERROR] video.json 저장 실패: {save_e}")
-
-            return {"updated_count": updated_count}
-
-        def done(ok: bool, payload: Optional[dict], err: Optional[Exception]):
-            self.btn_ai_request.setEnabled(True)
-            self.btn_update.setEnabled(True)
-            self.btn_cancel.setEnabled(True)
-
-            if not ok:
-                QtWidgets.QMessageBox.critical(self, "AI 요청 실패", f"작업 중 오류가 발생했습니다:\n{err}")
-                return
-            if payload:
-                count = payload.get("updated_count", 0)
-                if count > 0:
-                    QtWidgets.QMessageBox.information(self, "AI 요청 완료",
-                                                      f"총 {count}개 씬의 'prompt', 'prompt_img', 'prompt_movie' 필드를 갱신하고 저장했습니다.\n\n"
-                                                      f"(이제 '업데이트' 버튼을 눌러 direct_prompt도 저장하거나, 창을 닫으세요.)")
-                else:
-                    QtWidgets.QMessageBox.warning(self, "AI 요청", "AI가 갱신한 내용이 없거나 저장에 실패했습니다.")
-
-        run_job_with_progress_async(owner=self, title=f"AI 프롬프트 생성 중 ({self.json_path.name})", job=job, on_done=done)
-
-    # shorts_ui.py의 ScenePromptEditDialog 클래스 내부
-    # on_ai_request 함수를 이 코드로 덮어쓰세요.
 
     def on_ai_request(self):
         """
@@ -1222,8 +1114,6 @@ class ScenePromptEditDialog(QtWidgets.QDialog):
         except (OSError, Exception) as e_delete:
             QtWidgets.QMessageBox.critical(self, "삭제 실패", f"파일 삭제 중 오류가 발생했습니다:\n{e_delete}")
 
-    # shorts_ui.py의 ScenePromptEditDialog 클래스 내부
-    # load_and_build_ui 함수를 이 코드로 덮어쓰세요.
 
     def load_and_build_ui(self):
         """
@@ -2206,7 +2096,7 @@ class MainWindow(QtWidgets.QMainWindow):
     ######### ######### ######### #########
     ######### ######### ######### #########
     ######### ######### ######### #########
-
+    # real_use
     def _generate_and_save_ai_tags(self, project_path: Path, meta: dict, progress_callback: Callable) -> List[str]:
         """
         '긍정 프롬프트 (+)' 박스 내용을 AI로 보내 태그로 변환하고 project.json에 저장합니다.
@@ -2346,255 +2236,255 @@ class MainWindow(QtWidgets.QMainWindow):
                 pass
             btn.clicked.connect(handler)
 
-    def on_toggle_convert(self, checked: bool) -> None:
-        """
-        변환(LLS) 토글 핸들러.
-        - ON  : 현재 가사를 영어 발음(로마자) 표기로 변환하여 lyrics_lls에 저장, lls_enabled=True
-        - OFF : lyrics_lls 비우고 lls_enabled=False
-        - 우측 변환 에디터/패널은 항상 보이되 enable 상태만 토글
-        """
+    # def on_toggle_convert(self, checked: bool) -> None:
+    #     """
+    #     변환(LLS) 토글 핸들러.
+    #     - ON  : 현재 가사를 영어 발음(로마자) 표기로 변환하여 lyrics_lls에 저장, lls_enabled=True
+    #     - OFF : lyrics_lls 비우고 lls_enabled=False
+    #     - 우측 변환 에디터/패널은 항상 보이되 enable 상태만 토글
+    #     """
+    #
+    #
+    #
+    #     # 활성 프로젝트 경로 정규화
+    #     def _active_project_dir() -> str:
+    #         attr_list = [
+    #             "_get_active_project_dir", "_current_project_dir", "current_project_dir",
+    #             "_active_project_dir", "project_dir", "_forced_project_dir",
+    #         ]
+    #         for attr_name in attr_list:
+    #             val = getattr(self, attr_name, None)
+    #             if val is None:
+    #                 continue
+    #             if callable(val):
+    #                 try:
+    #                     val = val()
+    #                 except (TypeError, AttributeError):
+    #                     val = None
+    #             if callable(val):
+    #                 continue
+    #             if isinstance(val, (str, os.PathLike)):
+    #                 try:
+    #                     return os.fspath(val)
+    #                 except TypeError:
+    #                     continue
+    #             try:
+    #                 as_str = str(val)
+    #                 if as_str:
+    #                     return as_str
+    #             except (TypeError, ValueError):
+    #                 continue
+    #         return ""
+    #
+    #     proj_dir = _active_project_dir()
+    #     if not proj_dir:
+    #         return
+    #
+    #     meta_path = Path(proj_dir) / "project.json"
+    #
+    #     # project.json 로드/세이브
+    #     def _load_meta(p: Path) -> dict:
+    #         try:
+    #             return json.loads(p.read_text(encoding="utf-8")) or {}
+    #         except (FileNotFoundError, JSONDecodeError, UnicodeDecodeError, OSError, TypeError, ValueError):
+    #             return {}
+    #
+    #     def _save_meta(p: Path, data: dict) -> None:
+    #         try:
+    #             p.write_text(json.dumps(data, ensure_ascii=False, indent=2), encoding="utf-8")
+    #         except OSError:
+    #             return
+    #
+    #     meta = _load_meta(meta_path)
+    #
+    #     # 우측 패널/에디터 핸들
+    #     right_editor = getattr(self, "te_lyrics_converted", None) or getattr(self, "txt_lyrics_converted", None)
+    #     panel_widget = None
+    #     for panel_name in ("grp_convert", "box_convert", "frame_convert", "gb_convert", "w_convert"):
+    #         w = getattr(self, panel_name, None)
+    #         if w is not None:
+    #             panel_widget = w
+    #             break
+    #
+    #     # 패널은 항상 보이기, enable 상태만 토글
+    #     try:
+    #         if panel_widget is not None and hasattr(panel_widget, "setVisible"):
+    #             panel_widget.setVisible(True)
+    #         if right_editor is not None and hasattr(right_editor, "setVisible"):
+    #             right_editor.setVisible(True)
+    #         if panel_widget is not None and hasattr(panel_widget, "setEnabled"):
+    #             panel_widget.setEnabled(bool(checked))
+    #         if right_editor is not None and hasattr(right_editor, "setEnabled"):
+    #             right_editor.setEnabled(bool(checked))
+    #     except (AttributeError, RuntimeError):
+    #         pass
+    #
+    #     # OFF: lyrics_lls 비우기
+    #     if not checked:
+    #         meta["lls_enabled"] = False
+    #         if "lyrics_lls" in meta:
+    #             meta["lyrics_lls"] = ""
+    #         _save_meta(meta_path, meta)
+    #         if right_editor is not None and hasattr(right_editor, "clear"):
+    #             try:
+    #                 right_editor.clear()
+    #             except (AttributeError, RuntimeError):
+    #                 pass
+    #         return
+    #
+    #     # ===== ON: 변환 수행 =====
+    #
+    #     # 1) 원문 가사(왼쪽 에디터 우선, 없으면 project.json: lyrics)
+    #     src_text = ""
+    #     left_editor = getattr(self, "te_lyrics", None) or getattr(self, "txt_lyrics", None)
+    #     if left_editor is not None and hasattr(left_editor, "toPlainText"):
+    #         try:
+    #             src_text = (left_editor.toPlainText() or "").strip()
+    #         except (AttributeError, TypeError, ValueError):
+    #             src_text = ""
+    #     if not src_text:
+    #         src_text = str(meta.get("lyrics") or "").strip()
+    #
+    #     # 2) 섹션 정규화
+    #     norm_text = normalize_sections(src_text)
+    #
+    #     # 3) 변환기: kroman → 실패 시 간단 로마자화 fallback
+    #     def _convert(text_in: str) -> str:
+    #         # kroman 사용 시
+    #         try:
+    #             import kroman  # type: ignore
+    #             out_lines_k: list[str] = []
+    #             for line_text in (text_in or "").splitlines():
+    #                 s_line = (line_text or "").strip()
+    #                 if not s_line:
+    #                     continue
+    #                 # 섹션 헤더는 그대로
+    #                 if re.match(r"^\s*\[(?:verse|bridge)(?:\s+\d+)?]\s*$", s_line, flags=re.IGNORECASE):
+    #                     out_lines_k.append(s_line.lower())
+    #                     continue
+    #                 # 기존 [xx] 태그 제거 후 본문
+    #                 m_head = re.match(r"^\s*\[([a-z]{2})]\s*", s_line, flags=re.IGNORECASE)
+    #                 tail_text = s_line[m_head.end():].lstrip() if m_head else s_line
+    #                 rom = kroman.parse(tail_text).replace("-", "").strip()
+    #                 out_lines_k.append("[ko]" + rom if rom else "[ko]")
+    #             return "\n".join(out_lines_k).strip()
+    #         except ImportError:
+    #             # 아래 fallback 사용
+    #             pass
+    #
+    #         # fallback: 간단 로마자화(한글 부분만 분해→매핑)
+    #         cho_map = ["g", "kk", "n", "d", "tt", "r", "m", "b", "pp", "s", "ss", "", "j", "jj", "ch", "k", "t", "p",
+    #                    "h"]
+    #         jung_map = ["a", "ae", "ya", "yae", "eo", "e", "yeo", "ye", "o", "wa", "wae", "oe",
+    #                     "yo", "u", "wo", "we", "wi", "yu", "eu", "ui", "i"]
+    #         jong_map = ["", "k", "k", "k", "n", "n", "n", "t", "l", "k", "m", "p", "t", "l", "m", "p", "l", "m", "p",
+    #                     "t", "t", "ng", "t", "t", "k", "t", "p", "t"]
+    #
+    #         def _romanize_korean(seg_text: str) -> str:
+    #             buf_chars: list[str] = []
+    #             for ch in seg_text:
+    #                 code = ord(ch)
+    #                 if 0xAC00 <= code <= 0xD7A3:
+    #                     si = code - 0xAC00
+    #                     cho = si // 588
+    #                     jung = (si % 588) // 28
+    #                     jong = si % 28
+    #                     buf_chars.append(cho_map[cho] + jung_map[jung] + jong_map[jong])
+    #                 else:
+    #                     buf_chars.append(ch)
+    #             merged = "".join(buf_chars)
+    #             merged = re.sub(r"\s{2,}", " ", merged).strip()
+    #             return merged.lower()
+    #
+    #         out_lines_f: list[str] = []
+    #         for line_text in (text_in or "").splitlines():
+    #             s_line = (line_text or "").strip()
+    #             if not s_line:
+    #                 continue
+    #             if re.match(r"^\s*\[(?:verse|bridge)(?:\s+\d+)?]\s*$", s_line, flags=re.IGNORECASE):
+    #                 out_lines_f.append(s_line.lower())
+    #                 continue
+    #             m_head = re.match(r"^\s*\[([a-z]{2})]\s*", s_line, flags=re.IGNORECASE)
+    #             tail_text = s_line[m_head.end():].lstrip() if m_head else s_line
+    #             has_ko = bool(re.search(r"[가-힣]", tail_text))
+    #             if has_ko:
+    #                 out_lines_f.append("[ko]" + _romanize_korean(tail_text))
+    #             else:
+    #                 # 영문/숫자만 있으면 en로 태깅
+    #                 out_lines_f.append("[en]" + tail_text)
+    #         return "\n".join(out_lines_f).strip()
+    #
+    #     lls_text = _convert(norm_text)
+    #
+    #     # 4) 에디터/메타 반영
+    #     if right_editor is not None and hasattr(right_editor, "setPlainText"):
+    #         try:
+    #             right_editor.setPlainText(lls_text)
+    #         except (AttributeError, RuntimeError):
+    #             pass
+    #
+    #     meta["lls_enabled"] = True
+    #     meta["lyrics_lls"] = lls_text
+    #     _save_meta(meta_path, meta)
+    #
+    #     # 5) 로그(lyrics_gen.log) 요약
+    #     log_path = Path(proj_dir) / "lyrics_gen.log"
+    #     try:
+    #         preview = "\n".join(lls_text.splitlines()[:10])
+    #         log_path.parent.mkdir(parents=True, exist_ok=True)
+    #         with log_path.open("a", encoding="utf-8") as fp:
+    #             fp.write("\n===== CONVERT (LLS) =====\n")
+    #             fp.write(preview + "\n")
+    #     except OSError:
+    #         pass
 
-
-
-        # 활성 프로젝트 경로 정규화
-        def _active_project_dir() -> str:
-            attr_list = [
-                "_get_active_project_dir", "_current_project_dir", "current_project_dir",
-                "_active_project_dir", "project_dir", "_forced_project_dir",
-            ]
-            for attr_name in attr_list:
-                val = getattr(self, attr_name, None)
-                if val is None:
-                    continue
-                if callable(val):
-                    try:
-                        val = val()
-                    except (TypeError, AttributeError):
-                        val = None
-                if callable(val):
-                    continue
-                if isinstance(val, (str, os.PathLike)):
-                    try:
-                        return os.fspath(val)
-                    except TypeError:
-                        continue
-                try:
-                    as_str = str(val)
-                    if as_str:
-                        return as_str
-                except (TypeError, ValueError):
-                    continue
-            return ""
-
-        proj_dir = _active_project_dir()
-        if not proj_dir:
-            return
-
-        meta_path = Path(proj_dir) / "project.json"
-
-        # project.json 로드/세이브
-        def _load_meta(p: Path) -> dict:
-            try:
-                return json.loads(p.read_text(encoding="utf-8")) or {}
-            except (FileNotFoundError, JSONDecodeError, UnicodeDecodeError, OSError, TypeError, ValueError):
-                return {}
-
-        def _save_meta(p: Path, data: dict) -> None:
-            try:
-                p.write_text(json.dumps(data, ensure_ascii=False, indent=2), encoding="utf-8")
-            except OSError:
-                return
-
-        meta = _load_meta(meta_path)
-
-        # 우측 패널/에디터 핸들
-        right_editor = getattr(self, "te_lyrics_converted", None) or getattr(self, "txt_lyrics_converted", None)
-        panel_widget = None
-        for panel_name in ("grp_convert", "box_convert", "frame_convert", "gb_convert", "w_convert"):
-            w = getattr(self, panel_name, None)
-            if w is not None:
-                panel_widget = w
-                break
-
-        # 패널은 항상 보이기, enable 상태만 토글
-        try:
-            if panel_widget is not None and hasattr(panel_widget, "setVisible"):
-                panel_widget.setVisible(True)
-            if right_editor is not None and hasattr(right_editor, "setVisible"):
-                right_editor.setVisible(True)
-            if panel_widget is not None and hasattr(panel_widget, "setEnabled"):
-                panel_widget.setEnabled(bool(checked))
-            if right_editor is not None and hasattr(right_editor, "setEnabled"):
-                right_editor.setEnabled(bool(checked))
-        except (AttributeError, RuntimeError):
-            pass
-
-        # OFF: lyrics_lls 비우기
-        if not checked:
-            meta["lls_enabled"] = False
-            if "lyrics_lls" in meta:
-                meta["lyrics_lls"] = ""
-            _save_meta(meta_path, meta)
-            if right_editor is not None and hasattr(right_editor, "clear"):
-                try:
-                    right_editor.clear()
-                except (AttributeError, RuntimeError):
-                    pass
-            return
-
-        # ===== ON: 변환 수행 =====
-
-        # 1) 원문 가사(왼쪽 에디터 우선, 없으면 project.json: lyrics)
-        src_text = ""
-        left_editor = getattr(self, "te_lyrics", None) or getattr(self, "txt_lyrics", None)
-        if left_editor is not None and hasattr(left_editor, "toPlainText"):
-            try:
-                src_text = (left_editor.toPlainText() or "").strip()
-            except (AttributeError, TypeError, ValueError):
-                src_text = ""
-        if not src_text:
-            src_text = str(meta.get("lyrics") or "").strip()
-
-        # 2) 섹션 정규화
-        norm_text = normalize_sections(src_text)
-
-        # 3) 변환기: kroman → 실패 시 간단 로마자화 fallback
-        def _convert(text_in: str) -> str:
-            # kroman 사용 시
-            try:
-                import kroman  # type: ignore
-                out_lines_k: list[str] = []
-                for line_text in (text_in or "").splitlines():
-                    s_line = (line_text or "").strip()
-                    if not s_line:
-                        continue
-                    # 섹션 헤더는 그대로
-                    if re.match(r"^\s*\[(?:verse|bridge)(?:\s+\d+)?]\s*$", s_line, flags=re.IGNORECASE):
-                        out_lines_k.append(s_line.lower())
-                        continue
-                    # 기존 [xx] 태그 제거 후 본문
-                    m_head = re.match(r"^\s*\[([a-z]{2})]\s*", s_line, flags=re.IGNORECASE)
-                    tail_text = s_line[m_head.end():].lstrip() if m_head else s_line
-                    rom = kroman.parse(tail_text).replace("-", "").strip()
-                    out_lines_k.append("[ko]" + rom if rom else "[ko]")
-                return "\n".join(out_lines_k).strip()
-            except ImportError:
-                # 아래 fallback 사용
-                pass
-
-            # fallback: 간단 로마자화(한글 부분만 분해→매핑)
-            cho_map = ["g", "kk", "n", "d", "tt", "r", "m", "b", "pp", "s", "ss", "", "j", "jj", "ch", "k", "t", "p",
-                       "h"]
-            jung_map = ["a", "ae", "ya", "yae", "eo", "e", "yeo", "ye", "o", "wa", "wae", "oe",
-                        "yo", "u", "wo", "we", "wi", "yu", "eu", "ui", "i"]
-            jong_map = ["", "k", "k", "k", "n", "n", "n", "t", "l", "k", "m", "p", "t", "l", "m", "p", "l", "m", "p",
-                        "t", "t", "ng", "t", "t", "k", "t", "p", "t"]
-
-            def _romanize_korean(seg_text: str) -> str:
-                buf_chars: list[str] = []
-                for ch in seg_text:
-                    code = ord(ch)
-                    if 0xAC00 <= code <= 0xD7A3:
-                        si = code - 0xAC00
-                        cho = si // 588
-                        jung = (si % 588) // 28
-                        jong = si % 28
-                        buf_chars.append(cho_map[cho] + jung_map[jung] + jong_map[jong])
-                    else:
-                        buf_chars.append(ch)
-                merged = "".join(buf_chars)
-                merged = re.sub(r"\s{2,}", " ", merged).strip()
-                return merged.lower()
-
-            out_lines_f: list[str] = []
-            for line_text in (text_in or "").splitlines():
-                s_line = (line_text or "").strip()
-                if not s_line:
-                    continue
-                if re.match(r"^\s*\[(?:verse|bridge)(?:\s+\d+)?]\s*$", s_line, flags=re.IGNORECASE):
-                    out_lines_f.append(s_line.lower())
-                    continue
-                m_head = re.match(r"^\s*\[([a-z]{2})]\s*", s_line, flags=re.IGNORECASE)
-                tail_text = s_line[m_head.end():].lstrip() if m_head else s_line
-                has_ko = bool(re.search(r"[가-힣]", tail_text))
-                if has_ko:
-                    out_lines_f.append("[ko]" + _romanize_korean(tail_text))
-                else:
-                    # 영문/숫자만 있으면 en로 태깅
-                    out_lines_f.append("[en]" + tail_text)
-            return "\n".join(out_lines_f).strip()
-
-        lls_text = _convert(norm_text)
-
-        # 4) 에디터/메타 반영
-        if right_editor is not None and hasattr(right_editor, "setPlainText"):
-            try:
-                right_editor.setPlainText(lls_text)
-            except (AttributeError, RuntimeError):
-                pass
-
-        meta["lls_enabled"] = True
-        meta["lyrics_lls"] = lls_text
-        _save_meta(meta_path, meta)
-
-        # 5) 로그(lyrics_gen.log) 요약
-        log_path = Path(proj_dir) / "lyrics_gen.log"
-        try:
-            preview = "\n".join(lls_text.splitlines()[:10])
-            log_path.parent.mkdir(parents=True, exist_ok=True)
-            with log_path.open("a", encoding="utf-8") as fp:
-                fp.write("\n===== CONVERT (LLS) =====\n")
-                fp.write(preview + "\n")
-        except OSError:
-            pass
-
-    def _apply_convert_ui_from_meta(self, proj_dir: str) -> None:
-        """
-        project.json의 상태를 오른쪽 UI에 반영:
-        - lyrics_lls 존재 or lls_enabled=True → 변환 패널/에디터 보이기 + 내용 표시
-        - 아니면 숨김
-        버튼 상태는 사용자의 현재 상태를 해치지 않도록 시그널 차단 후 체크만 반영
-        """
-
-        pj = Path(proj_dir) / "project.json"
-        try:
-            meta = json.loads(pj.read_text(encoding="utf-8")) if pj.exists() else {}
-        except Exception:
-            meta = {}
-
-        te_c = getattr(self, "te_lyrics_converted", None)
-        panel = None
-        for name in ("grp_convert", "box_convert", "frame_convert", "gb_convert", "w_convert"):
-            w = getattr(self, name, None)
-            if w is not None:
-                panel = w
-                break
-        btn = getattr(self, "btn_convert_toggle", None)
-
-        lls = (meta.get("lyrics_lls") or "").strip()
-        on = bool(meta.get("lls_enabled")) or bool(lls)
-
-        # 우측 에디터/패널 표시/텍스트 반영
-        try:
-            if te_c is not None and hasattr(te_c, "setVisible"):
-                te_c.setVisible(on)
-            if panel is not None and hasattr(panel, "setVisible"):
-                panel.setVisible(on)
-            if on and lls and hasattr(te_c, "setPlainText"):
-                te_c.setPlainText(lls)
-        except Exception:
-            pass
-
-        # 토글 버튼 체크 상태만 맞춤(시그널 차단해서 불필요한 핸들러 재실행 방지)
-        try:
-            if btn is not None and hasattr(btn, "setChecked"):
-                if hasattr(btn, "blockSignals"):
-                    btn.blockSignals(True)
-                btn.setChecked(on)
-                if hasattr(btn, "blockSignals"):
-                    btn.blockSignals(False)
-        except Exception:
-            pass
+    # def _apply_convert_ui_from_meta(self, proj_dir: str) -> None:
+    #     """
+    #     project.json의 상태를 오른쪽 UI에 반영:
+    #     - lyrics_lls 존재 or lls_enabled=True → 변환 패널/에디터 보이기 + 내용 표시
+    #     - 아니면 숨김
+    #     버튼 상태는 사용자의 현재 상태를 해치지 않도록 시그널 차단 후 체크만 반영
+    #     """
+    #
+    #     pj = Path(proj_dir) / "project.json"
+    #     try:
+    #         meta = json.loads(pj.read_text(encoding="utf-8")) if pj.exists() else {}
+    #     except Exception:
+    #         meta = {}
+    #
+    #     te_c = getattr(self, "te_lyrics_converted", None)
+    #     panel = None
+    #     for name in ("grp_convert", "box_convert", "frame_convert", "gb_convert", "w_convert"):
+    #         w = getattr(self, name, None)
+    #         if w is not None:
+    #             panel = w
+    #             break
+    #     btn = getattr(self, "btn_convert_toggle", None)
+    #
+    #     lls = (meta.get("lyrics_lls") or "").strip()
+    #     on = bool(meta.get("lls_enabled")) or bool(lls)
+    #
+    #     # 우측 에디터/패널 표시/텍스트 반영
+    #     try:
+    #         if te_c is not None and hasattr(te_c, "setVisible"):
+    #             te_c.setVisible(on)
+    #         if panel is not None and hasattr(panel, "setVisible"):
+    #             panel.setVisible(on)
+    #         if on and lls and hasattr(te_c, "setPlainText"):
+    #             te_c.setPlainText(lls)
+    #     except Exception:
+    #         pass
+    #
+    #     # 토글 버튼 체크 상태만 맞춤(시그널 차단해서 불필요한 핸들러 재실행 방지)
+    #     try:
+    #         if btn is not None and hasattr(btn, "setChecked"):
+    #             if hasattr(btn, "blockSignals"):
+    #                 btn.blockSignals(True)
+    #             btn.setChecked(on)
+    #             if hasattr(btn, "blockSignals"):
+    #                 btn.blockSignals(False)
+    #     except Exception:
+    #         pass
 
     def on_convert_toggle(self, checked: bool) -> None:
         """
@@ -2695,6 +2585,7 @@ class MainWindow(QtWidgets.QMainWindow):
                 if hasattr(te_c, "setEnabled"):
                     te_c.setEnabled(False)  # 비활성화
 
+    # real_use
     def on_generate_lyrics_with_log(self) -> None:
         """
         가사 생성 버튼 핸들러.
@@ -2833,7 +2724,6 @@ class MainWindow(QtWidgets.QMainWindow):
                 _emit(f"[{head}] {msg}")
 
             _emit(f"[ai] prefer={prefer}, secs={secs}")
-
             data = generate_title_lyrics_tags(
                 prompt=prompt_text,
                 duration_min=max(1, min(3, int(round(secs / 60)) or 1)),
@@ -3012,7 +2902,7 @@ class MainWindow(QtWidgets.QMainWindow):
 
         run_job_with_progress_async(self, "가사 생성", job, tail_file=log_path, on_done=done)
 
-    # --- 누락 이미지 생성: 비동기 + 진행창 로그 (no _guess_project_dir) ---
+    # real_use
     def on_click_generate_missing_images_with_log(self) -> None:
         """video.json만 대상으로 누락된 씬 이미지를 생성한다(진행창/실시간 로그)."""
 
@@ -3152,8 +3042,7 @@ class MainWindow(QtWidgets.QMainWindow):
 
         run_job_with_progress_async(self, "누락 이미지 생성", job, tail_file=comfy_log_file, on_done=done)
 
-    # shorts_ui.py의 MainWindow 클래스 내부에 이 함수를 통째로 덮어쓰세요.
-
+    # real_use
     def on_click_segments_missing_images_with_log(self):
         """
         [2단계] 세그먼트 이미지 생성 (Qwen I2I) - 주입 검증 강화판
@@ -3395,9 +3284,7 @@ class MainWindow(QtWidgets.QMainWindow):
 
         run_job_with_progress_async(self, "세그먼트 이미지 생성 (Qwen)", job, on_done=done)
 
-
-
-
+    # real_use
     def on_click_generate_music(self) -> None:
         """
         음악 생성 버튼 핸들러
@@ -3574,6 +3461,7 @@ class MainWindow(QtWidgets.QMainWindow):
             self._music_inflight = False
             QtWidgets.QMessageBox.warning(self, "음악 생성 오류", str(e))
 
+    # real_use
     def on_click_analyze_music(self, *, on_done_override: Optional[Callable] = None) -> None: # <-- 시그니처 수정
         """
         (단순화) 음악분석: UI에서 필요한 정보를 수집하여 audio_sync.py의 핵심 분석 함수를 호출하고
@@ -3670,84 +3558,85 @@ class MainWindow(QtWidgets.QMainWindow):
 
 
 
-    @staticmethod
-    def _persist_lyric_sections(*, proj_dir: str, sections: list, last_end: float) -> None:
-        """
-        가사 섹션을 story.json, scene.json, project.json에 안전하게 반영한다.
-        - story.json: lyric_sections[], last_lyric_end_sec, effective_duration(없으면), updated_at
-        - scene.json: segments[] (start/end/label/text), duration(없으면), updated_at
-        - project.json: custom_seconds(없으면만) 기록
-        """
+    # @staticmethod
+    # def _persist_lyric_sections(*, proj_dir: str, sections: list, last_end: float) -> None:
+    #     """
+    #     가사 섹션을 story.json, scene.json, project.json에 안전하게 반영한다.
+    #     - story.json: lyric_sections[], last_lyric_end_sec, effective_duration(없으면), updated_at
+    #     - scene.json: segments[] (start/end/label/text), duration(없으면), updated_at
+    #     - project.json: custom_seconds(없으면만) 기록
+    #     """
+    #
+    #
+    #
+    #     base = Path(proj_dir)
+    #     now_ts = int(time.time())
+    #
+    #     # ---- story.json ----
+    #     story_path = base / "story.json"
+    #     story = load_json(story_path, {}) or {}
+    #     if not isinstance(story, dict):
+    #         story = {}
+    #
+    #     safe_sections = []
+    #     for s in sections or []:
+    #         if not isinstance(s, dict):
+    #             continue
+    #         try:
+    #             st = float(s.get("start", 0.0))
+    #             et = float(s.get("end", 0.0))
+    #         except (TypeError, ValueError):
+    #             continue
+    #         tx = str(s.get("text") or "")
+    #         lb = str(s.get("label") or "")
+    #         if et < st:
+    #             et = st
+    #         safe_sections.append({"start": max(0.0, st), "end": max(0.0, et), "text": tx, "label": lb})
+    #
+    #     story["lyric_sections"] = safe_sections
+    #     story["last_lyric_end_sec"] = float(max(0.0, float(last_end or 0.0)))
+    #     if "effective_duration" not in story:
+    #         story["effective_duration"] = float(max(story.get("last_lyric_end_sec", 0.0), 0.0))
+    #     story["updated_at"] = now_ts
+    #     save_json(story_path, story)
+    #
+    #     # ---- scene.json ----
+    #     scene_path = base / "scene.json"
+    #     scene = load_json(scene_path, {}) or {}
+    #     if not isinstance(scene, dict):
+    #         scene = {}
+    #
+    #     scene_segments = []
+    #     for i, s in enumerate(story.get("lyric_sections", [])):
+    #         scene_segments.append(
+    #             {
+    #                 "id": f"line_{i:03d}",
+    #                 "start": float(s.get("start", 0.0)),
+    #                 "end": float(s.get("end", 0.0)),
+    #                 "label": str(s.get("label") or ""),
+    #                 "text": str(s.get("text") or ""),
+    #             }
+    #         )
+    #     scene["segments"] = scene_segments
+    #     if "duration" not in scene:
+    #         scene["duration"] = float(max(story.get("effective_duration", 0.0), story.get("last_lyric_end_sec", 0.0)))
+    #     scene["updated_at"] = now_ts
+    #     save_json(scene_path, scene)
+    #
+    #     # ---- project.json (보수적 반영) ----
+    #     proj_path = base / "project.json"
+    #     proj = load_json(proj_path, {}) or {}
+    #     if not isinstance(proj, dict):
+    #         proj = {}
+    #     if "custom_seconds" not in proj:
+    #         try:
+    #             eff = float(story.get("effective_duration", story.get("last_lyric_end_sec", 0.0)) or 0.0)
+    #         except (TypeError, ValueError):
+    #             eff = float(story.get("last_lyric_end_sec", 0.0) or 0.0)
+    #         proj["custom_seconds"] = int(round(max(0.0, eff)))
+    #         save_json(proj_path, proj)
 
-
-
-        base = Path(proj_dir)
-        now_ts = int(time.time())
-
-        # ---- story.json ----
-        story_path = base / "story.json"
-        story = load_json(story_path, {}) or {}
-        if not isinstance(story, dict):
-            story = {}
-
-        safe_sections = []
-        for s in sections or []:
-            if not isinstance(s, dict):
-                continue
-            try:
-                st = float(s.get("start", 0.0))
-                et = float(s.get("end", 0.0))
-            except (TypeError, ValueError):
-                continue
-            tx = str(s.get("text") or "")
-            lb = str(s.get("label") or "")
-            if et < st:
-                et = st
-            safe_sections.append({"start": max(0.0, st), "end": max(0.0, et), "text": tx, "label": lb})
-
-        story["lyric_sections"] = safe_sections
-        story["last_lyric_end_sec"] = float(max(0.0, float(last_end or 0.0)))
-        if "effective_duration" not in story:
-            story["effective_duration"] = float(max(story.get("last_lyric_end_sec", 0.0), 0.0))
-        story["updated_at"] = now_ts
-        save_json(story_path, story)
-
-        # ---- scene.json ----
-        scene_path = base / "scene.json"
-        scene = load_json(scene_path, {}) or {}
-        if not isinstance(scene, dict):
-            scene = {}
-
-        scene_segments = []
-        for i, s in enumerate(story.get("lyric_sections", [])):
-            scene_segments.append(
-                {
-                    "id": f"line_{i:03d}",
-                    "start": float(s.get("start", 0.0)),
-                    "end": float(s.get("end", 0.0)),
-                    "label": str(s.get("label") or ""),
-                    "text": str(s.get("text") or ""),
-                }
-            )
-        scene["segments"] = scene_segments
-        if "duration" not in scene:
-            scene["duration"] = float(max(story.get("effective_duration", 0.0), story.get("last_lyric_end_sec", 0.0)))
-        scene["updated_at"] = now_ts
-        save_json(scene_path, scene)
-
-        # ---- project.json (보수적 반영) ----
-        proj_path = base / "project.json"
-        proj = load_json(proj_path, {}) or {}
-        if not isinstance(proj, dict):
-            proj = {}
-        if "custom_seconds" not in proj:
-            try:
-                eff = float(story.get("effective_duration", story.get("last_lyric_end_sec", 0.0)) or 0.0)
-            except (TypeError, ValueError):
-                eff = float(story.get("last_lyric_end_sec", 0.0) or 0.0)
-            proj["custom_seconds"] = int(round(max(0.0, eff)))
-            save_json(proj_path, proj)
-
+    # real_use
     def _find_latest_vocal(self) -> Path | None:
         """
         현재 프로젝트/FINAL_OUT 기준에서 가장 최신 vocal.* 또는 vocal_final_*.* 파일 하나를 찾는다.
@@ -3797,53 +3686,51 @@ class MainWindow(QtWidgets.QMainWindow):
 
         return max(uniq, key=_mtime_safe)
 
-    # shos_ui.py 파일의 on_click_build_story_from_seg_async 함수 전체를 교체하세요.
-    def fps_to_partion(self, video_json_path: Path) -> int:
-        """
-        UI에서 렌더 FPS 값을 읽어 video.json의 defaults.movie.target_fps 및
-        defaults.image.fps, 그리고 루트 fps에 저장하고, 해당 FPS 값을 반환합니다.
-        (함수 이름은 'fps_to_partion'이지만 실제로는 FPS 값 저장/반환 역할)
-        """
+    # def fps_to_partion(self, video_json_path: Path) -> int:
+    #     """
+    #     UI에서 렌더 FPS 값을 읽어 video.json의 defaults.movie.target_fps 및
+    #     defaults.image.fps, 그리고 루트 fps에 저장하고, 해당 FPS 값을 반환합니다.
+    #     (함수 이름은 'fps_to_partion'이지만 실제로는 FPS 값 저장/반환 역할)
+    #     """
+    #
+    #     # 1) UI에서 FPS 읽기
+    #     ui_fps_widget = getattr(self, "cmb_movie_fps", None)
+    #     try:
+    #         target_fps_val = int(ui_fps_widget.currentData()) if ui_fps_widget and hasattr(ui_fps_widget,
+    #                                                                                        "currentData") else 30
+    #     except Exception:
+    #         target_fps_val = 30
+    #         print("[WARN] UI에서 FPS 값 읽기 실패, 기본값 30 사용.")
+    #
+    #     # 2) video.json 로드
+    #     video_doc = load_json(video_json_path, {}) or {}
+    #     if not isinstance(video_doc, dict):
+    #         video_doc = {}
+    #
+    #     # 3) defaults 섹션에 FPS 주입
+    #     video_doc.setdefault("defaults", {})
+    #     movie_defaults = video_doc["defaults"].setdefault("movie", {})
+    #     image_defaults = video_doc["defaults"].setdefault("image", {})
+    #
+    #     movie_defaults["target_fps"] = target_fps_val
+    #     movie_defaults["input_fps"] = target_fps_val  # 레거시/호환
+    #     movie_defaults["fps"] = target_fps_val  # 레거시/호환
+    #     image_defaults["fps"] = target_fps_val
+    #
+    #     # ✅ 루트 fps도 같이 써줘야, (doc.get("fps"))를 읽는 코드가 제대로 작동함
+    #     video_doc["fps"] = target_fps_val
+    #
+    #     # 4) 저장
+    #     try:
+    #         save_json(video_json_path, video_doc)
+    #         print(f"[FPS-PARTITION] {target_fps_val} FPS 저장 완료: {video_json_path.name}")
+    #     except Exception as e_save_fps:
+    #         print(f"[ERROR] video.json에 FPS 값 저장 실패: {e_save_fps}")
+    #
+    #     return target_fps_val
 
-        # 1) UI에서 FPS 읽기
-        ui_fps_widget = getattr(self, "cmb_movie_fps", None)
-        try:
-            target_fps_val = int(ui_fps_widget.currentData()) if ui_fps_widget and hasattr(ui_fps_widget,
-                                                                                           "currentData") else 30
-        except Exception:
-            target_fps_val = 30
-            print("[WARN] UI에서 FPS 값 읽기 실패, 기본값 30 사용.")
-
-        # 2) video.json 로드
-        video_doc = load_json(video_json_path, {}) or {}
-        if not isinstance(video_doc, dict):
-            video_doc = {}
-
-        # 3) defaults 섹션에 FPS 주입
-        video_doc.setdefault("defaults", {})
-        movie_defaults = video_doc["defaults"].setdefault("movie", {})
-        image_defaults = video_doc["defaults"].setdefault("image", {})
-
-        movie_defaults["target_fps"] = target_fps_val
-        movie_defaults["input_fps"] = target_fps_val  # 레거시/호환
-        movie_defaults["fps"] = target_fps_val  # 레거시/호환
-        image_defaults["fps"] = target_fps_val
-
-        # ✅ 루트 fps도 같이 써줘야, (doc.get("fps"))를 읽는 코드가 제대로 작동함
-        video_doc["fps"] = target_fps_val
-
-        # 4) 저장
-        try:
-            save_json(video_json_path, video_doc)
-            print(f"[FPS-PARTITION] {target_fps_val} FPS 저장 완료: {video_json_path.name}")
-        except Exception as e_save_fps:
-            print(f"[ERROR] video.json에 FPS 값 저장 실패: {e_save_fps}")
-
-        return target_fps_val
-
-    # shorts_ui.py의 on_click_build_story_from_seg_async 함수를
     # (다시) 아래의 전체 코드로 덮어쓰십시오.
-
+    # real_use
     def on_click_build_story_from_seg_async(self) -> None:
         """
         seg.json → story.json 스켈레톤 → video.json(갭 포함) 생성 → video.json만 AI 강화 → 프롬프트 주입 → 가사 재주입
@@ -4036,7 +3923,6 @@ class MainWindow(QtWidgets.QMainWindow):
             except Exception:
                 return ""
 
-        # (참고: self.fps_to_partion 함수는 UI 스레드에서 이미 호출되었으므로 여기서는 호출 X)
 
         # ----- job 함수 정의 -----
         def job(on_progress_callback: Callable[[dict], None]) -> Dict[str, str]:
@@ -4481,9 +4367,6 @@ class MainWindow(QtWidgets.QMainWindow):
             # (on_click_test1_analyze에서 가져온 로직)
             _log_progress("[6/6] FPS 동기화 및 세그먼트 프롬프트 생성 시작...")
             try:
-                # video_json_path (Path 객체)와 _ask_en (Callable)은
-                # 이 job 함수 외부 스코프(on_click_build_story_from_seg_async)에 정의되어 있음
-                # fill_prompt_movie_with_ai 함수는 파일 상단에서 임포트됨
 
                 # --- [핵심 수정] UI FPS를 video.json에 먼저 저장 ---
                 vdoc_fps = load_json(video_json_path, {}) or {}
@@ -4599,51 +4482,50 @@ class MainWindow(QtWidgets.QMainWindow):
             on_done=done
         )
 
-    def _inject_ui_fps_to_video(self, video_json_path):
-        """
-        video.json에 UI에서 선택한 FPS를 주입한다.
-        - root "fps"
-        - defaults.movie.{target_fps,input_fps,fps}
-        - defaults.image.fps
-        를 모두 일관되게 세팅.
-        """
+    # def _inject_ui_fps_to_video(self, video_json_path):
+    #     """
+    #     video.json에 UI에서 선택한 FPS를 주입한다.
+    #     - root "fps"
+    #     - defaults.movie.{target_fps,input_fps,fps}
+    #     - defaults.image.fps
+    #     를 모두 일관되게 세팅.
+    #     """
+    #
+    #     p = Path(video_json_path)
+    #     doc = load_json(p, {}) or {}
+    #     if not isinstance(doc, dict):
+    #         doc = {}
+    #
+    #     # 1) UI에서 FPS 읽기
+    #     ui_fps = 30
+    #     cmb = getattr(self, "cmb_movie_fps", None)
+    #     try:
+    #         if cmb and hasattr(cmb, "currentData"):
+    #             val = cmb.currentData()
+    #             ui_fps = int(val if val is not None else 30)
+    #     except Exception:
+    #         ui_fps = 30
+    #
+    #     # 2) 문서에 주입
+    #     doc.setdefault("defaults", {})
+    #     movie = doc["defaults"].setdefault("movie", {})
+    #     image = doc["defaults"].setdefault("image", {})
+    #
+    #     doc["fps"] = ui_fps
+    #     movie["target_fps"] = ui_fps
+    #     movie["input_fps"] = ui_fps
+    #     movie["fps"] = ui_fps  # 레거시 호환
+    #     image["fps"] = ui_fps
+    #
+    #     try:
+    #         save_json(p, doc)
+    #         print(f"[FPS] UI {ui_fps} FPS → {p.name} 반영 완료")
+    #     except Exception as e:
+    #         print(f"[FPS][WARN] 저장 실패: {e}")
+    #
+    #     return ui_fps
 
-        p = Path(video_json_path)
-        doc = load_json(p, {}) or {}
-        if not isinstance(doc, dict):
-            doc = {}
-
-        # 1) UI에서 FPS 읽기
-        ui_fps = 30
-        cmb = getattr(self, "cmb_movie_fps", None)
-        try:
-            if cmb and hasattr(cmb, "currentData"):
-                val = cmb.currentData()
-                ui_fps = int(val if val is not None else 30)
-        except Exception:
-            ui_fps = 30
-
-        # 2) 문서에 주입
-        doc.setdefault("defaults", {})
-        movie = doc["defaults"].setdefault("movie", {})
-        image = doc["defaults"].setdefault("image", {})
-
-        doc["fps"] = ui_fps
-        movie["target_fps"] = ui_fps
-        movie["input_fps"] = ui_fps
-        movie["fps"] = ui_fps  # 레거시 호환
-        image["fps"] = ui_fps
-
-        try:
-            save_json(p, doc)
-            print(f"[FPS] UI {ui_fps} FPS → {p.name} 반영 완료")
-        except Exception as e:
-            print(f"[FPS][WARN] 저장 실패: {e}")
-
-        return ui_fps
-
-    # all_ui.py (또는 해당 클래스 안)
-
+    # real_use
     def on_click_test1_analyze(self) -> None:
         """
         [프로젝트 분석]
@@ -4790,92 +4672,92 @@ class MainWindow(QtWidgets.QMainWindow):
             on_done=done,
         )
 
-    # ====================== GPT PROMPT ADAPTER (paste as-is) ======================
-    # 모델 설정 (원하면 바꾸세요)
-    _GPT_MODEL = os.getenv("PROMPT_MODEL", "gpt-4o-mini")
-
-    # 캐릭터 규칙: female_*는 반드시 'adult woman' + 'huge breasts' 포함
-
-
-    # 시스템 프롬프트 (JSON만 반환하도록 강하게 제약)
-    _GPT_SYSTEM = """You are a prompt rewriter for image/video generation.
-    Strictly return a single JSON object with two fields:
-    - "prompt_img": string
-    - "prompt_movie": string
-
-    Rules:
-    1) Convert any Korean hints to clean, model-friendly English tags.
-    2) Always include character traits for each referenced character.
-       - For any character id that starts with "female", you MUST include "adult woman".
-       - For any character id that starts with "male", include "adult man".
-    3) Merge global themes, palette, and section mood into concise tags (English).
-    4) Keep quality tags concise (e.g., "photorealistic, cinematic lighting, high detail, 8k, masterpiece").
-    5) Append negative tags at the end as: "--neg <comma-separated negatives>".
-       Ensure "nsfw" stays inside negatives.
-    6) For movie prompt, reuse the image prompt and append a motion hint if provided, like:
-       '..., motion: <the action>'
-    7) Do NOT add extra keys. Do NOT wrap with Markdown. JSON object ONLY.
-    """
-
-    _GPT_USER_TEMPLATE = """TITLE: {title}
-    SECTION: {section}
-    LYRIC (this scene): {lyric}
-    GLOBAL SUMMARY: {global_summary}
-    THEMES: {themes}
-    PALETTE: {palette}
-    STYLE GUIDE: {style_guide}
-    SECTION MOOD: {section_mood}
-    NEGATIVE: {negative}
-
-    CHARACTERS (id:index → traits):
-    {char_lines}
-
-    IMAGE PROMPT (raw, may be Korean): {prompt_img_in}
-    MOVIE PROMPT (raw, may be Korean): {prompt_movie_in}
-    EFFECTS: {effects}
-
-    Output JSON schema:
-    {{
-      "prompt_img": "<string>",
-      "prompt_movie": "<string>"
-    }}
-    """
-
+    # # ====================== GPT PROMPT ADAPTER (paste as-is) ======================
+    # # 모델 설정 (원하면 바꾸세요)
+    # _GPT_MODEL = os.getenv("PROMPT_MODEL", "gpt-4o-mini")
+    #
+    # # 캐릭터 규칙: female_*는 반드시 'adult woman' + 'huge breasts' 포함
+    #
+    #
+    # # 시스템 프롬프트 (JSON만 반환하도록 강하게 제약)
+    # _GPT_SYSTEM = """You are a prompt rewriter for image/video generation.
+    # Strictly return a single JSON object with two fields:
+    # - "prompt_img": string
+    # - "prompt_movie": string
+    #
+    # Rules:
+    # 1) Convert any Korean hints to clean, model-friendly English tags.
+    # 2) Always include character traits for each referenced character.
+    #    - For any character id that starts with "female", you MUST include "adult woman".
+    #    - For any character id that starts with "male", include "adult man".
+    # 3) Merge global themes, palette, and section mood into concise tags (English).
+    # 4) Keep quality tags concise (e.g., "photorealistic, cinematic lighting, high detail, 8k, masterpiece").
+    # 5) Append negative tags at the end as: "--neg <comma-separated negatives>".
+    #    Ensure "nsfw" stays inside negatives.
+    # 6) For movie prompt, reuse the image prompt and append a motion hint if provided, like:
+    #    '..., motion: <the action>'
+    # 7) Do NOT add extra keys. Do NOT wrap with Markdown. JSON object ONLY.
+    # """
+    #
+    # _GPT_USER_TEMPLATE = """TITLE: {title}
+    # SECTION: {section}
+    # LYRIC (this scene): {lyric}
+    # GLOBAL SUMMARY: {global_summary}
+    # THEMES: {themes}
+    # PALETTE: {palette}
+    # STYLE GUIDE: {style_guide}
+    # SECTION MOOD: {section_mood}
+    # NEGATIVE: {negative}
+    #
+    # CHARACTERS (id:index → traits):
+    # {char_lines}
+    #
+    # IMAGE PROMPT (raw, may be Korean): {prompt_img_in}
+    # MOVIE PROMPT (raw, may be Korean): {prompt_movie_in}
+    # EFFECTS: {effects}
+    #
+    # Output JSON schema:
+    # {{
+    #   "prompt_img": "<string>",
+    #   "prompt_movie": "<string>"
+    # }}
+    # """
+    #
     # Basic Vocal(자동 포함 세트)
     BASIC_VOCAL_TAGS = [
         "clean vocals", "natural articulation", "warm emotional tone",
         "studio reverb light", "clear diction", "breath control", "balanced mixing",
     ]
-
-    # === GPT 호출 래퍼 (추가) ===
-    def _gpt_call(self, system_prompt=None, user_prompt: str = "", json_mode: bool = False, timeout: int = 30):
-        """
-        self._ai 백엔드의 가용 메서드(complete/chat/ask/__call__/scene_prompt)를 순차 시도.
-        - system_prompt/user_prompt/json_mode/timeout을 최대한 전달
-        - dict를 기대하는 경우(json_mode=True)면 dict만 반환
-        - 실패 시 예외를 올려 상위에서 템플릿 폴백을 쓰도록 함
-        """
-        ai = getattr(self, "_ai", None)
-        if ai is None:
-            raise RuntimeError("AI 백엔드(self._ai)가 초기화되지 않았습니다.")
-
-        # 선호 순서대로 호출 가능 함수 탐색
-        for name in ("complete", "chat", "ask", "__call__", "scene_prompt", "scene_prompt_kor"):
-            fn = getattr(ai, name, None)
-            if not callable(fn):
-                continue
-            try:
-                # 가장 풍부한 시그니처 시도
-                return fn(system_prompt=system_prompt, user_prompt=user_prompt, json_mode=json_mode, timeout=timeout)
-            except TypeError:
-                try:
-                    # 보통 형태
-                    return fn(user_prompt or "")
-                except TypeError:
-                    # 최후방: 메시지 하나만
-                    return fn(user_prompt or "")
-
-        raise RuntimeError("사용 가능한 GPT 호출 메서드(complete/chat/ask/__call__/scene_prompt)가 없습니다.")
+    #
+    # # === GPT 호출 래퍼 (추가) ===
+    # def _gpt_call(self, system_prompt=None, user_prompt: str = "", json_mode: bool = False, timeout: int = 30):
+    #     """
+    #     self._ai 백엔드의 가용 메서드(complete/chat/ask/__call__/scene_prompt)를 순차 시도.
+    #     - system_prompt/user_prompt/json_mode/timeout을 최대한 전달
+    #     - dict를 기대하는 경우(json_mode=True)면 dict만 반환
+    #     - 실패 시 예외를 올려 상위에서 템플릿 폴백을 쓰도록 함
+    #     """
+    #     ai = getattr(self, "_ai", None)
+    #     if ai is None:
+    #         raise RuntimeError("AI 백엔드(self._ai)가 초기화되지 않았습니다.")
+    #
+    #     # 선호 순서대로 호출 가능 함수 탐색
+    #     for name in ("complete", "chat", "ask", "__call__", "scene_prompt", "scene_prompt_kor"):
+    #         fn = getattr(ai, name, None)
+    #         if not callable(fn):
+    #             continue
+    #         try:
+    #             # 가장 풍부한 시그니처 시도
+    #             return fn(system_prompt=system_prompt, user_prompt=user_prompt, json_mode=json_mode, timeout=timeout)
+    #         except TypeError:
+    #             try:
+    #                 # 보통 형태
+    #                 return fn(user_prompt or "")
+    #             except TypeError:
+    #                 # 최후방: 메시지 하나만
+    #                 return fn(user_prompt or "")
+    #
+    #     raise RuntimeError("사용 가능한 GPT 호출 메서드(complete/chat/ask/__call__/scene_prompt)가 없습니다.")
 
     def on_clear_inputs(self) -> None:
         """
@@ -5006,6 +4888,7 @@ class MainWindow(QtWidgets.QMainWindow):
         except Exception:
             pass
 
+    # real_use
     def _add_clear_button_next_to_generate(self, parent_layout) -> None:
         """
         '가사 생성' 버튼 옆에 '초기화' 버튼을 추가한다.
@@ -5021,57 +4904,57 @@ class MainWindow(QtWidgets.QMainWindow):
         self.btn_clear_inputs.clicked.connect(self.on_clear_inputs)
         parent_layout.addWidget(self.btn_clear_inputs)
 
-    def _task_busy(self, name: str) -> bool:
-        """
-        name 작업이 실제로 돌고 있는지 확인.
-        - _{name}_thread 가 살아 있으면 True
-        - 스레드가 끝났거나 없는데 플래그만 True면 스테일 → 정리 후 False
-        """
-        th = getattr(self, f"_{name}_thread", None)
-        flag = bool(getattr(self, f"_{name}_running", False))
-
-        if isinstance(th, QtCore.QThread):
-            if th.isRunning():
-                return True
-            # 끝났으면 상태 정리
-            setattr(self, f"_{name}_thread", None)
-            setattr(self, f"_{name}_running", False)
-            return False
-
-        if flag:
-            # 스레드 없는데 플래그만 True → 스테일 플래그 정리
-            setattr(self, f"_{name}_running", False)
-        return False
+    # def _task_busy(self, name: str) -> bool:
+    #     """
+    #     name 작업이 실제로 돌고 있는지 확인.
+    #     - _{name}_thread 가 살아 있으면 True
+    #     - 스레드가 끝났거나 없는데 플래그만 True면 스테일 → 정리 후 False
+    #     """
+    #     th = getattr(self, f"_{name}_thread", None)
+    #     flag = bool(getattr(self, f"_{name}_running", False))
+    #
+    #     if isinstance(th, QtCore.QThread):
+    #         if th.isRunning():
+    #             return True
+    #         # 끝났으면 상태 정리
+    #         setattr(self, f"_{name}_thread", None)
+    #         setattr(self, f"_{name}_running", False)
+    #         return False
+    #
+    #     if flag:
+    #         # 스레드 없는데 플래그만 True → 스테일 플래그 정리
+    #         setattr(self, f"_{name}_running", False)
+    #     return False
 
     # --- analyze_project 호환 래퍼 ---------------------------------------------
 
 
     # --------------------------------------------------------------------------
 
-    def _try_begin(self, name: str, title: str = "안내",
-                   msg: str = "작업이 진행 중입니다. 완료 후 다시 시도하세요.") -> bool:
-        """
-        작업 시작 가드: 이미 돌고 있으면 안내 후 False, 아니면 플래그 세팅 후 True.
-        ※ 시작한 쪽에서 반드시 _task_done(name) 호출.
-        """
-        # 의도적 사용으로 린트 경고 방지(다른 훅에서 활용될 수 있음)
-        _unused = (title, msg)
+    # def _try_begin(self, name: str, title: str = "안내",
+    #                msg: str = "작업이 진행 중입니다. 완료 후 다시 시도하세요.") -> bool:
+    #     """
+    #     작업 시작 가드: 이미 돌고 있으면 안내 후 False, 아니면 플래그 세팅 후 True.
+    #     ※ 시작한 쪽에서 반드시 _task_done(name) 호출.
+    #     """
+    #     # 의도적 사용으로 린트 경고 방지(다른 훅에서 활용될 수 있음)
+    #     _unused = (title, msg)
+    #
+    #     if self._task_busy(name):
+    #         # 가능하면 사용자 메시지 전달, 시그니처가 다르면 name만 전달
+    #         try:
+    #             self._guard_alert(name, title=title, msg=msg)  # type: ignore[call-arg]
+    #         except TypeError:
+    #             self._guard_alert(name)
+    #         return False
+    #     setattr(self, f"_{name}_running", True)
+    #     return True
 
-        if self._task_busy(name):
-            # 가능하면 사용자 메시지 전달, 시그니처가 다르면 name만 전달
-            try:
-                self._guard_alert(name, title=title, msg=msg)  # type: ignore[call-arg]
-            except TypeError:
-                self._guard_alert(name)
-            return False
-        setattr(self, f"_{name}_running", True)
-        return True
-
-    def _task_done(self, name: str):
-        """작업 종료 시 상태 정리(플래그/스레드 핸들)."""
-        setattr(self, f"_{name}_running", False)
-        setattr(self, f"_{name}_thread", None)
-
+    # def _task_done(self, name: str):
+    #     """작업 종료 시 상태 정리(플래그/스레드 핸들)."""
+    #     setattr(self, f"_{name}_running", False)
+    #     setattr(self, f"_{name}_thread", None)
+    #
     # MainWindow 안 기존 _set_busy_ui 교체
     def _set_busy_ui(self, name: str, busy: bool):
         # 분석 중에도 테스트 버튼은 항상 활성 유지
@@ -5081,103 +4964,106 @@ class MainWindow(QtWidgets.QMainWindow):
                 btn.setEnabled(not busy)
         # 음악 가드 등 다른 용도는 그대로 두고 싶으면 여기서 분기 추가
 
-    @staticmethod
-    def _default_hair_map() -> dict:
-        return {
-            "female_01": "긴 웨이브 머리, 밝은 갈색, 앞머리 가볍게, 일관성 유지",
-            "male_01": "블랙 투블럭, 풍성한 머리, 살짝 볼륨, 일관성 유지",
-        }
+    # @staticmethod
+    # def _default_hair_map() -> dict:
+    #     return {
+    #         "female_01": "긴 웨이브 머리, 밝은 갈색, 앞머리 가볍게, 일관성 유지",
+    #         "male_01": "블랙 투블럭, 풍성한 머리, 살짝 볼륨, 일관성 유지",
+    #     }
 
-    def _start_build_image_movie_docs(self, proj: Path, hair_map: dict | None = None) -> None:
-        if self._docs_build_running:
-            QtWidgets.QMessageBox.information(self, "안내", "image.json / movie.json 생성이 이미 진행 중입니다.")
-            return
-        self._docs_build_running = True
-
-        hm = hair_map or self._default_hair_map()
-
-        jsons_dir_val = getattr(settings_mod, "JSONS_DIR", None)
-        wfdir = Path(jsons_dir_val) if jsons_dir_val else (Path(__file__).parent / "jsons")
-
-        self._dbg(f"[DOCS] start build | proj={proj} | wfdir={wfdir} exists={wfdir.exists()} | hair_map={hm}")
-
-        def job():
-            import inspect
-
-            # 빌더 + 타임라인 적용 함수 임포트 (ImportError만)
-
-
-            def _call_compatible(func, **kwargs):
-                """대상 함수 시그니처에 존재하는 파라미터만 추려 호출."""
-                sig = inspect.signature(func)
-                filtered = {k: v for k, v in kwargs.items() if k in sig.parameters}
-                return func(**filtered)
-
-            # image.json 생성
-            self._dbg("[DOCS] calling build_image_json()")
-            image_json_path = _call_compatible(
-                build_image_json,
-                project_dir=str(proj),
-                hair_map=hm,
-                workflow_dir=wfdir,  # 없으면 자동 필터
-            )
-            self._dbg(f"[DOCS] build_image_json -> {image_json_path}")
-
-            # movie.json 생성
-            self._dbg("[DOCS] calling build_movie_json()")
-            movie_json_path = _call_compatible(
-                build_movie_json,
-                project_dir=str(proj),
-                hair_map=hm,
-                workflow_dir=wfdir,  # 없으면 자동 필터
-            )
-            self._dbg(f"[DOCS] build_movie_json -> {movie_json_path}")
-
-            # 인트로/아웃트로 타임라인 10% 반영
-            self._dbg("[DOCS] applying intro/outro timelines (10%)")
-            story_json_path = apply_intro_outro_to_story_json(str(proj), intro_ratio=0.10, outro_ratio=0.10)
-            image_json_path2 = apply_intro_outro_to_image_json(str(proj), intro_ratio=0.10, outro_ratio=0.10)
-            movie_json_path2 = apply_intro_outro_to_movie_json(str(proj), intro_ratio=0.10, outro_ratio=0.10)
-
-            return {
-                "image": str(image_json_path or image_json_path2),
-                "movie": str(movie_json_path or movie_json_path2),
-                "story": str(story_json_path),
-            }
-
-        def on_done(res, err):
-            try:
-                if err:
-                    self._dbg(f"[DOCS] ERROR: {err}")
-                    QtWidgets.QMessageBox.critical(self, "문서 생성 실패", str(err))
-                    self.status.showMessage("image.json / movie.json 생성 실패")
-                    return
-                imgp = res.get("image")
-                movp = res.get("movie")
-                self._dbg(f"[DOCS] DONE: image={imgp} | movie={movp}")
-                QtWidgets.QMessageBox.information(self, "완료", f"image.json: {imgp}\nmovie.json: {movp}")
-                self.status.showMessage(f"문서 생성 완료: {imgp} / {movp}")
-            finally:
-                self._docs_build_running = False
-
-        th = QtCore.QThread(self)
-        wk = Worker(job)
-        wk.moveToThread(th)
-
-        # ✅ protected 멤버 직접접근 회피: 공개 'run' 우선, 없으면 문자열 기반 getattr로 '_run'
-        run_slot = getattr(wk, "run", None)
-        if not callable(run_slot):
-            run_slot = getattr(wk, "_run", None)  # linter의 protected-access 회피
-        if callable(run_slot):
-            th.started.connect(run_slot)  # type: ignore[arg-type]
-
-        wk.done.connect(on_done)
-        wk.done.connect(th.quit)
-        wk.done.connect(wk.deleteLater)
-        th.finished.connect(th.deleteLater)
-        th.start()
+    # def _start_build_image_movie_docs(self, proj: Path, hair_map: dict | None = None) -> None:
+    #     if self._docs_build_running:
+    #         QtWidgets.QMessageBox.information(self, "안내", "image.json / movie.json 생성이 이미 진행 중입니다.")
+    #         return
+    #     self._docs_build_running = True
+    #
+    #     hm = hair_map or self._default_hair_map()
+    #
+    #     jsons_dir_val = getattr(settings_mod, "JSONS_DIR", None)
+    #     wfdir = Path(jsons_dir_val) if jsons_dir_val else (Path(__file__).parent / "jsons")
+    #
+    #     self._dbg(f"[DOCS] start build | proj={proj} | wfdir={wfdir} exists={wfdir.exists()} | hair_map={hm}")
+    #
+    #     def job():
+    #         import inspect
+    #
+    #         # 빌더 + 타임라인 적용 함수 임포트 (ImportError만)
+    #
+    #
+    #         def _call_compatible(func, **kwargs):
+    #             """대상 함수 시그니처에 존재하는 파라미터만 추려 호출."""
+    #             sig = inspect.signature(func)
+    #             filtered = {k: v for k, v in kwargs.items() if k in sig.parameters}
+    #             return func(**filtered)
+    #
+    #         # image.json 생성
+    #         self._dbg("[DOCS] calling build_image_json()")
+    #         image_json_path = _call_compatible(
+    #             build_image_json,
+    #             project_dir=str(proj),
+    #             hair_map=hm,
+    #             workflow_dir=wfdir,  # 없으면 자동 필터
+    #         )
+    #         self._dbg(f"[DOCS] build_image_json -> {image_json_path}")
+    #
+    #         # movie.json 생성
+    #         self._dbg("[DOCS] calling build_movie_json()")
+    #         movie_json_path = _call_compatible(
+    #             build_movie_json,
+    #             project_dir=str(proj),
+    #             hair_map=hm,
+    #             workflow_dir=wfdir,  # 없으면 자동 필터
+    #         )
+    #         self._dbg(f"[DOCS] build_movie_json -> {movie_json_path}")
+    #
+    #         # 인트로/아웃트로 타임라인 10% 반영
+    #         self._dbg("[DOCS] applying intro/outro timelines (10%)")
+    #         story_json_path = apply_intro_outro_to_story_json(str(proj), intro_ratio=0.10, outro_ratio=0.10)
+    #         image_json_path2 = apply_intro_outro_to_image_json(str(proj), intro_ratio=0.10, outro_ratio=0.10)
+    #         movie_json_path2 = apply_intro_outro_to_movie_json(str(proj), intro_ratio=0.10, outro_ratio=0.10)
+    #
+    #         return {
+    #             "image": str(image_json_path or image_json_path2),
+    #             "movie": str(movie_json_path or movie_json_path2),
+    #             "story": str(story_json_path),
+    #         }
+    #
+    #     def on_done(res, err):
+    #         try:
+    #             if err:
+    #                 self._dbg(f"[DOCS] ERROR: {err}")
+    #                 QtWidgets.QMessageBox.critical(self, "문서 생성 실패", str(err))
+    #                 self.status.showMessage("image.json / movie.json 생성 실패")
+    #                 return
+    #             imgp = res.get("image")
+    #             movp = res.get("movie")
+    #             self._dbg(f"[DOCS] DONE: image={imgp} | movie={movp}")
+    #             QtWidgets.QMessageBox.information(self, "완료", f"image.json: {imgp}\nmovie.json: {movp}")
+    #             self.status.showMessage(f"문서 생성 완료: {imgp} / {movp}")
+    #         finally:
+    #             self._docs_build_running = False
+    #
+    #     th = QtCore.QThread(self)
+    #     wk = Worker(job)
+    #     wk.moveToThread(th)
+    #
+    #     # ✅ protected 멤버 직접접근 회피: 공개 'run' 우선, 없으면 문자열 기반 getattr로 '_run'
+    #     run_slot = getattr(wk, "run", None)
+    #     if not callable(run_slot):
+    #         run_slot = getattr(wk, "_run", None)  # linter의 protected-access 회피
+    #     if callable(run_slot):
+    #         th.started.connect(run_slot)  # type: ignore[arg-type]
+    #
+    #     wk.done.connect(on_done)
+    #     wk.done.connect(th.quit)
+    #     wk.done.connect(wk.deleteLater)
+    #     th.finished.connect(th.deleteLater)
+    #     th.start()
 
     # 워크플로우 이용
+
+
+
     def _comfy_run_workflow(self, wf_path: Path, prompt_text: str, out_png: Path,
                             char_ref: Path | None = None) -> bool:
         """
@@ -5811,7 +5697,7 @@ class MainWindow(QtWidgets.QMainWindow):
         self.btn_save = QtWidgets.QPushButton("프로젝트 저장")
         self.btn_load_proj = QtWidgets.QPushButton("프로젝트 불러오기")
         self.btn_music = QtWidgets.QPushButton("음악생성(ACE-Step)")
-        self.btn_show_progress = QtWidgets.QPushButton("테스트")  # (생성하지만 레이아웃에 추가 안 함)
+        # self.btn_show_progress = QtWidgets.QPushButton("테스트")  # (생성하지만 레이아웃에 추가 안 함)
         self.btn_video = QtWidgets.QPushButton("영상생성(i2v)")
         self.btn_analyze = QtWidgets.QPushButton("음악분석")
 
@@ -6556,7 +6442,7 @@ class MainWindow(QtWidgets.QMainWindow):
         # ↓↓↓ 기존 connect 들 그대로 ↓↓↓
         self.btn_save.clicked.connect(self.on_save_project)
         self.btn_load_proj.clicked.connect(self.on_load_project)
-        self.btn_show_progress.clicked.connect(self.on_show_progress)
+        # self.btn_show_progress.clicked.connect(self.on_show_progress)
         # --- ▼▼▼ [이 부분을 수정합니다] ▼▼▼ ---
         self.btn_video.clicked.connect(self.on_video) # <-- 기존 연결 주석 처리
         # self.btn_video.clicked.connect(self.on_video_wan)  # <-- [신규] 3단계 함수로 교체
@@ -7338,7 +7224,7 @@ class MainWindow(QtWidgets.QMainWindow):
     # ==== [도우미] 공통 경로/FFmpeg/파일 유틸 ==================================
 
 
-    # shorts_ui.py 내부, 클래스(MainWindow 등) 메서드로 추가
+    # real_use
     def _apply_lyrics_result(self, data: dict, manual_title: str, prompt: str) -> None:
         """
         가사 생성 결과를 UI에 반영 + 프로젝트 저장(project.json 생성/갱신) + 디버그 로그.
@@ -7780,6 +7666,7 @@ class MainWindow(QtWidgets.QMainWindow):
             pass
 
     # ────────────── 저장/불러오기 ──────────────
+    # real_use
     def on_save_project(self):
         title = sanitize_title(self.le_title.text())
         lyrics = self.te_lyrics.toPlainText().strip()
@@ -7875,6 +7762,7 @@ class MainWindow(QtWidgets.QMainWindow):
             pass
         return ""
 
+    # real_use
     def on_load_project(self) -> None:
         """
         프로젝트 불러오기(최소 수정):
@@ -7951,6 +7839,7 @@ class MainWindow(QtWidgets.QMainWindow):
 
 
     # --- [신규] JSON 편집 버튼 핸들러 ---
+    # real_use
     def on_click_edit_json(self):
         """
         '제이슨수정' 버튼 클릭 핸들러.
@@ -8007,474 +7896,474 @@ class MainWindow(QtWidgets.QMainWindow):
             if btn_to_disable:
                 btn_to_disable.setEnabled(True)
     # ────────────── 진행창/로그 ──────────────
-
-    def on_show_progress(self) -> None:
-        """
-        [테스트] xfade 병합(5개 청크 고정) – 업로드된 _chunk_gap_002_0000{0..4}.mp4 메타를 읽어
-        공통 fps/해상도(가장 많이 등장하는 해상도)를 선택해 정규화 후 병합한다.
-        결과: clips/test_merge.mp4
-        """
-
-
-        # 프로젝트/폴더 경로
-        try:
-            proj_dir_str = self._current_project_dir()
-        except Exception:
-            proj_dir_str = None
-        if not proj_dir_str:
-            QtWidgets.QMessageBox.warning(self, "테스트", "프로젝트 폴더를 찾을 수 없습니다.")
-            return
-
-        proj_dir = Path(proj_dir_str)
-        clips_dir = proj_dir / "clips"
-        work_dir = clips_dir / "xfade_work"
-        work_dir.mkdir(parents=True, exist_ok=True)
-
-        # 업로드된 5개 파일(고정 이름) – xfade_work에 있어야 함
-        file_names = [
-            "_chunk_t_001_00000.mp4",
-            "_chunk_t_001_00001.mp4",
-            "_chunk_t_001_00002.mp4",
-        ]
-        clip_paths: List[Path] = [work_dir / name for name in file_names]
-        missing_paths = [p for p in clip_paths if not p.exists()]
-        if missing_paths:
-            QtWidgets.QMessageBox.warning(
-                self,
-                "테스트",
-                "다음 파일이 없습니다:\n" + "\n".join(str(p) for p in missing_paths),
-            )
-            return
-
-        # ffprobe 헬퍼: fps/해상도 등 추출
-        def _ffprobe_meta(video_path: Path) -> Dict[str, object]:
-            meta: Dict[str, object] = {
-                "path": str(video_path),
-                "width": None,
-                "height": None,
-                "r_frame_rate": None,
-                "avg_frame_rate": None,
-                "nb_frames": None,
-                "duration_sec": None,
-            }
-            cmd = [
-                (globals().get("FFPROBE_EXE", "ffprobe")),
-                "-v", "error",
-                "-print_format", "json",
-                "-show_streams",
-                "-show_format",
-                str(video_path),
-            ]
-            proc = subprocess.run(
-                cmd,
-                stdout=subprocess.PIPE,
-                stderr=subprocess.STDOUT,
-                text=True,
-                encoding="utf-8",
-                errors="ignore",
-                check=False,
-            )
-            if proc.returncode != 0:
-                meta["ffprobe_out"] = proc.stdout
-                return meta
-            try:
-                parsed = json.loads(proc.stdout)
-            except json.JSONDecodeError:
-                meta["ffprobe_out"] = proc.stdout
-                return meta
-
-            vstreams = [s for s in parsed.get("streams", []) if s.get("codec_type") == "video"]
-            if vstreams:
-                vs = vstreams[0]
-                meta["width"] = vs.get("width")
-                meta["height"] = vs.get("height")
-                meta["r_frame_rate"] = vs.get("r_frame_rate")
-                meta["avg_frame_rate"] = vs.get("avg_frame_rate")
-                meta["nb_frames"] = vs.get("nb_frames")
-                tb = parsed.get("format", {}).get("duration")
-                if isinstance(tb, str):
-                    try:
-                        meta["duration_sec"] = float(tb)
-                    except ValueError:
-                        pass
-            return meta
-
-        def _parse_rate(rate_str: Optional[str]) -> float:
-            if not rate_str:
-                return 0.0
-            s = str(rate_str)
-            if "/" in s:
-                num, den = s.split("/", 1)
-                try:
-                    n = float(num)
-                    d = float(den) if float(den) != 0 else 1.0
-                    return n / d
-                except ValueError:
-                    return 0.0
-            try:
-                return float(s)
-            except ValueError:
-                return 0.0
-
-        # 5개 파일 메타 수집
-        metas: List[Dict[str, object]] = []
-        for vpath in clip_paths:
-            m = _ffprobe_meta(vpath)
-            print("[TEST] META:", m)
-            metas.append(m)
-
-        # 공통 fps: 다수결(동률이면 첫 파일 기준), 소수점은 반올림 정수
-        fps_candidates: List[int] = []
-        for m in metas:
-            fps_val = 0.0
-            if m.get("avg_frame_rate"):
-                fps_val = _parse_rate(m.get("avg_frame_rate"))  # type: ignore[arg-type]
-            if not fps_val and m.get("r_frame_rate"):
-                fps_val = _parse_rate(m.get("r_frame_rate"))  # type: ignore[arg-type]
-            fps_int = int(round(fps_val)) if fps_val > 0 else 0
-            fps_candidates.append(max(fps_int, 0))
-        # 모드 선택
-        fps_mode = None
-        if fps_candidates:
-            counts: Dict[int, int] = {}
-            for f in fps_candidates:
-                counts[f] = counts.get(f, 0) + 1
-            fps_mode = max(counts.items(), key=lambda kv: kv[1])[0]
-        if not fps_mode or fps_mode <= 0:
-            # 합의 실패 시 첫 파일 또는 30
-            first_f = fps_candidates[0] if fps_candidates and fps_candidates[0] > 0 else 30
-            fps_mode = first_f if first_f > 0 else 30
-
-        # 공통 해상도: (width,height) 다수결, 동률이면 첫 파일 해상도
-        wh_list: List[Optional[tuple]] = []
-        for m in metas:
-            w = m.get("width")
-            h = m.get("height")
-            if isinstance(w, int) and isinstance(h, int) and w > 0 and h > 0:
-                wh_list.append((w, h))
-            else:
-                wh_list.append(None)
-        wh_counts: Dict[tuple, int] = {}
-        for wh in wh_list:
-            if wh is None:
-                continue
-            wh_counts[wh] = wh_counts.get(wh, 0) + 1
-        if wh_counts:
-            out_w, out_h = max(wh_counts.items(), key=lambda kv: kv[1])[0]
-        else:
-            # 메타가 비정상일 때 기본값(세로 예시: 720x1080)
-            out_w, out_h = 720, 1080
-
-        print(f"[TEST] SELECTED: fps={fps_mode}, size={out_w}x{out_h}")
-
-        # 병합 실행
-        out_path = clips_dir / "test_merge.mp4"
-        try:
-            xfade_concat(
-                clip_paths=clip_paths,
-                overlap_frames=12,  # 업로드 분석 시 테스트했던 기본값 그대로
-                fps=fps_mode,
-                audio_path=None,
-                out_path=out_path,
-                out_fps=None,
-                scale_w=out_w,
-                scale_h=out_h,
-                work_dir=work_dir,
-            )
-            print("[TEST] DONE:", out_path)
-            QtWidgets.QMessageBox.information(self, "테스트 완료", f"출력: {out_path}")
-        except (OSError, ValueError, RuntimeError) as e_merge:
-            print("[TEST][ERROR]", e_merge)
-            QtWidgets.QMessageBox.warning(self, "테스트 실패", str(e_merge))
+    # real_use?????
+    # def on_show_progress(self) -> None:
+    #     """
+    #     [테스트] xfade 병합(5개 청크 고정) – 업로드된 _chunk_gap_002_0000{0..4}.mp4 메타를 읽어
+    #     공통 fps/해상도(가장 많이 등장하는 해상도)를 선택해 정규화 후 병합한다.
+    #     결과: clips/test_merge.mp4
+    #     """
+    #
+    #
+    #     # 프로젝트/폴더 경로
+    #     try:
+    #         proj_dir_str = self._current_project_dir()
+    #     except Exception:
+    #         proj_dir_str = None
+    #     if not proj_dir_str:
+    #         QtWidgets.QMessageBox.warning(self, "테스트", "프로젝트 폴더를 찾을 수 없습니다.")
+    #         return
+    #
+    #     proj_dir = Path(proj_dir_str)
+    #     clips_dir = proj_dir / "clips"
+    #     work_dir = clips_dir / "xfade_work"
+    #     work_dir.mkdir(parents=True, exist_ok=True)
+    #
+    #     # 업로드된 5개 파일(고정 이름) – xfade_work에 있어야 함
+    #     file_names = [
+    #         "_chunk_t_001_00000.mp4",
+    #         "_chunk_t_001_00001.mp4",
+    #         "_chunk_t_001_00002.mp4",
+    #     ]
+    #     clip_paths: List[Path] = [work_dir / name for name in file_names]
+    #     missing_paths = [p for p in clip_paths if not p.exists()]
+    #     if missing_paths:
+    #         QtWidgets.QMessageBox.warning(
+    #             self,
+    #             "테스트",
+    #             "다음 파일이 없습니다:\n" + "\n".join(str(p) for p in missing_paths),
+    #         )
+    #         return
+    #
+    #     # ffprobe 헬퍼: fps/해상도 등 추출
+    #     def _ffprobe_meta(video_path: Path) -> Dict[str, object]:
+    #         meta: Dict[str, object] = {
+    #             "path": str(video_path),
+    #             "width": None,
+    #             "height": None,
+    #             "r_frame_rate": None,
+    #             "avg_frame_rate": None,
+    #             "nb_frames": None,
+    #             "duration_sec": None,
+    #         }
+    #         cmd = [
+    #             (globals().get("FFPROBE_EXE", "ffprobe")),
+    #             "-v", "error",
+    #             "-print_format", "json",
+    #             "-show_streams",
+    #             "-show_format",
+    #             str(video_path),
+    #         ]
+    #         proc = subprocess.run(
+    #             cmd,
+    #             stdout=subprocess.PIPE,
+    #             stderr=subprocess.STDOUT,
+    #             text=True,
+    #             encoding="utf-8",
+    #             errors="ignore",
+    #             check=False,
+    #         )
+    #         if proc.returncode != 0:
+    #             meta["ffprobe_out"] = proc.stdout
+    #             return meta
+    #         try:
+    #             parsed = json.loads(proc.stdout)
+    #         except json.JSONDecodeError:
+    #             meta["ffprobe_out"] = proc.stdout
+    #             return meta
+    #
+    #         vstreams = [s for s in parsed.get("streams", []) if s.get("codec_type") == "video"]
+    #         if vstreams:
+    #             vs = vstreams[0]
+    #             meta["width"] = vs.get("width")
+    #             meta["height"] = vs.get("height")
+    #             meta["r_frame_rate"] = vs.get("r_frame_rate")
+    #             meta["avg_frame_rate"] = vs.get("avg_frame_rate")
+    #             meta["nb_frames"] = vs.get("nb_frames")
+    #             tb = parsed.get("format", {}).get("duration")
+    #             if isinstance(tb, str):
+    #                 try:
+    #                     meta["duration_sec"] = float(tb)
+    #                 except ValueError:
+    #                     pass
+    #         return meta
+    #
+    #     def _parse_rate(rate_str: Optional[str]) -> float:
+    #         if not rate_str:
+    #             return 0.0
+    #         s = str(rate_str)
+    #         if "/" in s:
+    #             num, den = s.split("/", 1)
+    #             try:
+    #                 n = float(num)
+    #                 d = float(den) if float(den) != 0 else 1.0
+    #                 return n / d
+    #             except ValueError:
+    #                 return 0.0
+    #         try:
+    #             return float(s)
+    #         except ValueError:
+    #             return 0.0
+    #
+    #     # 5개 파일 메타 수집
+    #     metas: List[Dict[str, object]] = []
+    #     for vpath in clip_paths:
+    #         m = _ffprobe_meta(vpath)
+    #         print("[TEST] META:", m)
+    #         metas.append(m)
+    #
+    #     # 공통 fps: 다수결(동률이면 첫 파일 기준), 소수점은 반올림 정수
+    #     fps_candidates: List[int] = []
+    #     for m in metas:
+    #         fps_val = 0.0
+    #         if m.get("avg_frame_rate"):
+    #             fps_val = _parse_rate(m.get("avg_frame_rate"))  # type: ignore[arg-type]
+    #         if not fps_val and m.get("r_frame_rate"):
+    #             fps_val = _parse_rate(m.get("r_frame_rate"))  # type: ignore[arg-type]
+    #         fps_int = int(round(fps_val)) if fps_val > 0 else 0
+    #         fps_candidates.append(max(fps_int, 0))
+    #     # 모드 선택
+    #     fps_mode = None
+    #     if fps_candidates:
+    #         counts: Dict[int, int] = {}
+    #         for f in fps_candidates:
+    #             counts[f] = counts.get(f, 0) + 1
+    #         fps_mode = max(counts.items(), key=lambda kv: kv[1])[0]
+    #     if not fps_mode or fps_mode <= 0:
+    #         # 합의 실패 시 첫 파일 또는 30
+    #         first_f = fps_candidates[0] if fps_candidates and fps_candidates[0] > 0 else 30
+    #         fps_mode = first_f if first_f > 0 else 30
+    #
+    #     # 공통 해상도: (width,height) 다수결, 동률이면 첫 파일 해상도
+    #     wh_list: List[Optional[tuple]] = []
+    #     for m in metas:
+    #         w = m.get("width")
+    #         h = m.get("height")
+    #         if isinstance(w, int) and isinstance(h, int) and w > 0 and h > 0:
+    #             wh_list.append((w, h))
+    #         else:
+    #             wh_list.append(None)
+    #     wh_counts: Dict[tuple, int] = {}
+    #     for wh in wh_list:
+    #         if wh is None:
+    #             continue
+    #         wh_counts[wh] = wh_counts.get(wh, 0) + 1
+    #     if wh_counts:
+    #         out_w, out_h = max(wh_counts.items(), key=lambda kv: kv[1])[0]
+    #     else:
+    #         # 메타가 비정상일 때 기본값(세로 예시: 720x1080)
+    #         out_w, out_h = 720, 1080
+    #
+    #     print(f"[TEST] SELECTED: fps={fps_mode}, size={out_w}x{out_h}")
+    #
+    #     # 병합 실행
+    #     out_path = clips_dir / "test_merge.mp4"
+    #     try:
+    #         xfade_concat(
+    #             clip_paths=clip_paths,
+    #             overlap_frames=12,  # 업로드 분석 시 테스트했던 기본값 그대로
+    #             fps=fps_mode,
+    #             audio_path=None,
+    #             out_path=out_path,
+    #             out_fps=None,
+    #             scale_w=out_w,
+    #             scale_h=out_h,
+    #             work_dir=work_dir,
+    #         )
+    #         print("[TEST] DONE:", out_path)
+    #         QtWidgets.QMessageBox.information(self, "테스트 완료", f"출력: {out_path}")
+    #     except (OSError, ValueError, RuntimeError) as e_merge:
+    #         print("[TEST][ERROR]", e_merge)
+    #         QtWidgets.QMessageBox.warning(self, "테스트 실패", str(e_merge))
 
     # ────────────── 음악 생성 ──────────────
 
 
 
-    def on_generate_missing_images(self):
-        """
-        누락 이미지 생성 (검사 기준: FINAL_OUT\[title]\imgs)
-        - story.json: FINAL_OUT\[title]\story.json
-        - imgs 폴더: FINAL_OUT\[title]\imgs
-        - 장면 프롬프트: scene.prompt (없으면 _gpt_scene_prompt 로 생성)
-        - 캐릭터 1명일 때만 swap 시도 (참조 이미지가 있을 때)
-        """
-        try:
-            title = (self.le_title.text().strip()
-                     or (load_json((self._latest_project() / "project.json"), {}) or {}).get("title", "")
-                     or "untitled")
+    # def on_generate_missing_images(self):
+    #     """
+    #     누락 이미지 생성 (검사 기준: FINAL_OUT\[title]\imgs)
+    #     - story.json: FINAL_OUT\[title]\story.json
+    #     - imgs 폴더: FINAL_OUT\[title]\imgs
+    #     - 장면 프롬프트: scene.prompt (없으면 _gpt_scene_prompt 로 생성)
+    #     - 캐릭터 1명일 때만 swap 시도 (참조 이미지가 있을 때)
+    #     """
+    #     try:
+    #         title = (self.le_title.text().strip()
+    #                  or (load_json((self._latest_project() / "project.json"), {}) or {}).get("title", "")
+    #                  or "untitled")
+    #
+    #         # 기준 경로(반드시 FINAL_OUT)
+    #         imgs_dir = self._img_dir_for_title(title)
+    #         imgs_dir.mkdir(parents=True, exist_ok=True)
+    #         story = self._read_story(title)  # FINAL_OUT\[title]\story.json 을 찾아서 scenes 스키마로 정규화
+    #         scenes = story.get("scenes") or []
+    #         if not scenes:
+    #             QtWidgets.QMessageBox.warning(self, "안내", "story.json에 scenes가 없습니다.")
+    #             return
+    #
+    #         # 누락 스캔 (이미지 경로 우선순위: scene.img_file → FINAL_OUT\[title]\imgs\[id].png)
+    #         def _resolve_img_path(scene_id: str, img_file_str: str | None) -> Path:
+    #             if img_file_str:
+    #                 # 'p' -> 'path_obj'로 변경하여 외부 변수와의 충돌 방지
+    #                 path_obj = Path(img_file_str)
+    #                 if path_obj.exists() and path_obj.stat().st_size > 0:
+    #                     return path_obj
+    #             # 'sid' -> 'scene_id'로 변경하여 외부 변수와의 충돌 방지
+    #             return imgs_dir / f"{scene_id}.png"
+    #
+    #         missing: list[tuple[str, dict, Path]] = []
+    #         for sc in scenes:
+    #             sid = sc.get("id") or sc.get("title") or f"t_{int(sc.get('idx', 0) or 0):02d}"
+    #             p = _resolve_img_path(sid, sc.get("img_file"))
+    #             if not (p.exists() and p.stat().st_size > 0):
+    #                 missing.append((sid, sc, p))
+    #
+    #         if not missing:
+    #             QtWidgets.QMessageBox.information(
+    #                 self, "누락 없음",
+    #                 f"누락된 이미지가 없습니다.\n검사 폴더: {imgs_dir}"
+    #             )
+    #             return
+    #
+    #         # 생성 진행
+    #         prog = QtWidgets.QProgressDialog("누락 이미지 생성 중…", "중지", 0, len(missing), self)
+    #         self.setWindowModality(QtCore.Qt.WindowModality.WindowModal)
+    #         prog.setMinimumDuration(0)
+    #
+    #         ok_cnt, fail_cnt = 0, 0
+    #         for i, (sid, sc, out_png) in enumerate(missing, 1):
+    #             if prog.wasCanceled():
+    #                 break
+    #             # 프롬프트
+    #             prompt = (sc.get("prompt") or "").strip()
+    #             if not prompt:
+    #                 try:
+    #                     prompt = self._gpt_scene_prompt(sc, story)
+    #                 except Exception:
+    #                     prompt = "감정/연출 중심, 카메라/분위기 묘사; 가사 금지"
+    #
+    #             # 캐릭터 참조(단일 캐릭터일 때만 swap)
+    #             char_ref = None
+    #             chars = sc.get("characters") or []
+    #             if isinstance(chars, list) and len(chars) == 1:
+    #                 char_ref = self._find_character_asset_path(str(chars[0]))
+    #
+    #             # 워크플로 선택: 참조 있으면 swap, 없으면 t2i
+    #             wf = Path("nunchaku-t2i_swap.json") if char_ref else Path("nunchaku_t2i.json")
+    #
+    #             prog.setLabelText(f"{sid} → 생성 중…")
+    #             QtCore.QCoreApplication.processEvents()
+    #
+    #             ok = self._comfy_run_workflow(wf_path=wf, prompt_text=prompt, out_png=out_png, char_ref=char_ref)
+    #             if ok:
+    #                 ok_cnt += 1
+    #                 prog.setLabelText(f"{sid} → 완료")
+    #             else:
+    #                 fail_cnt += 1
+    #                 prog.setLabelText(f"{sid} → 실패")
+    #
+    #             prog.setValue(i)
+    #             QtCore.QCoreApplication.processEvents()
+    #
+    #         QtWidgets.QMessageBox.information(
+    #             self, "완료",
+    #             f"누락 이미지 생성 결과\n\n생성: {ok_cnt}  |  실패: {fail_cnt}\n폴더: {imgs_dir}"
+    #         )
+    #         self.status.showMessage(f"누락 이미지 생성 완료 — 생성 {ok_cnt}, 실패 {fail_cnt}")
+    #
+    #     except Exception as e:
+    #         QtWidgets.QMessageBox.critical(self, "오류", str(e))
+    #         self.status.showMessage(f"오류: {e}")
 
-            # 기준 경로(반드시 FINAL_OUT)
-            imgs_dir = self._img_dir_for_title(title)
-            imgs_dir.mkdir(parents=True, exist_ok=True)
-            story = self._read_story(title)  # FINAL_OUT\[title]\story.json 을 찾아서 scenes 스키마로 정규화
-            scenes = story.get("scenes") or []
-            if not scenes:
-                QtWidgets.QMessageBox.warning(self, "안내", "story.json에 scenes가 없습니다.")
-                return
+    # @staticmethod
+    # def _move_latest_vocal_to_project(title: str) -> Path | None:
+    #     """
+    #     C:\comfyResult\shorts_make\[title]\ 에서 가장 최신 vocal_final_*.mp3 파일을
+    #     C:\my_games\shorts_make\maked_title\[title]\vocal.mp3 로 이동한다.
+    #     """
+    #     safe_title = _sanitize_title_for_path(title)
+    #
+    #     # 원본 폴더
+    #     src_dir = Path(getattr(_settings, "COMFY_RESULT_ROOT", r"C:\comfyResult\shorts_make")) / safe_title
+    #     if not src_dir.exists():
+    #         return None
+    #
+    #     # 목적지 폴더
+    #     dst_dir = _resolve_audio_dir_from_template(getattr(_settings, "FINAL_OUT", ""), title)
+    #     dst_dir.mkdir(parents=True, exist_ok=True)
+    #
+    #     # 최신 파일 찾기 (vocal_final_*.*)
+    #     candidates = list(src_dir.glob("vocal_final_*.*"))
+    #     if not candidates:
+    #         return None
+    #     latest = max(candidates, key=lambda p: p.stat().st_mtime)
+    #
+    #     # 목적지 파일명 통일
+    #     dst_file = dst_dir / f"vocal{latest.suffix.lower()}"
+    #
+    #     try:
+    #         shutil.move(str(latest), str(dst_file))
+    #     except Exception:
+    #         shutil.copyfile(str(latest), str(dst_file))
+    #     return dst_file
 
-            # 누락 스캔 (이미지 경로 우선순위: scene.img_file → FINAL_OUT\[title]\imgs\[id].png)
-            def _resolve_img_path(scene_id: str, img_file_str: str | None) -> Path:
-                if img_file_str:
-                    # 'p' -> 'path_obj'로 변경하여 외부 변수와의 충돌 방지
-                    path_obj = Path(img_file_str)
-                    if path_obj.exists() and path_obj.stat().st_size > 0:
-                        return path_obj
-                # 'sid' -> 'scene_id'로 변경하여 외부 변수와의 충돌 방지
-                return imgs_dir / f"{scene_id}.png"
+    # @QtCore.pyqtSlot(bool, str)
+    # def _on_music_done(self, success: bool, msg: str) -> None:
+    #     """
+    #     ACE-Step 완료 이후:
+    #       1) 진행 로그/타이머 정리
+    #       2) 생성된 오디오를 프로젝트 폴더로 이동(최신본 1개)
+    #       3) 이동 결과 상태 표시 및 총 프레임 갱신
+    #       4) 바로 story.json 생성(가능할 때만)
+    #     (기존 기능 보존, 파라미터/경로 안전성만 보강)
+    #     """
+    #     # 진행창 메시지
+    #     if getattr(self, "_dlg", None):
+    #         self._dlg.set_status("ACE-Step 완료 — 파일 정리 중…")
+    #         self._dlg.append_log(f"ACE-Step 완료 (성공: {bool(success)}) ✅")
+    #         if msg:
+    #             self._dlg.append_log(str(msg))
+    #
+    #     # 로그 테일 정리 (창은 유지)
+    #     try:
+    #         if getattr(self, "_log_timer", None):
+    #             self._log_timer.stop()
+    #             self._log_timer.deleteLater()
+    #             self._log_timer = None
+    #         if getattr(self, "_log_fp", None):
+    #             self._log_fp.close()
+    #             self._log_fp = None
+    #     except (AttributeError, OSError):
+    #         pass
+    #
+    #     # ── 이동 대상 결정: title 또는 프로젝트 폴더(Path) ──
+    #
+    #     title_text = ""
+    #     try:
+    #         if hasattr(self, "le_title") and self.le_title is not None:
+    #             title_text = (self.le_title.text() or "").strip()
+    #     except Exception:
+    #         title_text = ""
+    #
+    #     proj_dir: Path | None = None
+    #     if not title_text:
+    #         try:
+    #             proj_dir = self._latest_project()
+    #         except Exception:
+    #             proj_dir = None
+    #         if proj_dir and (proj_dir / "project.json").exists():
+    #             try:
+    #                 meta = _load_json(proj_dir / "project.json", {}) or {}
+    #                 title_text = str(meta.get("title", "")).strip()
+    #             except Exception:
+    #                 title_text = ""
+    #
+    #     # ── 실제 이동 시도 ──
+    #     moved_paths: list[Path] = []
+    #     try:
+    #         # 제목이 있으면 제목으로, 없으면 프로젝트 폴더(Path)로 이동 함수 호출
+    #         target_hint: str | Path = title_text if title_text else (proj_dir or Path(""))
+    #         if str(target_hint):
+    #             moved_paths.extend(self._move_generated_audio_to_target(target_hint) or [])
+    #         # vocal.wav 최신본 별도 보강(기존 함수 호출 보존)
+    #         try:
+    #             one_more = self._move_latest_vocal_to_project(title_text or (proj_dir.name if proj_dir else ""))
+    #             if one_more:
+    #                 moved_paths.append(one_more)
+    #         except Exception:
+    #             # 선택적 경로이므로 조용히 패스
+    #             pass
+    #     except Exception as ex_move:
+    #         try:
+    #             self.status.showMessage(f"파일 이동 실패: {ex_move}")
+    #         except Exception:
+    #             pass
+    #         if getattr(self, "_dlg", None):
+    #             self._dlg.append_log(f"[MOVE] 실패: {ex_move}")
+    #
+    #     # ── 상태 표시 및 총 프레임 산출 ──
+    #     if moved_paths:
+    #         last_dst = moved_paths[-1]
+    #         try:
+    #             self.status.showMessage(f"음악 생성 완료 — {last_dst.name}")
+    #         except Exception:
+    #             pass
+    #         if getattr(self, "_dlg", None):
+    #             self._dlg.append_log(f"[MOVE] 완료: {last_dst}")
+    #         try:
+    #             self._set_total_frames_from_audio(last_dst)
+    #         except Exception:
+    #             pass
+    #     else:
+    #         try:
+    #             self.status.showMessage("음악 생성 완료 — 이동된 파일 없음")
+    #         except Exception:
+    #             pass
+    #         if getattr(self, "_dlg", None):
+    #             self._dlg.append_log("[MOVE] 이동된 파일 없음")
+    #
+    #     # 음악 가드 해제
+    #     try:
+    #         self._task_done("music")
+    #     except Exception:
+    #         pass
+    #
+    #     # ── story.json 빌드용 분석 오디오 선택 ──
+    #     audio_for_analysis: Path | None = None
+    #     try:
+    #         proj2 = self._latest_project()
+    #     except Exception:
+    #         proj2 = None
+    #
+    #     try:
+    #         meta2 = _load_json((proj2 / "project.json") if proj2 else "", {}) or {}
+    #         vud = (meta2.get("paths", {}) or {}).get("vocal_user_dir", "")
+    #         if vud:
+    #             audio_for_analysis = self._resolve_audio_for_analysis(Path(vud))
+    #     except Exception:
+    #         audio_for_analysis = None
+    #
+    #     if not audio_for_analysis:
+    #         try:
+    #             audio_for_analysis = self._resolve_audio_for_analysis(
+    #                 self._find_vocal_in_project(proj2) if proj2 else None)
+    #         except Exception:
+    #             audio_for_analysis = None
+    #
+    #     if (not audio_for_analysis) and moved_paths:
+    #         audio_for_analysis = self._resolve_audio_for_analysis(moved_paths[-1])
+    #
+    #     # ── 바로 story 빌드 (팝업 없음) ──
+    #     proj_dir_final = audio_for_analysis.parent if audio_for_analysis else None
+    #     pj_path = (proj_dir_final / "project.json") if proj_dir_final else None
+    #
+    #     if audio_for_analysis and audio_for_analysis.exists() and pj_path and pj_path.exists():
+    #         if getattr(self, "_dlg", None):
+    #             self._dlg.set_status("음악 완료 → story.json 생성 시작…")
+    #             self._dlg.append_log(f"[AUTO-STORY] 시작: {audio_for_analysis}")
+    #         try:
+    #             self._start_build_story_from_analysis(audio_for_analysis, pj_path)
+    #         except Exception:
+    #             pass
+    #     else:
+    #         print("[AUTO-STORY] skip: audio or project.json missing", flush=True)
 
-            missing: list[tuple[str, dict, Path]] = []
-            for sc in scenes:
-                sid = sc.get("id") or sc.get("title") or f"t_{int(sc.get('idx', 0) or 0):02d}"
-                p = _resolve_img_path(sid, sc.get("img_file"))
-                if not (p.exists() and p.stat().st_size > 0):
-                    missing.append((sid, sc, p))
-
-            if not missing:
-                QtWidgets.QMessageBox.information(
-                    self, "누락 없음",
-                    f"누락된 이미지가 없습니다.\n검사 폴더: {imgs_dir}"
-                )
-                return
-
-            # 생성 진행
-            prog = QtWidgets.QProgressDialog("누락 이미지 생성 중…", "중지", 0, len(missing), self)
-            self.setWindowModality(QtCore.Qt.WindowModality.WindowModal)
-            prog.setMinimumDuration(0)
-
-            ok_cnt, fail_cnt = 0, 0
-            for i, (sid, sc, out_png) in enumerate(missing, 1):
-                if prog.wasCanceled():
-                    break
-                # 프롬프트
-                prompt = (sc.get("prompt") or "").strip()
-                if not prompt:
-                    try:
-                        prompt = self._gpt_scene_prompt(sc, story)
-                    except Exception:
-                        prompt = "감정/연출 중심, 카메라/분위기 묘사; 가사 금지"
-
-                # 캐릭터 참조(단일 캐릭터일 때만 swap)
-                char_ref = None
-                chars = sc.get("characters") or []
-                if isinstance(chars, list) and len(chars) == 1:
-                    char_ref = self._find_character_asset_path(str(chars[0]))
-
-                # 워크플로 선택: 참조 있으면 swap, 없으면 t2i
-                wf = Path("nunchaku-t2i_swap.json") if char_ref else Path("nunchaku_t2i.json")
-
-                prog.setLabelText(f"{sid} → 생성 중…")
-                QtCore.QCoreApplication.processEvents()
-
-                ok = self._comfy_run_workflow(wf_path=wf, prompt_text=prompt, out_png=out_png, char_ref=char_ref)
-                if ok:
-                    ok_cnt += 1
-                    prog.setLabelText(f"{sid} → 완료")
-                else:
-                    fail_cnt += 1
-                    prog.setLabelText(f"{sid} → 실패")
-
-                prog.setValue(i)
-                QtCore.QCoreApplication.processEvents()
-
-            QtWidgets.QMessageBox.information(
-                self, "완료",
-                f"누락 이미지 생성 결과\n\n생성: {ok_cnt}  |  실패: {fail_cnt}\n폴더: {imgs_dir}"
-            )
-            self.status.showMessage(f"누락 이미지 생성 완료 — 생성 {ok_cnt}, 실패 {fail_cnt}")
-
-        except Exception as e:
-            QtWidgets.QMessageBox.critical(self, "오류", str(e))
-            self.status.showMessage(f"오류: {e}")
-
-    @staticmethod
-    def _move_latest_vocal_to_project(title: str) -> Path | None:
-        """
-        C:\comfyResult\shorts_make\[title]\ 에서 가장 최신 vocal_final_*.mp3 파일을
-        C:\my_games\shorts_make\maked_title\[title]\vocal.mp3 로 이동한다.
-        """
-        safe_title = _sanitize_title_for_path(title)
-
-        # 원본 폴더
-        src_dir = Path(getattr(_settings, "COMFY_RESULT_ROOT", r"C:\comfyResult\shorts_make")) / safe_title
-        if not src_dir.exists():
-            return None
-
-        # 목적지 폴더
-        dst_dir = _resolve_audio_dir_from_template(getattr(_settings, "FINAL_OUT", ""), title)
-        dst_dir.mkdir(parents=True, exist_ok=True)
-
-        # 최신 파일 찾기 (vocal_final_*.*)
-        candidates = list(src_dir.glob("vocal_final_*.*"))
-        if not candidates:
-            return None
-        latest = max(candidates, key=lambda p: p.stat().st_mtime)
-
-        # 목적지 파일명 통일
-        dst_file = dst_dir / f"vocal{latest.suffix.lower()}"
-
-        try:
-            shutil.move(str(latest), str(dst_file))
-        except Exception:
-            shutil.copyfile(str(latest), str(dst_file))
-        return dst_file
-
-    @QtCore.pyqtSlot(bool, str)
-    def _on_music_done(self, success: bool, msg: str) -> None:
-        """
-        ACE-Step 완료 이후:
-          1) 진행 로그/타이머 정리
-          2) 생성된 오디오를 프로젝트 폴더로 이동(최신본 1개)
-          3) 이동 결과 상태 표시 및 총 프레임 갱신
-          4) 바로 story.json 생성(가능할 때만)
-        (기존 기능 보존, 파라미터/경로 안전성만 보강)
-        """
-        # 진행창 메시지
-        if getattr(self, "_dlg", None):
-            self._dlg.set_status("ACE-Step 완료 — 파일 정리 중…")
-            self._dlg.append_log(f"ACE-Step 완료 (성공: {bool(success)}) ✅")
-            if msg:
-                self._dlg.append_log(str(msg))
-
-        # 로그 테일 정리 (창은 유지)
-        try:
-            if getattr(self, "_log_timer", None):
-                self._log_timer.stop()
-                self._log_timer.deleteLater()
-                self._log_timer = None
-            if getattr(self, "_log_fp", None):
-                self._log_fp.close()
-                self._log_fp = None
-        except (AttributeError, OSError):
-            pass
-
-        # ── 이동 대상 결정: title 또는 프로젝트 폴더(Path) ──
-
-        title_text = ""
-        try:
-            if hasattr(self, "le_title") and self.le_title is not None:
-                title_text = (self.le_title.text() or "").strip()
-        except Exception:
-            title_text = ""
-
-        proj_dir: Path | None = None
-        if not title_text:
-            try:
-                proj_dir = self._latest_project()
-            except Exception:
-                proj_dir = None
-            if proj_dir and (proj_dir / "project.json").exists():
-                try:
-                    meta = _load_json(proj_dir / "project.json", {}) or {}
-                    title_text = str(meta.get("title", "")).strip()
-                except Exception:
-                    title_text = ""
-
-        # ── 실제 이동 시도 ──
-        moved_paths: list[Path] = []
-        try:
-            # 제목이 있으면 제목으로, 없으면 프로젝트 폴더(Path)로 이동 함수 호출
-            target_hint: str | Path = title_text if title_text else (proj_dir or Path(""))
-            if str(target_hint):
-                moved_paths.extend(self._move_generated_audio_to_target(target_hint) or [])
-            # vocal.wav 최신본 별도 보강(기존 함수 호출 보존)
-            try:
-                one_more = self._move_latest_vocal_to_project(title_text or (proj_dir.name if proj_dir else ""))
-                if one_more:
-                    moved_paths.append(one_more)
-            except Exception:
-                # 선택적 경로이므로 조용히 패스
-                pass
-        except Exception as ex_move:
-            try:
-                self.status.showMessage(f"파일 이동 실패: {ex_move}")
-            except Exception:
-                pass
-            if getattr(self, "_dlg", None):
-                self._dlg.append_log(f"[MOVE] 실패: {ex_move}")
-
-        # ── 상태 표시 및 총 프레임 산출 ──
-        if moved_paths:
-            last_dst = moved_paths[-1]
-            try:
-                self.status.showMessage(f"음악 생성 완료 — {last_dst.name}")
-            except Exception:
-                pass
-            if getattr(self, "_dlg", None):
-                self._dlg.append_log(f"[MOVE] 완료: {last_dst}")
-            try:
-                self._set_total_frames_from_audio(last_dst)
-            except Exception:
-                pass
-        else:
-            try:
-                self.status.showMessage("음악 생성 완료 — 이동된 파일 없음")
-            except Exception:
-                pass
-            if getattr(self, "_dlg", None):
-                self._dlg.append_log("[MOVE] 이동된 파일 없음")
-
-        # 음악 가드 해제
-        try:
-            self._task_done("music")
-        except Exception:
-            pass
-
-        # ── story.json 빌드용 분석 오디오 선택 ──
-        audio_for_analysis: Path | None = None
-        try:
-            proj2 = self._latest_project()
-        except Exception:
-            proj2 = None
-
-        try:
-            meta2 = _load_json((proj2 / "project.json") if proj2 else "", {}) or {}
-            vud = (meta2.get("paths", {}) or {}).get("vocal_user_dir", "")
-            if vud:
-                audio_for_analysis = self._resolve_audio_for_analysis(Path(vud))
-        except Exception:
-            audio_for_analysis = None
-
-        if not audio_for_analysis:
-            try:
-                audio_for_analysis = self._resolve_audio_for_analysis(
-                    self._find_vocal_in_project(proj2) if proj2 else None)
-            except Exception:
-                audio_for_analysis = None
-
-        if (not audio_for_analysis) and moved_paths:
-            audio_for_analysis = self._resolve_audio_for_analysis(moved_paths[-1])
-
-        # ── 바로 story 빌드 (팝업 없음) ──
-        proj_dir_final = audio_for_analysis.parent if audio_for_analysis else None
-        pj_path = (proj_dir_final / "project.json") if proj_dir_final else None
-
-        if audio_for_analysis and audio_for_analysis.exists() and pj_path and pj_path.exists():
-            if getattr(self, "_dlg", None):
-                self._dlg.set_status("음악 완료 → story.json 생성 시작…")
-                self._dlg.append_log(f"[AUTO-STORY] 시작: {audio_for_analysis}")
-            try:
-                self._start_build_story_from_analysis(audio_for_analysis, pj_path)
-            except Exception:
-                pass
-        else:
-            print("[AUTO-STORY] skip: audio or project.json missing", flush=True)
-
-    @QtCore.pyqtSlot()
-    def _on_analysis_thread_finished(self):
-        """분석 QThread가 어떤 이유로든 끝나면 버튼/플래그를 반드시 복구."""
-        try:
-            # 공통 가드/플래그 정리
-            if hasattr(self, "_task_done"):
-                self._task_done("analysis")
-            else:
-                # 구버전 호환
-                self._analysis_running = False
-                self._analysis_thread = None
-            # UI 잠금 해제
-            self._set_busy_ui("analysis", False)
-        except Exception:
-            pass
+    # @QtCore.pyqtSlot()
+    # def _on_analysis_thread_finished(self):
+    #     """분석 QThread가 어떤 이유로든 끝나면 버튼/플래그를 반드시 복구."""
+    #     try:
+    #         # 공통 가드/플래그 정리
+    #         if hasattr(self, "_task_done"):
+    #             self._task_done("analysis")
+    #         else:
+    #             # 구버전 호환
+    #             self._analysis_running = False
+    #             self._analysis_thread = None
+    #         # UI 잠금 해제
+    #         self._set_busy_ui("analysis", False)
+    #     except Exception:
+    #         pass
 
     def _start_analysis_watchdog(self):
         """2초마다 analysis 스레드 상태를 보고 스테일이면 UI 잠금 해제."""
@@ -8509,51 +8398,51 @@ class MainWindow(QtWidgets.QMainWindow):
                 pass
 
     # MainWindow 안에 추가
-    def _guard_alert(self, name: str):
-        """이미 같은 작업이 실행 중일 때 사용자에게 팝업으로 알림(과도한 중복 팝업은 3초 스로틀)."""
-        import time
-        if not hasattr(self, "_last_alert_at"):
-            self._last_alert_at = {}
-
-        now = time.monotonic()
-        last = float(self._last_alert_at.get(name, 0.0) or 0.0)
-        if now - last < 3.0:
-            # 3초 내 재클릭이면 팝업은 생략하고 상태바만 갱신
-            try:
-                self.status.showMessage("이미 같은 작업이 진행 중입니다.")
-            except Exception:
-                pass
-            return
-        self._last_alert_at[name] = now
-
-        # 작업별 안내 문구
-        if name == "music":
-            msg = "음악 생성이 이미 진행 중입니다. 동시에 두 번 실행할 수 없어요.\n작업이 끝나면 자동으로 해제됩니다."
-        elif name == "analysis":
-            msg = "음악 분석이 이미 진행 중입니다. 동시에 두 번 실행할 수 없어요.\n작업이 끝나면 자동으로 해제됩니다."
-        else:
-            msg = "작업이 진행 중입니다. 완료 후 다시 시도하세요."
-
-        # 음악 생성은 진행창이 있으니 열어줄지 물어봄, 그 외엔 정보 팝업만
-        if name == "music" and getattr(self, "_dlg", None) is not None:
-            ret = QtWidgets.QMessageBox.question(
-                self, "안내", msg + "\n\n지금 '진행상황 보기' 창을 열까요?",
-                            QtWidgets.QMessageBox.Yes | QtWidgets.QMessageBox.No, QtWidgets.QMessageBox.No
-            )
-            if ret == QtWidgets.QMessageBox.Yes:
-                try:
-                    self.on_show_progress()
-                except Exception:
-                    pass
-        else:
-            QtWidgets.QMessageBox.information(self, "안내", msg)
+    # def _guard_alert(self, name: str):
+    #     """이미 같은 작업이 실행 중일 때 사용자에게 팝업으로 알림(과도한 중복 팝업은 3초 스로틀)."""
+    #     import time
+    #     if not hasattr(self, "_last_alert_at"):
+    #         self._last_alert_at = {}
+    #
+    #     now = time.monotonic()
+    #     last = float(self._last_alert_at.get(name, 0.0) or 0.0)
+    #     if now - last < 3.0:
+    #         # 3초 내 재클릭이면 팝업은 생략하고 상태바만 갱신
+    #         try:
+    #             self.status.showMessage("이미 같은 작업이 진행 중입니다.")
+    #         except Exception:
+    #             pass
+    #         return
+    #     self._last_alert_at[name] = now
+    #
+    #     # 작업별 안내 문구
+    #     if name == "music":
+    #         msg = "음악 생성이 이미 진행 중입니다. 동시에 두 번 실행할 수 없어요.\n작업이 끝나면 자동으로 해제됩니다."
+    #     elif name == "analysis":
+    #         msg = "음악 분석이 이미 진행 중입니다. 동시에 두 번 실행할 수 없어요.\n작업이 끝나면 자동으로 해제됩니다."
+    #     else:
+    #         msg = "작업이 진행 중입니다. 완료 후 다시 시도하세요."
+    #
+    #     # 음악 생성은 진행창이 있으니 열어줄지 물어봄, 그 외엔 정보 팝업만
+    #     if name == "music" and getattr(self, "_dlg", None) is not None:
+    #         ret = QtWidgets.QMessageBox.question(
+    #             self, "안내", msg + "\n\n지금 '진행상황 보기' 창을 열까요?",
+    #                         QtWidgets.QMessageBox.Yes | QtWidgets.QMessageBox.No, QtWidgets.QMessageBox.No
+    #         )
+    #         if ret == QtWidgets.QMessageBox.Yes:
+    #             try:
+    #                 self.on_show_progress()
+    #             except Exception:
+    #                 pass
+    #     else:
+    #         QtWidgets.QMessageBox.information(self, "안내", msg)
 
     # 분석 연결 함수
-    def _cleanup_analysis_state(self):
-        # 플래그/스레드 핸들 정리
-        self._task_done("analysis")
-        # ★ 반드시 UI 잠금 해제까지
-        self._set_busy_ui("analysis", False)
+    # def _cleanup_analysis_state(self):
+    #     # 플래그/스레드 핸들 정리
+    #     self._task_done("analysis")
+    #     # ★ 반드시 UI 잠금 해제까지
+    #     self._set_busy_ui("analysis", False)
 
 
 
@@ -8870,8 +8759,7 @@ class MainWindow(QtWidgets.QMainWindow):
         return moved
 
     # ────────────── 영상 빌드(선택) ──────────────
-    # shorts_ui.py 파일의 on_video 함수 전체를 이 코드로 교체하세요. (약 7076 라인)
-
+    # real_use
     def on_video(self, *, on_done_override: Optional[Callable] = None) -> None:
         try:
             self._save_ui_prefs_to_project()
@@ -9167,401 +9055,401 @@ class MainWindow(QtWidgets.QMainWindow):
                     except RuntimeError:
                         pass
 
-    def on_video_wan(self, *, on_done_override: Optional[Callable] = None) -> None:
-        """
-        [3단계] 영상 생성 (Wan 2.2 Start-End Interpolation 모드)
-
-        수정 사항:
-        1. [워크플로우] 'wan2.2movie.json' 전용 ID 매핑 적용 (Start: 386, End: 387, Len: 405)
-        2. [로직] 키프레임(kf_i, kf_i+1)을 Start/End로 주입하여 구간 생성.
-        3. [구조] 41프레임 단위 고정 분할 (오버랩 없음).
-        4. [ReActor] 제거됨 (워크플로우에 없음).
-        """
-
-        # --- 버튼 제어 ---
-        btn_video_widget: Optional[QtWidgets.QAbstractButton] = None
-        for btn_name in ("btn_video", "btn_build_video"):
-            widget_candidate = getattr(self, btn_name, None)
-            if widget_candidate is not None:
-                btn_video_widget = widget_candidate
-                break
-        if btn_video_widget:
-            try:
-                btn_video_widget.setEnabled(False)
-            except RuntimeError:
-                pass
-
-        try:
-
-
-            # --- 경로 준비 ---
-            proj_dir_val = None
-            if hasattr(self, "_current_project_dir") and callable(self._current_project_dir):
-                proj_dir_val = str(self._current_project_dir())
-            if not proj_dir_val:
-                proj_dir_val = str(getattr(self, "project_dir", ""))
-
-            if not proj_dir_val:
-                QtWidgets.QMessageBox.warning(self, "오류", "프로젝트 폴더가 선택되지 않았습니다.")
-                if btn_video_widget: btn_video_widget.setEnabled(True)
-                return
-
-            proj_dir = Path(proj_dir_val)
-            video_json_path = proj_dir / "video.json"
-            if not video_json_path.exists():
-                QtWidgets.QMessageBox.critical(self, "오류", f"video.json 없음: {video_json_path}")
-                if btn_video_widget: btn_video_widget.setEnabled(True)
-                return
-
-            # ★ [수정] wan2.2movie.json 로드
-            wan_wf_path = Path(JSONS_DIR) / "wan2.2movie.json"
-            if not wan_wf_path.exists():
-                QtWidgets.QMessageBox.critical(self, "오류", f"워크플로우 파일 없음: {wan_wf_path.name}")
-                if btn_video_widget: btn_video_widget.setEnabled(True)
-                return
-
-            wan_workflow_template = load_json(wan_wf_path)
-
-            comfy_input_path = Path(COMFY_INPUT_DIR)
-
-            clips_dir = proj_dir / "clips"
-            clips_dir.mkdir(parents=True, exist_ok=True)
-
-            imgs_base_dir = proj_dir / "imgs"
-            imgs_base_dir.mkdir(parents=True, exist_ok=True)
-
-            # --- 헬퍼 ---
-            def _is_valid_video(path: Path) -> bool:
-                if not path.exists() or path.stat().st_size < 1024: return False
-                try:
-                    cmd = [FFPROBE_EXE, "-v", "error", "-select_streams", "v:0", "-show_entries", "stream=codec_name",
-                           "-of", "default=noprint_wrappers=1:nokey=1", str(path)]
-                    subprocess.run(cmd, check=True, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, timeout=5)
-                    return True
-                except:
-                    return False
-
-            def _submit_and_wait_custom(base_url: str, graph: Dict, timeout: int, poll: float,
-                                        log_func: Callable) -> Dict:
-                prompt_url = f"{base_url.rstrip('/')}/prompt"
-                history_url = f"{base_url.rstrip('/')}/history"
-                try:
-                    payload = {"prompt": graph, "client_id": "shorts_maker_wan_se"}
-                    resp = requests.post(prompt_url, json=payload, timeout=30)
-                    if resp.status_code != 200: raise RuntimeError(f"HTTP {resp.status_code}: {resp.text}")
-                    prompt_id = resp.json().get("prompt_id")
-                    if not prompt_id: raise RuntimeError("No prompt_id")
-                except Exception as e:
-                    raise RuntimeError(f"제출 실패: {e}")
-
-                start_time = time.time()
-                while True:
-                    if time.time() - start_time > timeout: raise TimeoutError("시간 초과")
-                    try:
-                        h_resp = requests.get(f"{history_url}/{prompt_id}", timeout=10)
-                        if h_resp.status_code == 200 and prompt_id in h_resp.json():
-                            return h_resp.json()[prompt_id]
-                    except:
-                        pass
-                    time.sleep(poll)
-
-            # --- Job ---
-            def _job(progress_callback: _CallableType[[Dict[str, Any]], None]) -> str:
-                _log = lambda msg: progress_callback({"msg": msg})
-                _log(f"워크플로우({wan_wf_path.name}) - Start-End Interpolation 모드")
-
-                vdoc = load_json(video_json_path) or {}
-                fps_val = int(vdoc.get("fps", 16))
-                scenes = vdoc.get("scenes") or []
-                if not scenes: return "생성할 씬이 없습니다."
-
-                SEG_LEN = 41  # 고정 세그먼트 길이
-
-                for scene in scenes:
-                    scene_id = scene.get("id")
-                    if not scene_id: continue
-
-                    # 1. 목표 프레임 계산
-                    try:
-                        duration_val = float(scene.get("duration", 0.0))
-                    except:
-                        duration_val = 0.0
-                    scene_total_frames = int(round(duration_val * fps_val))
-                    if scene_total_frames <= 0: continue
-
-                    _log(f"[{scene_id}] 처리 시작 (목표 {scene_total_frames}f)")
-
-                    # 2. 구간 분할 (41프레임 단위)
-                    # 예: 100f -> 0~41, 41~82, 82~100 (3구간)
-                    segments = []
-                    cursor = 0
-                    while cursor < scene_total_frames:
-                        end = min(cursor + SEG_LEN, scene_total_frames)
-                        segments.append((cursor, end))
-                        cursor = end
-
-                    # 3. 폴더 준비
-                    scene_chunk_dir = clips_dir / scene_id
-                    if scene_chunk_dir.exists(): shutil.rmtree(scene_chunk_dir)  # 기존 잔여물 삭제 (필수)
-                    scene_chunk_dir.mkdir(parents=True, exist_ok=True)
-
-                    # 4. 이 씬의 캐릭터:인덱스 맵 (예: ["female_01:0", "male_01:1"])
-                    # 4. 이 씬의 캐릭터:인덱스 맵 (예: ["female_01:0", "male_01:1"])
-                    char_index_map: Dict[str, int] = {}
-                    chars_list = (
-                            scene.get("characters")
-                            or scene.get("character_objs")
-                            or vdoc.get("characters")
-                            or vdoc.get("character_objs")
-                            or []
-                    )
-
-                    for c in chars_list:
-                        cid = ""
-                        cidx = 0
-                        if isinstance(c, dict):
-                            cid = str(c.get("id") or c.get("name") or "").strip()
-                            try:
-                                cidx = int(c.get("index") or c.get("face_index") or 0)
-                            except Exception:
-                                cidx = 0
-                        elif isinstance(c, str):
-                            text_c = c.strip()
-                            if ":" in text_c:
-                                left, right = text_c.split(":", 1)
-                                cid = left.strip()
-                                try:
-                                    cidx = int(right.strip())
-                                except Exception:
-                                    cidx = 0
-                            else:
-                                cid = text_c
-                                cidx = 0
-                        if cid:
-                            # 같은 캐릭터가 여러 번 나오면 마지막 값으로 덮어씀
-                            char_index_map[cid] = cidx
-
-                    # wan2.2movie.json 기준 ReActor ↔ LoadImage ↔ 캐릭터ID 매핑
-                    # 475 ↔ 480(female_01), 477 ↔ 479(male_01), 478 ↔ 481(other_char/기타)
-                    reactor_map = {
-                        "475": ("480", "female_01"),
-                        "477": ("479", "male_01"),
-                        "478": ("481", "other_char"),
-                    }
-
-
-                    video_chunks: list[Path] = []
-                    scene_failed = False
-
-                    # 4. 구간별 생성
-                    for idx, (s_f, e_f) in enumerate(segments):
-                        chunk_name = f"seg_{idx:03d}.mp4"
-                        chunk_path = scene_chunk_dir / chunk_name
-                        video_chunks.append(chunk_path)
-
-                        # 실제 생성해야 할 길이 (끝-시작)
-                        # 주의: Interpolation 모델은 보통 '양 끝 포함' 프레임 수를 요구함.
-                        # 예: 0~41 -> 41프레임 생성 (0번, 41번 이미지가 있고 그 사이+양끝 포함 42장? 아니면 간격이 41?)
-                        # Wan VACE 노드는 'num_frames'가 생성될 총 프레임 수(양 끝 포함)를 의미할 가능성이 높음.
-                        current_seg_len = e_f - s_f
-                        if current_seg_len <= 1: continue  # 너무 짧으면 스킵
-
-                        # 키프레임 이미지 준비 (Start & End)
-                        # 1단계(이미지 생성)에서 kf_0, kf_1... 로 저장되어 있다고 가정
-                        # idx번째 구간의 시작은 kf_{idx}, 끝은 kf_{idx+1}
-                        # 마지막 구간의 끝 이미지는? -> kf_{idx+1}이 없으면 곤란함.
-                        # 사용자 로직: "세그먼트별 프롬프트 이용" -> video.json에 frame_segments가 있고 그 개수만큼 이미지가 있어야 함.
-
-                        kf_start_name = f"kf_{idx}.png"
-                        kf_end_name = f"kf_{idx + 1}.png"
-
-                        kf_start_path = imgs_base_dir / scene_id / kf_start_name
-                        kf_end_path = imgs_base_dir / scene_id / kf_end_name
-
-                        # 예외 처리: 마지막 구간인데 끝 이미지가 없다면?
-                        # 보통 마지막 이미지는 t_00x.png (씬 대표 이미지)일 수도 있고, kf_마지막 번호일 수도 있음.
-                        # 여기선 일단 파일이 있어야 진행. 없으면 에러.
-                        if not kf_start_path.exists():
-                            # 첫 시작이면 씬 대표 이미지 사용 시도
-                            if idx == 0 and Path(scene.get("img_file", "")).exists():
-                                kf_start_path = Path(scene.get("img_file"))
-                            else:
-                                _log(f"[ERR] 시작 이미지 {kf_start_name} 없음.")
-                                scene_failed = True
-                                break
-
-                        if not kf_end_path.exists():
-                            # 마지막 구간이면 시작 이미지를 복사해서 끝 이미지로 쓸 수도 없음 (움직임이 없으므로).
-                            # 일단 에러 처리
-                            _log(f"[ERR] 끝 이미지 {kf_end_name} 없음.")
-                            scene_failed = True
-                            break
-
-                        _log(
-                            f"[{scene_id}] 구간 {idx + 1}/{len(segments)} 생성 ({current_seg_len}f, {kf_start_name}~{kf_end_name})...")
-
-                        try:
-                            wf = json.loads(json.dumps(wan_workflow_template))
-
-                            # 이미지 복사 & 주입
-                            shutil.copy2(str(kf_start_path), comfy_input_path / kf_start_path.name)
-                            shutil.copy2(str(kf_end_path), comfy_input_path / kf_end_path.name)
-
-                            # ★ ID 매핑 (wan2.2movie.json 기준)
-                            if "386" in wf: wf["386"]["inputs"]["image"] = kf_start_path.name  # Start
-                            if "387" in wf: wf["387"]["inputs"]["image"] = kf_end_path.name  # End
-                            if "405" in wf: wf["405"]["inputs"]["value"] = int(current_seg_len)  # Frames
-
-                            # 프롬프트 (해당 구간의 프롬프트 찾기)
-                            # video.json의 frame_segments 리스트에서 idx번째 항목 사용
-                            seg_prompt = ""
-                            frame_segs = scene.get("frame_segments", [])
-                            if idx < len(frame_segs):
-                                seg_prompt = frame_segs[idx].get("prompt_movie", "")
-                            if not seg_prompt: seg_prompt = scene.get("prompt_movie", "")
-
-                            # if "106" in wf: wf["106"]["inputs"]["positive_prompt"] = seg_prompt
-
-                            # 시드
-                            seed = random.randint(1, 9999999999)
-                            if "391" in wf: wf["391"]["inputs"]["seed"] = seed
-
-                            # --- 페이스스왑 주입 (캐릭터:인덱스 기반) ---
-
-                            # 1) GIMMVFI 입력을 ReActor 체인 출력(477)으로 변경
-                            #    28(디코드) → 478 → 475 → 477 → 455(GIMMVFI) → 450(업스케일) → 439(저장)
-                            if "455" in wf:
-                                wf["455"].setdefault("inputs", {})["images"] = ["477", 0]
-
-                            # 2) 캐릭터ID 별로 ReActor/LoadImage 세팅
-                            char_base = Path(CHARACTER_DIR)
-                            for reactor_id, (load_node_id, char_id) in reactor_map.items():
-                                node_re = wf.get(reactor_id)
-                                node_load = wf.get(load_node_id)
-                                if not isinstance(node_re, dict) or not isinstance(node_load, dict):
-                                    continue
-
-                                inputs_re = node_re.setdefault("inputs", {})
-                                face_idx = char_index_map.get(char_id)
-
-                                # 이 씬에 해당 캐릭터가 없으면 비활성화
-                                if face_idx is None:
-                                    inputs_re["enabled"] = False
-                                    continue
-
-                                # 캐릭터 이미지 찾기 (CHARACTER_DIR/female_01.png 같은 것)
-                                char_img_path = None
-                                for ext in (".png", ".jpg", ".jpeg", ".webp"):
-                                    p = char_base / f"{char_id}{ext}"
-                                    if p.exists():
-                                        char_img_path = p
-                                        break
-
-                                if char_img_path is None:
-                                    # 이미지 없으면 이 ReActor만 끔
-                                    inputs_re["enabled"] = False
-                                    continue
-
-                                dst_name = f"{char_id}{char_img_path.suffix}"
-                                try:
-                                    shutil.copy2(str(char_img_path), comfy_input_path / dst_name)
-                                except Exception:
-                                    # 복사 실패해도 일단 계속 진행
-                                    pass
-
-                                # LoadImage 노드에 소스 얼굴 이미지 주입
-                                node_load.setdefault("inputs", {})["image"] = dst_name
-
-                                # ReActor 활성화 + 인덱스 설정
-                                inputs_re["enabled"] = True
-                                inputs_re["input_faces_index"] = str(int(face_idx))
-                                # source_faces_index는 기본값(0)을 유지, 없으면 0으로
-                                if "source_faces_index" not in inputs_re:
-                                    inputs_re["source_faces_index"] = "0"
-
-
-                            # 저장 (439번이 Upscaled 최종본)
-                            target_save = "439"
-                            if target_save in wf:
-                                prefix = f"wan_se/{scene_id}/{idx}"
-                                wf[target_save]["inputs"]["filename_prefix"] = prefix
-                            else:
-                                raise RuntimeError("저장 노드(439)를 찾을 수 없습니다.")
-
-                            # 실행
-                            res = _submit_and_wait_custom(COMFY_HOST, wf, timeout=1800, poll=5.0, log_func=_log)
-
-                            # 결과 처리
-                            outs = res.get("outputs", {})
-                            tgt_out = outs.get(target_save, {})
-                            vids = tgt_out.get("videos") or tgt_out.get("gifs")
-
-                            if not vids: raise RuntimeError(f"결과 없음 (Output: {list(outs.keys())})")
-
-                            dl_info = vids[0]
-                            ftype = dl_info.get("type", "output")
-                            resp = requests.get(
-                                f"{COMFY_HOST}/view",
-                                params={"filename": dl_info['filename'], "subfolder": dl_info['subfolder'],
-                                        "type": ftype},
-                                timeout=120
-                            )
-                            if len(resp.content) < 1024: raise RuntimeError("0바이트 파일")
-
-                            with open(chunk_path, "wb") as f:
-                                f.write(resp.content)
-
-                            if not _is_valid_video(chunk_path): raise RuntimeError("손상된 파일")
-
-                        except Exception as e:
-                            _log(f"[{scene_id}] 생성 실패: {e}")
-                            scene_failed = True
-                            try:
-                                chunk_path.unlink()
-                            except:
-                                pass
-                            break
-
-                    # 5. 단순 병합 (Concat)
-                    if not scene_failed and video_chunks:
-                        final_path = clips_dir / f"{scene_id}.mp4"
-                        try:
-                            concatenate_scene_clips(video_chunks, final_path, FFMPEG_EXE)
-                            _log(f"[{scene_id}] 병합 완료.")
-
-                            # 최종 길이 보정 (선택 사항)
-                            # _trim_to_frames(FFMPEG_EXE, FFPROBE_EXE, final_path, final_path, scene_total_frames, fps_val)
-
-                        except Exception as e:
-                            _log(f"[{scene_id}] 병합 실패: {e}")
-
-                return "작업 완료"
-
-            def _done(ok, payload, err):
-                if on_done_override:
-                    on_done_override(ok, payload, err)
-                elif not ok:
-                    QtWidgets.QMessageBox.critical(self, "실패", str(err))
-                else:
-                    QtWidgets.QMessageBox.information(self, "완료", str(payload))
-                if btn_video_widget: btn_video_widget.setEnabled(True)
-
-            run_job_with_progress_async(owner=self, title="Wan 2.2 (Start-End)", job=_job, on_done=_done)
-
-        except Exception as e:
-            if btn_video_widget: btn_video_widget.setEnabled(True)
-            QtWidgets.QMessageBox.critical(self, "오류", str(e))
-
-    # ────────────── 기타 ──────────────
-    def _set_total_frames_from_audio(self, audio_path: Path) -> None:
-        dur = audio_duration_sec(audio_path)
-        if dur <= 0:
-            QtWidgets.QMessageBox.warning(self, "안내", "오디오 길이를 읽지 못했습니다.")
-            return
-        fps = self.sb_outfps.value()
-        total = int(round(dur * fps))
-        self.sb_total.setValue(max(total, 1))
-        self.status.showMessage(f"오디오 길이 {dur:.2f}s × {fps}fps → 총 프레임 {total}")
+    # def on_video_wan(self, *, on_done_override: Optional[Callable] = None) -> None:
+    #     """
+    #     [3단계] 영상 생성 (Wan 2.2 Start-End Interpolation 모드)
+    #
+    #     수정 사항:
+    #     1. [워크플로우] 'wan2.2movie.json' 전용 ID 매핑 적용 (Start: 386, End: 387, Len: 405)
+    #     2. [로직] 키프레임(kf_i, kf_i+1)을 Start/End로 주입하여 구간 생성.
+    #     3. [구조] 41프레임 단위 고정 분할 (오버랩 없음).
+    #     4. [ReActor] 제거됨 (워크플로우에 없음).
+    #     """
+    #
+    #     # --- 버튼 제어 ---
+    #     btn_video_widget: Optional[QtWidgets.QAbstractButton] = None
+    #     for btn_name in ("btn_video", "btn_build_video"):
+    #         widget_candidate = getattr(self, btn_name, None)
+    #         if widget_candidate is not None:
+    #             btn_video_widget = widget_candidate
+    #             break
+    #     if btn_video_widget:
+    #         try:
+    #             btn_video_widget.setEnabled(False)
+    #         except RuntimeError:
+    #             pass
+    #
+    #     try:
+    #
+    #
+    #         # --- 경로 준비 ---
+    #         proj_dir_val = None
+    #         if hasattr(self, "_current_project_dir") and callable(self._current_project_dir):
+    #             proj_dir_val = str(self._current_project_dir())
+    #         if not proj_dir_val:
+    #             proj_dir_val = str(getattr(self, "project_dir", ""))
+    #
+    #         if not proj_dir_val:
+    #             QtWidgets.QMessageBox.warning(self, "오류", "프로젝트 폴더가 선택되지 않았습니다.")
+    #             if btn_video_widget: btn_video_widget.setEnabled(True)
+    #             return
+    #
+    #         proj_dir = Path(proj_dir_val)
+    #         video_json_path = proj_dir / "video.json"
+    #         if not video_json_path.exists():
+    #             QtWidgets.QMessageBox.critical(self, "오류", f"video.json 없음: {video_json_path}")
+    #             if btn_video_widget: btn_video_widget.setEnabled(True)
+    #             return
+    #
+    #         # ★ [수정] wan2.2movie.json 로드
+    #         wan_wf_path = Path(JSONS_DIR) / "wan2.2movie.json"
+    #         if not wan_wf_path.exists():
+    #             QtWidgets.QMessageBox.critical(self, "오류", f"워크플로우 파일 없음: {wan_wf_path.name}")
+    #             if btn_video_widget: btn_video_widget.setEnabled(True)
+    #             return
+    #
+    #         wan_workflow_template = load_json(wan_wf_path)
+    #
+    #         comfy_input_path = Path(COMFY_INPUT_DIR)
+    #
+    #         clips_dir = proj_dir / "clips"
+    #         clips_dir.mkdir(parents=True, exist_ok=True)
+    #
+    #         imgs_base_dir = proj_dir / "imgs"
+    #         imgs_base_dir.mkdir(parents=True, exist_ok=True)
+    #
+    #         # --- 헬퍼 ---
+    #         def _is_valid_video(path: Path) -> bool:
+    #             if not path.exists() or path.stat().st_size < 1024: return False
+    #             try:
+    #                 cmd = [FFPROBE_EXE, "-v", "error", "-select_streams", "v:0", "-show_entries", "stream=codec_name",
+    #                        "-of", "default=noprint_wrappers=1:nokey=1", str(path)]
+    #                 subprocess.run(cmd, check=True, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, timeout=5)
+    #                 return True
+    #             except:
+    #                 return False
+    #
+    #         def _submit_and_wait_custom(base_url: str, graph: Dict, timeout: int, poll: float,
+    #                                     log_func: Callable) -> Dict:
+    #             prompt_url = f"{base_url.rstrip('/')}/prompt"
+    #             history_url = f"{base_url.rstrip('/')}/history"
+    #             try:
+    #                 payload = {"prompt": graph, "client_id": "shorts_maker_wan_se"}
+    #                 resp = requests.post(prompt_url, json=payload, timeout=30)
+    #                 if resp.status_code != 200: raise RuntimeError(f"HTTP {resp.status_code}: {resp.text}")
+    #                 prompt_id = resp.json().get("prompt_id")
+    #                 if not prompt_id: raise RuntimeError("No prompt_id")
+    #             except Exception as e:
+    #                 raise RuntimeError(f"제출 실패: {e}")
+    #
+    #             start_time = time.time()
+    #             while True:
+    #                 if time.time() - start_time > timeout: raise TimeoutError("시간 초과")
+    #                 try:
+    #                     h_resp = requests.get(f"{history_url}/{prompt_id}", timeout=10)
+    #                     if h_resp.status_code == 200 and prompt_id in h_resp.json():
+    #                         return h_resp.json()[prompt_id]
+    #                 except:
+    #                     pass
+    #                 time.sleep(poll)
+    #
+    #         # --- Job ---
+    #         def _job(progress_callback: _CallableType[[Dict[str, Any]], None]) -> str:
+    #             _log = lambda msg: progress_callback({"msg": msg})
+    #             _log(f"워크플로우({wan_wf_path.name}) - Start-End Interpolation 모드")
+    #
+    #             vdoc = load_json(video_json_path) or {}
+    #             fps_val = int(vdoc.get("fps", 16))
+    #             scenes = vdoc.get("scenes") or []
+    #             if not scenes: return "생성할 씬이 없습니다."
+    #
+    #             SEG_LEN = 41  # 고정 세그먼트 길이
+    #
+    #             for scene in scenes:
+    #                 scene_id = scene.get("id")
+    #                 if not scene_id: continue
+    #
+    #                 # 1. 목표 프레임 계산
+    #                 try:
+    #                     duration_val = float(scene.get("duration", 0.0))
+    #                 except:
+    #                     duration_val = 0.0
+    #                 scene_total_frames = int(round(duration_val * fps_val))
+    #                 if scene_total_frames <= 0: continue
+    #
+    #                 _log(f"[{scene_id}] 처리 시작 (목표 {scene_total_frames}f)")
+    #
+    #                 # 2. 구간 분할 (41프레임 단위)
+    #                 # 예: 100f -> 0~41, 41~82, 82~100 (3구간)
+    #                 segments = []
+    #                 cursor = 0
+    #                 while cursor < scene_total_frames:
+    #                     end = min(cursor + SEG_LEN, scene_total_frames)
+    #                     segments.append((cursor, end))
+    #                     cursor = end
+    #
+    #                 # 3. 폴더 준비
+    #                 scene_chunk_dir = clips_dir / scene_id
+    #                 if scene_chunk_dir.exists(): shutil.rmtree(scene_chunk_dir)  # 기존 잔여물 삭제 (필수)
+    #                 scene_chunk_dir.mkdir(parents=True, exist_ok=True)
+    #
+    #                 # 4. 이 씬의 캐릭터:인덱스 맵 (예: ["female_01:0", "male_01:1"])
+    #                 # 4. 이 씬의 캐릭터:인덱스 맵 (예: ["female_01:0", "male_01:1"])
+    #                 char_index_map: Dict[str, int] = {}
+    #                 chars_list = (
+    #                         scene.get("characters")
+    #                         or scene.get("character_objs")
+    #                         or vdoc.get("characters")
+    #                         or vdoc.get("character_objs")
+    #                         or []
+    #                 )
+    #
+    #                 for c in chars_list:
+    #                     cid = ""
+    #                     cidx = 0
+    #                     if isinstance(c, dict):
+    #                         cid = str(c.get("id") or c.get("name") or "").strip()
+    #                         try:
+    #                             cidx = int(c.get("index") or c.get("face_index") or 0)
+    #                         except Exception:
+    #                             cidx = 0
+    #                     elif isinstance(c, str):
+    #                         text_c = c.strip()
+    #                         if ":" in text_c:
+    #                             left, right = text_c.split(":", 1)
+    #                             cid = left.strip()
+    #                             try:
+    #                                 cidx = int(right.strip())
+    #                             except Exception:
+    #                                 cidx = 0
+    #                         else:
+    #                             cid = text_c
+    #                             cidx = 0
+    #                     if cid:
+    #                         # 같은 캐릭터가 여러 번 나오면 마지막 값으로 덮어씀
+    #                         char_index_map[cid] = cidx
+    #
+    #                 # wan2.2movie.json 기준 ReActor ↔ LoadImage ↔ 캐릭터ID 매핑
+    #                 # 475 ↔ 480(female_01), 477 ↔ 479(male_01), 478 ↔ 481(other_char/기타)
+    #                 reactor_map = {
+    #                     "475": ("480", "female_01"),
+    #                     "477": ("479", "male_01"),
+    #                     "478": ("481", "other_char"),
+    #                 }
+    #
+    #
+    #                 video_chunks: list[Path] = []
+    #                 scene_failed = False
+    #
+    #                 # 4. 구간별 생성
+    #                 for idx, (s_f, e_f) in enumerate(segments):
+    #                     chunk_name = f"seg_{idx:03d}.mp4"
+    #                     chunk_path = scene_chunk_dir / chunk_name
+    #                     video_chunks.append(chunk_path)
+    #
+    #                     # 실제 생성해야 할 길이 (끝-시작)
+    #                     # 주의: Interpolation 모델은 보통 '양 끝 포함' 프레임 수를 요구함.
+    #                     # 예: 0~41 -> 41프레임 생성 (0번, 41번 이미지가 있고 그 사이+양끝 포함 42장? 아니면 간격이 41?)
+    #                     # Wan VACE 노드는 'num_frames'가 생성될 총 프레임 수(양 끝 포함)를 의미할 가능성이 높음.
+    #                     current_seg_len = e_f - s_f
+    #                     if current_seg_len <= 1: continue  # 너무 짧으면 스킵
+    #
+    #                     # 키프레임 이미지 준비 (Start & End)
+    #                     # 1단계(이미지 생성)에서 kf_0, kf_1... 로 저장되어 있다고 가정
+    #                     # idx번째 구간의 시작은 kf_{idx}, 끝은 kf_{idx+1}
+    #                     # 마지막 구간의 끝 이미지는? -> kf_{idx+1}이 없으면 곤란함.
+    #                     # 사용자 로직: "세그먼트별 프롬프트 이용" -> video.json에 frame_segments가 있고 그 개수만큼 이미지가 있어야 함.
+    #
+    #                     kf_start_name = f"kf_{idx}.png"
+    #                     kf_end_name = f"kf_{idx + 1}.png"
+    #
+    #                     kf_start_path = imgs_base_dir / scene_id / kf_start_name
+    #                     kf_end_path = imgs_base_dir / scene_id / kf_end_name
+    #
+    #                     # 예외 처리: 마지막 구간인데 끝 이미지가 없다면?
+    #                     # 보통 마지막 이미지는 t_00x.png (씬 대표 이미지)일 수도 있고, kf_마지막 번호일 수도 있음.
+    #                     # 여기선 일단 파일이 있어야 진행. 없으면 에러.
+    #                     if not kf_start_path.exists():
+    #                         # 첫 시작이면 씬 대표 이미지 사용 시도
+    #                         if idx == 0 and Path(scene.get("img_file", "")).exists():
+    #                             kf_start_path = Path(scene.get("img_file"))
+    #                         else:
+    #                             _log(f"[ERR] 시작 이미지 {kf_start_name} 없음.")
+    #                             scene_failed = True
+    #                             break
+    #
+    #                     if not kf_end_path.exists():
+    #                         # 마지막 구간이면 시작 이미지를 복사해서 끝 이미지로 쓸 수도 없음 (움직임이 없으므로).
+    #                         # 일단 에러 처리
+    #                         _log(f"[ERR] 끝 이미지 {kf_end_name} 없음.")
+    #                         scene_failed = True
+    #                         break
+    #
+    #                     _log(
+    #                         f"[{scene_id}] 구간 {idx + 1}/{len(segments)} 생성 ({current_seg_len}f, {kf_start_name}~{kf_end_name})...")
+    #
+    #                     try:
+    #                         wf = json.loads(json.dumps(wan_workflow_template))
+    #
+    #                         # 이미지 복사 & 주입
+    #                         shutil.copy2(str(kf_start_path), comfy_input_path / kf_start_path.name)
+    #                         shutil.copy2(str(kf_end_path), comfy_input_path / kf_end_path.name)
+    #
+    #                         # ★ ID 매핑 (wan2.2movie.json 기준)
+    #                         if "386" in wf: wf["386"]["inputs"]["image"] = kf_start_path.name  # Start
+    #                         if "387" in wf: wf["387"]["inputs"]["image"] = kf_end_path.name  # End
+    #                         if "405" in wf: wf["405"]["inputs"]["value"] = int(current_seg_len)  # Frames
+    #
+    #                         # 프롬프트 (해당 구간의 프롬프트 찾기)
+    #                         # video.json의 frame_segments 리스트에서 idx번째 항목 사용
+    #                         seg_prompt = ""
+    #                         frame_segs = scene.get("frame_segments", [])
+    #                         if idx < len(frame_segs):
+    #                             seg_prompt = frame_segs[idx].get("prompt_movie", "")
+    #                         if not seg_prompt: seg_prompt = scene.get("prompt_movie", "")
+    #
+    #                         # if "106" in wf: wf["106"]["inputs"]["positive_prompt"] = seg_prompt
+    #
+    #                         # 시드
+    #                         seed = random.randint(1, 9999999999)
+    #                         if "391" in wf: wf["391"]["inputs"]["seed"] = seed
+    #
+    #                         # --- 페이스스왑 주입 (캐릭터:인덱스 기반) ---
+    #
+    #                         # 1) GIMMVFI 입력을 ReActor 체인 출력(477)으로 변경
+    #                         #    28(디코드) → 478 → 475 → 477 → 455(GIMMVFI) → 450(업스케일) → 439(저장)
+    #                         if "455" in wf:
+    #                             wf["455"].setdefault("inputs", {})["images"] = ["477", 0]
+    #
+    #                         # 2) 캐릭터ID 별로 ReActor/LoadImage 세팅
+    #                         char_base = Path(CHARACTER_DIR)
+    #                         for reactor_id, (load_node_id, char_id) in reactor_map.items():
+    #                             node_re = wf.get(reactor_id)
+    #                             node_load = wf.get(load_node_id)
+    #                             if not isinstance(node_re, dict) or not isinstance(node_load, dict):
+    #                                 continue
+    #
+    #                             inputs_re = node_re.setdefault("inputs", {})
+    #                             face_idx = char_index_map.get(char_id)
+    #
+    #                             # 이 씬에 해당 캐릭터가 없으면 비활성화
+    #                             if face_idx is None:
+    #                                 inputs_re["enabled"] = False
+    #                                 continue
+    #
+    #                             # 캐릭터 이미지 찾기 (CHARACTER_DIR/female_01.png 같은 것)
+    #                             char_img_path = None
+    #                             for ext in (".png", ".jpg", ".jpeg", ".webp"):
+    #                                 p = char_base / f"{char_id}{ext}"
+    #                                 if p.exists():
+    #                                     char_img_path = p
+    #                                     break
+    #
+    #                             if char_img_path is None:
+    #                                 # 이미지 없으면 이 ReActor만 끔
+    #                                 inputs_re["enabled"] = False
+    #                                 continue
+    #
+    #                             dst_name = f"{char_id}{char_img_path.suffix}"
+    #                             try:
+    #                                 shutil.copy2(str(char_img_path), comfy_input_path / dst_name)
+    #                             except Exception:
+    #                                 # 복사 실패해도 일단 계속 진행
+    #                                 pass
+    #
+    #                             # LoadImage 노드에 소스 얼굴 이미지 주입
+    #                             node_load.setdefault("inputs", {})["image"] = dst_name
+    #
+    #                             # ReActor 활성화 + 인덱스 설정
+    #                             inputs_re["enabled"] = True
+    #                             inputs_re["input_faces_index"] = str(int(face_idx))
+    #                             # source_faces_index는 기본값(0)을 유지, 없으면 0으로
+    #                             if "source_faces_index" not in inputs_re:
+    #                                 inputs_re["source_faces_index"] = "0"
+    #
+    #
+    #                         # 저장 (439번이 Upscaled 최종본)
+    #                         target_save = "439"
+    #                         if target_save in wf:
+    #                             prefix = f"wan_se/{scene_id}/{idx}"
+    #                             wf[target_save]["inputs"]["filename_prefix"] = prefix
+    #                         else:
+    #                             raise RuntimeError("저장 노드(439)를 찾을 수 없습니다.")
+    #
+    #                         # 실행
+    #                         res = _submit_and_wait_custom(COMFY_HOST, wf, timeout=1800, poll=5.0, log_func=_log)
+    #
+    #                         # 결과 처리
+    #                         outs = res.get("outputs", {})
+    #                         tgt_out = outs.get(target_save, {})
+    #                         vids = tgt_out.get("videos") or tgt_out.get("gifs")
+    #
+    #                         if not vids: raise RuntimeError(f"결과 없음 (Output: {list(outs.keys())})")
+    #
+    #                         dl_info = vids[0]
+    #                         ftype = dl_info.get("type", "output")
+    #                         resp = requests.get(
+    #                             f"{COMFY_HOST}/view",
+    #                             params={"filename": dl_info['filename'], "subfolder": dl_info['subfolder'],
+    #                                     "type": ftype},
+    #                             timeout=120
+    #                         )
+    #                         if len(resp.content) < 1024: raise RuntimeError("0바이트 파일")
+    #
+    #                         with open(chunk_path, "wb") as f:
+    #                             f.write(resp.content)
+    #
+    #                         if not _is_valid_video(chunk_path): raise RuntimeError("손상된 파일")
+    #
+    #                     except Exception as e:
+    #                         _log(f"[{scene_id}] 생성 실패: {e}")
+    #                         scene_failed = True
+    #                         try:
+    #                             chunk_path.unlink()
+    #                         except:
+    #                             pass
+    #                         break
+    #
+    #                 # 5. 단순 병합 (Concat)
+    #                 if not scene_failed and video_chunks:
+    #                     final_path = clips_dir / f"{scene_id}.mp4"
+    #                     try:
+    #                         concatenate_scene_clips(video_chunks, final_path, FFMPEG_EXE)
+    #                         _log(f"[{scene_id}] 병합 완료.")
+    #
+    #                         # 최종 길이 보정 (선택 사항)
+    #                         # _trim_to_frames(FFMPEG_EXE, FFPROBE_EXE, final_path, final_path, scene_total_frames, fps_val)
+    #
+    #                     except Exception as e:
+    #                         _log(f"[{scene_id}] 병합 실패: {e}")
+    #
+    #             return "작업 완료"
+    #
+    #         def _done(ok, payload, err):
+    #             if on_done_override:
+    #                 on_done_override(ok, payload, err)
+    #             elif not ok:
+    #                 QtWidgets.QMessageBox.critical(self, "실패", str(err))
+    #             else:
+    #                 QtWidgets.QMessageBox.information(self, "완료", str(payload))
+    #             if btn_video_widget: btn_video_widget.setEnabled(True)
+    #
+    #         run_job_with_progress_async(owner=self, title="Wan 2.2 (Start-End)", job=_job, on_done=_done)
+    #
+    #     except Exception as e:
+    #         if btn_video_widget: btn_video_widget.setEnabled(True)
+    #         QtWidgets.QMessageBox.critical(self, "오류", str(e))
+    #
+    # # ────────────── 기타 ──────────────
+    # def _set_total_frames_from_audio(self, audio_path: Path) -> None:
+    #     dur = audio_duration_sec(audio_path)
+    #     if dur <= 0:
+    #         QtWidgets.QMessageBox.warning(self, "안내", "오디오 길이를 읽지 못했습니다.")
+    #         return
+    #     fps = self.sb_outfps.value()
+    #     total = int(round(dur * fps))
+    #     self.sb_total.setValue(max(total, 1))
+    #     self.status.showMessage(f"오디오 길이 {dur:.2f}s × {fps}fps → 총 프레임 {total}")
 
     @staticmethod
     def _final_out_for_title(title: str) -> Path:
@@ -9622,35 +9510,35 @@ class MainWindow(QtWidgets.QMainWindow):
 
 
     # ==== [테스트1] 분석→story.json (항상 scenes로 저장) =======================
-    def _gpt_scene_prompt(self, scene_ctx: dict, global_ctx: dict) -> str:
-        """story.json의 scene(dict) + 전역 컨텍스트에서 AI.scene_prompt_kor 인자 구성"""
-        section = str(scene_ctx.get("section") or "").lower()
-        scene_hint = str(scene_ctx.get("scene") or "")
-        characters = [str(c) for c in (scene_ctx.get("characters") or [])]
-
-        # 전역 태그는 너무 길지 않게 6개 정도만
-        tags = [str(t) for t in (global_ctx.get("tags") or [])][:6]
-
-        # effect: list/str 모두 허용 → 1개만 고름
-        eff = scene_ctx.get("effect")
-        if isinstance(eff, list) and eff:
-            effect = str(eff[0])
-        elif isinstance(eff, str):
-            effect = eff
-        else:
-            effect = None
-
-        # 화면 전환 플래그를 motion 힌트로 전달(선택)
-        motion = "transition" if scene_ctx.get("screen_transition") else None
-
-        return self._ai.scene_prompt_kor(
-            section=section,
-            scene_hint=scene_hint,
-            characters=characters,
-            tags=tags,
-            effect=effect,
-            motion=motion,
-        )
+    # def _gpt_scene_prompt(self, scene_ctx: dict, global_ctx: dict) -> str:
+    #     """story.json의 scene(dict) + 전역 컨텍스트에서 AI.scene_prompt_kor 인자 구성"""
+    #     section = str(scene_ctx.get("section") or "").lower()
+    #     scene_hint = str(scene_ctx.get("scene") or "")
+    #     characters = [str(c) for c in (scene_ctx.get("characters") or [])]
+    #
+    #     # 전역 태그는 너무 길지 않게 6개 정도만
+    #     tags = [str(t) for t in (global_ctx.get("tags") or [])][:6]
+    #
+    #     # effect: list/str 모두 허용 → 1개만 고름
+    #     eff = scene_ctx.get("effect")
+    #     if isinstance(eff, list) and eff:
+    #         effect = str(eff[0])
+    #     elif isinstance(eff, str):
+    #         effect = eff
+    #     else:
+    #         effect = None
+    #
+    #     # 화면 전환 플래그를 motion 힌트로 전달(선택)
+    #     motion = "transition" if scene_ctx.get("screen_transition") else None
+    #
+    #     return self._ai.scene_prompt_kor(
+    #         section=section,
+    #         scene_hint=scene_hint,
+    #         characters=characters,
+    #         tags=tags,
+    #         effect=effect,
+    #         motion=motion,
+    #     )
 
     # ======= usage test =======
 
@@ -9662,6 +9550,7 @@ class MainWindow(QtWidgets.QMainWindow):
     # ======= /end =======
 
     # ==== 완성된 영상 합치기 ==========
+    # real_use
     def merging_videos_start(self, *, on_done_override: Optional[Callable] = None) -> None: # <-- 시그니처 수정
         """
         '영상 합치기' 버튼 핸들러:
@@ -9703,6 +9592,7 @@ class MainWindow(QtWidgets.QMainWindow):
         )
 
     # ==== 가사넣기 ================================
+    # real_use
     def lyrics_in_start(self, *, on_done_override: Optional[Callable] = None): # <-- 시그니처 수정
         """
         [수정됨] music_ready.mp4 파일에 video.json의 제목과 가사를 주입하고
@@ -9768,6 +9658,7 @@ class MainWindow(QtWidgets.QMainWindow):
 
         # ────────────── 신규 매크로 핸들러 ──────────────
 
+    # real_use
     def on_click_macro_analyze(self) -> None:
         """매크로: 1. 음악분석 -> 2. 프로젝트분석"""
 
@@ -9781,7 +9672,6 @@ class MainWindow(QtWidgets.QMainWindow):
             print("[MACRO-ANALYZE] 1단계 (음악분석) 완료. 2단계 (프로젝트분석) 시작...")
 
             # 2단계(프로젝트분석) 호출
-            # on_click_build_story_from_seg_async는 자체적으로 팝업을 띄우므로 on_done_override 불필요
             try:
                 self.on_click_build_story_from_seg_async()
             except Exception as erroe:
@@ -9795,8 +9685,7 @@ class MainWindow(QtWidgets.QMainWindow):
         except Exception as e:
             QtWidgets.QMessageBox.critical(self, "분석 매크로 1단계 오류", f"음악 분석 시작 중 오류:\n{e}")
 
-        # shorts_ui.py
-
+    # real_use
     def on_click_macro_build_video(self) -> None:
         """매크로: 1. 영상생성(i2v) -> 2. 영상합치기 -> 3. 가사넣기"""
         # (Callback 시그니처를 위해 typing 임포트)
@@ -10754,8 +10643,6 @@ class SegmentEditDialog(QtWidgets.QDialog):
         except Exception as e_update:
             QtWidgets.QMessageBox.critical(self, "저장 오류", f"파일을 저장하는 중 오류가 발생했습니다:\n{e_update}")
 
-    # shorts_ui.py의 SegmentEditDialog 클래스 내부
-    # on_ai_request_segment 함수를 이 코드로 덮어쓰세요.
 
     def on_ai_request_segment(self):
             """[신규] 세그먼트 수정 창의 'AI 요청' 버튼"""
