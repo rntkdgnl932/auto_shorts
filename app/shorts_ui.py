@@ -26,22 +26,20 @@ import math
 import sys
 import faulthandler
 import datetime
-from app.utils import sanitize_title as _sanitize_title_fn, normalize_tags_to_english, audio_duration_sec, AI, save_story_overwrite_with_prompts, _normalize_maked_title_root, sanitize_title
+from app.utils import normalize_tags_to_english, save_story_overwrite_with_prompts, _normalize_maked_title_root, sanitize_title
 from app.utils import AI
 from app.utils import load_json as _lj, save_json as _sj
-from app.utils import load_json as _load_json
-from app.utils import sanitize_title as _sanitize
 from app.utils import run_job_with_progress_async as run_async_imp
 from app.utils import run_job_with_progress_async
 from app.utils import load_json, save_json, sanitize_title as sanitize_title_fn
 from app.video_build import build_and_merge_full_video, add_subtitles_with_ffmpeg, xfade_concat, concatenate_scene_clips
 from app.video_build import build_shots_with_i2v as build_func_imp
-from app.video_build import build_video_json_with_gap_policy, retry_cut_audio_for_scene, fill_prompt_movie_with_ai, build_missing_images_from_story
+from app.video_build import retry_cut_audio_for_scene, fill_prompt_movie_with_ai, build_missing_images_from_story, build_video_json_with_gap_policy
 
 from PyQt5.QtCore import Qt
 from PyQt5.QtWidgets import QPlainTextEdit, QTextEdit, QFontComboBox
 
-from app.audio_sync import generate_music_with_acestep, sync_lyrics_with_whisper_pro, build_story_json
+from app.audio_sync import generate_music_with_acestep, sync_lyrics_with_whisper_pro # build_story_json
 from app.audio_sync import _submit_and_wait as _submit_and_wait_comfy
 from app.shorts_json_edit import ScenePromptEditDialog
 import re
@@ -51,12 +49,6 @@ _CANON_RE = re.compile(r"[^a-z0-9]+")
 import app.settings as _settings
 
 from app.settings import FFPROBE_EXE, BASE_DIR, CHARACTER_DIR, COMFY_HOST, JSONS_DIR, COMFY_INPUT_DIR, FFMPEG_EXE
-from video_build import (
-                    build_image_json, build_movie_json,
-                    apply_intro_outro_to_story_json,
-                    apply_intro_outro_to_image_json,
-                    apply_intro_outro_to_movie_json,
-                )
 from app.lyrics_gen import create_project_files, normalize_sections, generate_title_lyrics_tags
 from json import loads, dumps
 from app.story_enrich import apply_gpt_to_story_v11
@@ -1476,19 +1468,12 @@ class MainWindow(QtWidgets.QMainWindow):
 
         run_job_with_progress_async(self, "누락 이미지 생성", job, tail_file=comfy_log_file, on_done=done)
 
+
     # real_use
     def on_click_segments_missing_images_with_log(self):
         """
-        [2단계] 세그먼트 이미지 생성 (Qwen I2I) - 주입 검증 강화판
-
-        수정 사항:
-        1. [Fix] ReActor 매핑 오류 수정 (23번 ReActor의 소스는 20번이 아니라 18번).
-           -> 20번(메인 이미지)이 오염되지 않도록 보호.
-        2. [Debug] 주입되는 이미지 경로와 프롬프트를 로그에 출력.
+        [2단계] 세그먼트 이미지 생성 (Qwen I2I) - 주입 검증 강화 및 에러 방지 패치
         """
-
-
-
         btn = getattr(self, "btn_segments_img", None)
         if btn: btn.setEnabled(False)
 
@@ -1511,6 +1496,12 @@ class MainWindow(QtWidgets.QMainWindow):
 
             comfy_input_path = Path(COMFY_INPUT_DIR)
             character_base_dir = Path(CHARACTER_DIR)
+
+            # [Patch] UI에서 Steps 값 읽기 (Node 1 주입용)
+            try:
+                ui_steps = int(self.spn_t2i_steps.value())
+            except Exception:
+                ui_steps = 28
 
         except Exception as e_prep:
             QtWidgets.QMessageBox.critical(self, "준비 오류", str(e_prep))
@@ -1561,15 +1552,11 @@ class MainWindow(QtWidgets.QMainWindow):
 
             processed_count = 0
 
-            # ★ [수정됨] ReActor ID 매핑 (정확한 Source Loader ID로 수정)
-            # Node 20: 메인 입력 이미지 (건드리면 안 됨, Source로 쓰면 안 됨)
-            # Node 18: ReActor_2 (23번)용 Source Loader
-            # Node 17: ReActor_1 (19번)용 Source Loader
-            # Node 21: ReActor_0 (22번)용 Source Loader
+            # ReActor ID 매핑
             QWEN_REACTOR_MAP = {
                 "19": ("17", "female_01"),  # Slot 1
                 "22": ("21", "male_01"),  # Slot 2
-                "23": ("18", "other_char"),  # Slot 3 (20 -> 18로 수정!)
+                "23": ("18", "other_char"),  # Slot 3
             }
 
             SAVE_NODE_ID = "24"
@@ -1589,6 +1576,11 @@ class MainWindow(QtWidgets.QMainWindow):
 
                 # 메인 이미지 복사
                 main_img_name = _copy_to_input(base_image_path)
+
+                # [Patch] 메인 이미지가 복사되지 않았다면 건너뜀 (안전장치)
+                if not main_img_name:
+                    _log(f"[{scene_id}] 메인 이미지 복사 실패. 스킵.")
+                    continue
 
                 keyframe_dir = base_image_path.parent / scene_id
                 keyframe_dir.mkdir(parents=True, exist_ok=True)
@@ -1634,14 +1626,19 @@ class MainWindow(QtWidgets.QMainWindow):
                     try:
                         wf = json.loads(json.dumps(qwen_workflow_template))
 
-                        # 1. ★ 메인 이미지 주입 (Node 20) ★
+                        # [Patch] Node 1 (ImageScaleToTotalPixels) resolution_steps 주입
+                        # 에러 로그: "Required input is missing: resolution_steps" 해결
+                        if "1" in wf:
+                            wf["1"]["inputs"]["resolution_steps"] = ui_steps
+
+                        # 1. 메인 이미지 주입 (Node 20)
                         if "20" in wf:
                             wf["20"]["inputs"]["image"] = main_img_name
                             _log(f"   -> [Input] Image: {main_img_name}")
                         else:
                             _log("   -> [ERR] Node 20 (LoadImage) not found!")
 
-                        # 2. ★ 프롬프트 주입 (Node 7) ★
+                        # 2. 프롬프트 주입 (Node 7)
                         if "7" in wf:
                             wf["7"]["inputs"]["prompt"] = seg_prompt
                             _log(f"   -> [Input] Prompt: {seg_prompt[:50]}...")
@@ -1650,18 +1647,30 @@ class MainWindow(QtWidgets.QMainWindow):
                         if "4" in wf:
                             wf["4"]["inputs"]["seed"] = (scene_index * 1000) + seg_index + 12345
 
-                        # 4. ReActor 설정
+                        # 4. ReActor 설정 및 [Patch] LoadImage 에러 방지
                         for r_id, (l_id, def_char) in QWEN_REACTOR_MAP.items():
                             if r_id in wf:
+                                should_enable = False
+
                                 if r_id in reactors_to_enable:
-                                    wf[r_id]["inputs"]["enabled"] = True
-                                    wf[r_id]["inputs"]["input_faces_index"] = reactors_to_enable[r_id]
-                                    wf[r_id]["inputs"]["source_faces_index"] = 0
+                                    # 활성화 대상이면 파일이 있는지 확인
                                     if l_id in wf and l_id in face_files_to_inject:
                                         wf[l_id]["inputs"]["image"] = face_files_to_inject[l_id]
+                                        wf[r_id]["inputs"]["enabled"] = True
+                                        wf[r_id]["inputs"]["input_faces_index"] = reactors_to_enable[r_id]
+                                        wf[r_id]["inputs"]["source_faces_index"] = 0
                                         _log(f"   -> [ReActor] {def_char} ON (Node {r_id})")
-                                else:
+                                        should_enable = True
+                                    else:
+                                        _log(f"   -> [WARN] {def_char} 활성화 대상이나 이미지 없음.")
+
+                                # 활성화되지 않는 경우 (비활성 OR 이미지 없음)
+                                if not should_enable:
                                     wf[r_id]["inputs"]["enabled"] = False
+                                    # [Patch] Node 17 등 LoadImage가 깨진 경로(female_01 (1).png)를 갖고 있으면
+                                    # ComfyUI가 에러를 뱉으므로, 유효한 파일(메인 이미지)로 덮어씌움
+                                    if l_id in wf:
+                                        wf[l_id]["inputs"]["image"] = main_img_name
 
                         # 5. 저장 파일명 설정
                         if SAVE_NODE_ID in wf:
@@ -5186,7 +5195,7 @@ class MainWindow(QtWidgets.QMainWindow):
                     # utils.load_json 안전 가져오기
 
                     video_path = pdir / "video.json"
-                    video_doc = _load_json(video_path, {}) or {}
+                    video_doc = _lj(video_path, {}) or {}
 
                     # fps
                     try:

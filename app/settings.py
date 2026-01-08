@@ -80,6 +80,9 @@ DEFAULT_HOST_CANDIDATES = [
 JSONS_DIR: Path = BASE_DIR.parent / "app" / "jsons"  # 기존 구조 유지
 JSONS_DIR.mkdir(parents=True, exist_ok=True)
 
+
+
+
 ACE_STEP_PROMPT_JSON: Path = JSONS_DIR / "ace_step_1_t2m.json"  # 음악 생성 프롬프트 JSON
 # I2V_WORKFLOW:         Path = JSONS_DIR / "guff_movie.json"         # i2v 워크플로 JSON
 I2V_WORKFLOW:         Path = JSONS_DIR / "No.48.WAN2.2-LightX2V-I2V.json"
@@ -100,6 +103,13 @@ FFMPEG_EXE:   str = os.environ.get("FFMPEG_EXE", "ffmpeg")
 FFPROBE_EXE:  str = os.environ.get("FFPROBE_EXE", "")
 
 USE_HWACCEL: bool = True
+
+
+get_style_list = ["electronic","rock","pop","funk","soul","cyberpunk","acid jazz","edm","soft electric drums","melodic"]
+get_scene_list = ["background music for parties","radio broadcasts","workout playlists"]
+get_instr_list = ["saxophone","jazz","piano","violin","acoustic guitar","electric bass"]
+get_tempo_list = ["110 bpm","fast tempo","slow tempo","loops","fills"]
+
 
 
 # ───────── I2V (Image-to-Video) 생성 상수 (Wan 2.2 / ComfyUI) ─────────
