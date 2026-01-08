@@ -14,12 +14,10 @@ try:
     from app.audio_sync import (
         _http_get as _http_get_audio,
         _load_workflow_graph as _load_workflow_graph_audio,
-        _find_nodes_by_class_contains as _find_nodes_by_class_contains_audio,
     )
 except Exception:  # 단독 실행/상대 경로일 수도 있으니 폴백 제공
     _http_get_audio = None
     _load_workflow_graph_audio = None
-    _find_nodes_by_class_contains_audio = None
 import math
 import json as json_mod
 import time

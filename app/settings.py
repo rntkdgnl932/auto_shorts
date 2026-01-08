@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import os
+import re
 import json
 from pathlib import Path
 from dotenv import load_dotenv
@@ -86,6 +87,23 @@ JSONS_DIR.mkdir(parents=True, exist_ok=True)
 ACE_STEP_PROMPT_JSON: Path = JSONS_DIR / "ace_step_1_t2m.json"  # 음악 생성 프롬프트 JSON
 # I2V_WORKFLOW:         Path = JSONS_DIR / "guff_movie.json"         # i2v 워크플로 JSON
 I2V_WORKFLOW:         Path = JSONS_DIR / "No.48.WAN2.2-LightX2V-I2V.json"
+
+
+# 음악생성 대기시간 등
+_DEFAULT_ACE_WAIT_TIMEOUT_SEC = 900.0   # 15분
+_DEFAULT_ACE_POLL_INTERVAL_SEC = 2.0    # 2초
+
+_DEFAULT_WEIGHTS = {
+    "verse": 1.0,
+    "chorus": 1.2,
+    "bridge": 1.0,
+    "pre-chorus": 1.0,
+    "intro": 0.6,
+    "outro": 0.8,
+    "unknown": 1.0,
+}
+
+SECTION_HEADER_RE = re.compile(r"^\s*\[(?P<name>[^]]+)]\s*$", re.IGNORECASE)
 
 # Wan / SeedVR2 보간용 세그먼트 최대 프레임 수 (메모리 안전 상한)
 # - 0 또는 음수면 "제한 없음"

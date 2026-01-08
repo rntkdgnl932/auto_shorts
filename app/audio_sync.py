@@ -9,8 +9,8 @@ from typing import Any, Callable, Dict, List, Optional, Tuple, cast, Union, Iter
 import random
 from pydub import AudioSegment  # type: ignore
 from app.settings import (
-    BASE_DIR, COMFY_HOST, DEFAULT_HOST_CANDIDATES,
-    ACE_STEP_PROMPT_JSON, FFMPEG_EXE, FINAL_OUT
+    BASE_DIR, COMFY_HOST, DEFAULT_HOST_CANDIDATES, _DEFAULT_ACE_WAIT_TIMEOUT_SEC, _DEFAULT_ACE_POLL_INTERVAL_SEC, _DEFAULT_WEIGHTS,
+    ACE_STEP_PROMPT_JSON, FFMPEG_EXE, FINAL_OUT, SECTION_HEADER_RE
 )
 from app import settings as _s
 from app.utils import load_json, save_json, sanitize_title, effective_title, save_to_user_library, audio_duration_sec
@@ -53,6 +53,7 @@ librosa = cast(Any, _librosa_mod)  # 정적 분석 경고 억제
 
 
 # ───────────────────────── 오디오 유틸 ─────────────────────────
+# real use
 def _librosa_trim_edges(audio_path: Path) -> Tuple[float, float, float]:
     """앞뒤 무음 트리밍 추정: (offset, effective, full) 초 단위. 실패 시 (0, full, full)."""
     full = audio_duration_sec(audio_path)
@@ -67,7 +68,7 @@ def _librosa_trim_edges(audio_path: Path) -> Tuple[float, float, float]:
     except (ValueError, RuntimeError, OSError, AttributeError):
         return 0.0, full, full
 
-
+# real use
 def _safe_load_audio_for_onsets(p: Path):
     if librosa is None:
         return None, None
@@ -77,7 +78,7 @@ def _safe_load_audio_for_onsets(p: Path):
     except (FileNotFoundError, OSError, ValueError, RuntimeError):
         return None, None
 
-
+# real use
 def _detect_onsets_sec(p: Path) -> List[float]:
     """오디오에서 온셋(초) 리스트 검출. librosa 없으면 빈 리스트."""
     y, sr = _safe_load_audio_for_onsets(p)
@@ -96,8 +97,9 @@ def _detect_onsets_sec(p: Path) -> List[float]:
 
 
 # ───────────────────────── 가사 → 블록 파서 ─────────────────────────
-SECTION_HEADER_RE = re.compile(r"^\s*\[(?P<name>[^]]+)]\s*$", re.IGNORECASE)
+# SECTION_HEADER_RE = re.compile(r"^\s*\[(?P<name>[^]]+)]\s*$", re.IGNORECASE)
 
+# real use
 def parse_lyrics_blocks(lyrics_text: str) -> List[Dict[str, Any]]:
     """[verse]/[chorus]/[bridge]/... 헤더로 블록 분리"""
     lines = (lyrics_text or "").splitlines()
@@ -132,16 +134,16 @@ def parse_lyrics_blocks(lyrics_text: str) -> List[Dict[str, Any]]:
 
 
 # ───────────────────────── 길이 배분 ─────────────────────────
-_DEFAULT_WEIGHTS = {
-    "verse": 1.0,
-    "chorus": 1.2,
-    "bridge": 1.0,
-    "pre-chorus": 1.0,
-    "intro": 0.6,
-    "outro": 0.8,
-    "unknown": 1.0,
-}
-
+# _DEFAULT_WEIGHTS = {
+#     "verse": 1.0,
+#     "chorus": 1.2,
+#     "bridge": 1.0,
+#     "pre-chorus": 1.0,
+#     "intro": 0.6,
+#     "outro": 0.8,
+#     "unknown": 1.0,
+# }
+# real use
 def _section_weight(section: str) -> float:
     s = section.lower().strip()
     if s.startswith("chorus") or "hook" in s:
@@ -158,9 +160,11 @@ def _section_weight(section: str) -> float:
         return _DEFAULT_WEIGHTS["outro"]
     return _DEFAULT_WEIGHTS.get(s, _DEFAULT_WEIGHTS["unknown"])
 
+# real use
 def _round_half(x: float) -> float:
     return round(x * 2.0) / 2.0  # 0.5초 스냅
 
+# real use
 def allocate_durations_by_lyrics(total_seconds: float, blocks: List[Dict[str, Any]]) -> List[float]:
     if total_seconds <= 0 or not blocks:
         return []
@@ -181,6 +185,7 @@ def allocate_durations_by_lyrics(total_seconds: float, blocks: List[Dict[str, An
         snapped[-1] = max(0.5, snapped[-1] + diff2)
     return snapped
 
+# real use
 def build_timeline(
     blocks: List[Dict[str, Any]],
     durations: List[float],
@@ -213,6 +218,7 @@ def build_timeline(
 
 
 # ───────────────────────── 의미 단위 분해 ─────────────────────────
+# real use
 def _meaning_units_from_lyrics(lines: List[str], *, section: str, ai: Any) -> List[Dict[str, Any]]:
     """
     GPT 우선 의미 단위 분해. 실패하면 [].
@@ -285,7 +291,7 @@ def _meaning_units_from_lyrics(lines: List[str], *, section: str, ai: Any) -> Li
 
     return units
 
-
+# real use
 def _rule_meaning_units_from_lines(lines: List[str]) -> List[Dict[str, Any]]:
     """규칙 기반 의미 단위(빈줄/구두점/접속사 단서). 가사 원문 인용 없이 일반 요약문 사용."""
     if not lines:
@@ -318,72 +324,17 @@ def _rule_meaning_units_from_lines(lines: List[str]) -> List[Dict[str, Any]]:
     for i, grp in enumerate(groups):
         result.append({"lines": grp, "summary": generic_summaries[i % len(generic_summaries)]})
     return result
+
+# real use
 def _unit_lyric_text(lines: List[str], idxs: List[int]) -> str:
     picked = [lines[i].strip() for i in idxs if 0 <= i < len(lines)]
     joined = " ".join(picked).strip()
     return re.sub(r"\s+([,.!?])", r"\1", joined)
 
-def _even_slices(n: int, k: int) -> List[Tuple[int, int]]:
-    # n개 아이템을 k등분(앞쪽부터 1개 차이 허용)
-    cuts = [round(j * n / k) for j in range(k + 1)]
-    return [(cuts[j], cuts[j + 1]) for j in range(k)]
-# ---- 의미 단위로 가사 적용(토큰 분배보다 '마지막에' 실행) ----  # // NEW
-def _apply_units_overwrite(
-    scenes: List[Dict[str, Any]],
-    units: List[Dict[str, Any]],
-    lines: List[str],
-    target_sections: List[str] = None
-) -> None:
-    """
-    이미 생성된 씬 목록(scenes)에 대해, 지정된 섹션을 골라
-    의미 단위(units) 단위로 가사를 '균등 분배' 방식으로 덮어쓴다.
-    - units[*]["lines"] : 원본 lines에서 사용할 인덱스 리스트
-    - lines            : 원본 가사(라인 단위)
-    - target_sections  : 기본 ["verse"]
-    """
-    if not scenes or not units or not lines:
-        return
-
-    sects = set(target_sections or ["verse"])
-    idxs = [i for i, s in enumerate(scenes) if s.get("section") in sects]
-    if not idxs:
-        return
-
-    # 유닛 -> 텍스트
-    def _text_for_unit(u: Dict[str, Any]) -> str:
-        sel = []
-        for k in (u.get("lines") or []):
-            try:
-                if isinstance(k, int) and 0 <= k < len(lines):
-                    sel.append(lines[k])
-            except (TypeError, ValueError):
-                continue
-        return " ".join(sel).strip()
-
-    unit_texts = [_text_for_unit(u) for u in units]
-    unit_texts = [t for t in unit_texts if t]  # 빈 문자열 제거
-    if not unit_texts:
-        return
-
-    # idxs를 unit_texts 개수만큼 '가능한 균등'하게 슬라이스
-    m, n = len(idxs), len(unit_texts)
-    base, rem = divmod(m, n)
-    slices = []
-    start = 0
-    for r in range(n):
-        size = base + (1 if r < rem else 0)
-        end = start + size
-        slices.append((start, end))
-        start = end
-
-    # 덮어쓰기
-    for uidx, (a, b) in enumerate(slices):
-        for j in idxs[a:b]:
-            scenes[j]["lyric"] = unit_texts[uidx]
-
 
 
 # ───────────────────────── 섹션 내 길이 분배 & 스냅 ─────────────────────────
+# real use
 def _allocate_and_fix_durations(
     total: float,
     n: int,
@@ -475,7 +426,7 @@ def _allocate_and_fix_durations(
     vals = _waterfill(vals, total, min_len, max_len)
     return vals
 
-
+# real use
 def _snap_boundaries_to_onsets(
     borders: List[float],
     onsets: List[float],
@@ -526,7 +477,7 @@ def _snap_boundaries_to_onsets(
 
     return [round(x, 6) for x in b]
 
-
+# real use
 def _validate_and_fix_segments(
     segs: List[Dict[str, Any]],
     *,
@@ -605,7 +556,7 @@ def _validate_and_fix_segments(
 
 
 
-
+# real use
 def _merge_overflow_shots(segs: List[Dict[str, Any]], *, max_shots: int) -> List[Dict[str, Any]]:
     """샷 개수가 너무 많을 때 인접 샷 병합(섹션 유지)으로 감소."""
     if len(segs) <= max_shots:
@@ -635,137 +586,6 @@ def _merge_overflow_shots(segs: List[Dict[str, Any]], *, max_shots: int) -> List
     return merged_shots
 
 
-# ───────────────────────── 공개 API: 분석 ─────────────────────────
-
-
-# ───────────────────────── 전역 콘텍스트/GPT 프롬프트 ─────────────────────────
-def _analyze_lyrics_global_kor(ai: Any, *, lyrics: str, title: str = "") -> Dict[str, Any]:
-    """
-    가사 전체를 한 번만 분석해 전역 컨텍스트를 만든다.
-    반환 예:
-    {
-      "global_summary": "...", "themes": [...], "palette": "...", "style_guide": "...",
-      "section_moods": {"intro":"암시/미니멀", "verse":"잔잔/근접", "chorus":"개방감/광각", ...},
-      "avoid": ["가사 원문 인용 금지", "문자 텍스트 등장 금지"]
-    }
-    """
-    import json
-    lyrics = (lyrics or "").strip()
-    if not ai or not lyrics:
-        return {
-            "global_summary": "도시적 감성의 서정적인 곡. 정면 얼굴과 일관된 스타일 유지.",
-            "themes": ["서정", "도시", "야간", "희미한 추억"],
-            "palette": "야간 네온 + 따뜻한 톤, 보케",
-            "style_guide": "인물 정면, 헤어/의상/분위기 일관, 자연스러운 조명",
-            "section_moods": {
-                "intro": "도입/암시/미니멀",
-                "verse": "잔잔함/근접/친밀감",
-                "chorus": "개방감/광각/확장",
-                "bridge": "전환감/대비/변화",
-                "outro": "여운/잔상/감쇠",
-            },
-            "avoid": ["가사 원문 인용 금지", "문자 텍스트 삽입 금지"],
-        }
-
-    ask = None
-    for name in ("lyrics_analysis_kor", "analyze_lyrics", "complete", "chat", "__call__"):
-        fn = getattr(ai, name, None)
-        if callable(fn):
-            ask = fn
-            break
-    if not ask:
-        return _analyze_lyrics_global_kor(None, lyrics=lyrics, title=title)
-
-    sys_msg = (
-        "다음 전체 가사를 분석해 영상 연출용 전역 컨텍스트를 JSON으로 만들어라. "
-        "가사 원문 문구는 결과에 인용하지 말 것. 한국어만 사용. "
-        "필드: global_summary(문장), themes(리스트), palette(문장), style_guide(문장), "
-        "section_moods(섹션별 문장: intro/verse/chorus/bridge/outro), avoid(리스트)."
-    )
-    user_msg = f"[제목] {title}\n[가사]\n{lyrics}"
-    try:
-        raw = ask(f"{sys_msg}\n\n{user_msg}")
-        data = json.loads(raw) if isinstance(raw, str) else (raw or {})
-        if isinstance(data, dict) and data:
-            return data
-    except (TypeError, ValueError, RuntimeError, json.JSONDecodeError):
-        pass
-    return _analyze_lyrics_global_kor(None, lyrics=lyrics, title=title)
-
-
-def _gpt_prompt_for_scene(
-    ai: Any,
-    *,
-    section: str,
-    summary: str | None,
-    index: int,
-    duration: float,
-    characters: List[str] | None = None,
-    meta: Dict[str, Any] | None = None,
-    global_ctx: Dict[str, Any] | None = None,
-    mode: str = "image",  # "image" | "movie" | "generic"
-) -> str:
-    try:
-        if not ai:
-            return ""
-        ask = None
-        for name in ("shot_prompt_kor", "scene_prompt_kor", "complete", "chat", "__call__"):
-            fn = getattr(ai, name, None)
-            if callable(fn):
-                ask = fn
-                break
-        if not ask:
-            return ""
-
-        sec = (section or "").lower()
-        moods = (global_ctx or {}).get("section_moods", {}) if isinstance(global_ctx, dict) else {}
-        sec_mood = (
-            moods.get("chorus") if sec.startswith("chorus") else
-            moods.get("verse")  if sec.startswith("verse")  else
-            moods.get("bridge") if "bridge" in sec          else
-            moods.get("intro")  if "intro"  in sec          else
-            moods.get("outro")  if "outro"  in sec          else
-            "자연스러운 흐름"
-        )
-        palette = (global_ctx or {}).get("palette") or "자연광/네온 혼합, 보케"
-        style_guide = (global_ctx or {}).get("style_guide") or "정면 얼굴, 실사화, 스타일 일관"
-        avoid = (global_ctx or {}).get("avoid") or ["가사 원문 인용 금지"]
-
-        has_people = bool(characters)
-        frontal = "정면 얼굴, " if has_people else ""
-        realism = "실사화, " if has_people else ""
-        role = "영상용" if mode == "movie" else "이미지용"
-        extra = "카메라/동작/조명을 간결히 포함" if mode == "movie" else "조명/분위기 중심"
-
-        text_summary = (summary or "감정 변주를 강조").strip()
-        title = str((meta or {}).get("title") or "").strip()
-        genre = str((meta or {}).get("genre") or (meta or {}).get("style") or "").strip()
-        tags = (meta or {}).get("tags_in_use") or (meta or {}).get("ace_tags") or []
-        tagline = ", ".join([t for t in tags if isinstance(t, str)])[:100]
-
-        sys_prompt = (
-            f"{role} 한국어 프롬프트 한 문장을 생성하라. "
-            "원칙: (1) 가사 원문 문구 인용 금지, (2) 섹션 무드/팔레트/스타일가이드를 반영, "
-            f"(3) {extra}, (4) 따옴표/코드블록 없이 문장만 출력."
-        )
-        user_prompt = (
-            f"- 프로젝트: {title or '무제'} / 장르: {genre or '미정'}\n"
-            f"- 샷 번호: {index}\n"
-            f"- 섹션: {section}\n"
-            f"- 의미 요약: {text_summary}\n"
-            f"- 전역 무드: {sec_mood}\n"
-            f"- 팔레트: {palette}\n"
-            f"- 스타일: {realism}{frontal}{style_guide}\n"
-            f"- 길이(초): {max(0.0, float(duration)):.3f}\n"
-            f"- 태그: {tagline}\n"
-            f"- 피해야 할 것: {', '.join(map(str, avoid))}\n"
-        )
-
-        raw = ask(f"{sys_prompt}\n\n{user_prompt}")
-        val = raw.get("text") if isinstance(raw, dict) else str(raw or "")
-        return val.strip().strip("`'\"").strip()
-    except (TypeError, ValueError, RuntimeError):
-        return ""
 
 
 # real_use
@@ -963,107 +783,10 @@ def analyze_project(
 
 
 
-# ───────────────────────── story 빌더 보조(shot 길이/인트로) ─────────────────────────
-def _split_segment_for_story(seg: Dict[str, Any], max_len: float) -> List[Dict[str, Any]]:
-    """긴 세그먼트를 max_len 이하로 여러 개로 쪼갠다."""
-    start_ts = float(seg.get("start", 0.0))
-    end_ts = float(seg.get("end", 0.0)) or (start_ts + float(seg.get("duration", 0.0)))
-
-    if end_ts <= start_ts:
-        return []
-
-    duration = end_ts - start_ts
-    if duration <= max_len:
-        seg2 = dict(seg)
-        seg2["duration"] = round(duration, 3)
-        return [seg2]
-
-    parts: List[Dict[str, Any]] = []
-    cursor = start_ts
-    index = 0
-
-    while cursor < end_ts - 1e-6:
-        piece = min(max_len, end_ts - cursor)
-        sub = dict(seg)
-        sub["start"] = round(cursor, 3)
-        sub["end"] = round(cursor + piece, 3)
-        sub["duration"] = round(piece, 3)
-        base_label = str(seg.get("label") or seg.get("section") or "scene").strip()
-        sub["label"] = f"{base_label}_{index + 1:02d}"
-        parts.append(sub)
-        cursor += piece
-        index += 1
-
-    return parts
-
-
-def _limit_shot_lengths_for_story(segments_in: List[Dict[str, Any]], max_len: float) -> List[Dict[str, Any]]:
-    """각 샷의 길이를 max_len 이하로 제한하고, 순차적으로 시간(start/end)을 재계산한다."""
-    max_secs = float(max(0.5, max_len))
-
-    pieces: List[Dict[str, Any]] = []
-    for seg in segments_in or []:
-        pieces.extend(_split_segment_for_story(seg, max_secs))
-
-    # 연속 재타이밍(겹침 방지)
-    t = 0.0
-    for seg in pieces:
-        d = float(seg.get("duration", 0.0))
-        seg["start"] = round(t, 3)
-        seg["end"] = round(t + d, 3)
-        t += d
-
-    return pieces
-
-
-def _ensure_intro_for_story(
-    segments_in: List[Dict[str, Any]],
-    *,
-    total_duration: float,
-    threshold_sec: float = 60.0,
-    intro_len: float = 1.5,
-) -> List[Dict[str, Any]]:
-    """총 길이가 threshold 이상인데 첫 섹션이 intro가 아니면 intro 세그먼트를 1개 삽입."""
-    try:
-        total = float(total_duration)
-    except (TypeError, ValueError):
-        total = 0.0
-
-    if total < float(threshold_sec) or not segments_in:
-        return segments_in
-
-    first = segments_in[0]
-    section = str(first.get("section") or "").lower()
-    if section.startswith("intro"):
-        return segments_in
-
-    intro_secs = float(max(0.5, intro_len))
-    intro = {
-        "id": "intro",
-        "section": "intro",
-        "label": "Intro",
-        "start": 0.0,
-        "end": round(intro_secs, 3),
-        "duration": round(intro_secs, 3),
-        "summary": "도입/암시/미니멀",
-    }
-
-    result: List[Dict[str, Any]] = [intro]
-    for seg in segments_in:
-        s = float(seg.get("start", 0.0)) + intro_secs
-        de = float(seg.get("end", 0.0)) + intro_secs
-        if de <= s:
-            continue
-        sub = dict(seg)
-        sub["start"] = round(s, 3)
-        sub["end"] = round(de, 3)
-        sub["duration"] = round(de - s, 3)
-        result.append(sub)
-
-    return result
 
 
 # ───────────────────────── 인트로 삽입(섹션 타임라인 단계) ─────────────────────────
+# real_use
 def _ensure_intro_at_head(
     timeline: List[Dict[str, Any]],
     total_dur: float,
@@ -1131,39 +854,13 @@ def _ensure_intro_at_head(
     return new_tl
 
 
-# ───────────────────────── 호환 보조 ─────────────────────────
-
-
-
-# ============================================================
-# drop-in replacement for: split_lyrics_into_semantic_units_ai
-# - 컷 수 강제 없음
-# - 반복 보존
-# - 섹션 태그 제거/한줄화는 호출부에서 이미 처리했다고 가정(그대로 받아서 분할)
-# - AI가 가능하면 우선 시도 → 실패/비일관 시 규칙 기반으로 자연 호흡 분할
-# ============================================================
-# ============================================================
-# Natural Korean lyric splitter (no hardcoded, no per-lyric helpers)
-# - 컷 수 강제하지 않음
-# - 반복 보존
-# - 섹션 태그 제거/한줄화는 호출부에서 이미 처리했다고 가정(그대로 받아서 분할)
-# - AI가 있으면 시도하되, 결과가 부자연스러우면 규칙 기반으로 교정
-# ============================================================
-
-
-
-
-# 가사# 가사# 가사# 가사# 가사# 가사# 가사# 가사# 가사# 가사# 가사# 가#
-
-
-# audio_sync.py — Whisper 정렬 + 폴백 배분 통합판
-
 
 
 
 # ─────────────────────────────────────────────────────────────
 # 0) 유틸: 오디오 길이 견고 획득(중앙값, 3배 튐 방지)
 # ─────────────────────────────────────────────────────────────
+# real_use
 def _probe_duration_ffprobe(path: str) -> float:
     import json
     try:
@@ -1176,7 +873,7 @@ def _probe_duration_ffprobe(path: str) -> float:
         return dur if math.isfinite(dur) and dur > 0 else 0.0
     except Exception:
         return 0.0
-
+# real_use
 def _probe_duration_mutagen(path: str) -> float:
     try:
           # type: ignore
@@ -1185,7 +882,7 @@ def _probe_duration_mutagen(path: str) -> float:
         return dur if math.isfinite(dur) and dur > 0 else 0.0
     except Exception:
         return 0.0
-
+# real_use
 def _probe_duration_pydub(path: str) -> float:
     try:
 
@@ -1194,7 +891,7 @@ def _probe_duration_pydub(path: str) -> float:
         return dur if math.isfinite(dur) and dur > 0 else 0.0
     except Exception:
         return 0.0
-
+# real_use
 def _probe_duration_soundfile(path: str) -> float:
     try:
         import soundfile as zsf  # type: ignore
@@ -1203,7 +900,7 @@ def _probe_duration_soundfile(path: str) -> float:
             return dur if math.isfinite(dur) and dur > 0 else 0.0
     except Exception:
         return 0.0
-
+# real_use
 def _probe_duration_wave(path: str) -> float:
     try:
         import wave
@@ -1214,7 +911,7 @@ def _probe_duration_wave(path: str) -> float:
             return dur if math.isfinite(dur) and dur > 0 else 0.0
     except Exception:
         return 0.0
-
+# real_use
 def _probe_duration_librosa(path: str) -> float:
     try:
         import librosa  # type: ignore
@@ -1255,150 +952,8 @@ def get_audio_duration(path: str) -> float:
         return mn
     return median
 
-# ─────────────────────────────────────────────────────────────
-# 1) 온셋 검출(없으면 빈 리스트)
-# ─────────────────────────────────────────────────────────────
-# real_use
-def detect_onsets_seconds(
-    path: str,
-    *,
-    sr: int = 22050,
-    hop_length: int = 512,
-    backtrack: bool = True,
-) -> List[float]:
-    p = str(path or "").strip()
-    if not p or not os.path.isfile(p):
-        return []
 
-
-    try:
-
-        import librosa  # type: ignore
-        y, _sr = librosa.load(p, sr=sr, mono=True)
-        if y is None or len(y) == 0:
-            return []
-        on_f = librosa.onset.onset_detect(
-            y=y, sr=sr, hop_length=hop_length, backtrack=backtrack, units="frames"
-        )
-        times = librosa.frames_to_time(on_f, sr=sr, hop_length=hop_length)
-        out = [float(t) for t in np.asarray(times).ravel().tolist() if math.isfinite(float(t)) and t >= 0.0]
-        out_sorted = []
-        last = -1.0
-        for t in sorted(out):
-            if last < 0 or (t - last) >= 0.01:
-                out_sorted.append(t)
-                last = t
-        return out_sorted
-    except Exception:
-        return []
-
-# ─────────────────────────────────────────────────────────────
-# 2) 길이 배분(온셋 분위 + tail + end_bias) — 폴백에 사용
-# ─────────────────────────────────────────────────────────────
-def layout_time_by_weights(
-    units: List[str],
-    total_start: float,
-    total_end: float,
-    *,
-    onsets: Optional[List[float]] = None,
-    min_len: float = 0.5,
-    end_bias_sec: float = 2.5,
-    avg_min_sec_per_unit: float = 2.0,
-) -> List[Tuple[float, float]]:
-    import re as _re
-    n = len(units or [])
-    if n <= 0:
-        return []
-    start = float(total_start)
-    end = float(total_end)
-    if not math.isfinite(start):
-        start = 0.0
-    if not math.isfinite(end) or end <= start:
-        end = start + max(1.0, n * min_len)
-
-    usable_end = end
-    if onsets:
-        hz = sorted([float(t) for t in onsets if math.isfinite(float(t)) and start <= float(t) <= end])
-        k = len(hz)
-        if k >= 2:
-            diffs = [hz[i + 1] - hz[i] for i in range(k - 1)]
-            diffs = [d for d in diffs if d > 1e-3]
-            if diffs:
-                ds = sorted(diffs)
-                mid = len(ds) // 2
-                med = ds[mid] if len(ds) % 2 == 1 else 0.5 * (ds[mid - 1] + ds[mid])
-            else:
-                med = 0.6
-            q_raw = n / float(n + 4.0)
-            q = max(0.45, min(0.75, q_raw))
-            idx = int(max(0, min(k - 1, round((k - 1) * q))))
-            t_q = hz[idx]
-            tail = med * 1.5
-            guess = t_q + tail + max(0.0, float(end_bias_sec))
-            floor_end = start + max(n * min_len, n * max(0.5, float(avg_min_sec_per_unit)))
-            usable_end = max(floor_end, min(end, guess))
-
-    def _w(s: str) -> float:
-        core = _re.sub(r"[^0-9A-Za-z가-힣]+", "", (s or ""))
-        return max(1.0, float(len(core)))
-
-    weights = [_w(u) for u in units]
-    wsum = sum(weights) or float(n)
-    bounds = [start]
-    acc = 0.0
-    span = usable_end - start
-    for w in weights:
-        acc += w
-        bounds.append(start + span * (acc / wsum))
-
-    if onsets:
-        hints = sorted([float(x) for x in onsets if math.isfinite(float(x))])
-        hints = [h for h in hints if start <= h <= usable_end]
-        tol = max(0.12, min(0.6, span * 0.02))
-        for i in range(1, len(bounds) - 1):
-            t = bounds[i]
-            lo, hi = 0, len(hints) - 1
-            best = None
-            bestd = 1e9
-            while lo <= hi:
-                mid = (lo + hi) // 2
-                d = abs(hints[mid] - t)
-                if d < bestd:
-                    bestd = d
-                    best = hints[mid]
-                if hints[mid] < t:
-                    lo = mid + 1
-                else:
-                    hi = mid - 1
-            if best is not None and abs(best - t) <= tol:
-                bounds[i] = best
-
-    tiny = 1e-6
-    for i in range(1, len(bounds)):
-        if bounds[i] <= bounds[i - 1] + tiny:
-            bounds[i] = bounds[i - 1] + tiny
-
-    segs = [(bounds[i], bounds[i + 1]) for i in range(n)]
-
-    for i in range(n):
-        a, b = segs[i]
-        if b - a < min_len:
-            need = min_len - (b - a)
-            push = min(need, usable_end - b)
-            if push > 0:
-                segs[i] = (a, b + push)
-                for j in range(i + 1, n):
-                    aj, bj = segs[j]
-                    segs[j] = (aj + push, bj + push)
-
-    la, lb = segs[-1]
-    if abs(lb - usable_end) > 1e-6:
-        segs[-1] = (la, usable_end)
-    return segs
-
-# ─────────────────────────────────────────────────────────────
-# 3) (선택) 보컬 분리 — 없으면 None 반환(폴백)
-# ─────────────────────────────────────────────────────────────
+# real use
 def separate_vocals_demucs(input_path: str) -> Optional[str]:
     try:
         if not os.path.isfile(input_path):
@@ -1425,172 +980,6 @@ def separate_vocals_demucs(input_path: str) -> Optional[str]:
 
 
 
-
-
-
-
-
-
-
-
-
-def _normalize_korean_text(s: str) -> str:
-    """가사/ASR 매칭 안정화를 위한 아주 가벼운 정규화."""
-
-    s = (s or "").strip().lower()
-    s = re.sub(r"\s+", " ", s)
-    s = re.sub(r"[.,!?~…·:;\"'()`\[\]{}<>^/\\|-]+", " ", s)
-    s = re.sub(r"\s+", " ", s).strip()
-    return s
-
-def _split_lyrics_body_lines(lyrics_text: str) -> List[str]:
-    """섹션 헤더([intro]/[chorus]/...)와 빈 줄을 제외한 '본문 줄'만 리스트로 반환."""
-    lines: List[str] = []
-    for ln in (lyrics_text or "").splitlines():
-        s = (ln or "").strip()
-        if not s:
-            continue
-        if s.startswith("[") and s.endswith("]"):
-            continue
-        lines.append(s)
-    return lines
-
-def _soft_match_line_in_words(
-    line_norm: str,
-    words: List[Tuple[str, float, float]],
-    win: int = 22,
-) -> Optional[Tuple[int, int, float]]:
-    """
-    정규화된 가사 1줄(line_norm)을 (단어,시작,끝) 시퀀스에서 유사도 최고인 구간으로 매칭.
-    개선:
-      - 완전 부분포함/역방향 포함시 큰 가중치
-      - 토큰 Jaccard
-      - 윈도우 시작이 앞쪽일수록 소폭 가산(앞줄 우선 편향)
-      - 임계값 완화(0.18)
-    반환: (start_idx, end_idx, score) 또는 None
-    """
-    if not words:
-        return None
-    tokens = [_normalize_korean_text(w[0]) for w in words]
-    target = line_norm.strip()
-    if not target:
-        return None
-
-    best = (-1.0, 0, 0)  # (score, si, ei)
-    n = len(tokens)
-
-    tgt_len = max(1, len(target.split()))
-    wsize = max(4, min(win, tgt_len + 6))
-
-    for si in range(0, n):
-        ei = min(n, si + wsize)
-        sub = " ".join(tokens[si:ei]).strip()
-        if not sub:
-            continue
-
-        # 포함 점수(강화)
-        contain_score = 0.0
-        if target and sub:
-            if target in sub:
-                contain_score = 1.0
-            elif sub in target:
-                contain_score = 0.55
-
-        # Jaccard
-        set_a = set(target.split()); set_b = set(sub.split())
-        inter = len(set_a & set_b); union = len(set_a | set_b) or 1
-        jacc = inter / union
-
-        # 앞쪽 윈도우 보너스(초반 줄 성공률 개선)
-        pos_bias = 1.0 - (si / max(1.0, n - 1))  # 1.0(앞) → 0.0(뒤)
-        pos_bonus = 0.08 * pos_bias
-
-        score = 0.35 * contain_score + 0.57 * jacc + pos_bonus
-        if score > best[0]:
-            best = (score, si, ei)
-
-    if best[0] < 0.18:
-        return None
-    return best[1], best[2], best[0]  # ← 중복 괄호 제거
-
-
-
-
-def _interpolate_missing_lines(
-        aligned: List[Dict[str, Any]],
-        *,
-        min_start_sec: float = 0.0,
-        guard: float = 0.12,
-        min_line_sec: float = 0.6,
-) -> List[Dict[str, Any]]:
-    """
-    [개선된 버전] 앞/중간뿐만 아니라, 마지막에 남은 미할당 라인들도 보간(Extrapolate)합니다.
-    - (New) 성공적으로 할당된 라인들의 평균 길이를 계산합니다.
-    - (New) 마지막으로 할당된 라인 뒤에 남은 라인들을 이 평균 길이를 이용해 순차적으로 배치합니다.
-    - 기존의 앞/중간 보간 기능은 그대로 유지합니다.
-    """
-
-    def _is_num(x: Any) -> bool:
-        return isinstance(x, (int, float))
-
-    known: List[Tuple[int, float, float]] = []
-    for i, item in enumerate(aligned):
-        s_val, e_val = item.get("start"), item.get("end")
-        if _is_num(s_val) and _is_num(e_val) and float(e_val) >= float(s_val):
-            known.append((i, float(s_val), float(e_val)))
-
-    if not known:
-        # 모든 라인이 미할당 상태면, 최소 길이로 순차 배치
-        t = float(min_start_sec)
-        for item in aligned:
-            item["start"], item["end"], item["score"] = t, t + min_line_sec, 0.0
-            t += min_line_sec
-        return aligned
-
-    # --- 선두 구간 (첫 매칭 전) ---
-    first_i, first_s, _ = known[0]
-    if first_i > 0:
-        lead_start = float(min_start_sec)
-        lead_end = max(lead_start, first_s - guard)
-        if lead_end > lead_start:
-            lengths = [max(1, len(str(aligned[k].get("line", "")))) for k in range(first_i)]
-            total_len = float(sum(lengths)) or 1.0
-            t = lead_start
-            for k, length_val in zip(range(first_i), lengths):
-                span = max(min_line_sec, (lead_end - lead_start) * (length_val / total_len))
-                aligned[k]["start"], aligned[k]["end"], aligned[k]["score"] = t, min(lead_end, t + span), 0.0
-                t = aligned[k]["end"]
-
-    # --- 중간 구간 (매칭된 라인 사이) ---
-    for (a_idx, _, a_e), (b_idx, b_s, _) in zip(known, known[1:]):
-        if b_idx - a_idx <= 1: continue
-        gap_s = max(a_e + guard, a_e)
-        gap_e = max(gap_s, b_s - guard)
-        if gap_e > gap_s:
-            mids = list(range(a_idx + 1, b_idx))
-            lengths = [max(1, len(str(aligned[k].get("line", "")))) for k in mids]
-            total_len = float(sum(lengths)) or 1.0
-            t = gap_s
-            for k, length_val in zip(mids, lengths):
-                span = max(min_line_sec, (gap_e - gap_s) * (length_val / total_len))
-                aligned[k]["start"], aligned[k]["end"], aligned[k]["score"] = t, min(gap_e, t + span), 0.0
-                t = aligned[k]["end"]
-
-    # --- [NEW] 후미 구간 (마지막 매칭 후) ---
-    last_i, _, last_e = known[-1]
-    if last_i < len(aligned) - 1:
-        # 성공한 라인들의 평균 길이 계산
-        durations = [e - s for _, s, e in known if e > s]
-        avg_dur = float(np.mean(durations)) if durations else min_line_sec
-        avg_dur_to_use = max(min_line_sec, avg_dur)
-
-        trail_start = float(last_e + guard)
-        t = trail_start
-        for k in range(last_i + 1, len(aligned)):
-            aligned[k]["start"], aligned[k]["end"], aligned[k]["score"] = t, t + avg_dur_to_use, 0.0
-            t += avg_dur_to_use
-
-    return aligned
 
 
 
@@ -1627,18 +1016,17 @@ ACE-Step(ComfyUI) 음악 생성 — 태그/길이 병합·주입 + 포맷 보장
 
 # ── settings / utils 유연 임포트 ───────────────────────────────────────────────
 
-S = settings  # noqa: N816
-# --- ACE-Step 대기/폴링 기본값 & 헬퍼 (설정에 없으면 이 값 사용) ---
-# --- ACE-Step 대기/폴링 기본값 & 헬퍼 ---
-_DEFAULT_ACE_WAIT_TIMEOUT_SEC = 900.0   # 15분
-_DEFAULT_ACE_POLL_INTERVAL_SEC = 2.0    # 2초
-
+#
+# _DEFAULT_ACE_WAIT_TIMEOUT_SEC = 900.0   # 15분
+# _DEFAULT_ACE_POLL_INTERVAL_SEC = 2.0    # 2초
+# real use
 def _ace_wait_timeout_sec():
     return (
         (getattr(_s, "ACE_STEP_WAIT_TIMEOUT_SEC", None) if _s else None)
         or (getattr(_s, "ACE_WAIT_TIMEOUT_SEC", None) if _s else None)
         or _DEFAULT_ACE_WAIT_TIMEOUT_SEC
     )
+# real use
 def _ace_poll_interval_sec():
     return (
         (getattr(_s, "ACE_STEP_POLL_INTERVAL_SEC", None) if _s else None)
@@ -1656,10 +1044,11 @@ def _ace_poll_interval_sec():
 
 
 # ───────────────────────────── HTTP 유틸 ────────────────────────────────────
-
+# real use
 def _http_get(base: str, path: str, timeout: int = 30, params: Optional[dict] = None) -> requests.Response:
     return requests.get(base.rstrip("/") + path, params=params or {}, timeout=timeout)
 
+# real use
 def _probe_server(base: str, timeout: int = 3) -> bool:
     for p in ("/view", "/history"):
         try:
@@ -1671,7 +1060,7 @@ def _probe_server(base: str, timeout: int = 3) -> bool:
     return False
 
 
-# ───────────────────────────── 워크플로 로더 ──────────────────────────────────
+# real use
 def _load_workflow_graph(json_path: str | Path) -> dict:
     """
     ComfyUI용 워크플로 JSON을 로드해, /prompt에 바로 넣을 수 있는
@@ -1786,13 +1175,13 @@ def _load_workflow_graph(json_path: str | Path) -> dict:
 
 
 
-# ───────────────────────────── 서버/노드 유틸 ──────────────────────────────────
+# real use
 def _choose_host() -> str:
     """settings의 COMFY_HOST 우선, 그 다음 DEFAULT_HOST_CANDIDATES에서 살아있는 서버를 선택."""
     cand: List[str] = []
     if COMFY_HOST:
         cand.append(COMFY_HOST)
-    for c in (getattr(S, "DEFAULT_HOST_CANDIDATES", DEFAULT_HOST_CANDIDATES) or []):
+    for c in (getattr(settings, "DEFAULT_HOST_CANDIDATES", DEFAULT_HOST_CANDIDATES) or []):
         if c and c not in cand:
             cand.append(c)
     for host in cand:
@@ -1802,11 +1191,6 @@ def _choose_host() -> str:
 
 
 
-
-# ───────────────────────────── 태그/노드 유틸 ──────────────────────────────────
-# audio_sync.py 파일의 _collect_effective_tags 함수를 교체하세요. (약 722 라인 근처)
-
-# C:\my_games\shorts_make\app\audio_sync.py
 # real_use
 def _collect_effective_tags(meta: dict) -> List[str]:
     """
@@ -1928,7 +1312,7 @@ def generate_music_with_acestep(
         api_workflow_path: Optional[Path] = None
 
         try:
-            jsons_dir_val = getattr(S, "JSONS_DIR", "jsons")
+            jsons_dir_val = getattr(settings, "JSONS_DIR", "jsons")
             api_workflow_path = Path(jsons_dir_val) / "ace_step_text_change.json"
             if not api_workflow_path.exists():
                 api_workflow_path = Path("jsons") / "ace_step_text_change.json"
@@ -2040,7 +1424,7 @@ def generate_music_with_acestep(
         comfy_host_addr_local = _choose_host()
     except Exception as host_err:
         _dlog(f"[ERROR] ComfyUI host selection failed: {host_err}.")
-        return f"Music generation failed: Cannot connect to ComfyUI host ({getattr(S, 'COMFY_HOST', 'default')})."
+        return f"Music generation failed: Cannot connect to ComfyUI host ({getattr(settings, 'COMFY_HOST', 'default')})."
 
     lyrics_eff: str
     if use_lls:
@@ -2102,7 +1486,7 @@ def generate_music_with_acestep(
     seconds_val: int = 60
     positive_tags: List[str] = []
     negative_tags: List[str] = []
-    main_wf_path: Union[str, Path] = getattr(S, "ACE_STEP_PROMPT_JSON", "jsons/ace_step_1_t2m.json")
+    main_wf_path: Union[str, Path] = getattr(settings, "ACE_STEP_PROMPT_JSON", "jsons/ace_step_1_t2m.json")
     graph_loaded: Optional[Dict] = None
     base_host: str = comfy_host_addr_local
     subfolder_path: str = ""
@@ -2236,7 +1620,7 @@ def generate_music_with_acestep(
 
             if source_audio and source_audio.exists():
                 _dlog("SELECTED_SOURCE_AUDIO", f"Selected '{source_audio.name}'.")
-                ffmpeg_p = getattr(S, "FFMPEG_EXE", "ffmpeg") or "ffmpeg"
+                ffmpeg_p = getattr(settings, "FFMPEG_EXE", "ffmpeg") or "ffmpeg"
                 try:
                     final_audio_path = _ensure_vocal_wav(source_audio, proj, ffmpeg_exe=ffmpeg_p)
                     _dlog("ENSURED_WAV", f"Final WAV: '{final_audio_path.name}'")
@@ -2245,9 +1629,9 @@ def generate_music_with_acestep(
                     if callable(master_fn) and isinstance(final_audio_path, Path) and final_audio_path.exists():
                         _dlog("MASTERING_START", "Applying mastering...")
                         try:
-                            ti = float(getattr(S, "MASTER_TARGET_I", -12.0))
-                            tp = float(getattr(S, "MASTER_TARGET_TP", -1.0))
-                            tl = float(getattr(S, "MASTER_TARGET_LRA", 11.0))
+                            ti = float(getattr(settings, "MASTER_TARGET_I", -12.0))
+                            tp = float(getattr(settings, "MASTER_TARGET_TP", -1.0))
+                            tl = float(getattr(settings, "MASTER_TARGET_LRA", 11.0))
                             mastered_p = master_fn(final_audio_path, I=ti, TP=tp, LRA=tl, ffmpeg_exe=ffmpeg_p)
 
                             if isinstance(mastered_p, Path) and mastered_p.exists():
@@ -2360,111 +1744,16 @@ def generate_music_with_acestep(
     notify("finished", summary=summary_final)
     return summary_final
 
-def _graph(prompt) -> dict:
-    """
-    프롬프트 JSON이 다양한 스키마(dict / {'prompt':{}} / {'nodes':[...]})로 올 수 있으니
-    항상 dict를 돌려주도록 방어적으로 정규화한다.
-    """
-    # 1) 없으면 빈 dict
-    if prompt is None:
-        return {}
-
-    # 2) 최상위에 {"prompt": {...}} 형태면 내부만
-    if isinstance(prompt, dict):
-        inner = prompt.get("prompt")
-        if isinstance(inner, dict):
-            prompt = inner
-
-    # 3) {"nodes":[{id:.., class_type:..}, ...]} → {id(str): node(dict)}
-    if isinstance(prompt, dict) and isinstance(prompt.get("nodes"), list):
-        g = {}
-        for n in prompt["nodes"]:
-            if isinstance(n, dict):
-                nid = str(n.get("id") or "")
-                if nid:
-                    g[nid] = {k: v for k, v in n.items() if k != "id"}
-        return g
-
-    # 4) dict면 그대로, 아니면 빈 dict
-    return prompt if isinstance(prompt, dict) else {}
 
 
-def _find_nodes_by_class_names(graph: dict, class_names: Iterable[str]) -> List[Tuple[str, dict]]:
-    names = set(class_names)
-    res: List[Tuple[str, dict]] = []
-    for nid, node in (graph or {}).items():
-        if isinstance(node, dict) and node.get("class_type") in names:
-            res.append((str(nid), node))
-    return res
-
-def _find_nodes_by_class_contains(graph: dict, needle: str) -> list[tuple[str, dict]]:
-    needle = (needle or "").lower()
-    out = []
-    for nid, node in (graph or {}).items():
-        ct = str(node.get("class_type", "")).lower()
-        if needle and needle in ct:
-            out.append((str(nid), node))
-    return out
-
-def rewrite_prompt_audio_format(json_path: Path, desired_fmt: str) -> Tuple[int, str]:
-    """
-    워크플로 파일 안의 SaveAudio* 노드를 desired_fmt('wav'|'mp3'|'opus')로 바꿔 저장.
-    """
-    desired_fmt = (desired_fmt or "mp3").lower().strip()
-    if desired_fmt not in ("mp3", "wav", "opus"):
-        desired_fmt = "mp3"
-        # return 0
-    try:
-        data = load_json(json_path, {}) or {}
-    except Exception as e:
-        return 0, f"프롬프트 JSON 로드 실패: {e}"
-
-    g = _graph(data)
-    if not isinstance(g, dict) or not g:
-        return 0, f"프롬프트 JSON 형식 오류: {json_path}"
-
-    targets = _find_nodes_by_class_contains(g, "saveaudio")
-    if not targets:
-        return 0, "SaveAudio* 노드를 찾지 못했습니다."
-
-    changed = 0
-    for _nid, node in targets:
-        ins = node.setdefault("inputs", {})
-        if desired_fmt == "wav":
-            node["class_type"] = "SaveAudioWAV"
-            ins.pop("quality", None)
-            changed += 1
-        elif desired_fmt == "opus":
-            node["class_type"] = "SaveAudioOpus"
-            ins.pop("quality", None)
-            changed += 1
-        else:  # mp3
-            node["class_type"] = "SaveAudioMP3"
-            q = str(ins.get("quality", "")).strip().lower()
-            if q not in ("v0", "128k", "320k"):
-                ins["quality"] = "320k"
-            changed += 1
-
-    if changed:
-        try:
-            save_json(json_path, data)
-            return changed, f"{json_path.name} 저장 노드 {changed}개를 '{desired_fmt}'로 갱신."
-        except Exception as e:
-            return 0, f"프롬프트 JSON 저장 실패: {e}"
-    return 0, "변경 사항 없음."
-
-
+# real use
 def _rand_seed() -> int:
     return random.randint(1, 2_147_483_646)
 
 
-# ────────────────────── 저장 노드 '적응' 로직(핵심) ────────────────────────────
-# --- NEW: 서버에 설치된 노드 클래스 목록 가져오기 (없으면 빈 set) ---
-
-
-
 
 # ───────────────────────────── 결과 파일 처리 ─────────────────────────────────
+# real use
 def _download_output_file(base: str, filename: str, subfolder: str, out_dir: Path) -> Path:
     out_dir.mkdir(parents=True, exist_ok=True)
     _dlog("TRY-DOWNLOAD", f"filename={filename}", f"subfolder={subfolder}", f"out_dir={out_dir}")
@@ -2499,31 +1788,9 @@ def _download_output_file(base: str, filename: str, subfolder: str, out_dir: Pat
         raise last_err
     raise RuntimeError(f"다운로드 실패: filename={filename}, subfolder='{subfolder}'")
 
-
-
-
-
-
-
-
-
-
-
-
 # ───────────────────────────── 메인 함수 ──────────────────────────────────────
 
-
-
-# ─────────────────────────────
-# 필요한 유틸이 이 파일에 이미 있다고 가정:
-# - _dlog, load_json, save_json, effective_title, sanitize_title
-# - _load_workflow_graph(ACE_STEP_PROMPT_JSON), _choose_host
-# - _apply_save_audio_node_adaptively, _find_nodes_by_class_names, _find_nodes_by_class_contains
-# - _ensure_filename_prefix, _submit_and_wait, _rand_seed
-# - save_to_user_library
-# - settings as S (FFMPEG_EXE, FINAL_OUT, AUDIO_SAVE_FORMAT 등)
-# ─────────────────────────────
-
+# real use
 def _ensure_vocal_wav(src_path: Path, proj_dir: Path, ffmpeg_exe: str = "ffmpeg") -> Path:
     """
     입력이 wav가 아니면 wav(16-bit PCM, 44.1kHz, 2ch)로 트랜스코딩하여
@@ -2555,103 +1822,6 @@ def _ensure_vocal_wav(src_path: Path, proj_dir: Path, ffmpeg_exe: str = "ffmpeg"
 
 
 
-
-
-######################분석 보완############################################
-def preprocess_for_analysis(src: str) -> str:
-    """
-    분석 친화 전처리:
-      - 48k/mono로 로드
-      - 약한 노이즈 리덕션
-      - 하모닉 우세화(보컬 강조)
-      - -16 LUFS 근사 정규화
-      - 16-bit WAV 임시 파일로 저장
-    실패 또는 의존성 부재 시 원본 경로 반환.
-    """
-    try:
-
-
-        src_path = Path(src)
-        if not src_path.exists():
-            return src
-
-        y, sr = librosa.load(str(src_path), sr=48000, mono=True)
-        if y is None or y.size == 0:
-            return src
-
-        # 약한 노이즈 리덕션(stationary=False: 음악에 안전)
-        y = nr.reduce_noise(y=y, sr=sr, prop_decrease=0.3, stationary=False)
-
-        # 하모닉/퍼커시브 분리 후 보컬 쪽 비중 약간 높임
-        harm, perc = librosa.effects.hpss(y)
-        y = (harm * 0.9) + (perc * 0.1)
-
-        # -16 LUFS 정규화(EBU R128)
-        meter = pyln.Meter(sr)
-        loudness = meter.integrated_loudness(y)
-        y = pyln.normalize.loudness(y, loudness, -16.0)
-
-        # 소프트 클립으로 과도 피크 방지
-        y = np.clip(y, -0.98, 0.98)
-
-        out_path = src_path.with_suffix(".pre.wav")
-        sf.write(str(out_path), y, sr, subtype="PCM_16")
-        return str(out_path)
-    except ImportError:
-        # 의존성 없으면 원본 사용
-        return src
-    except Exception:
-        # 전처리 실패 시에도 원본 사용(분석 파이프는 계속 진행)
-        return src
-def demucs_vocals_drums(src: str) -> dict:
-    """
-    Demucs로 stems 분리 후 vocals/drums 경로 딕셔너리 반환.
-    - 실패/미설치 시 빈 dict 반환
-    - 호출부는 존재 여부만 검사해서 쓰도록 설계
-    """
-    try:
-
-
-        src_path = Path(src)
-        if not src_path.exists():
-            return {}
-
-        # 출력 폴더: 원본과 같은 폴더 아래 demucs_out/
-        out_dir = src_path.parent / "demucs_out"
-        out_dir.mkdir(parents=True, exist_ok=True)
-
-        cmd = [sys.executable, "-m", "demucs", "-n", "htdemucs", "-o", str(out_dir), str(src_path)]
-        # demucs 실행 (에러 시 예외 발생 → 빈 dict 폴백)
-        subprocess.run(cmd, check=True)
-
-        # 결과: out_dir/model/songname/*.wav
-        # 여러 번 실행 가능하므로 가장 최근 파일을 고른다.
-        vocals = None
-        drums = None
-        latest_time = -1.0
-        for p in out_dir.rglob("*.wav"):
-            name = p.name.lower()
-            try:
-                t = p.stat().st_mtime
-            except OSError:
-                t = 0.0
-            if t >= latest_time:
-                latest_time = t
-                if "vocals" in name:
-                    vocals = p
-                if "drums" in name:
-                    drums = p
-
-        out = {}
-        if vocals and vocals.exists():
-            out["vocals"] = str(vocals)
-        if drums and drums.exists():
-            out["drums"] = str(drums)
-        return out
-    except ImportError:
-        return {}
-    except Exception:
-        return {}
 
 ###################################################################
 #######################테스트중##################################
@@ -2845,116 +2015,8 @@ def sync_lyrics_with_whisper_pro(
         "summary_text": summary_text
     }
 
-# 시간 관련 유사도(아래 2개는 링크 안되어도 실제로 쓰임)
-def build_time_variant_map(ref_lines: list[str]) -> dict:
-    """
-    ref_lines(= lyrics_raw, 헤더 포함 가능)를 훑어,
-    문장 내 '시간 표현'을 캐논 (h, m, s) 키로 매핑한 '정답 표기' 사전을 만든다.
 
-    반환 예:
-      { (3, None, None): '세 시',
-        (15, 5, 0): '15시 5분 0초',
-        (17, 32, 8): '열일곱 시 32분 8초' ... }
-    """
-
-
-    def to_int_from_k_num(token: str) -> Optional[int]:
-        # 간단 한글수사 파서 (99까지 대충 처리). '한/두/세/네'도 처리.
-        token = token.strip()
-        special = {'한': 1, '두': 2, '세': 3, '네': 4}
-        if token in special:
-            return special[token]
-        digit = {'영': 0, '공': 0, '일': 1, '이': 2, '삼': 3, '사': 4, '오': 5,
-                 '육': 6, '칠': 7, '팔': 8, '구': 9}
-        if token.isdigit():
-            return int(token)
-        # 십 기반 단순 조합: '십오'(15), '이십삼'(23) ...
-        if '십' in token:
-            parts = token.split('십')
-            tens = digit.get(parts[0], 1) if parts[0] else 1
-            ones = digit.get(parts[1], 0) if len(parts) > 1 and parts[1] else 0
-            return tens * 10 + ones
-        # 한 글자 숫자
-        if len(token) == 1 and token in digit:
-            return digit[token]
-        # 못 파싱하면 None
-        return None
-
-    def parse_colon_time(s: str) -> list[tuple[int, Optional[int], Optional[int], str]]:
-        # HH:MM(:SS?) 또는 M:SS (앞뒤 텍스트에 붙어있어도 findall)
-        colon_rx = re.compile(r'(?<!\d)(\d{1,2}):(\d{2})(?::(\d{2}))?(?!\d)')
-        results: list[tuple[int, Optional[int], Optional[int], str]] = []
-        for m in colon_rx.finditer(s):
-            h_or_m = int(m.group(1))
-            mm = int(m.group(2))
-            ss = int(m.group(3)) if m.group(3) is not None else None
-            # 3-part면 (H,M,S), 2-part면 (M, S)로 해석될 수도 있으나
-            # 여기서는 보수적으로 (H,M,SS)로 보고, 말이 안 되면 (M,S)로 다운캐스트
-            if m.group(3) is not None:
-                h = h_or_m
-                results.append((h, mm, ss, m.group(0)))
-            else:
-                # 두 파트만 있을 때: 시:분 또는 분:초 모호성
-                # ref 측에서는 표기 그대로 쓰므로 우선 (h, m)로 본다.
-                h = h_or_m
-                results.append((h, mm, None, m.group(0)))
-        return results
-
-    def parse_unit_time(s: str) -> list[tuple[Optional[int], Optional[int], Optional[int], str]]:
-        # (숫자|한글수사) + (시|분|초) 패턴을 모두 모은 후 가장 최근 세 개를 묶어본다.
-        # 예) "세 시 26분 10초" -> ('세','시'),('26','분'),('10','초')
-        num_unit_rx = re.compile(
-    r'(?P<num>\d{1,2}|[영공일이삼사오육칠팔구]+|한|두|세|네)\s*(?P<unit>[시분초])'
-)
-        pairs = [(m.group('num'), m.group('unit'), m.group(0)) for m in num_unit_rx.finditer(s)]
-        if not pairs:
-            return []
-        # 연속된 시/분/초를 하나의 묶음으로 조립
-        out: list[tuple[Optional[int], Optional[int], Optional[int], str]] = []
-        i = 0
-        while i < len(pairs):
-            h = m = sec = None
-            buf = []
-            j = i
-            while j < len(pairs) and len(buf) < 3:
-                num_raw, unit, raw = pairs[j]
-                buf.append(raw)
-                val: Optional[int]
-                if num_raw.isdigit():
-                    val = int(num_raw)
-                else:
-                    val = to_int_from_k_num(num_raw)
-                if unit == '시':
-                    h = val
-                elif unit == '분':
-                    m = val
-                elif unit == '초':
-                    sec = val
-                j += 1
-            raw_join = ' '.join(buf).strip()
-            out.append((h, m, sec, raw_join))
-            i = j
-        return out
-
-    def extract_all_times(line: str) -> list[tuple[Optional[int], Optional[int], Optional[int], str]]:
-        found: list[tuple[Optional[int], Optional[int], Optional[int], str]] = []
-        found.extend(parse_colon_time(line))
-        found.extend(parse_unit_time(line))
-        return found
-
-    time_map: dict = {}
-    for line in ref_lines:
-        # 헤더 제거: [A], [HOOK] 등
-        if line.strip().startswith('[') and line.strip().endswith(']'):
-            continue
-        for h, m, s_val, raw in extract_all_times(line):
-            key = (h, m, s_val)  # None 허용
-            # 동일 키에 여러 표기가 있으면 "가장 긴 표기"를 우선(예: '세 시 5분' > '세 시')
-            prev = time_map.get(key)
-            if not prev or len(raw) > len(prev):
-                time_map[key] = raw
-    return time_map
-
+# real use
 def normalize_times_in_text(text: str, ref_time_map: dict) -> str:
     """
     ASR 결과 한 줄에서 시간 표현만 찾아,
@@ -3046,15 +2108,7 @@ def normalize_times_in_text(text: str, ref_time_map: dict) -> str:
     return out
 
 
-
-# 한글 자모 분해를 위한 전역 상수
-CHOSUNG = ['ㄱ', 'ㄲ', 'ㄴ', 'ㄷ', 'ㄸ', 'ㄹ', 'ㅁ', 'ㅂ', 'ㅃ', 'ㅅ', 'ㅆ', 'ㅇ', 'ㅈ', 'ㅉ', 'ㅊ', 'ㅋ', 'ㅌ', 'ㅍ', 'ㅎ']
-JUNGSUNG = ['ㅏ', 'ㅐ', 'ㅑ', 'ㅒ', 'ㅓ', 'ㅔ', 'ㅕ', 'ㅖ', 'ㅗ', 'ㅘ', 'ㅙ', 'ㅚ', 'ㅛ', 'ㅜ', 'ㅝ', 'ㅞ', 'ㅟ', 'ㅠ', 'ㅡ', 'ㅢ', 'ㅣ']
-JONGSUNG = ['', 'ㄱ', 'ㄲ', 'ㄳ', 'ㄴ', 'ㄵ', 'ㄶ', 'ㄷ', 'ㄹ', 'ㄺ', 'ㄻ', 'ㄼ', 'ㄽ', 'ㄾ', 'ㄿ', 'ㅀ', 'ㅁ', 'ㅂ', 'ㅄ', 'ㅅ', 'ㅆ', 'ㅇ', 'ㅈ', 'ㅊ', 'ㅋ', 'ㅌ', 'ㅍ', 'ㅎ']
-
-
-# 파일: audio_sync.py
-
+# real_use
 def _create_final_segments_from_ready(
         seg_ready_payload: list,
         clean_lyrics_lines: list,  # 헤더 포함된 원본 가사 (입력)
@@ -3594,7 +2648,7 @@ def _create_final_segments_from_ready(
 
 
 
-
+# real_use
 def transcribe_words(
         path: str,
         model_size: str | None = None,
@@ -3731,12 +2785,10 @@ def transcribe_words(
 
 
 
-
-# (다른 함수 정의들...)
-
 # ============================================================
 # 최종 오디오 처리 및 시간 업데이트 함수 (모든 경고 해결 최종 버전)
 # ============================================================
+# real use
 def _finalize_audio_and_update_time(
         final_segments: List[Dict[str, Any]],  # 타입 힌트 명시
         project_dir: str,
@@ -3862,11 +2914,7 @@ def _finalize_audio_and_update_time(
 
     return organized_segments  # [수정] 처리된 세그먼트 리스트 반환
 
-
-# ───────────────────────────── 제출/폴링 ──────────────────────────────────────
-
-# ACE-step 음악 생성 시에도 사용되지만, 본질적으로는 ComfyUI 서버에 프롬프트(JSON)를 전달하고 작업 완료를 기다리는 범용 엔진
-# real_use
+# real use
 def _submit_and_wait(
     base: str,
     wf_graph: dict,
@@ -4053,7 +3101,7 @@ def _submit_and_wait(
 
 # ───────────────────────────── 디버그 ────────────────────────────────────
 _LOG_PATH = Path(BASE_DIR) / "music_gen.log"  # 언제나 여기로도 기록
-
+# real use
 def _dlog(*args):
     msg = " ".join(str(a) for a in args)
     line = f"[MUSIC] {msg}"
