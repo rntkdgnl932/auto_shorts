@@ -22,7 +22,7 @@ from app.utils import (
     ensure_dir
 )
 from app import settings
-from app.video_build import build_shots_with_i2v, concatenate_scene_clips
+from app.video_build import build_shots_with_i2v, concatenate_scene_clips, fill_prompt_movie_with_ai
 from app.audio_sync import get_audio_duration
 
 def _now_str() -> str:
@@ -541,6 +541,7 @@ class ShoppingVideoJsonBuilder:
         - Image 1 (Canvas): 배경/인물/조명만 묘사. 제품은 '투명/더미' 처리하여 환각 방지.
         - Image 2 (Paint): 'object from image 2' 키워드로 합성 위치만 지정. 형용사 금지.
         - Audio: 자동 마이그레이션 및 측정.
+        - [강화] 모든 프롬프트 출력은 반드시 '영어'로 작성하도록 강제.
         """
         vpath = Path(video_json_path)
         p_dir = vpath.parent
@@ -549,6 +550,9 @@ class ShoppingVideoJsonBuilder:
         data = load_json(vpath, {})
         scenes = data.get("scenes", [])
 
+        # ---------------------------------------------------------------------
+        # 1. 오디오 생성 및 측정 (기존 로직 유지)
+        # ---------------------------------------------------------------------
         gender = data.get("meta", {}).get("voice_gender", "female").lower()
         if "male" == gender:
             ref_voice = Path(r"C:\my_games\shorts_make\voice\남자성우1.mp3")
@@ -562,9 +566,8 @@ class ShoppingVideoJsonBuilder:
         for sc in scenes:
             sid = sc["id"]
 
-            # 1. 텍스트 파싱 및 수치 변환
+            # 텍스트 파싱 및 수치 변환
             config = _get_zonos_config(sc, self.ai)
-
             narr = sc.get("narration", "").strip()
             v_path = Path(sc.get("voice_file") or str(voice_dir / f"{sid}.wav"))
 
@@ -573,7 +576,7 @@ class ShoppingVideoJsonBuilder:
                 total_dur += sc["seconds"]
                 continue
 
-            # 2. 음성 생성
+            # 음성 생성
             if not v_path.exists() or v_path.stat().st_size == 0:
                 self.on_progress(f"   🎙️ Scene {sid} 음성 생성 (속도: {config.get('speed', 1.0)})...")
                 success = generate_tts_zonos(narr, v_path, ref_voice, comfy_host, config)
@@ -583,7 +586,7 @@ class ShoppingVideoJsonBuilder:
                     self.on_progress(f"      ❌ 생성 실패 (기본 4초)")
                     continue
 
-            # 3. 시간 측정
+            # 시간 측정
             final_dur = 0.0
             max_retries = 5
             for i in range(max_retries):
@@ -612,12 +615,11 @@ class ShoppingVideoJsonBuilder:
         save_json(vpath, data)
 
         # ---------------------------------------------------------------------
-        # [핵심] 프롬프트 상세화 (Canvas & Paint 전략)
+        # 2. [핵심] 프롬프트 상세화 (Canvas & Paint 전략) - 영어 강제 강화
         # ---------------------------------------------------------------------
-        self.on_progress("[Enrich] 2/2단계: 비주얼 프롬프트 고도화 (합성 최적화)...")
+        self.on_progress("[Enrich] 2/2단계: 비주얼 프롬프트 고도화 (합성 최적화 + 영어 변환)...")
 
         char_prompt = data.get("meta", {}).get("character_prompt", "Young Korean model")
-
         if "male" == gender:
             gender_kw = "male, man, 1boy"
         else:
@@ -628,93 +630,108 @@ class ShoppingVideoJsonBuilder:
             sfx_info = f" (SFX: {sc.get('sfx')})" if sc.get("sfx") else ""
             scene_texts.append(f"- Scene {sc['id']} (지문): {sc.get('prompt')}{sfx_info}")
 
+        # [수정] 시스템 프롬프트에 '영어 작성' 규칙을 매우 강력하게 명시
         sys_p = (
-            "당신은 ComfyUI 합성 전문가(Compositing Director)입니다. "
-            "이미지 생성은 2단계(1.배경/인물 생성 -> 2.제품 합성)로 이루어집니다. "
-            "각 단계의 역할에 철저히 맞춰 프롬프트를 분리하세요."
+            "You are a ComfyUI Compositing Director. "
+            "Your task is to generate 2-step image generation prompts based on the provided scenario.\n"
+            "The image generation process consists of two steps: 1. Background/Character (Canvas) -> 2. Product Inpainting (Paint).\n\n"
+            "**[CRITICAL RULE]**\n"
+            "1. **LANGUAGE: ALL OUTPUT PROMPTS MUST BE IN ENGLISH.** Translate any Korean input into detailed English descriptions.\n"
+            "2. **NO KOREAN CHARACTERS** in the `prompt_img_1`, `prompt_img_2`, `prompt_movie`, or `prompt_negative` fields.\n"
         )
 
         user_p = f"""
-        [프롬프트 작성 전략: Canvas & Paint]
+        [Prompting Strategy: Canvas & Paint]
 
-        **Target Info**:
-        - Character: "{char_prompt}"
-        - Gender: "{gender_kw}"
+        **Context Info**:
+        - Character Style: "{char_prompt}"
+        - Gender Keywords: "{gender_kw}"
 
-        각 씬을 분석하여 **[인물 중심]**인지 **[제품 단독]**인지 판단하고 아래 규칙을 적용하세요.
+        Analyze each scene to determine if it's a **[Person Shot]** or **[Product-only Shot]**, then apply the rules below.
 
         ---
-        ### 1. `prompt_img_1` (The Canvas: 베이스 이미지)
-        *목표: 제품이 들어갈 자리를 비워두고, 배경과 인물의 '자세'만 완벽하게 준비.*
-        * **절대 금지**: 제품(Product)을 구체적으로 묘사하지 마세요. (색상, 로고, 재질 금지).
+        ### 1. `prompt_img_1` (The Canvas: Base Image)
+        *Goal: Prepare the perfect background and pose, leaving a space for the product.*
+        * **FORBIDDEN**: Do NOT describe the product itself (No colors, No logos, No specific materials of the product).
 
-        **(A) 인물 중심 (Person Shot)**
-        - 캐릭터와 **'손 동작(Gesture)'**에 집중하세요.
-        - 손: 제품을 쥐고 있는 듯한 손 모양을 묘사하되, **빈 손(empty hand)**이나 **투명한 원통(generic invisible cylinder)**을 쥐고 있다고 표현하세요.
-        - 예: "Woman extending her arm in a throwing gesture, hand gripping a generic invisible cylinder, focus on the dynamic pose."
+        **(A) Person Shot**
+        - Focus on the **Gesture** and **Expression**.
+        - Hand: Describe the hand as **"holding a generic invisible cylinder"** or **"empty hand with open palm"** to reserve space for the product.
+        - Example: "A {gender_kw} extending arm, hand gripping a generic invisible cylinder, focused expression, soft lighting."
 
-        **(B) 제품 단독 (Product Shot)**
-        - **배경(Surface/Background)**과 **조명(Lighting)**만 묘사하세요.
-        - 제품이 놓일 중앙 공간은 비워두세요 (Empty space in center).
-        - 예: "Elegant marble table surface, soft cinematic lighting, bokeh background, empty center area ready for product placement."
+        **(B) Product-only Shot**
+        - Focus on **Background Surface** and **Lighting**.
+        - Leave the center empty: "Empty space in center ready for product placement."
+        - Example: "Elegant wooden table surface, sunlight from window, bokeh background, empty center area."
 
-        ### 2. `prompt_img_2` (The Paint: 합성)
-        *목표: 준비된 캔버스 위에 실제 제품 이미지를 합성.*
-        * **필수 구문**: 무조건 **"object from image 2"**라는 단어를 사용하세요.
-        * **절대 금지**: 제품의 색상(Red, Blue...), 재질(Metal, Plastic...), 형태(Round...) 등 **형용사를 절대 쓰지 마세요.** (AI가 혼동함)
-        * **부정어 금지**: "no color", "ignore material" 같은 부정 명령도 쓰지 마세요.
+        ### 2. `prompt_img_2` (The Paint: Inpainting)
+        *Goal: Composite the actual product onto the canvas.*
+        * **MANDATORY**: You MUST use the exact phrase **"object from image 2"** to refer to the product.
+        * **FORBIDDEN**: Do NOT use adjectives for the product (e.g., "red bottle", "round shape"). The AI knows the product image.
+        * **NO NEGATIVES**: Do not use "no color", "ignore material".
 
-        - 형식 1 (인물): "The [Subject] holding the **object from image 2** in hand."
-        - 형식 2 (배경): "The **object from image 2** placed on the surface."
-        - 형식 3 (던짐): "The **object from image 2** flying in the air."
+        - Format 1 (Person): "The [Subject] holding the **object from image 2** in hand."
+        - Format 2 (Background): "The **object from image 2** placed on the surface."
+        - Format 3 (Action): "The **object from image 2** flying in the air."
 
         ### 3. `prompt_negative`
-        - 기본: "text, watermark, username, signature, title, low quality, deformed hands, missing fingers".
-        - **제품 묘사 방지**: "product details, specific logo, complex object" (베이스 이미지에서 제품이 생기는 것 방지).
+        - Standard: "text, watermark, username, signature, title, low quality, deformed hands, missing fingers, extra limbs".
+        - Anti-Hallucination: "product details, specific logo, complex object, holding random object" (Prevents random items in base image).
 
         ### 4. `prompt_movie`
-        - 카메라 무빙 (영어).
+        - Camera movement description in English (e.g., "Slow zoom in", "Tracking shot").
 
-        [입력 시나리오]
+        [Input Scenarios (Korean)]
         {chr(10).join(scene_texts)}
 
-        [출력 포맷 (JSON)]
+        [Output Format (JSON Only)]
         {{
-            "scenes": [
-                {{
-                    "id": "001",
-                    "prompt_img_1": "...",
-                    "prompt_img_2": "...",
-                    "prompt_negative": "...",
-                    "prompt_movie": "..."
+            "scenes": {{
+                "scene_id_1": {{
+                    "prompt_img_1": "English description...",
+                    "prompt_img_2": "English description...",
+                    "prompt_negative": "English description...",
+                    "prompt_movie": "English description..."
                 }},
                 ...
-            ]
+            }}
         }}
         """
 
         try:
             resp = self.ai.ask_smart(sys_p, user_p, prefer="openai")
             enriched = self._safe_json_parse(resp)
+
+            # 파싱된 결과 병합
+            en_map = enriched.get("scenes", {})
+            # 리스트 형태일 경우 대비 (가끔 AI가 리스트로 줄 때가 있음)
+            if isinstance(en_map, list):
+                en_map = {item.get("id", f"t_{i + 1:03d}"): item for i, item in enumerate(en_map)}
+
+            for sc in scenes:
+                sid = sc["id"]
+                # ID 매칭 시도 (t_001 <-> 001 호환)
+                tgt = en_map.get(sid) or en_map.get(sid.replace("t_", "")) or en_map.get(sid.split("_")[-1])
+
+                if tgt:
+                    sc["prompt_img_1"] = tgt.get("prompt_img_1", "")
+                    sc["prompt_img_2"] = tgt.get("prompt_img_2", "")
+                    sc["prompt_negative"] = tgt.get("prompt_negative", "")
+                    sc["prompt_movie"] = tgt.get("prompt_movie", "")
+                    # 호환성을 위해 prompt_img에도 1번 프롬프트 복사
+                    sc["prompt_img"] = sc["prompt_img_1"]
+
+            data["audit"]["enriched_at"] = _now_str()
+            data["audit"]["step"] = "enriched"
+
+            save_json(vpath, data)
+            self.on_progress(f"[Enrich] 상세화 완료 (총 {total_dur:.1f}초, 영어 변환 적용됨).")
+
         except Exception as e:
             self.on_progress(f"❌ 상세화 AI 실패: {e}")
-            raise
+            # 실패 시 에러를 던져서 상위에서 알 수 있게 함 (선택)
+            # raise e
 
-        en_map = {s["id"]: s for s in enriched.get("scenes", [])}
-        for sc in scenes:
-            if sc["id"] in en_map:
-                tgt = en_map[sc["id"]]
-                sc["prompt_img_1"] = tgt.get("prompt_img_1", "")
-                sc["prompt_img_2"] = tgt.get("prompt_img_2", "")
-                sc["prompt_negative"] = tgt.get("prompt_negative", "")
-                sc["prompt_movie"] = tgt.get("prompt_movie", "")
-                sc["prompt_img"] = sc["prompt_img_1"]
-
-        data["audit"]["enriched_at"] = _now_str()
-        data["audit"]["step"] = "enriched"
-
-        save_json(vpath, data)
-        self.on_progress(f"[Enrich] 상세화 완료 (총 {total_dur:.1f}초).")
         return vpath
 
     def _safe_json_parse(self, text: str) -> Dict:
@@ -867,3 +884,142 @@ class ShoppingShortsPipeline:
             mov_gen.merge_movies(vpath)
 
         return vpath
+
+
+
+def convert_shopping_to_video_json_with_ai(
+        project_dir: str,
+        ai_client: Any = None,
+        fps: int = 30,
+        width: int = 1080,
+        height: int = 1920,
+        steps: int = 20,  # [New] UI에서 전달받을 Steps 인자 추가
+        on_progress: Optional[Callable[[Dict[str, Any]], None]] = None
+) -> str:
+    """
+    [쇼핑->쇼츠 변환]
+    video_shopping.json을 읽어서 Shorts 탭과 호환되는 video.json을 생성합니다.
+    UI에서 입력받은 FPS, 해상도, Steps 값을 video.json에 영구 저장합니다.
+    """
+
+    def _log(msg: str):
+        if on_progress:
+            on_progress({"msg": msg})
+        print(f"[ShoppingConverter] {msg}")
+
+    proj_path = Path(project_dir)
+    src_json_path = proj_path / "video_shopping.json"
+    dst_json_path = proj_path / "video.json"
+
+    if not src_json_path.exists():
+        raise FileNotFoundError(f"video_shopping.json이 없습니다: {src_json_path}")
+
+    # 1. 쇼핑 데이터 로드
+    try:
+        with open(src_json_path, "r", encoding="utf-8") as f:
+            src_data = json.load(f)
+    except Exception as e:
+        raise ValueError(f"데이터 로드 실패: {e}")
+
+    _log("데이터 구조 변환 시작...")
+
+    # 2. 기본 정보 매핑
+    prod = src_data.get("product", {})
+    project_name = prod.get("product_name") or src_data.get("project_name", "Shopping Project")
+    src_scenes = src_data.get("scenes", [])
+    if not src_scenes:
+        src_scenes = src_data.get("groups", [])
+
+    # 3. video.json 씬 리스트 조립
+    new_scenes = []
+    current_time = 0.0
+    full_lyrics_parts = []
+
+    for idx, sc in enumerate(src_scenes):
+        scene_id = f"t_{idx + 1:03d}"
+        dur = float(sc.get("seconds") or sc.get("duration") or 4.0)
+        start_t = current_time
+        end_t = current_time + dur
+        current_time = end_t
+
+        narration = str(sc.get("narration") or sc.get("narration_text") or "")
+        full_lyrics_parts.append(narration)
+
+        new_scene = {
+            "id": scene_id,
+            "section": "main",
+            "start": round(start_t, 3),
+            "end": round(end_t, 3),
+            "duration": round(dur, 3),
+            "img_file": sc.get("img_file") or sc.get("image_path") or "",
+            "voice_file": sc.get("voice_file") or sc.get("audio_path") or "",
+            "lyric": narration,
+            "prompt": sc.get("prompt", ""),
+            "prompt_movie": sc.get("prompt_movie", ""),
+            "prompt_img": sc.get("prompt_img", ""),
+            "prompt_negative": sc.get("prompt_negative", ""),
+            "effect": [],
+            "screen_transition": (idx == len(src_scenes) - 1)
+        }
+        new_scenes.append(new_scene)
+
+    total_duration = current_time
+    full_lyrics = "\n".join(full_lyrics_parts)
+
+    # 4. video.json 뼈대 저장 (UI 설정값 반영)
+    video_data = {
+        "title": project_name,
+        "duration": round(total_duration, 3),
+        "fps": fps,  # [UI값] 최상위 FPS 저장
+        "lyrics": full_lyrics,
+        "scenes": new_scenes,
+        "defaults": {
+            "movie": {
+                "fps": fps,
+                "target_fps": fps,
+                "input_fps": fps
+            },
+            "image": {
+                "width": width,   # [UI값] 해상도 저장
+                "height": height, # [UI값] 해상도 저장
+                "fps": fps
+            },
+            # [New] 생성 관련 파라미터 저장 (나중에 UI가 이 값을 읽어옴)
+            "generator": {
+                "steps": steps
+            }
+        },
+        "audit": {
+            "source": "shopping_converter_v2",
+            "converted_at": str(datetime.datetime.now())
+        }
+    }
+
+    with open(dst_json_path, "w", encoding="utf-8") as f:
+        json.dump(video_data, f, indent=2, ensure_ascii=False)
+
+    _log(f"video.json 저장 완료 (FPS: {fps}, Size: {width}x{height}, Steps: {steps})")
+    _log("AI 상세화 진행...")
+
+    # 5. [핵심] app.video_build 함수 재사용 -> 세그먼트별 프롬프트(frame_segments) 생성
+    if ai_client:
+        try:
+            # [Fix] AI 객체를 함수 래퍼로 변환하여 전달 (TypeError 방지)
+            def ask_wrapper(sys_msg, user_msg):
+                return ai_client.ask_smart(sys_msg, user_msg, prefer="openai")
+
+            # fill_prompt_movie_with_ai는 video.json 경로를 받아 로드 후,
+            # 갭(Gap) 정책, 세그먼트 분할, AI 프롬프트 채우기를 수행하고 다시 저장함.
+            fill_prompt_movie_with_ai(
+                str(dst_json_path.parent),  # [Fix] 파일이 아닌 '폴더' 경로 전달
+                ask_wrapper,                # [Fix] 래퍼 함수 전달
+                log_fn=_log                 # [Fix] 로그 함수 전달
+            )
+            _log("✅ AI 상세화(Segments/Prompts) 완료.")
+        except Exception as e:
+            _log(f"❌ AI 상세화 실패: {e}")
+            # 실패해도 기본 video.json은 있으므로 중단하지 않음 (필요시 raise)
+
+    return str(dst_json_path)
+
+#

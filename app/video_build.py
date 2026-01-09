@@ -3083,73 +3083,6 @@ def build_missing_images_from_story(
 
 
 
-#  이건 뭐지???#  이건 뭐지???#  이건 뭐지???#  이건 뭐지???#  이건 뭐지???#  이건 뭐지???#  이건 뭐지???#  이건 뭐지???
-#  이건 뭐지???#  이건 뭐지???#  이건 뭐지???#  이건 뭐지???#  이건 뭐지???#  이건 뭐지???#  이건 뭐지???#  이건 뭐지???
-#  이건 뭐지???#  이건 뭐지???#  이건 뭐지???#  이건 뭐지???#  이건 뭐지???#  이건 뭐지???#  이건 뭐지???#  이건 뭐지???
-
-S = settings_obj  # noqa: N816  # (하위호환: 기존 코드가 S를 참조해도 동작)
-
-
-
-
-_FACE_RULES = "front-facing, eyes looking at camera, full face visible; photorealistic; no profile, no back view"
-_COMPOSITION = "vertical 9:16, face-centered, cinematic grading"
-_VARIATIONS = [
-    "subtle lighting change",
-    "micro head tilt (still facing camera)",
-    "background depth-of-field shift",
-    "slight camera height change",
-    "gentle lens breathing",
-]
-
-
-
-
-TARGET = Path("app/image_movie_docs.py")
-
-# 들여쓰기 제거 + 멀티라인/도트올 플래그 사용
-_DEMO_BLOCK_RE = re.compile(
-    dedent(r"""
-        ^\s*prefs\s*=\s*load_ui_prefs_for_audio\([^)]*\)\s*
-        .*?
-        ^\s*#\s*out\["defaults"]\s*=\s*defaults.*?$
-    """),
-    re.MULTILINE | re.DOTALL,
-)
-
-# 여분의 ===== 같은 구분선 제거
-_SEP_LINE_RE = re.compile(r"(?m)^\s*=+\s*$")
-
-def verify_demo_block(path: str | Path = TARGET) -> dict:
-    """전역 예시 블록 존재 여부 확인."""
-    p = Path(path)
-    if not p.exists():
-        return {"file": str(p), "exists": False}
-    src = p.read_text(encoding="utf-8")
-    return {"file": str(p), "exists": bool(_DEMO_BLOCK_RE.search(src))}
-
-def strip_demo_block(path: str | Path = TARGET) -> dict:
-    """전역 예시 블록 삭제(.bak 백업 생성)."""
-    p = Path(path)
-    if not p.exists():
-        return {"file": str(p), "changed": False, "backup": None}
-
-    src = p.read_text(encoding="utf-8")
-    new_src = _DEMO_BLOCK_RE.sub("", src)
-    new_src = _SEP_LINE_RE.sub("", new_src)
-    new_src = re.sub(r"\n{3,}", "\n\n", new_src)  # 공백 줄 정리
-
-    if new_src == src:
-        return {"file": str(p), "changed": False, "backup": None}
-
-    bak = p.with_suffix(p.suffix + ".bak")
-    bak.write_text(src, encoding="utf-8")
-    p.write_text(new_src, encoding="utf-8")
-    return {"file": str(p), "changed": True, "backup": str(bak)}
-
-#  이건 뭐지???#  이건 뭐지???#  이건 뭐지???#  이건 뭐지???#  이건 뭐지???#  이건 뭐지???#  이건 뭐지???#  이건 뭐지???
-#  이건 뭐지???#  이건 뭐지???#  이건 뭐지???#  이건 뭐지???#  이건 뭐지???#  이건 뭐지???#  이건 뭐지???#  이건 뭐지???
-#  이건 뭐지???#  이건 뭐지???#  이건 뭐지???#  이건 뭐지???#  이건 뭐지???#  이건 뭐지???#  이건 뭐지???#  이건 뭐지???
 
 
 
@@ -3759,14 +3692,3 @@ def retry_cut_audio_for_scene(project_dir: str, scene_id: str, offset: float) ->
     return str(out_audio)
 
 
-
-
-# ======================= /A안 GPT 적용기 끝 =======================
-
-if __name__ == "__main__":
-    info = verify_demo_block()
-    print("BEFORE:", info)
-    if info["exists"]:
-        print(strip_demo_block())
-    else:
-        print("No demo block found.")

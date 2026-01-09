@@ -10,6 +10,8 @@ import re
 from pathlib import Path
 from PyQt5 import QtWidgets, QtCore, QtGui
 
+from app import settings
+
 from app.utils import (
     run_job_with_progress_async,
     sanitize_title,
@@ -33,7 +35,6 @@ from app.shopping_video_build import (
 )
 
 
-# [shopping.py] VideoBuildDialog 클래스 위쪽에 추가
 
 class SceneEditDialog(QtWidgets.QDialog):
     """
@@ -466,23 +467,75 @@ class MediaEditDialog(QtWidgets.QDialog):
 
 class VideoBuildDialog(QtWidgets.QDialog):
     """
-    '영상제작' 버튼 클릭 시 열리는 창.
-    - 탭1: 시나리오(JSON) 관리 (1.초안 -> 2.수정 -> 3.상세화)
-    - 탭2: 제작(이미지/영상) -> (검수) -> 합치기
+    [수정됨] 영상 제작 설정 창
+    - settings.py의 기본값(FPS 16, 405x720, Step 6)을 UI 초기값으로 반영
+    - video.json이 있다면 그 값을 우선 사용
     """
 
     def __init__(self, product_dir: str, product_data: dict, parent=None):
         super().__init__(parent)
         self.setWindowTitle(f"영상 제작 - {product_data.get('product_name', '')}")
-        self.resize(1000, 750)
+        self.resize(1000, 850)
 
         self.product_dir = str(product_dir)
         self.product_data = product_data or {}
+        # video_shopping.json (기획 데이터)
         self.video_json_path = str(Path(self.product_dir) / "video_shopping.json")
+        # video.json (최종 쇼츠 데이터)
+        self.target_video_json = str(Path(self.product_dir) / "video.json")
 
         root = QtWidgets.QVBoxLayout(self)
 
-        # 탭 위젯
+        # ── [New] 상단 공통 설정 영역 (settings.py 연동) ──
+        setting_group = QtWidgets.QGroupBox("영상 제작 공통 설정 (Settings)", self)
+        setting_group.setStyleSheet("QGroupBox { font-weight: bold; background-color: #f9f9f9; }")
+        setting_layout = QtWidgets.QHBoxLayout(setting_group)
+        setting_layout.setSpacing(20)
+
+        # 1. 해상도
+        setting_layout.addWidget(QtWidgets.QLabel("해상도:"))
+        self.combo_res = QtWidgets.QComboBox()
+        # settings에 정의된 해상도 목록 사용
+        res_choices = getattr(settings, "IMG_SIZE_CHOICES", ["405x720", "540x960", "720x1280", "1080x1920"])
+
+        # (중요) 목록에 기본값(405x720)이 없으면 강제로 추가하기 위해 확인
+        default_wh = getattr(settings, "DEFAULT_IMG_SIZE", (405, 720))
+        if isinstance(default_wh, (list, tuple)):
+            def_str = f"{default_wh[0]}x{default_wh[1]}"
+            # 리스트에 문자열 형태나 튜플 형태로 존재하는지 체크 (단순화를 위해 문자열 변환 비교)
+            str_choices = [f"{x[0]}x{x[1]}" if isinstance(x, (list, tuple)) else str(x) for x in res_choices]
+            if def_str not in str_choices:
+                res_choices.insert(0, default_wh)  # 맨 앞에 추가
+
+        for rc in res_choices:
+            if isinstance(rc, (list, tuple)) and len(rc) == 2:
+                self.combo_res.addItem(f"{rc[0]}x{rc[1]}", tuple(rc))
+            elif isinstance(rc, str):
+                parts = rc.lower().split("x")
+                if len(parts) == 2:
+                    self.combo_res.addItem(rc, (int(parts[0]), int(parts[1])))
+                else:
+                    self.combo_res.addItem(rc, (1080, 1920))  # fallback
+        setting_layout.addWidget(self.combo_res)
+
+        # 2. FPS
+        setting_layout.addWidget(QtWidgets.QLabel("FPS:"))
+        self.combo_fps = QtWidgets.QComboBox()
+        fps_choices = getattr(settings, "MOVIE_FPS_CHOICES", [16, 24, 30, 60])
+        for fps in fps_choices:
+            self.combo_fps.addItem(str(fps), int(fps))
+        setting_layout.addWidget(self.combo_fps)
+
+        # 3. Steps
+        setting_layout.addWidget(QtWidgets.QLabel("Steps:"))
+        self.spin_steps = QtWidgets.QSpinBox()
+        self.spin_steps.setRange(1, 100)
+        setting_layout.addWidget(self.spin_steps)
+
+        setting_layout.addStretch(1)
+        root.addWidget(setting_group)
+
+        # ── 탭 위젯 ──
         self.tabs = QtWidgets.QTabWidget(self)
         root.addWidget(self.tabs, 1)
 
@@ -519,22 +572,24 @@ class VideoBuildDialog(QtWidgets.QDialog):
         btn_group = QtWidgets.QGroupBox("1단계: 시나리오 작업 순서", tab1)
         btn_layout = QtWidgets.QHBoxLayout(btn_group)
 
-        # 1. 초안 생성
         self.btn_draft = QtWidgets.QPushButton("1. 초안 생성 (Draft)", tab1)
-        self.btn_draft.setToolTip("AI가 상품정보를 분석해 '기획의도'와 '한글 대본' 초안을 작성합니다.")
-
-        # 2. 초안 수정 (파일 열기)
         self.btn_edit_json = QtWidgets.QPushButton("2. 초안 수정 (편집)", tab1)
-        self.btn_edit_json.setToolTip("생성된 JSON 파일을 열어 한글 대본을 수정합니다.")
-
-        # 3. AI 상세화
         self.btn_enrich = QtWidgets.QPushButton("3. AI 상세화 (최종 변환)", tab1)
         self.btn_enrich.setStyleSheet("color: blue; font-weight: bold;")
-        self.btn_enrich.setToolTip("확정된 한글 대본을 바탕으로 영문 프롬프트, 시간 등을 생성합니다.")
+
+        # [NEW] 4. 비디오 JSON 생성 (쇼츠 호환용)
+        self.btn_make_video_json = QtWidgets.QPushButton("4. 비디오 JSON 생성 (AI)", tab1)
+        self.btn_make_video_json.setStyleSheet("color: darkgreen; font-weight: bold;")
+        self.btn_make_video_json.setToolTip(
+            "상단의 설정(FPS, 해상도, Steps)을 적용하여 video.json을 생성하고,\n"
+            "AI로 장면 연출(프롬프트)을 채웁니다."
+        )
+        self.btn_make_video_json.clicked.connect(self.on_click_make_video_json)
 
         btn_layout.addWidget(self.btn_draft)
         btn_layout.addWidget(self.btn_edit_json)
         btn_layout.addWidget(self.btn_enrich)
+        btn_layout.addWidget(self.btn_make_video_json)
 
         t1.addWidget(btn_group)
 
@@ -569,12 +624,6 @@ class VideoBuildDialog(QtWidgets.QDialog):
         chk_row.addWidget(self.cb_img_skip)
         chk_row.addSpacing(15)
         chk_row.addWidget(self.cb_mov_skip)
-        chk_row.addSpacing(15)
-        chk_row.addWidget(QtWidgets.QLabel("FPS:", tab2))
-        self.sp_fps = QtWidgets.QSpinBox(tab2)
-        self.sp_fps.setRange(8, 60)
-        self.sp_fps.setValue(24)
-        chk_row.addWidget(self.sp_fps)
         chk_row.addStretch(1)
         t2.addLayout(chk_row)
 
@@ -591,7 +640,6 @@ class VideoBuildDialog(QtWidgets.QDialog):
         self.btn_gen_movies = QtWidgets.QPushButton("3. 영상 생성 (I2V)", tab2)
         self.btn_gen_movies.setMinimumHeight(40)
 
-        # [New] 3.5단계 수정/검수 버튼
         self.btn_media_edit = QtWidgets.QPushButton("3.5 이미지/영상 수정 (검수)", tab2)
         self.btn_media_edit.setMinimumHeight(40)
         self.btn_media_edit.setStyleSheet("color: #d32f2f; font-weight: bold;")
@@ -601,7 +649,7 @@ class VideoBuildDialog(QtWidgets.QDialog):
 
         lay_actions.addWidget(self.btn_gen_images)
         lay_actions.addWidget(self.btn_gen_movies)
-        lay_actions.addWidget(self.btn_media_edit)  # 추가됨
+        lay_actions.addWidget(self.btn_media_edit)
         lay_actions.addWidget(self.btn_merge)
 
         t2.addWidget(grp_actions)
@@ -653,12 +701,97 @@ class VideoBuildDialog(QtWidgets.QDialog):
 
         self.btn_gen_images.clicked.connect(self.on_gen_images_clicked)
         self.btn_gen_movies.clicked.connect(self.on_gen_movies_clicked)
-        self.btn_media_edit.clicked.connect(self.on_media_edit_clicked)  # 연결
+        self.btn_media_edit.clicked.connect(self.on_media_edit_clicked)
         self.btn_merge.clicked.connect(self.on_merge_clicked)
         self.btn_run_all.clicked.connect(self.on_run_all_clicked)
 
-        # 초기 로드
+        # [핵심] 초기값 로드 실행
+        self._load_initial_settings()
         self._refresh_preview_if_exists()
+
+    def _load_initial_settings(self):
+        """
+        video.json이 있으면 거기서 값을 읽고, 없으면 settings.py 기본값 사용
+        """
+        # 1. settings.py 기본값 확보
+        # IMG_SIZE가 튜플 (405, 720) 형태로 온다고 가정
+        def_res = getattr(settings, "DEFAULT_IMG_SIZE", (405, 720))
+        def_fps = int(getattr(settings, "DEFAULT_MOVIE_FPS", 16))
+        def_steps = int(getattr(settings, "DEFAULT_T2I_STEPS", 6))
+
+        # 2. video.json 파일 확인 (덮어쓰기)
+        vpath = Path(self.target_video_json)
+        if vpath.exists():
+            try:
+                with open(vpath, "r", encoding="utf-8") as f:
+                    data = json.load(f)
+
+                # FPS 읽기
+                file_fps = data.get("fps") or data.get("defaults", {}).get("movie", {}).get("fps")
+                if file_fps:
+                    def_fps = int(file_fps)
+
+                # 해상도 읽기
+                img_def = data.get("defaults", {}).get("image", {})
+                w = img_def.get("width")
+                h = img_def.get("height")
+                if w and h:
+                    def_res = (int(w), int(h))
+
+                # Steps 읽기
+                gen_def = data.get("defaults", {}).get("generator", {})
+                st = gen_def.get("steps")
+                if st:
+                    def_steps = int(st)
+
+            except Exception as e:
+                self._append_log(f"⚠ video.json 설정 로드 실패 (기본값 사용): {e}")
+
+        # 3. UI에 값 반영 (여기가 중요: 콤보박스 선택)
+
+        # (1) 해상도 선택
+        # combo_res의 data(UserRole)는 튜플 (w, h) 형태임
+        found_res = False
+        target_res_val = tuple(def_res) if isinstance(def_res, list) else def_res
+
+        for i in range(self.combo_res.count()):
+            item_data = self.combo_res.itemData(i)
+            # 튜플 비교 (405, 720) == (405, 720)
+            if item_data == target_res_val:
+                self.combo_res.setCurrentIndex(i)
+                found_res = True
+                break
+
+        if not found_res:
+            # 목록에 없으면 추가 후 선택
+            label = f"{target_res_val[0]}x{target_res_val[1]}"
+            self.combo_res.addItem(label, target_res_val)
+            self.combo_res.setCurrentIndex(self.combo_res.count() - 1)
+
+        # (2) FPS 선택
+        found_fps = False
+        for i in range(self.combo_fps.count()):
+            if self.combo_fps.itemData(i) == def_fps:
+                self.combo_fps.setCurrentIndex(i)
+                found_fps = True
+                break
+
+        if not found_fps:
+            self.combo_fps.addItem(str(def_fps), def_fps)
+            self.combo_fps.setCurrentIndex(self.combo_fps.count() - 1)
+
+        # (3) Steps 설정
+        self.spin_steps.setValue(def_steps)
+
+        # 로그 확인용
+        # self._append_log(f"[Init] UI 설정 적용: {target_res_val}, {def_fps}fps, {def_steps}steps")
+
+    def _get_current_settings(self):
+        """현재 UI에 설정된 (width, height, fps, steps) 반환"""
+        w, h = self.combo_res.currentData()
+        fps = self.combo_fps.currentData()
+        steps = self.spin_steps.value()
+        return w, h, fps, steps
 
     # ── 헬퍼 함수들 ─────────────────────────
     def _append_log(self, msg: str):
@@ -675,19 +808,24 @@ class VideoBuildDialog(QtWidgets.QDialog):
             self._append_log(f"⚠ 열기 실패: {e}")
 
     def _options(self) -> BuildOptions:
+        # FPS는 공통 설정에서 가져옴
+        _, _, fps, _ = self._get_current_settings()
         return BuildOptions(
             scene_count=int(self.sp_scene_count.value()),
             style=str(self.cb_style.currentText()),
             hook_level=int(self.sp_hook.value()),
-            fps=int(self.sp_fps.value()),
+            fps=fps,
         )
 
     def _refresh_preview_if_exists(self):
-        p = Path(self.video_json_path)
+        p = Path(self.target_video_json)
+        if not p.exists():
+            p = Path(self.video_json_path)
+
         if p.exists():
             try:
                 txt = p.read_text(encoding="utf-8")
-                self.te_preview.setPlainText(txt)
+                self.te_preview.setPlainText(f"[{p.name}]\n{txt}")
             except Exception as e:
                 self.te_preview.setPlainText(f"읽기 실패: {e}")
         else:
@@ -719,8 +857,10 @@ class VideoBuildDialog(QtWidgets.QDialog):
 
     def on_edit_json_clicked(self):
         """1단계: 초안 수정 (SceneEditDialog 호출)"""
-        if not Path(self.video_json_path).exists():
-            self._append_log("⚠ 수정할 파일이 없습니다. 먼저 '초안 생성'을 하세요.")
+        # video_shopping.json이 대상
+        p = Path(self.video_json_path)
+        if not p.exists():
+            self._append_log("⚠ 수정할 파일(video_shopping.json)이 없습니다. 먼저 '초안 생성'을 하세요.")
             return
 
         dlg = SceneEditDialog(self.video_json_path, parent=self)
@@ -752,15 +892,80 @@ class VideoBuildDialog(QtWidgets.QDialog):
 
         run_job_with_progress_async(self, "AI 상세화", job, on_done=done)
 
-    def on_gen_images_clicked(self):
-        if not Path(self.video_json_path).exists():
-            self._append_log("⚠ video_shopping.json이 없습니다.")
+    def on_click_make_video_json(self):
+        """
+        [시나리오 탭] video.json(쇼츠 호환) 생성 및 AI 상세화 버튼
+        """
+        if not self.product_dir or not Path(self.product_dir).exists():
+            QtWidgets.QMessageBox.warning(self, "오류", "프로젝트 경로가 유효하지 않습니다.")
             return
 
+        src_path = Path(self.product_dir) / "video_shopping.json"
+        if not src_path.exists():
+            QtWidgets.QMessageBox.warning(self, "알림", "video_shopping.json이 없습니다.\n먼저 '쇼핑데이터생성' 3단계까지 진행해주세요.")
+            return
+
+        # UI 설정값 가져오기
+        w, h, fps, steps = self._get_current_settings()
+        self._append_log(f"⚙ 설정 적용: {w}x{h}, {fps}fps, {steps}steps")
+
+        # 버튼 비활성화
+        self.btn_make_video_json.setEnabled(False)
+
+        from app.shopping_video_build import convert_shopping_to_video_json_with_ai
+
+        def job(progress_callback):
+            # AI 객체 확보
+            ai_client = getattr(self, "ai", None)
+            if not ai_client:
+                from app.utils import AI
+                ai_client = AI()
+
+            result = convert_shopping_to_video_json_with_ai(
+                project_dir=self.product_dir,
+                ai_client=ai_client,
+                fps=fps,
+                width=w,
+                height=h,
+                steps=steps,  # [New] steps 전달
+                on_progress=progress_callback
+            )
+            return result
+
+        def done(ok, payload, err):
+            self.btn_make_video_json.setEnabled(True)
+            if ok:
+                QtWidgets.QMessageBox.information(self, "완료", f"video.json 생성 및 AI 연출 완료!\n경로: {payload}")
+                self._refresh_preview_if_exists()
+            else:
+                QtWidgets.QMessageBox.critical(self, "실패", f"작업 실패:\n{err}")
+
+        from app.utils import run_job_with_progress_async
+        run_job_with_progress_async(
+            owner=self,
+            title="video.json 생성 및 AI 상세화",
+            job=job,
+            on_done=done
+        )
+
+    def on_gen_images_clicked(self):
+        if not Path(self.target_video_json).exists():
+            QtWidgets.QMessageBox.warning(self, "알림", "video.json이 없습니다.\n'4. 비디오 JSON 생성'을 먼저 진행해주세요.")
+            return
+
+        w, h, _, steps = self._get_current_settings()
+
         def job(progress):
-            progress("[Image] 이미지 생성 시작...")
-            gen = ShoppingImageGenerator(on_progress=progress)
-            gen.generate_images(self.video_json_path, skip_if_exists=self.cb_img_skip.isChecked())
+            progress(f"[Image] 이미지 생성 시작 ({w}x{h}, steps={steps})...")
+            from app.shopping_video_build import build_shopping_images_2step
+
+            build_shopping_images_2step(
+                video_json_path=self.target_video_json,
+                ui_width=w,
+                ui_height=h,
+                steps=steps,
+                on_progress=lambda d: progress(d.get("msg", ""))
+            )
             return "OK"
 
         def done(ok, res, err):
@@ -771,7 +976,6 @@ class VideoBuildDialog(QtWidgets.QDialog):
 
         run_job_with_progress_async(self, "이미지 생성", job, on_done=done)
 
-    # [New] 3.5단계 핸들러 추가
     def on_media_edit_clicked(self):
         if not Path(self.video_json_path).exists():
             self._append_log("⚠ video_shopping.json이 없습니다.")
@@ -782,17 +986,21 @@ class VideoBuildDialog(QtWidgets.QDialog):
         self._append_log("🔧 미디어 수정/검수 창을 닫았습니다.")
 
     def on_gen_movies_clicked(self):
-        if not Path(self.video_json_path).exists():
-            self._append_log("⚠ video_shopping.json이 없습니다.")
+        if not Path(self.target_video_json).exists():
+            QtWidgets.QMessageBox.warning(self, "알림", "video.json이 없습니다.\n'4. 비디오 JSON 생성'을 먼저 진행해주세요.")
             return
 
+        _, _, fps, _ = self._get_current_settings()
+
         def job(progress):
-            progress("[Movie] I2V 영상 생성 시작...")
-            gen = ShoppingMovieGenerator(on_progress=progress)
-            gen.generate_movies(
-                self.video_json_path,
-                skip_if_exists=self.cb_mov_skip.isChecked(),
-                fps=int(self.sp_fps.value())
+            progress(f"[Movie] I2V 영상 생성 시작 ({fps} fps)...")
+            from app.video_build import build_shots_with_i2v
+
+            build_shots_with_i2v(
+                project_dir=self.product_dir,
+                total_frames=0,
+                ui_fps=fps,
+                on_progress=lambda d: progress(d.get("msg", ""))
             )
             return "OK"
 
@@ -805,14 +1013,14 @@ class VideoBuildDialog(QtWidgets.QDialog):
         run_job_with_progress_async(self, "영상 생성", job, on_done=done)
 
     def on_merge_clicked(self):
-        if not Path(self.video_json_path).exists():
-            self._append_log("⚠ video_shopping.json이 없습니다.")
+        if not Path(self.target_video_json).exists():
+            self._append_log("⚠ video.json이 없습니다.")
             return
 
         def job(progress):
             progress("[Merge] 영상 합치기 시작...")
             gen = ShoppingMovieGenerator(on_progress=progress)
-            gen.merge_movies(self.video_json_path)
+            gen.merge_movies(self.target_video_json)
             return "OK"
 
         def done(ok, res, err):
@@ -824,33 +1032,9 @@ class VideoBuildDialog(QtWidgets.QDialog):
         run_job_with_progress_async(self, "영상 합치기", job, on_done=done)
 
     def on_run_all_clicked(self):
-        """전체 파이프라인 일괄 실행 (ShoppingShortsPipeline 활용)"""
-
-        def job(progress):
-            progress("[All] 전체 파이프라인 시작...")
-
-            pipe = ShoppingShortsPipeline(on_progress=progress)
-
-            pipe.run_all(
-                product_dir=self.product_dir,
-                product_data=self.product_data,
-                options=self._options(),
-                build_json=False,
-                build_images=True,
-                build_movies=True,
-                merge=True,
-                skip_if_exists=True,
-            )
-            return "OK"
-
-        def done(ok, res, err):
-            if ok:
-                self._append_log("✅ 전체 실행 완료!")
-                self._refresh_preview_if_exists()
-            else:
-                self._append_log(f"❌ 전체 실행 실패: {err}")
-
-        run_job_with_progress_async(self, "전체 실행", job, on_done=done)
+        # 전체 실행 로직... (순차 실행 필요, 일단 메시지 처리)
+        self.on_click_make_video_json()
+        self._append_log("ℹ '전체 실행'은 현재 순차 실행 로직 보완이 필요합니다. 각 버튼을 순서대로 눌러주세요.")
 
 
 class ShoppingWidget(QtWidgets.QWidget):

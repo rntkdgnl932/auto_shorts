@@ -5700,7 +5700,7 @@ class MainWindow(QtWidgets.QMainWindow):
         h_candidates_val = sorted(list(h_candidates_set))
 
         fps_choices_val = getattr(settings_mod, "MOVIE_FPS_CHOICES", [16, 24, 30, 60])
-        default_fps_val = int(getattr(settings_mod, "DEFAULT_MOVIE_FPS", 30))
+        default_fps_val = int(getattr(settings_mod, "DEFAULT_MOVIE_FPS", 16))
         default_steps_val = int(getattr(settings_mod, "DEFAULT_T2I_STEPS", 6))
 
         presets_data = [
