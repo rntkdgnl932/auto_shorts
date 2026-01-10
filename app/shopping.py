@@ -224,6 +224,8 @@ class SceneEditDialog(QtWidgets.QDialog):
             QtWidgets.QMessageBox.critical(self, "저장 실패", f"파일 저장 중 오류가 발생했습니다:\n{e}")
 
 
+
+
 class MediaEditDialog(QtWidgets.QDialog):
     """
     [수정됨] 3.5단계 이미지/영상 수정 및 검수 다이얼로그 (2-Step 프롬프트 적용)
@@ -311,11 +313,22 @@ class MediaEditDialog(QtWidgets.QDialog):
         lbl_info.setStyleSheet("color: #555; margin-bottom: 5px;")
         left_layout.addWidget(lbl_info)
 
-        # 2. 이미지 미리보기
+        # 2. 이미지 미리보기 (수정됨: 클릭 이벤트 추가)
         lbl_img = QtWidgets.QLabel()
         lbl_img.setFixedSize(300, 300)
         lbl_img.setStyleSheet("background-color: #eee; border: 1px solid #aaa;")
         lbl_img.setAlignment(QtCore.Qt.AlignCenter)
+        lbl_img.setCursor(QtCore.Qt.PointingHandCursor)  # 마우스 올리면 손가락 모양
+        lbl_img.setToolTip("클릭하면 원본 크기로 봅니다.")
+
+        # [핵심] 클릭 이벤트 바인딩 (람다로 sid 캡처)
+        # QLabel은 clicked 시그널이 없으므로 mousePressEvent를 오버라이딩
+        def on_img_click(event):
+            if event.button() == QtCore.Qt.LeftButton:
+                self.on_view_full_image(sid)
+
+        lbl_img.mousePressEvent = on_img_click
+
         self._refresh_preview(sid, lbl_img)  # 이미지 로드
         left_layout.addWidget(lbl_img)
 
@@ -410,19 +423,44 @@ class MediaEditDialog(QtWidgets.QDialog):
             QtWidgets.QMessageBox.critical(self, "오류", f"이미지 변경 실패: {e}")
 
     def on_delete_image(self, sid: str, label: QtWidgets.QLabel):
-        """2. 이미지 삭제"""
-        target_path = self.imgs_dir / f"{sid}.png"
-        if not target_path.exists():
+        """
+        2. 이미지 삭제 (수정됨)
+        - [Step 2] 완성본({sid}.png) 뿐만 아니라
+        - [Step 1] 베이스(temp_{sid}.png) 이미지도 함께 삭제합니다.
+        """
+        # 경로 정의
+        final_path = self.imgs_dir / f"{sid}.png"  # Step 2 결과물
+        temp_path = self.imgs_dir / f"temp_{sid}.png"  # Step 1 결과물
+
+        # 둘 다 없으면 삭제할 게 없음
+        if not final_path.exists() and not temp_path.exists():
+            QtWidgets.QMessageBox.information(self, "알림", "삭제할 이미지가 없습니다.")
             return
 
         reply = QtWidgets.QMessageBox.question(
-            self, "삭제 확인", "정말 이 이미지를 삭제하시겠습니까?",
+            self, "이미지 완전 삭제",
+            f"Scene {sid}의 이미지를 삭제하시겠습니까?\n\n"
+            "⚠️ 주의: [Step 1: 베이스]와 [Step 2: 완성본]이 모두 삭제됩니다.\n"
+            "재생성 시 '배경/인물'부터 다시 생성하게 됩니다.",
             QtWidgets.QMessageBox.Yes | QtWidgets.QMessageBox.No
         )
+
         if reply == QtWidgets.QMessageBox.Yes:
             try:
-                os.remove(target_path)
+                deleted_msg = []
+                # Step 2 삭제 시도
+                if final_path.exists():
+                    os.remove(final_path)
+                    deleted_msg.append("완성본")
+
+                # Step 1 삭제 시도
+                if temp_path.exists():
+                    os.remove(temp_path)
+                    deleted_msg.append("베이스(Temp)")
+
                 self._refresh_preview(sid, label)
+                QtWidgets.QMessageBox.information(self, "삭제 완료", f"{', '.join(deleted_msg)} 이미지가 삭제되었습니다.")
+
             except Exception as e:
                 QtWidgets.QMessageBox.critical(self, "오류", f"삭제 실패: {e}")
 
@@ -476,6 +514,57 @@ class MediaEditDialog(QtWidgets.QDialog):
         else:
             self.accept()
 
+    def on_view_full_image(self, sid: str):
+        """[New] 원본 이미지 팝업 열기"""
+        img_path = self.imgs_dir / f"{sid}.png"
+        if not img_path.exists():
+            # 혹시 Step 2가 없고 Step 1만 있을 경우도 대비
+            img_path = self.imgs_dir / f"temp_{sid}.png"
+
+        if img_path.exists():
+            viewer = ImageViewerDialog(str(img_path), parent=self)
+            viewer.exec_()
+        else:
+            QtWidgets.QMessageBox.warning(self, "알림", "확인할 이미지가 없습니다.")
+
+
+class ImageViewerDialog(QtWidgets.QDialog):
+    """
+    [New] 이미지를 스크롤 가능한 원본 크기로 보여주는 다이얼로그
+    """
+    def __init__(self, img_path: str, parent=None):
+        super().__init__(parent)
+        self.setWindowTitle(f"원본 이미지 보기: {Path(img_path).name}")
+        self.resize(1000, 900)  # 기본 창 크기
+
+        layout = QtWidgets.QVBoxLayout(self)
+
+        # 스크롤 영역 (이미지가 화면보다 클 수 있으므로)
+        scroll = QtWidgets.QScrollArea(self)
+        scroll.setWidgetResizable(True)
+        layout.addWidget(scroll)
+
+        # 이미지 라벨
+        self.lbl_image = QtWidgets.QLabel()
+        self.lbl_image.setAlignment(QtCore.Qt.AlignCenter)
+        self.lbl_image.setStyleSheet("background-color: #333;") # 배경을 어둡게 해서 이미지 집중
+
+        # 이미지 로드
+        pix = QtGui.QPixmap(img_path)
+        if not pix.isNull():
+            self.lbl_image.setPixmap(pix)
+            # 이미지가 너무 작으면 적당히 확대할 수도 있지만, 원본 확인용이라 그대로 둠
+        else:
+            self.lbl_image.setText("이미지를 불러올 수 없습니다.")
+            self.lbl_image.setStyleSheet("color: white;")
+
+        scroll.setWidget(self.lbl_image)
+
+        # 닫기 버튼
+        btn_close = QtWidgets.QPushButton("닫기", self)
+        btn_close.setMinimumHeight(40)
+        btn_close.clicked.connect(self.accept)
+        layout.addWidget(btn_close)
 
 class VideoBuildDialog(QtWidgets.QDialog):
     """

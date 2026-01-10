@@ -1100,7 +1100,7 @@ def convert_shopping_to_video_json_with_ai(
         fps: int = 30,
         width: int = 1080,
         height: int = 1920,
-        steps: int = 20,  # [New] UI에서 전달받을 Steps 인자 추가
+        steps: int = 20,
         on_progress: Optional[Callable[[Dict[str, Any]], None]] = None
 ) -> str:
     """
@@ -1143,7 +1143,16 @@ def convert_shopping_to_video_json_with_ai(
     full_lyrics_parts = []
 
     for idx, sc in enumerate(src_scenes):
-        scene_id = f"t_{idx + 1:03d}"
+        # =========================================================================
+        # [수정] ID 통일성 유지: 원본 ID가 있으면 그대로 사용, 없으면 t_001 생성
+        # 이렇게 해야 이미지 파일명(001.png vs t_001.png) 불일치가 사라짐
+        # =========================================================================
+        original_id = str(sc.get("id", "")).strip()
+        if original_id:
+            scene_id = original_id
+        else:
+            scene_id = f"t_{idx + 1:03d}"
+
         dur = float(sc.get("seconds") or sc.get("duration") or 4.0)
         start_t = current_time
         end_t = current_time + dur
@@ -1187,11 +1196,11 @@ def convert_shopping_to_video_json_with_ai(
                 "input_fps": fps
             },
             "image": {
-                "width": width,   # [UI값] 해상도 저장
-                "height": height, # [UI값] 해상도 저장
+                "width": width,  # [UI값] 해상도 저장
+                "height": height,  # [UI값] 해상도 저장
                 "fps": fps
             },
-            # [New] 생성 관련 파라미터 저장 (나중에 UI가 이 값을 읽어옴)
+            # [New] 생성 관련 파라미터 저장
             "generator": {
                 "steps": steps
             }
@@ -1208,24 +1217,20 @@ def convert_shopping_to_video_json_with_ai(
     _log(f"video.json 저장 완료 (FPS: {fps}, Size: {width}x{height}, Steps: {steps})")
     _log("AI 상세화 진행...")
 
-    # 5. [핵심] app.video_build 함수 재사용 -> 세그먼트별 프롬프트(frame_segments) 생성
+    # 5. AI 상세화 (세그먼트 생성)
     if ai_client:
         try:
-            # [Fix] AI 객체를 함수 래퍼로 변환하여 전달 (TypeError 방지)
             def ask_wrapper(sys_msg, user_msg):
                 return ai_client.ask_smart(sys_msg, user_msg, prefer="openai")
 
-            # fill_prompt_movie_with_ai는 video.json 경로를 받아 로드 후,
-            # 갭(Gap) 정책, 세그먼트 분할, AI 프롬프트 채우기를 수행하고 다시 저장함.
             fill_prompt_movie_with_ai(
-                str(dst_json_path.parent),  # [Fix] 파일이 아닌 '폴더' 경로 전달
-                ask_wrapper,                # [Fix] 래퍼 함수 전달
-                log_fn=_log                 # [Fix] 로그 함수 전달
+                str(dst_json_path.parent),
+                ask_wrapper,
+                log_fn=_log
             )
             _log("✅ AI 상세화(Segments/Prompts) 완료.")
         except Exception as e:
             _log(f"❌ AI 상세화 실패: {e}")
-            # 실패해도 기본 video.json은 있으므로 중단하지 않음 (필요시 raise)
 
     return str(dst_json_path)
 #
