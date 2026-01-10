@@ -1249,6 +1249,7 @@ def generate_music_with_acestep(
         * 긍정 프롬프트 박스 + UI 태그를 결합하여 Node 14('tags')에 주입.
         * Node 74('lyrics')에는 순수 가사만 주입.
     - lyrics_lls_after 복원 등 이전 수정사항 유지.
+    - [추가] 부정 프롬프트(negative tags)를 Node 80(CLIPTextEncode.text)에 주입하여 KSampler negative로 반영.
     """
 
     # --- 내부 헬퍼 함수 ---
@@ -1299,7 +1300,6 @@ def generate_music_with_acestep(
                         inputs_map_local[bd_key] = 16
         return ".wav"
 
-    # --- Comfy API 호출 로직 (generate_music_with_acestep 함수 내부에 통합) ---
     def _call_comfy_api_for_ko_chunk(text_chunk: str, host_address: str) -> str:
         """
         한글 덩어리를 전용 워크플로우로 변환 시도. (v12 파싱 로직 유지)
@@ -1558,9 +1558,17 @@ def generate_music_with_acestep(
             if sampler_id in graph_loaded:
                 graph_loaded[sampler_id].setdefault("inputs", {})["seed"] = _rand_seed()
                 _dlog("INJECT", f"Node {sampler_id} (Seed)")
-            if negative_tags:
-                _dlog("INFO",
-                      f"Negative tags ({len(negative_tags)}) not injected (expected behavior, uses prompt_neg).")
+
+            # (추가) 부정 프롬프트(negative tags)도 워크플로에 주입
+            # ace_step_1_t2mm.json 기준: Node 80(CLIPTextEncode.text) → KSampler.negative 입력
+            neg_txt_id = "80"
+            neg_string = ", ".join(negative_tags).strip()
+            if neg_txt_id in graph_loaded:
+                graph_loaded[neg_txt_id].setdefault("inputs", {})["text"] = neg_string
+                _dlog("INJECT", f"Node {neg_txt_id} (Negative Prompt) len={len(neg_string)}")
+            else:
+                if neg_string:
+                    _dlog("WARN", f"Negative prompt node {neg_txt_id} not found. negative will be ignored.")
         except Exception as e:
             _dlog(f"[ERROR] Main WF injection failed: {e}")
             raise
@@ -1595,12 +1603,6 @@ def generate_music_with_acestep(
                         if not fn or fn.startswith("ComfyUI_temp_"):
                             continue
                         sf_norm = sf.replace("\\", "/").lstrip("/")
-
-                        # [수정] 엄격한 서브폴더 검사 비활성화
-                        # SaveAudio 노드 종류에 따라 subfolder가 비어서 오거나 경로가 다를 수 있음.
-                        # 해당 prompt_id에 대한 결과이므로 무조건 다운로드 시도.
-                        # if not sf_norm.startswith(subfolder_path):
-                        #     continue
 
                         try:
                             dl_file = _download_output_file(base_host, fn, sf_norm, out_dir=proj)
@@ -1743,6 +1745,7 @@ def generate_music_with_acestep(
     _dlog("LEAVE", summary_final.replace("\n", " | "))
     notify("finished", summary=summary_final)
     return summary_final
+
 
 
 

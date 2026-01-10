@@ -9,7 +9,7 @@ import os
 import re
 from pathlib import Path
 from PyQt5 import QtWidgets, QtCore, QtGui
-
+from typing import List
 from app import settings
 
 from app.utils import (
@@ -38,13 +38,13 @@ from app.shopping_video_build import (
 
 class SceneEditDialog(QtWidgets.QDialog):
     """
-    [수정됨] 씬별 기획 + 캐릭터/성별 수정 (상단 배치)
+    [수정됨] 씬별 기획 + 캐릭터/성별 + 배경음(BGM) 수정 (상단 배치)
     """
 
     def __init__(self, json_path: str, parent=None):
         super().__init__(parent)
-        self.setWindowTitle("시나리오 초안 및 캐릭터 설정 수정")
-        self.resize(950, 850)
+        self.setWindowTitle("시나리오 초안 및 상세 설정 수정")
+        self.resize(950, 900)  # 높이 약간 증가
         self.json_path = Path(json_path)
 
         self.data = load_json(self.json_path, {})
@@ -53,8 +53,8 @@ class SceneEditDialog(QtWidgets.QDialog):
 
         layout = QtWidgets.QVBoxLayout(self)
 
-        # ─── 상단: 캐릭터 & 성별 설정 (AI가 초안에서 제안한 값 표시/수정) ───
-        char_group = QtWidgets.QGroupBox("👤 메인 캐릭터 & 성별 설정 (AI 제안값 수정)", self)
+        # ─── 상단: 기획 설정 (성별, 캐릭터, BGM) ───
+        char_group = QtWidgets.QGroupBox("👤 기획 설정 (캐릭터/성별/BGM)", self)
         char_group.setStyleSheet(
             "QGroupBox { font-weight: bold; border: 2px solid #0078d7; margin-top: 10px; background-color: #f0f8ff; } "
             "QGroupBox::title { subcontrol-origin: margin; left: 10px; padding: 0 5px; color: #0078d7; }")
@@ -64,7 +64,6 @@ class SceneEditDialog(QtWidgets.QDialog):
         self.cb_gender = QtWidgets.QComboBox()
         self.cb_gender.addItems(["Female", "Male"])
         current_gender = str(self.meta.get("voice_gender", "female")).capitalize()
-        # AI가 잡아준 성별을 기본으로 선택
         if "Male" in current_gender:
             self.cb_gender.setCurrentText("Male")
         else:
@@ -76,9 +75,17 @@ class SceneEditDialog(QtWidgets.QDialog):
         self.le_char = QtWidgets.QLineEdit(char_val)
         self.le_char.setPlaceholderText("예: Stylish 30s urban news anchor")
         self.le_char.setStyleSheet("background-color: white; padding: 5px; font-weight: bold;")
-
         char_layout.addRow("캐릭터 컨셉 (EN):", self.le_char)
-        char_layout.addRow(QtWidgets.QLabel("* AI가 제안한 캐릭터가 마음에 들지 않으면 여기서 수정하세요. 모든 장면에 적용됩니다."))
+
+        # [New] 3. 배경음(BGM) 프롬프트
+        bgm_val = self.meta.get("bgm_prompt", "")
+        self.te_bgm = QtWidgets.QPlainTextEdit(bgm_val)
+        self.te_bgm.setPlaceholderText("예: instrumental, background music, calm, piano, loopable...")
+        self.te_bgm.setMaximumHeight(60)
+        self.te_bgm.setStyleSheet("background-color: white; padding: 5px;")
+        char_layout.addRow("배경음(BGM) 설정:", self.te_bgm)
+
+        char_layout.addRow(QtWidgets.QLabel("* AI가 제안한 설정이 마음에 들지 않으면 여기서 수정하세요. BGM은 '상세화' 단계에서 생성됩니다."))
 
         layout.addWidget(char_group)
 
@@ -171,12 +178,17 @@ class SceneEditDialog(QtWidgets.QDialog):
         layout.addLayout(btn_box)
 
     def on_save(self):
-        # 1. 메인 설정 저장 (성별 & 캐릭터)
+        # 1. 메인 설정 저장 (성별 & 캐릭터 & BGM)
         self.meta["voice_gender"] = self.cb_gender.currentText().lower()
 
         new_char = self.le_char.text().strip()
         if new_char:
             self.meta["character_prompt"] = new_char
+
+        # [New] BGM 저장
+        new_bgm = self.te_bgm.toPlainText().strip()
+        if new_bgm:
+            self.meta["bgm_prompt"] = new_bgm
 
         # 2. 씬별 내용 저장
         changed_count = 0
@@ -206,7 +218,7 @@ class SceneEditDialog(QtWidgets.QDialog):
 
         try:
             save_json(self.json_path, self.data)
-            QtWidgets.QMessageBox.information(self, "저장 완료", f"캐릭터 설정 및 {changed_count}개 장면이 수정되었습니다.")
+            QtWidgets.QMessageBox.information(self, "저장 완료", f"기획 설정 및 {changed_count}개 장면이 수정되었습니다.")
             self.accept()
         except Exception as e:
             QtWidgets.QMessageBox.critical(self, "저장 실패", f"파일 저장 중 오류가 발생했습니다:\n{e}")
@@ -1044,6 +1056,8 @@ class ShoppingWidget(QtWidgets.QWidget):
 
     def __init__(self, parent=None):
         super().__init__(parent)
+        self.products_dir = Path(r"C:\my_games\shorts_make\products")
+        self.products_dir.mkdir(parents=True, exist_ok=True)
         self._uploaded_image_path = ""  # 사용자가 업로드한 이미지 원본 경로
         self._build_ui()
         self._wire_signals()
@@ -1822,100 +1836,60 @@ class ShoppingWidget(QtWidgets.QWidget):
         return result
 
     def on_load_registered_clicked(self):
-        """
-        등록된 상품 불러오기:
-        - 등록상품을 스캔해서 선택(멀티)
-        - 좌측 트리에 "📦 등록상품" 루트 아래에 추가
-        """
-        products = self._scan_registered_products()
-        if not products:
-            QtWidgets.QMessageBox.information(self, "등록상품 없음", "등록된 상품(product.json)을 찾지 못했습니다.")
+        """기존 상품 불러오기 버튼 클릭 시 (TreeWidget 버전 수정)"""
+        if not self.products_dir.exists():
+            QtWidgets.QMessageBox.warning(self, "오류", f"폴더가 없습니다: {self.products_dir}")
             return
 
-        # 선택 다이얼로그
-        dlg = QtWidgets.QDialog(self)
-        dlg.setWindowTitle("등록된 상품 불러오기")
-        dlg.resize(650, 500)
-        lay = QtWidgets.QVBoxLayout(dlg)
+        # LoadProductDialog 사용
+        dlg = LoadProductDialog(self.products_dir, self)
 
-        info = QtWidgets.QLabel("불러올 상품을 선택하세요. (Ctrl/Shift 멀티 선택 가능)")
-        lay.addWidget(info)
+        if dlg.exec_() == QtWidgets.QDialog.Accepted:
+            paths = dlg.get_selected_paths()
+            added_count = 0
 
-        lw = QtWidgets.QListWidget(dlg)
-        lw.setSelectionMode(QtWidgets.QAbstractItemView.ExtendedSelection)
-        lay.addWidget(lw, 1)
+            # 1. '내 상품' 루트 폴더 확보 (없으면 자동 생성)
+            root = self._ensure_my_products_root()
 
-        for p in products:
-            item = QtWidgets.QListWidgetItem(p["product_name"])
-            item.setData(QtCore.Qt.UserRole, p)
-            lw.addItem(item)
+            # 2. 이미 있는 상품인지 확인하기 위해 이름 목록 수집
+            existing_names = set()
+            for i in range(root.childCount()):
+                existing_names.add(root.child(i).text(0))
 
-        btns = QtWidgets.QHBoxLayout()
-        btns.addStretch(1)
-        btn_ok = QtWidgets.QPushButton("추가", dlg)
-        btn_cancel = QtWidgets.QPushButton("취소", dlg)
-        btns.addWidget(btn_ok)
-        btns.addWidget(btn_cancel)
-        lay.addLayout(btns)
+            last_item = None
 
-        btn_cancel.clicked.connect(dlg.reject)
-        btn_ok.clicked.connect(dlg.accept)
+            for p in paths:
+                product_name = p.name
 
-        if dlg.exec_() != QtWidgets.QDialog.Accepted:
-            return
+                # 중복이면 추가하지 않음
+                if product_name in existing_names:
+                    continue
 
-        selected_items = lw.selectedItems()
-        if not selected_items:
-            return
+                # 3. 트리에 자식 아이템으로 추가
+                item = QtWidgets.QTreeWidgetItem(root)
+                item.setText(0, product_name)
 
-        # "📦 등록상품" 루트 찾거나 생성
-        root = None
-        for i in range(self.tree_selected.topLevelItemCount()):
-            it = self.tree_selected.topLevelItem(i)
-            if (it.text(0) or "").strip() == "📦 등록상품":
-                root = it
-                break
-        if root is None:
-            root = QtWidgets.QTreeWidgetItem(self.tree_selected)
-            root.setText(0, "📦 등록상품")
-            root.setFlags(root.flags() | QtCore.Qt.ItemIsEditable)
-            root.setData(0, QtCore.Qt.UserRole, {"type": "issue", "reason": "확정으로 저장된 등록상품"})
-            root.setExpanded(True)
+                # 데이터 설정 (product.json 자동 로드를 위한 초기값)
+                # product_dir 경로를 명시적으로 심어줌
+                init_data = {"product_dir": str(p), "type": "product"}
+                item.setData(0, QtCore.Qt.UserRole, init_data)
 
-        added = 0
-        existing_names = set()
-        for i in range(root.childCount()):
-            existing_names.add(self._get_product_name_from_item(root.child(i)))
+                # 4. 디스크 정보(이미지, 가격 등) 즉시 로드 및 '✅' 표시 반영
+                self._hydrate_product_item_from_disk(item)
 
-        for it in selected_items:
-            p = it.data(QtCore.Qt.UserRole) or {}
-            pname = (p.get("product_name") or "").strip()
-            if not pname:
-                continue
-            if pname in existing_names:
-                continue
+                added_count += 1
+                last_item = item
 
-            child = QtWidgets.QTreeWidgetItem(root)
-            child.setText(0, f"✅ {pname}")
-            child.setFlags(child.flags() | QtCore.Qt.ItemIsEditable)
+            if added_count > 0:
+                root.setExpanded(True)
+                self.append_log(f"상품 {added_count}개를 '내 상품' 목록에 추가했습니다.")
 
-            data = p.get("data") or {}
-            if not isinstance(data, dict):
-                data = {"type": "product"}
-            data.setdefault("type", "product")
-            data["product_name"] = pname
-            data["product_dir"] = p.get("product_dir", "")
-            data["source"] = data.get("source") or "registered"
-            child.setData(0, QtCore.Qt.UserRole, data)
-
-            # 디스크 내용으로 최종 hydrate
-            self._hydrate_product_item_from_disk(child)
-
-            existing_names.add(pname)
-            added += 1
-
-        root.setExpanded(True)
-        self.append_log(f"📥 등록상품 {added}개를 좌측 트리에 추가했습니다.")
+                # [핵심] 마지막으로 추가된 항목 자동 선택
+                if last_item:
+                    self.tree_selected.setCurrentItem(last_item)
+                    # 트리 선택 시 상세정보 로드 함수는 시그널로 자동 연결되어 있으므로 setCurrentItem만 하면 됨
+            else:
+                self.append_log("추가된 상품이 없습니다 (이미 목록에 있거나 선택 안 함).")
 
     def on_delete_registered_clicked(self):
         """
@@ -2192,6 +2166,79 @@ class ShoppingWidget(QtWidgets.QWidget):
             for ch in child_items:
                 it.addChild(ch)
 
+
+# [shopping.py] ShoppingWidget 클래스 정의 바로 위에 추가
+
+class LoadProductDialog(QtWidgets.QDialog):
+    """
+    [New] 기존 탐색기 대신, 상품 폴더만 리스트로 보여주고
+    '더블 클릭'으로 바로 추가할 수 있게 만든 커스텀 창
+    """
+
+    def __init__(self, products_dir: Path, parent=None):
+        super().__init__(parent)
+        self.setWindowTitle("상품 불러오기")
+        self.resize(400, 500)
+        self.products_dir = products_dir
+        self._init_ui()
+        self._load_list()
+
+    def _init_ui(self):
+        layout = QtWidgets.QVBoxLayout(self)
+
+        # 안내
+        lbl = QtWidgets.QLabel(f"<b>폴더 위치:</b> {self.products_dir}<br>불러올 상품을 더블 클릭하세요.")
+        lbl.setTextFormat(QtCore.Qt.RichText)
+        layout.addWidget(lbl)
+
+        # 리스트 위젯
+        self.list_widget = QtWidgets.QListWidget()
+        self.list_widget.setSelectionMode(QtWidgets.QAbstractItemView.ExtendedSelection)
+
+        # [핵심] 아이템 더블 클릭 시 -> 바로 accept(확인) 실행
+        self.list_widget.itemDoubleClicked.connect(self.accept)
+
+        layout.addWidget(self.list_widget)
+
+        # 버튼
+        btn_layout = QtWidgets.QHBoxLayout()
+        self.btn_load = QtWidgets.QPushButton("불러오기")
+        self.btn_load.clicked.connect(self.accept)
+
+        self.btn_cancel = QtWidgets.QPushButton("취소")
+        self.btn_cancel.clicked.connect(self.reject)
+
+        btn_layout.addStretch(1)
+        btn_layout.addWidget(self.btn_load)
+        btn_layout.addWidget(self.btn_cancel)
+
+        layout.addLayout(btn_layout)
+
+    def _load_list(self):
+        """products 폴더 안의 하위 폴더만 깔끔하게 보여줌"""
+        self.list_widget.clear()
+        if not self.products_dir.exists():
+            return
+
+        try:
+            subdirs = [p for p in self.products_dir.iterdir() if p.is_dir()]
+            subdirs.sort(key=lambda x: x.name)  # 이름순 정렬
+
+            for p in subdirs:
+                item = QtWidgets.QListWidgetItem(p.name)
+                item.setData(QtCore.Qt.UserRole, str(p))
+                self.list_widget.addItem(item)
+        except Exception as e:
+            QtWidgets.QMessageBox.warning(self, "오류", f"목록 로드 실패: {e}")
+
+    def get_selected_paths(self) -> List[Path]:
+        selected_items = self.list_widget.selectedItems()
+        paths = []
+        for item in selected_items:
+            path_str = item.data(QtCore.Qt.UserRole)
+            if path_str:
+                paths.append(Path(path_str))
+        return paths
 
 # ────────────────────────────────────────
 # 팝업 다이얼로그 (수정됨)

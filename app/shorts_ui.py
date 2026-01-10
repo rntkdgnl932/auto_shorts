@@ -773,8 +773,14 @@ class MainWindow(QtWidgets.QMainWindow):
     # real_use
     def _generate_and_save_ai_tags(self, project_path: Path, meta: dict, progress_callback: Callable) -> List[str]:
         """
-        '긍정 프롬프트 (+)' 박스 내용을 AI로 보내 태그로 변환하고 project.json에 저장합니다.
-        (수정됨: progress_callback을 항상 dict 형태로 변환하여 호출하도록 수정)
+        '긍정 프롬프트 (+)' / '부정 프롬프트 (-)' 박스 내용을 AI로 보내
+        - 긍정: tags(Comma-separated) 생성 → meta["prompt_user_ai_tags"]
+        - 부정: negative tags 생성 → meta["prompt_user_ai_neg_tags"] + meta["prompt_neg"](문자열)
+        project.json에 저장합니다.
+
+        (수정됨)
+        - progress_callback을 항상 dict 형태로 변환하여 호출
+        - 부정 프롬프트가 비어있어도(빈값) AI가 기본 negative tags를 생성하여 project.json에 저장
         """
 
         # 헬퍼 함수: progress_callback을 항상 dict 형태로 호출
@@ -783,30 +789,34 @@ class MainWindow(QtWidgets.QMainWindow):
             try:
                 # 상위 run_job_with_progress_async의 progress 콜백은 dict를 받습니다.
                 progress_callback({"msg": message, "stage": "AI Tags"})
-            except Exception as e:
+            except Exception:
                 # 만약 상위 콜백이 문자열을 인자로 받는 형태의 Fallback이라면:
                 try:
                     progress_callback(f"[AI Tags] {message}")
                 except Exception:
-                    # 최후의 수단: 아무것도 하지 않음
                     pass
 
-
-        prompt_text_src = ""
+        # 1) UI에서 긍정/부정 텍스트 읽기
         try:
-            if hasattr(self, "te_prompt_pos") and hasattr(self.te_prompt_pos, "toPlainText"):
-                prompt_text_src = self.te_prompt_pos.toPlainText().strip()
-
-            # 사용자가 수동으로 제거할 기본 텍스트 (안전장치)
-            if prompt_text_src == "ace-step tag 추천해줘 :":
-                prompt_text_src = ""
+            prompt_text_src = ""
+            te_pos = getattr(self, "te_prompt_pos", None)
+            if te_pos is not None and hasattr(te_pos, "toPlainText"):
+                prompt_text_src = str(te_pos.toPlainText() or "").strip()
         except Exception as read_exc:
-            # 콜백은 문자열만
             _log_progress(f"긍정 프롬프트 UI 읽기 실패: {read_exc}")
             prompt_text_src = ""
 
-        ai_tags_result: List[str] = []
+        try:
+            neg_text_src = ""
+            te_neg = getattr(self, "te_prompt_neg", None)
+            if te_neg is not None and hasattr(te_neg, "toPlainText"):
+                neg_text_src = str(te_neg.toPlainText() or "").strip()
+        except Exception as read_exc:
+            _log_progress(f"부정 프롬프트 UI 읽기 실패: {read_exc}")
+            neg_text_src = ""
 
+        # 2) 긍정 태그 생성
+        ai_tags_result: List[str] = []
         if not prompt_text_src:
             _log_progress("긍정 프롬프트가 비어있어 AI 태그 생성을 건너뜁니다.")
         else:
@@ -816,7 +826,7 @@ class MainWindow(QtWidgets.QMainWindow):
                 "You are an expert tag generator for music AI. "
                 "Based on the user's text, extract key themes, moods, genres, instruments, and styles. "
                 "Return *only* a simple, comma-separated list of 5-10 relevant English tags. "
-                "Do not add any other text, explanation, or markdown. Just the tags."
+                "Do not add any other text, explanation, or markdown. Just the tags. "
                 "Example: lyrical, calm, pop, piano, female vocal, night, urban"
             )
             user_prompt = f'Text: "{prompt_text_src}"\n\nTags (comma-separated):'
@@ -825,7 +835,6 @@ class MainWindow(QtWidgets.QMainWindow):
                 if not hasattr(self, "_ai"):
                     raise RuntimeError("AI instance (self._ai) not found.")
 
-                # gemini 우선
                 raw_response = self._ai.ask_smart(
                     system_prompt,
                     user_prompt,
@@ -837,7 +846,6 @@ class MainWindow(QtWidgets.QMainWindow):
                 import json
 
                 if isinstance(raw_response, dict):
-                    # 모델이 줄 법한 키 우선
                     text_body = (
                             raw_response.get("tags")
                             or raw_response.get("text")
@@ -846,7 +854,6 @@ class MainWindow(QtWidgets.QMainWindow):
                             or json.dumps(raw_response, ensure_ascii=False)
                     )
                 elif isinstance(raw_response, (list, tuple)):
-                    # ["pop", "jazz"] 이런 식이면 콤마로 합치기
                     text_body = ", ".join(str(item) for item in raw_response)
                 else:
                     text_body = str(raw_response or "")
@@ -866,11 +873,87 @@ class MainWindow(QtWidgets.QMainWindow):
                 _log_progress(f"AI 태그 생성 실패: {ai_exc}. 빈 목록을 사용합니다.")
                 ai_tags_result = []
 
-        # project.json에 'prompt_user_ai_tags' 키로 저장
+        # 3) 부정 태그(negative) 생성 — 빈값이어도 생성(기본 negative bank)
+        ai_neg_tags: List[str] = []
+        try:
+            if not hasattr(self, "_ai"):
+                raise RuntimeError("AI instance (self._ai) not found.")
+
+            # 사용자가 부정프롬프트를 적으면 그걸 정규화(태그화)하는 모드,
+            # 비어있으면 긍정 프롬프트/태그 기반으로 '피하고 싶은 요소'를 AI가 제안하는 모드
+            if neg_text_src:
+                _log_progress(f"부정 프롬프트 AI 태그 변환 시작... (내용: {neg_text_src[:30]}...)")
+                neg_source_text = neg_text_src
+                neg_mode_hint = "Normalize the user's negative prompt into negative tags."
+            else:
+                _log_progress("부정 프롬프트가 비어있어도 기본 negative tags를 생성합니다.")
+                neg_source_text = prompt_text_src or "music"
+                neg_mode_hint = "Generate reasonable negative tags to improve audio quality and avoid unwanted artifacts."
+
+            system_prompt_neg = (
+                "You are an expert negative prompt/tag generator for music AI. "
+                f"{neg_mode_hint} "
+                "Return *only* a simple, comma-separated list of 5-12 relevant English negative tags. "
+                "Focus on avoiding: low quality, noise, distortion, clipping, harshness, off-key, wrong genre, "
+                "and (unless explicitly requested) vocals/singing/human voice. "
+                "Do not add any other text, explanation, or markdown. Just the tags. "
+                "Example: low quality, noisy, distortion, clipping, harsh, off-key, bad mix, vocals, singing, human voice"
+            )
+
+            # 긍정 태그가 있으면 컨텍스트로 제공
+            pos_ctx = ", ".join(ai_tags_result) if ai_tags_result else ""
+            if pos_ctx:
+                user_prompt_neg = (
+                    f'Positive context tags: "{pos_ctx}"\n'
+                    f'Text: "{neg_source_text}"\n\nNegative tags (comma-separated):'
+                )
+            else:
+                user_prompt_neg = f'Text: "{neg_source_text}"\n\nNegative tags (comma-separated):'
+
+            raw_neg = self._ai.ask_smart(
+                system_prompt_neg,
+                user_prompt_neg,
+                prefer="gemini",
+                allow_fallback=True,
+            )
+
+            import json
+            if isinstance(raw_neg, dict):
+                neg_body = (
+                        raw_neg.get("tags")
+                        or raw_neg.get("negative")
+                        or raw_neg.get("text")
+                        or raw_neg.get("content")
+                        or raw_neg.get("output")
+                        or json.dumps(raw_neg, ensure_ascii=False)
+                )
+            elif isinstance(raw_neg, (list, tuple)):
+                neg_body = ", ".join(str(item) for item in raw_neg)
+            else:
+                neg_body = str(raw_neg or "")
+
+            neg_body = str(neg_body or "").strip()
+            ai_neg_tags = [t.strip().lower() for t in neg_body.split(",") if t.strip()]
+            if not ai_neg_tags and ":" in neg_body:
+                tail = neg_body.split(":", 1)[-1]
+                ai_neg_tags = [t.strip().lower() for t in tail.split(",") if t.strip()]
+
+            _log_progress(f"AI 부정 태그 생성 완료: {ai_neg_tags}")
+        except Exception as ai_exc:
+            _log_progress(f"AI 부정 태그 생성 실패: {ai_exc}. 빈 목록을 사용합니다.")
+            ai_neg_tags = []
+
+        # 4) project.json에 저장
         try:
             meta["prompt_user_ai_tags"] = ai_tags_result
+            meta["prompt_user_ai_neg_tags"] = ai_neg_tags
+            meta["prompt_pos"] = prompt_text_src
+            # generate_music_with_acestep에서 meta["prompt_neg"]를 사용하므로 문자열로도 유지
+            meta["prompt_neg"] = ", ".join(ai_neg_tags).strip()
             save_json(project_path, meta)
-            _log_progress(f"{len(ai_tags_result)}개의 AI 태그를 project.json에 저장했습니다.")
+            _log_progress(
+                f"AI 태그 저장 완료: +{len(ai_tags_result)} / -{len(ai_neg_tags)} (project.json)"
+            )
         except Exception as save_exc:
             _log_progress(f"project.json 저장 실패: {save_exc}")
 
