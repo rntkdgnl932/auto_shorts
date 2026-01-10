@@ -393,13 +393,34 @@ class MediaEditDialog(QtWidgets.QDialog):
         })
 
     def _refresh_preview(self, sid: str, label: QtWidgets.QLabel):
-        """이미지 미리보기 갱신"""
+        """
+        이미지 미리보기 갱신 (ID 호환성 강화)
+        - 기획서 ID(001)로 파일이 없으면,
+        - 영상제작용 ID(t_001)로 자동으로 찾아서 보여줍니다.
+        """
+        # 1차 시도: 001.png
         img_path = self.imgs_dir / f"{sid}.png"
+
+        # 2차 시도: t_001.png (영상 엔진용 포맷)
+        if not img_path.exists():
+            # sid가 숫자형태면 t_ 붙임
+            if sid.isdigit():
+                img_path = self.imgs_dir / f"t_{sid}.png"
+            # 만약 sid가 이미 t_001이면 여기서 걸림
+
+        # 3차 시도: temp_ 파일 (Step 1만 있는 경우) 확인
+        if not img_path.exists():
+            img_path = self.imgs_dir / f"temp_{sid}.png"
+            if not img_path.exists() and sid.isdigit():
+                img_path = self.imgs_dir / f"temp_t_{sid}.png"
+
         if img_path.exists():
             pix = QtGui.QPixmap(str(img_path))
             if not pix.isNull():
                 label.setPixmap(pix.scaled(label.size(), QtCore.Qt.KeepAspectRatio, QtCore.Qt.SmoothTransformation))
                 label.setText("")
+                # [중요] 뷰어에서 원본 볼 때 쓸 경로를 라벨에 저장해둠 (Full View 연동용)
+                label.setProperty("full_path", str(img_path))
             else:
                 label.setText("이미지 로드 실패")
         else:
@@ -424,45 +445,48 @@ class MediaEditDialog(QtWidgets.QDialog):
 
     def on_delete_image(self, sid: str, label: QtWidgets.QLabel):
         """
-        2. 이미지 삭제 (수정됨)
-        - [Step 2] 완성본({sid}.png) 뿐만 아니라
-        - [Step 1] 베이스(temp_{sid}.png) 이미지도 함께 삭제합니다.
+        [완벽 삭제 버전]
+        ID가 '001'이든 't_001'이든 상관없이 관련된 모든 이미지 파일(원본/Temp)을 찾아 삭제합니다.
         """
-        # 경로 정의
-        final_path = self.imgs_dir / f"{sid}.png"  # Step 2 결과물
-        temp_path = self.imgs_dir / f"temp_{sid}.png"  # Step 1 결과물
+        # 삭제 대상 후보군 (구버전 001, 신버전 t_001 모두 포함)
+        candidates = [
+            self.imgs_dir / f"{sid}.png",  # 001.png
+            self.imgs_dir / f"t_{sid}.png",  # t_001.png (현재 생성되는 파일)
+            self.imgs_dir / f"temp_{sid}.png",  # temp_001.png
+            self.imgs_dir / f"temp_t_{sid}.png"  # temp_t_001.png
+        ]
 
-        # 둘 다 없으면 삭제할 게 없음
-        if not final_path.exists() and not temp_path.exists():
+        # 실제로 존재하는 파일이 하나라도 있는지 확인
+        exists_files = [p for p in candidates if p.exists()]
+
+        if not exists_files:
             QtWidgets.QMessageBox.information(self, "알림", "삭제할 이미지가 없습니다.")
             return
 
         reply = QtWidgets.QMessageBox.question(
             self, "이미지 완전 삭제",
-            f"Scene {sid}의 이미지를 삭제하시겠습니까?\n\n"
-            "⚠️ 주의: [Step 1: 베이스]와 [Step 2: 완성본]이 모두 삭제됩니다.\n"
-            "재생성 시 '배경/인물'부터 다시 생성하게 됩니다.",
+            f"Scene {sid} 관련 이미지를 모두 삭제하시겠습니까?\n"
+            f"(총 {len(exists_files)}개 파일 감지됨)\n\n"
+            "⚠️ [Step 1: 베이스]와 [Step 2: 완성본]이 모두 삭제되어 초기화됩니다.",
             QtWidgets.QMessageBox.Yes | QtWidgets.QMessageBox.No
         )
 
         if reply == QtWidgets.QMessageBox.Yes:
             try:
-                deleted_msg = []
-                # Step 2 삭제 시도
-                if final_path.exists():
-                    os.remove(final_path)
-                    deleted_msg.append("완성본")
+                deleted_count = 0
+                for p in exists_files:
+                    try:
+                        os.remove(p)
+                        deleted_count += 1
+                    except Exception:
+                        pass  # 혹시 파일이 사용 중이라 안 지워져도 계속 진행
 
-                # Step 1 삭제 시도
-                if temp_path.exists():
-                    os.remove(temp_path)
-                    deleted_msg.append("베이스(Temp)")
-
+                # 화면 갱신
                 self._refresh_preview(sid, label)
-                QtWidgets.QMessageBox.information(self, "삭제 완료", f"{', '.join(deleted_msg)} 이미지가 삭제되었습니다.")
+                QtWidgets.QMessageBox.information(self, "삭제 완료", f"총 {deleted_count}개의 이미지 파일이 삭제되었습니다.")
 
             except Exception as e:
-                QtWidgets.QMessageBox.critical(self, "오류", f"삭제 실패: {e}")
+                QtWidgets.QMessageBox.critical(self, "오류", f"삭제 중 오류 발생: {e}")
 
     def on_delete_movie(self, sid: str):
         """3. 영상 삭제: clips/{id}.mp4 삭제"""
@@ -515,14 +539,28 @@ class MediaEditDialog(QtWidgets.QDialog):
             self.accept()
 
     def on_view_full_image(self, sid: str):
-        """[New] 원본 이미지 팝업 열기"""
-        img_path = self.imgs_dir / f"{sid}.png"
-        if not img_path.exists():
-            # 혹시 Step 2가 없고 Step 1만 있을 경우도 대비
-            img_path = self.imgs_dir / f"temp_{sid}.png"
+        """원본 이미지 팝업 열기 (경로 자동 인식)"""
+        # _refresh_preview에서 찾은 경로가 있다면 그걸 최우선으로 사용
+        # (UI 라벨에서 찾아서 넘겨주는 방식이 가장 정확함)
 
-        if img_path.exists():
-            viewer = ImageViewerDialog(str(img_path), parent=self)
+        # 현재 해당 씬의 라벨 위젯을 찾기가 번거로울 수 있으므로 재탐색 로직 사용
+        # (위 _refresh_preview와 동일한 탐색 순서)
+
+        candidates = [
+            self.imgs_dir / f"{sid}.png",
+            self.imgs_dir / f"t_{sid}.png",
+            self.imgs_dir / f"temp_{sid}.png",
+            self.imgs_dir / f"temp_t_{sid}.png"
+        ]
+
+        target_path = None
+        for p in candidates:
+            if p.exists():
+                target_path = p
+                break
+
+        if target_path:
+            viewer = ImageViewerDialog(str(target_path), parent=self)
             viewer.exec_()
         else:
             QtWidgets.QMessageBox.warning(self, "알림", "확인할 이미지가 없습니다.")

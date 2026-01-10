@@ -624,7 +624,10 @@ class ShoppingVideoJsonBuilder:
         self.ai = AI()
 
     def create_draft(self, product_dir: str | Path, product_data: Dict[str, Any], options: BuildOptions) -> Path:
-        """[1단계] 기획 초안 - BGM 기획 추가 + [수정] 시각적 환각(로고/QR) 방지"""
+        """
+        [1단계] 기획 초안 생성
+        [수정] 시작부터 ID를 't_001' 포맷으로 고정하여 파이프라인 전체 통일성을 보장합니다.
+        """
         p_dir = Path(product_dir)
         vpath = p_dir / "video_shopping.json"
 
@@ -633,7 +636,7 @@ class ShoppingVideoJsonBuilder:
 
         self.on_progress(f"[Draft] AI 기획 시작 (상품: {product_name})...")
 
-        # BGM 가이드 (기존 동일)
+        # BGM 가이드
         bgm_guide = (
             "4. **Background Music (BGM)**: \n"
             "   - Design a prompt for audio generation.\n"
@@ -643,7 +646,7 @@ class ShoppingVideoJsonBuilder:
             "   - Example: 'instrumental, background music, bright, acoustic pop, guitar, piano, medium tempo, uplifting'."
         )
 
-        # [수정] 시각적 제약사항(Visual Constraints) 강력 추가
+        # 시각적 제약사항
         visual_rules = (
             "5. **Visual Description Rules (Clean Prompt)**:\n"
             "   - Focus ONLY on the **Situation, Action, and Background**.\n"
@@ -682,7 +685,7 @@ class ShoppingVideoJsonBuilder:
             }},
             "scenes": [
                 {{
-                    "id": "001",
+                    "id": "t_001",  <-- AI에게 예시도 t_포맷으로 제시
                     "banner": "...",
                     "prompt": "화면 묘사 (한글, 절대 시퀀스/단계 나열 금지, 단일 동작 위주, 로고/텍스트 묘사 금지)",
                     "narration": "실제 읽을 대사 (지시문 제외)",
@@ -723,7 +726,10 @@ class ShoppingVideoJsonBuilder:
         ensure_dir(voice_dir)
 
         for idx, sc in enumerate(data.get("scenes", [])):
-            sid = sc.get("id") or f"{idx + 1:03d}"
+            # [핵심 수정] AI가 001로 주든 1로 주든, 무조건 t_001 포맷으로 강제 변환
+            # 이제 video_shopping.json 단계부터 t_001로 저장됩니다.
+            sid = f"t_{idx + 1:03d}"
+
             new_scene = {
                 "id": sid,
                 "banner": sc.get("banner"),
@@ -737,6 +743,7 @@ class ShoppingVideoJsonBuilder:
                 "prompt_img_2": "",
                 "prompt_movie": "",
                 "prompt_negative": "",
+                # 이미지 경로도 t_001.png 로 통일
                 "img_file": str(imgs_dir / f"{sid}.png"),
                 "movie_file": str(clips_dir / f"{sid}.mp4"),
                 "voice_file": str(voice_dir / f"{sid}.wav")
@@ -744,13 +751,14 @@ class ShoppingVideoJsonBuilder:
             final_json["scenes"].append(new_scene)
 
         save_json(vpath, final_json)
-        self.on_progress(f"[Draft] 초안 완료. BGM: {final_json['meta'].get('bgm_prompt')}")
+        self.on_progress(f"[Draft] 초안 완료. (ID 포맷: t_001)")
         return vpath
 
     def enrich_video_json(self, video_json_path: str | Path, product_data: Dict[str, Any]) -> Path:
         """
-        [3단계] 상세화 (음성 -> BGM -> 영어 프롬프트)
-        [수정] Qwen 모델 전용 문법("Subject from image 1...") 강제 적용
+        [2단계] 상세화 (음성 -> BGM -> 영어 프롬프트)
+        - ID 매칭: t_001 포맷 지원
+        - 프롬프트 2: 복잡한 묘사 제거하고 "Subject from image 1 ... object from image 2" 공식 강제
         """
         vpath = Path(video_json_path)
         p_dir = vpath.parent
@@ -762,7 +770,7 @@ class ShoppingVideoJsonBuilder:
         meta = data.get("meta", {})
 
         # ---------------------------------------------------------------------
-        # 1. 음성 생성 (기존 유지)
+        # 1. 음성 생성 (유지)
         # ---------------------------------------------------------------------
         gender = meta.get("voice_gender", "female").lower()
         if "male" == gender:
@@ -810,7 +818,7 @@ class ShoppingVideoJsonBuilder:
         save_json(vpath, data)
 
         # ---------------------------------------------------------------------
-        # 2. BGM 생성 (기존 유지)
+        # 2. BGM 생성 (유지)
         # ---------------------------------------------------------------------
         bgm_prompt = meta.get("bgm_prompt", "")
         if not bgm_prompt:
@@ -821,80 +829,59 @@ class ShoppingVideoJsonBuilder:
             self.on_progress(f"[Enrich] 2/3단계: BGM 이미 존재 (스킵).")
         else:
             self.on_progress(f"[Enrich] 2/3단계: BGM 생성 중...")
-            success_bgm = generate_bgm_acestep(
+            generate_bgm_acestep(
                 prompt=bgm_prompt,
                 out_path=bgm_path,
                 duration_sec=total_dur,
                 comfy_host=comfy_host,
             )
-            if success_bgm:
-                self.on_progress("   ✅ BGM 생성 완료!")
-            else:
-                self.on_progress("   ❌ BGM 생성 실패 (로그 확인).")
 
         # ---------------------------------------------------------------------
-        # 3. 프롬프트 상세화 (문법 대수술)
+        # 3. 프롬프트 상세화 (심플하고 강력한 합성 공식 적용)
         # ---------------------------------------------------------------------
-        self.on_progress("[Enrich] 3/3단계: 비주얼 프롬프트 고도화 (Qwen 문법 적용)...")
+        self.on_progress("[Enrich] 3/3단계: 비주얼 프롬프트 고도화 (합성 공식 강제)...")
 
         char_prompt = meta.get("character_prompt", "Young Korean model")
         if "male" == gender:
-            gender_kw = "male, man, 1boy"
+            gender_kw = "male, man"
         else:
-            gender_kw = "female, woman, 1girl"
+            gender_kw = "female, woman"
 
         scene_texts = []
         for sc in scenes:
-            sfx_info = f" (SFX: {sc.get('sfx')})" if sc.get("sfx") else ""
-            scene_texts.append(f"- Scene {sc['id']} (지문): {sc.get('prompt')}{sfx_info}")
+            scene_texts.append(f"- Scene {sc['id']} (Action): {sc.get('prompt')}")
 
-        # [핵심] Qwen 모델이 알아먹는 문법 강제
+        # [수정] 복잡한 설명 다 빼고 '공식'만 지키라고 명령
         sys_p = (
-            "You are a ComfyUI Compositing Director using Qwen-Edit.\n"
-            "Your task is to generate 2-step prompts. Step 2 requires a VERY SPECIFIC grammar to work.\n\n"
-            "**[CRITICAL RULE FOR Step 2]**\n"
-            "You MUST explicitly identify the subject in Image 1 and the object in Image 2.\n"
-            "**Syntax:** \"[Subject] from image 1 [action] [object] from image 2\"\n"
-            "**Examples:**\n"
+            "You are a prompt engineer for AI Image Compositing.\n"
+            "Your Goal: Generate simple English prompts for 2-step generation.\n\n"
+            "** STRICT RULES for `prompt_img_2` (The Paint/Composite Step) **\n"
+            "You MUST use this exact sentence structure:\n"
+            "\"[Subject] from image 1 [action] the object from image 2\"\n\n"
+            "**Examples (Follow these exactly):**\n"
             "- \"The woman from image 1 holds the object from image 2 in her hand.\"\n"
-            "- \"The table from image 1 has the object from image 2 placed on it.\"\n"
-            "- \"The man from image 1 is looking at the object from image 2.\"\n\n"
-            "**Language:** English Only. No Korean."
+            "- \"The man from image 1 looks at the object from image 2.\"\n"
+            "- \"The table from image 1 has the object from image 2 placed on it.\"\n\n"
+            "Do NOT use adjectives for the object (e.g. don't say 'red bottle', just say 'object from image 2').\n"
+            "Do NOT add complex lighting or background details in prompt_img_2."
         )
 
         user_p = f"""
-        [Prompting Strategy]
+        Context: Character is "{char_prompt}" ({gender_kw}).
 
-        **Context**:
-        - Character: "{char_prompt}" ({gender_kw})
+        Analyze these scenes and generate prompts:
 
-        Analyze each scene and apply these rules:
+        1. `prompt_img_1`: Describe the character/background. Leave space for the product. (e.g., "Woman extending empty hand")
+        2. `prompt_img_2`: Apply the STRICT FORMULA: "[Subject] from image 1 ... object from image 2".
+        3. `prompt_movie`: Simple camera movement (e.g., "Slow zoom in").
 
-        ### 1. `prompt_img_1` (Canvas)
-        - Describe background, lighting, and character pose.
-        - **IMPORTANT**: Leave space for the product (e.g., "empty hand", "empty table space").
-        - **NO Product Details**: Do not describe the product itself.
-
-        ### 2. `prompt_img_2` (Paint / Qwen)
-        - **STRICT GRAMMAR**: You MUST use "from image 1" for the subject/background AND "from image 2" for the product.
-        - **Format (Person)**: "The {gender_kw} from image 1 holds the object from image 2 in hand."
-        - **Format (Background)**: "The surface from image 1 has the object from image 2 placed on it."
-        - **Format (Action)**: "The {gender_kw} from image 1 throws the object from image 2."
-        - **NO Adjectives for Product**: Do not say "red bottle". Just say "object from image 2".
-
-        ### 3. `prompt_negative`
-        - Standard: "text, watermark, logo, deformed hands, extra fingers, product details".
-
-        ### 4. `prompt_movie`
-        - Camera movement description (English).
-
-        [Input Scenarios]
+        [Scenes]
         {chr(10).join(scene_texts)}
 
-        [Output Format (JSON)]
+        [Output JSON Format]
         {{
             "scenes": {{
-                "001": {{ "prompt_img_1": "...", "prompt_img_2": "...", "prompt_negative": "...", "prompt_movie": "..." }},
+                "t_001": {{ "prompt_img_1": "...", "prompt_img_2": "...", "prompt_negative": "...", "prompt_movie": "..." }},
                 ...
             }}
         }}
@@ -906,21 +893,25 @@ class ShoppingVideoJsonBuilder:
             en_map = enriched.get("scenes", {})
 
             if isinstance(en_map, list):
-                en_map = {item.get("id", f"t_{i + 1:03d}"): item for i, item in enumerate(en_map)}
+                en_map = {f"t_{i + 1:03d}": item for i, item in enumerate(en_map)}
 
             for sc in scenes:
-                sid = sc["id"]
-                tgt = None
-                candidates = [sid, sid.lstrip("0"), f"Scene {sid}", f"t_{sid}", sid.replace("t_", "")]
+                sid = str(sc["id"])
 
+                # 매칭 후보 (t_001, 001 등)
+                candidates = [sid, sid.replace("t_", ""), sid.replace("t_", "").lstrip("0"), f"t_{sid}"]
+                tgt = None
+
+                # 키로 찾기
                 for key in candidates:
                     if key in en_map:
                         tgt = en_map[key]
                         break
 
+                # 값으로 찾기
                 if not tgt:
                     for val in en_map.values():
-                        if isinstance(val, dict) and str(val.get("id", "")) == sid:
+                        if isinstance(val, dict) and str(val.get("id", "")) in candidates:
                             tgt = val
                             break
 
@@ -932,10 +923,8 @@ class ShoppingVideoJsonBuilder:
                     sc["prompt_img"] = sc["prompt_img_1"]
 
             data["audit"]["enriched_at"] = _now_str()
-            data["audit"]["step"] = "enriched"
-
             save_json(vpath, data)
-            self.on_progress(f"[Enrich] 상세화 완료 (Qwen 문법 적용됨).")
+            self.on_progress(f"[Enrich] 상세화 완료 (합성 공식 적용됨).")
 
         except Exception as e:
             self.on_progress(f"❌ 상세화 실패: {e}")
@@ -1104,9 +1093,9 @@ def convert_shopping_to_video_json_with_ai(
         on_progress: Optional[Callable[[Dict[str, Any]], None]] = None
 ) -> str:
     """
-    [쇼핑->쇼츠 변환]
-    video_shopping.json을 읽어서 Shorts 탭과 호환되는 video.json을 생성합니다.
-    UI에서 입력받은 FPS, 해상도, Steps 값을 video.json에 영구 저장합니다.
+    [쇼핑->쇼츠 변환 최종판]
+    - 원본(video_shopping.json)의 ID가 't_001'이면 그대로 계승합니다.
+    - 억지로 인덱스 기준으로 ID를 새로 만들지 않습니다. (삭제/순서변경 대응)
     """
 
     def _log(msg: str):
@@ -1117,41 +1106,43 @@ def convert_shopping_to_video_json_with_ai(
     proj_path = Path(project_dir)
     src_json_path = proj_path / "video_shopping.json"
     dst_json_path = proj_path / "video.json"
+    imgs_dir = proj_path / "imgs"
 
     if not src_json_path.exists():
         raise FileNotFoundError(f"video_shopping.json이 없습니다: {src_json_path}")
 
-    # 1. 쇼핑 데이터 로드
     try:
         with open(src_json_path, "r", encoding="utf-8") as f:
             src_data = json.load(f)
     except Exception as e:
         raise ValueError(f"데이터 로드 실패: {e}")
 
-    _log("데이터 구조 변환 시작...")
+    _log("데이터 구조 변환 시작 (ID 계승 모드)...")
 
-    # 2. 기본 정보 매핑
     prod = src_data.get("product", {})
     project_name = prod.get("product_name") or src_data.get("project_name", "Shopping Project")
     src_scenes = src_data.get("scenes", [])
     if not src_scenes:
         src_scenes = src_data.get("groups", [])
 
-    # 3. video.json 씬 리스트 조립
     new_scenes = []
     current_time = 0.0
     full_lyrics_parts = []
 
     for idx, sc in enumerate(src_scenes):
-        # =========================================================================
-        # [수정] ID 통일성 유지: 원본 ID가 있으면 그대로 사용, 없으면 t_001 생성
-        # 이렇게 해야 이미지 파일명(001.png vs t_001.png) 불일치가 사라짐
-        # =========================================================================
+        # [핵심 수정]
+        # video_shopping.json에 있는 ID를 최우선으로 사용한다.
+        # 초안 생성 단계에서 이미 't_001'로 만들어졌으므로 그대로 가져온다.
         original_id = str(sc.get("id", "")).strip()
+
         if original_id:
             scene_id = original_id
         else:
+            # 만약 구버전 데이터라 ID가 없다면 안전장치로 생성
             scene_id = f"t_{idx + 1:03d}"
+
+        # 이미지는 ID와 동일한 이름의 png 파일
+        target_img_name = f"{scene_id}.png"
 
         dur = float(sc.get("seconds") or sc.get("duration") or 4.0)
         start_t = current_time
@@ -1162,12 +1153,12 @@ def convert_shopping_to_video_json_with_ai(
         full_lyrics_parts.append(narration)
 
         new_scene = {
-            "id": scene_id,
+            "id": scene_id,  # t_001 그대로 유지
             "section": "main",
             "start": round(start_t, 3),
             "end": round(end_t, 3),
             "duration": round(dur, 3),
-            "img_file": sc.get("img_file") or sc.get("image_path") or "",
+            "img_file": str(imgs_dir / target_img_name),  # imgs/t_001.png
             "voice_file": sc.get("voice_file") or sc.get("audio_path") or "",
             "lyric": narration,
             "prompt": sc.get("prompt", ""),
@@ -1182,28 +1173,16 @@ def convert_shopping_to_video_json_with_ai(
     total_duration = current_time
     full_lyrics = "\n".join(full_lyrics_parts)
 
-    # 4. video.json 뼈대 저장 (UI 설정값 반영)
     video_data = {
         "title": project_name,
         "duration": round(total_duration, 3),
-        "fps": fps,  # [UI값] 최상위 FPS 저장
+        "fps": fps,
         "lyrics": full_lyrics,
         "scenes": new_scenes,
         "defaults": {
-            "movie": {
-                "fps": fps,
-                "target_fps": fps,
-                "input_fps": fps
-            },
-            "image": {
-                "width": width,  # [UI값] 해상도 저장
-                "height": height,  # [UI값] 해상도 저장
-                "fps": fps
-            },
-            # [New] 생성 관련 파라미터 저장
-            "generator": {
-                "steps": steps
-            }
+            "movie": {"fps": fps, "target_fps": fps, "input_fps": fps},
+            "image": {"width": width, "height": height, "fps": fps},
+            "generator": {"steps": steps}
         },
         "audit": {
             "source": "shopping_converter_v2",
@@ -1214,15 +1193,15 @@ def convert_shopping_to_video_json_with_ai(
     with open(dst_json_path, "w", encoding="utf-8") as f:
         json.dump(video_data, f, indent=2, ensure_ascii=False)
 
-    _log(f"video.json 저장 완료 (FPS: {fps}, Size: {width}x{height}, Steps: {steps})")
+    _log(f"video.json 저장 완료 (ID: {scene_id} 등)")
     _log("AI 상세화 진행...")
 
-    # 5. AI 상세화 (세그먼트 생성)
     if ai_client:
         try:
             def ask_wrapper(sys_msg, user_msg):
                 return ai_client.ask_smart(sys_msg, user_msg, prefer="openai")
 
+            # ID가 t_001 형식이므로 세그먼트 분할 AI가 정상적으로 작동합니다.
             fill_prompt_movie_with_ai(
                 str(dst_json_path.parent),
                 ask_wrapper,
