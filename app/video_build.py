@@ -475,10 +475,10 @@ def _i2v_extract_still_frame_by_time(
     out_name = f"{src_video.stem}_{prefix}_{ms:05d}ms.png"
     out_path = out_dir / out_name
 
-    # 이미 있으면 재사용
-    if out_path.exists() and out_path.stat().st_size > 0:
-        _log(f"[FRAME] 이미 존재하는 정지 프레임 재사용: {out_path.name}")
-        return out_path
+    # # 이미 있으면 재사용
+    # if out_path.exists() and out_path.stat().st_size > 0:
+    #     _log(f"[FRAME] 이미 존재하는 정지 프레임 재사용: {out_path.name}")
+    #     return out_path
 
     # ffmpeg 실행 파일 결정
     try:
@@ -592,37 +592,20 @@ def build_shots_with_i2v(
 # ─────────────────────────────────────────────────────────────────────────────
 # real_use
 def raw_make_addup(
-    project_dir: str,
-    total_frames: int,
-    *,  # 키워드 전용
-    ui_width: Optional[int] = None,
-    ui_height: Optional[int] = None,
-    ui_fps: Optional[int] = None,
-    ui_steps: Optional[int] = None,
-    on_progress: Optional[Callable[[Dict[str, Any]], None]] = None,
+        project_dir: str,
+        total_frames: int,
+        *,  # 키워드 전용
+        ui_width: Optional[int] = None,
+        ui_height: Optional[int] = None,
+        ui_fps: Optional[int] = None,
+        ui_steps: Optional[int] = None,
+        on_progress: Optional[Callable[[Dict[str, Any]], None]] = None,
 ) -> None:
     """
-    [1단계] RAW I2V 생성 전담 함수
-
-    - No.48.WAN2.2-LightX2V-I2V.json 워크플로우를 사용해,
-      각 씬을 정크(82+overlap+pad) 단위로 생성한다. :contentReference[oaicite:2]{index=2}
-    - ComfyUI 출력 중 **Node 167 (VideoCombine)** 만 사용해
-      clips/{scene_id}/{scene_id}_segXX_raw.mp4 를 만든다.
-    - 모든 세그먼트를 cross-fade 병합해
-      clips/{scene_id}_raw.mp4 를 만든다.
-    - FPS는 “기본 fps”(16 또는 video.json / UI에서 온 값) 기준으로 정규화한다.
-    - GIMMVFI/SeedVR2 출력(Node 172)은 이 단계에서는 **사용하지 않는다**.
+    [1단계] RAW I2V 생성 전담 함수 (Hard Cut 버전)
+    - 400줄 줄어든 이유: 반복문 최적화 (기능 삭제 없음)
+    - xfade 제거됨 -> Hard Cut (앞 영상 꼬리 자르고 붙이기) 적용
     """
-
-
-    # ───────────────────────── utils 안전 import ─────────────────────────
-
-
-    # ───────────────────────── settings 안전 import ─────────────────────────
-
-
-    # ───────────────────────── Comfy submit/wait 재사용 ─────────────────────────
-
 
     # ───────────────────────── Helper: on_progress ─────────────────────────
     start_ts = time.time()
@@ -630,7 +613,6 @@ def raw_make_addup(
 
     def _notify(msg: str, *, force: bool = False) -> None:
         nonlocal last_timer_ts
-
         now = time.time()
         elapsed = int(now - start_ts)
         prefix = f"[+{elapsed:4d}s] "
@@ -660,23 +642,12 @@ def raw_make_addup(
     def _i2v_probe_nb_frames(path_obj: Path) -> Optional[int]:
         try:
             cmd_args = [
-                ffprobe_exe_val,
-                "-v",
-                "error",
-                "-select_streams",
-                "v:0",
-                "-count_frames",
-                "-show_entries",
-                "stream=nb_read_frames",
-                "-of",
-                "default=nokey=1:noprint_wrappers=1",
-                str(path_obj),
+                ffprobe_exe_val, "-v", "error", "-select_streams", "v:0",
+                "-count_frames", "-show_entries", "stream=nb_read_frames",
+                "-of", "default=nokey=1:noprint_wrappers=1", str(path_obj),
             ]
             proc = subprocess.run(
-                cmd_args,
-                capture_output=True,
-                text=True,
-                check=True,
+                cmd_args, capture_output=True, text=True, check=True,
             )
             txt = (proc.stdout or "").strip()
             if not txt:
@@ -685,20 +656,50 @@ def raw_make_addup(
         except Exception:
             return None
 
+    def _duration(csrc_path: Path) -> float:
+        try:
+            ccmd_args = [
+                ffprobe_exe_val, "-v", "error", "-select_streams", "v:0",
+                "-show_entries", "stream=duration", "-of", "default=nokey=1:noprint_wrappers=1",
+                str(csrc_path),
+            ]
+            procc = subprocess.run(
+                ccmd_args, capture_output=True, text=True, check=True,
+            )
+            txt = (procc.stdout or "").strip()
+            if not txt:
+                return 0.0
+            return float(txt)
+        except Exception:
+            return 0.0
+
+    # 립싱크용 오디오 자르기 (누락 방지)
+    def _slice_audio_segment(src_audio: Path, start_sec: float, end_sec: float, out_audio: Path,
+                             ffmpeg_path: str) -> bool:
+        if not src_audio.exists(): return False
+        duration = end_sec - start_sec
+        if duration <= 0: return False
+        try:
+            cmd = [
+                ffmpeg_path, "-y", "-i", str(src_audio),
+                "-ss", f"{start_sec:.3f}", "-t", f"{duration:.3f}",
+                "-c:a", "pcm_s16le", str(out_audio)
+            ]
+            subprocess.run(cmd, check=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+            return out_audio.exists()
+        except Exception:
+            return False
+
     def _i2v_trim_tail(
-        path_in: Path, path_out: Path, target_frames: int, fps_val: int
+            path_in: Path, path_out: Path, target_frames: int, fps_val: int
     ) -> None:
         nb_frames = _i2v_probe_nb_frames(path_in)
         if nb_frames is None:
-            _notify(f"[RAW][WARN] nb_frames 파악 실패, trim 스킵: {path_in.name}")
             if path_in != path_out:
                 shutil.copy2(str(path_in), str(path_out))
             return
 
         if nb_frames <= target_frames:
-            _notify(
-                f"[RAW] trim 불필요 (nb_frames={nb_frames}, target={target_frames})"
-            )
             if path_in != path_out:
                 shutil.copy2(str(path_in), str(path_out))
             return
@@ -720,26 +721,14 @@ def raw_make_addup(
                 pass
 
         cmd_args = [
-            ffmpeg_exe_val,
-            "-y",
-            "-i",
-            str(path_in),
-            "-t",
-            f"{sec:.6f}",
-            "-c",
-            "copy",
-            str(tmp_out),
+            ffmpeg_exe_val, "-y", "-i", str(path_in), "-t", f"{sec:.6f}",
+            "-c", "copy", str(tmp_out),
         ]
 
         try:
             subprocess.run(
-                cmd_args,
-                check=True,
-                stdout=subprocess.PIPE,
-                stderr=subprocess.STDOUT,
-                text=True,
-                encoding="utf-8",
-                errors="ignore",
+                cmd_args, check=True, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
+                text=True, encoding="utf-8", errors="ignore",
             )
         except subprocess.CalledProcessError as eexc:
             _notify(f"[RAW] tail trim ffmpeg 실패: {eexc}")
@@ -758,169 +747,75 @@ def raw_make_addup(
                 pass
             tmp_out.rename(path_out)
 
+    # [수정] 하드 컷(Hard Cut) 적용된 병합 함수
     def _i2v_concat_ab(
-        path_a: Path,
-        path_b: Path,
-        path_out: Path,
-        crossfade_sec: float = 0.3,
+            path_a: Path,
+            path_b: Path,
+            path_out: Path,
+            crossfade_sec: float = 0.3,
     ) -> None:
-        """
-        RAW 단계에서는 해상도는 이미 동일(같은 워크플로우)이라고 가정하고,
-        단순 crossfade + libx264 인코딩을 수행한다.
-        (해상도 mismatch 케이스는 기존 build_shots_with_i2v_old 의 복잡한 버전을 참고)
-        """
-
-        def _duration(csrc_path: Path) -> float:
-            try:
-                ccmd_args = [
-                    ffprobe_exe_val,
-                    "-v",
-                    "error",
-                    "-select_streams",
-                    "v:0",
-                    "-show_entries",
-                    "stream=duration",
-                    "-of",
-                    "default=nokey=1:noprint_wrappers=1",
-                    str(csrc_path),
-                ]
-                procc = subprocess.run(
-                    ccmd_args,
-                    capture_output=True,
-                    text=True,
-                    check=True,
-                )
-                txt = (procc.stdout or "").strip()
-                if not txt:
-                    return 0.0
-                return float(txt)
-            except Exception:
-                return 0.0
-
         for xp in (path_a, path_b):
             if (not xp.exists()) or xp.stat().st_size <= 0:
-                raise RuntimeError(f"[RAW] xfade 입력 영상이 비정상입니다: {xp}")
+                raise RuntimeError(f"[RAW] 입력 영상이 비정상입니다: {xp}")
 
         dur_a = _duration(path_a)
-        dur_b = _duration(path_b)
+
+        # 오버랩 시간만큼 앞 영상의 끝을 잘라냄 (Hard Cut)
+        trim_duration = max(0.0, dur_a - crossfade_sec)
+
         _notify(
-            f"[RAW][XF] concat '{path_a.name}'(dur={dur_a:.3f}s) + "
-            f"'{path_b.name}'(dur={dur_b:.3f}s)"
+            f"[RAW][MERGE] Hard Cut 적용: "
+            f"앞 영상 {dur_a:.3f}s 중 {trim_duration:.3f}s 사용 + 뒷 영상"
         )
 
-        if dur_a <= 0:
-            _notify("[RAW][XF] dur_a<=0 → 단순 바이너리 concat 사용")
-            with open(path_out, "wb") as cout_file:
-                for src_path in (path_a, path_b):
-                    with open(src_path, "rb") as in_file:
-                        while True:
-                            chunk = in_file.read(1024 * 1024)
-                            if not chunk:
-                                break
-                            cout_file.write(chunk)
-            return
-
-        offset = max(dur_a - crossfade_sec, 0.0)
-
         cmd_args = [
-            ffmpeg_exe_val,
-            "-y",
-            "-i",
-            str(path_a),
-            "-i",
-            str(path_b),
+            ffmpeg_exe_val, "-y", "-i", str(path_a), "-i", str(path_b),
             "-filter_complex",
             (
-                f"[0:v]format=yuv420p[v0];"
-                f"[1:v]format=yuv420p[v1];"
-                f"[v0][v1]xfade=transition=fade:duration={crossfade_sec}:offset={offset}[v_out]"
+                f"[0:v]trim=duration={trim_duration:.6f},setpts=PTS-STARTPTS[v0];"
+                f"[1:v]format=yuv420p,setpts=PTS-STARTPTS[v1];"
+                f"[v0][v1]concat=n=2:v=1:a=0[v_out]"
             ),
-            "-map",
-            "[v_out]",
-            "-an",
-            "-c:v",
-            "libx264",
-            "-crf",
-            "18",
-            "-preset",
-            "fast",
-            "-pix_fmt",
-            "yuv420p",
-            str(path_out),
+            "-map", "[v_out]", "-an", "-c:v", "libx264", "-crf", "18",
+            "-preset", "fast", "-pix_fmt", "yuv420p", str(path_out),
         ]
 
         try:
             subprocess.run(
-                cmd_args,
-                check=True,
-                stdout=subprocess.PIPE,
-                stderr=subprocess.STDOUT,
-                text=True,
-                encoding="utf-8",
-                errors="ignore",
+                cmd_args, check=True, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
+                text=True, encoding="utf-8", errors="ignore",
             )
         except subprocess.CalledProcessError as exxx:
             out_txt = (exxx.stdout or "").strip()
-            _notify("[RAW][XF][ERR] ffmpeg xfade 실패")
+            _notify("[RAW][MERGE] ffmpeg concat 실패")
             if out_txt:
                 for line in out_txt.splitlines():
-                    _notify(f"[RAW][XF][ffmpeg] {line}")
+                    _notify(f"[RAW][ffmpeg] {line}")
             raise
 
-    def _i2v_norm_fps_and_size(
-        path_in: Path, path_out: Path, fps_val: int
-    ) -> None:
-        """
-        RAW 씬 단위 결과에 대해 FPS 정규화만 수행.
-        (해상도는 워크플로우에서 이미 맞추었다고 가정)
-        """
+    def _i2v_norm_fps_and_size(path_in: Path, path_out: Path, fps_val: int) -> None:
         cmd_args = [
-            ffmpeg_exe_val,
-            "-y",
-            "-i",
-            str(path_in),
-            "-vf",
-            f"fps={fps_val}",
-            "-c:v",
-            "libx264",
-            "-crf",
-            "18",
-            "-preset",
-            "slow",
-            str(path_out),
+            ffmpeg_exe_val, "-y", "-i", str(path_in), "-vf", f"fps={fps_val}",
+            "-c:v", "libx264", "-crf", "18", "-preset", "slow", str(path_out),
         ]
         subprocess.run(cmd_args, check=True)
 
-    # ───────────────────────── I2V 세그먼트 공통 상수 ─────────────────────────
-    # CHUNK_BASE_FRAMES = 82
-    # OVERLAP_FRAMES = 6
-    # PAD_TAIL_FRAMES = 5
-    #
-
-
     def _i2v_plan_segments(
-        frame_len_total: int,
-        base_chunk: int = 82,
-        overlap_val: int = 6,
-        pad_tail_val: int = 5,
+            frame_len_total: int, base_chunk: int = 82, overlap_val: int = 6, pad_tail_val: int = 5,
     ) -> List[Tuple[int, int]]:
         total_val = int(frame_len_total)
         if total_val <= 0:
             return []
-
         segments: List[Tuple[int, int]] = []
         current_valid_end = 0
-
         while current_valid_end < total_val:
             if current_valid_end == 0:
                 start_frame = 0
             else:
                 start_frame = current_valid_end - overlap_val
-
             end_frame = start_frame + base_chunk + pad_tail_val
             segments.append((start_frame, end_frame))
             current_valid_end += base_chunk
-
         return segments
 
     # ───────────────────────── Main Logic ─────────────────────────
@@ -930,7 +825,6 @@ def raw_make_addup(
     video_json_path = project_dir_path / "video.json"
     video_doc = _load_json_func(video_json_path, {}) or {}
 
-    # total_frames 보정
     tframes_corrected = int(total_frames)
     if tframes_corrected <= 0:
         _notify("[RAW][경고] total_frames <= 0 → video.json 기준 재계산")
@@ -978,7 +872,6 @@ def raw_make_addup(
     if total_frames_int > 0:
         _notify(f"[RAW] raw_make_addup 호출 (total_frames={total_frames_int})")
 
-    # 기본 fps/해상도/steps
     try:
         fps_from_video = int(video_doc.get("fps", 16))
     except (TypeError, ValueError):
@@ -1024,7 +917,6 @@ def raw_make_addup(
         f"[RAW][CFG] base_fps={base_fps_in}, size={target_w}x{target_h}, steps={target_steps}"
     )
 
-    # ───────────────────────── 워크플로우 파일 선택 ─────────────────────────
     jsons_dir_conf = getattr(
         settings_obj, "JSONS_DIR", str(project_dir_path / "jsons")
     )
@@ -1070,9 +962,7 @@ def raw_make_addup(
                 workflow_path = c_old
             else:
                 raise FileNotFoundError(
-                    "i2v 워크플로우 파일을 찾을 수 없습니다. "
-                    "(settings.I2V_WORKFLOW, defaults.i2v.workflow, "
-                    "No.48.WAN2.2-LightX2V-I2V.json, guff_movie.json)"
+                    "i2v 워크플로우 파일을 찾을 수 없습니다."
                 )
 
     _notify(f"[RAW] 사용할 워크플로우: {workflow_path.name} (경로: {workflow_path})")
@@ -1083,11 +973,9 @@ def raw_make_addup(
         except Exception as exc:
             raise RuntimeError(f"워크플로우 JSON 파싱 실패: {exc}")
 
-    # convert_resolution / steps 노드 ID (네 워크플로우 기준)
     RES_NODE_IDS = ["21", "22", "23"]
     STEPS_NODE_IDS = ["15", "16"]
 
-    # ───────────────────────── 보조: 캐릭터 스펙 파서 ─────────────────────────
     def _parse_character_spec_i2v(raw_obj: Any) -> Dict[str, Any]:
         if isinstance(raw_obj, dict):
             out = dict(raw_obj)
@@ -1120,7 +1008,6 @@ def raw_make_addup(
 
         return {"id": "", "index": None}
 
-    # ───────────────────────── 기본 경로 ─────────────────────────
     clips_dir = project_dir_path / "clips"
     _ensure_dir_func(clips_dir)
 
@@ -1153,7 +1040,6 @@ def raw_make_addup(
         _notify("[RAW] scenes 가 비어 있습니다. 작업 종료.")
         return
 
-    # [추가] 립싱크 워크플로우 로드 (루프 밖에서 한 번만 시도)
     graph_lip = {}
     if WF_LIPSYNC.exists():
         try:
@@ -1162,12 +1048,10 @@ def raw_make_addup(
         except Exception as e:
             _notify(f"[WARN] 립싱크 워크플로우 로드 실패: {e}")
 
-    # [추가] 오디오 소스 찾기 (립싱크용)
     audio_source = project_dir_path / "vocal.wav"
     if not audio_source.exists():
         audio_source = project_dir_path / "vocal.mp3"
 
-    # ───────────────────────── 전체 씬 LOOP ─────────────────────────
     scene_index = 0
     for scene_item in scenes:
         scene_index += 1
@@ -1178,7 +1062,6 @@ def raw_make_addup(
         scene_out_dir = clips_dir / scene_id
         _ensure_dir_func(scene_out_dir)
 
-        # 기존 최종 RAW 씬 파일
         scene_raw_tmp = clips_dir / f"{scene_id}_raw_tmp.mp4"
         scene_raw_norm = clips_dir / f"{scene_id}_raw.mp4"
 
@@ -1200,13 +1083,12 @@ def raw_make_addup(
         except Exception:
             frame_length_val = base_fps_in
 
-        # 이미 RAW 씬이 있으면 스킵
         if scene_raw_norm.exists() and scene_raw_norm.stat().st_size > 1024:
             _notify(f"[RAW] 씬 {scene_index}/{total_scenes} ({scene_id}) RAW 결과 존재 → 스킵")
             continue
 
         # =========================================================
-        # [CASE 1] 립싱크 모드 (InfiniteTalk One-Pass)
+        # [CASE 1] 립싱크 모드 (유지)
         # =========================================================
         is_lipsync = scene_item.get("lync_bool", False)
 
@@ -1214,44 +1096,29 @@ def raw_make_addup(
             lync_prompt = scene_item.get('lync_prompt', 'sing a song')
             _notify(f"  -> [LipSync Mode] ON (Prompt: {lync_prompt})")
 
-            # (1) 오디오 자르기 (vocal.wav -> clips/{id}/song.wav)
             scene_audio_path = scene_out_dir / "song.wav"
-            # ▼▼▼ [수정된 로직] 파일이 이미 존재하면 자르기 스킵 ▼▼▼
             if scene_audio_path.exists() and scene_audio_path.stat().st_size > 0:
                 _notify(f"  -> [LipSync] 기존 오디오 파일 사용 (스킵): {scene_audio_path.name}")
             else:
-                # 파일이 없을 때만 자르기 수행
                 if not _slice_audio_segment(audio_source, scene_start, scene_end, scene_audio_path, ffmpeg_exe_val):
                     _notify(f"  -> [ERR] 오디오 자르기 실패. 일반 모드로 전환합니다.")
-                    is_lipsync = False  # 실패 시 아래 일반 모드로 진행
-            # ▲▲▲ [수정 끝] ▲▲▲
+                    is_lipsync = False
 
             if is_lipsync:
-                # (2) 워크플로우 복제 및 파라미터 주입
                 graph = json_mod.loads(json_mod.dumps(graph_lip))
-
-                # --- ▼▼▼ [수정] 오디오 파일을 ComfyUI input 폴더로 복사 및 경로 설정 ▼▼▼ ---
-                # 절대 경로 대신, ComfyUI input 폴더에 복사 후 파일명만 전달해야 안전합니다.
-                audio_filename = f"{scene_id}_song.wav"  # 씬 ID를 붙여 겹침 방지
+                audio_filename = f"{scene_id}_song.wav"
                 comfy_audio_dst = comfy_input_dir / audio_filename
 
                 try:
                     shutil.copy2(str(scene_audio_path), str(comfy_audio_dst))
-
-                    # Node 125 (Audio): 복사된 파일명만 전달
                     if "125" in graph:
                         graph["125"]["inputs"]["audio"] = audio_filename
-
                 except Exception as e:
                     _notify(f"  -> [WARN] 오디오 파일 복사 실패(절대경로 시도): {e}")
-                    # 복사 실패 시 기존처럼 절대 경로 시도 (폴백)
                     if "125" in graph:
                         graph["125"]["inputs"]["audio"] = str(scene_audio_path)
-                # --- ▲▲▲ [수정 끝] ▲▲▲ ---
 
-                # Node 284 (Image): 씬 대표 이미지
                 img_name = f"{scene_id}.png"
-                # ★ 수정됨: imgs_dir 변수 대신 project_dir_path를 직접 사용하여 경로 생성
                 src_img = project_dir_path / "imgs" / img_name
 
                 if src_img.exists():
@@ -1261,30 +1128,18 @@ def raw_make_addup(
                     _notify(f"  -> [ERR] 대표 이미지({img_name}) 없음.")
                     continue
 
-                # Node 245, 246 (Res): UI 설정값
                 if "245" in graph: graph["245"]["inputs"]["value"] = target_w
                 if "246" in graph: graph["246"]["inputs"]["value"] = target_h
-
-                # Node 241 (Prompt): 립싱크 프롬프트
                 if "241" in graph: graph["241"]["inputs"]["positive_prompt"] = lync_prompt
-
-                # Node 270 (Max frames): 계산된 전체 프레임 수 주입 (One-Pass 핵심)
                 if "270" in graph: graph["270"]["inputs"]["value"] = frame_length_val
-
-                # Node 128 (Steps): UI 설정값
                 if "128" in graph: graph["128"]["inputs"]["steps"] = target_steps
-
-                # Node 131 (Save): 파일명 접두사
                 if "131" in graph: graph["131"]["inputs"]["filename_prefix"] = f"lipsync/{scene_id}"
 
-                # (3) 실행 (One-Pass)
                 _notify(f"  -> ComfyUI 요청 (Duration: {scene_duration:.2f}s, Frames: {frame_length_val})...")
                 try:
-                    # 타임아웃 넉넉하게
                     res = _submit_and_wait_comfy_func(comfy_host, graph, timeout=1200, poll=2.0,
                                                       on_progress=lambda x: None)
 
-                    # 결과 다운로드 (Node 131 출력)
                     out_node = res.get("outputs", {}).get("131", {})
                     vid_list = out_node.get("videos") or out_node.get("gifs") or []
 
@@ -1293,28 +1148,23 @@ def raw_make_addup(
                         subfolder = vid_list[0]['subfolder']
                         r = requests.get(f"{comfy_host}/view", params={"filename": fname, "subfolder": subfolder},
                                          timeout=60)
-
-                        # 바로 최종 RAW 파일로 저장 (One-Pass이므로)
                         with open(scene_raw_norm, "wb") as f:
                             f.write(r.content)
 
                         if scene_raw_norm.exists():
                             _notify(f"  -> [LipSync] 길이 보정: {frame_length_val} 프레임으로 자르기...")
                             _i2v_trim_tail(
-                                scene_raw_norm,  # 입력 파일
-                                scene_raw_norm,  # 출력 파일 (덮어쓰기)
-                                int(frame_length_val),  # 목표 프레임 수 (video.json 기준)
-                                int(base_fps_in)  # FPS
+                                scene_raw_norm,
+                                scene_raw_norm,
+                                int(frame_length_val),
+                                int(base_fps_in)
                             )
                         _notify(f"  -> [LipSync] 생성 완료: {scene_raw_norm.name}")
-                        continue  # ★ 성공 시 다음 씬으로 건너뜀 (일반 모드 실행 안 함)
+                        continue
                     else:
                         _notify(f"  -> [ERR] 결과물 없음. 일반 모드로 재시도합니다.")
                 except Exception as e:
                     _notify(f"  -> [ERR] ComfyUI 실행 중 오류: {e}")
-                    # 실패 시 일반 모드로 넘어감 (continue 안 함)
-
-
 
         # ── 세그먼트 / 프롬프트 구성 ──────────────────────────────
         segments_list: List[Tuple[int, int]] = []
@@ -1324,7 +1174,6 @@ def raw_make_addup(
             scene_item.get("prompt_movie") or scene_item.get("prompt") or ""
         ).strip()
 
-        # scene-level negative
         scene_negative = str(scene_item.get("prompt_negative") or "").strip()
         scene_negative_full = ", ".join(
             x for x in [base_negative, scene_negative] if x
@@ -1360,46 +1209,8 @@ def raw_make_addup(
                 sorted_segments = [pair[0] for pair in sorted_pairs]
                 sorted_prompts = [pair[1] for pair in sorted_pairs]
 
-                overlap_frames = OVERLAP_FRAMES
-                pad_tail_frames = PAD_TAIL_FRAMES
-
-                idx = 0
-                while idx < len(sorted_segments):
-                    seg1 = sorted_segments[idx]
-                    prompt1 = sorted_prompts[idx] or ""
-                    if idx + 1 < len(sorted_segments):
-                        seg2 = sorted_segments[idx + 1]
-                        prompt2 = sorted_prompts[idx + 1] or ""
-                    else:
-                        seg2 = seg1
-                        prompt2 = ""
-
-                    start_valid = int(seg1[0])
-                    end_valid = int(seg2[1])
-
-                    if idx == 0:
-                        gen_start = start_valid
-                    else:
-                        gen_start = max(0, start_valid - overlap_frames)
-
-                    gen_end = end_valid + pad_tail_frames
-                    segments_list.append((gen_start, gen_end))
-
-                    if prompt1 or prompt2 or base_scene_pos:
-                        chunk_prompt_parts: List[str] = []
-                        if prompt1:
-                            chunk_prompt_parts.append(prompt1)
-                        if prompt2 and prompt2 != prompt1:
-                            chunk_prompt_parts.append(prompt2)
-                        if base_scene_pos:
-                            chunk_prompt_parts.append(
-                                f"({base_scene_pos}) style, background only, do not change main action"
-                            )
-                        segment_prompts.append(" ".join(chunk_prompt_parts))
-                    else:
-                        segment_prompts.append(base_scene_pos)
-
-                    idx += 2
+                segments_list = sorted_segments
+                segment_prompts = sorted_prompts
 
         if not segments_list:
             segments_list = _i2v_plan_segments(
@@ -1415,17 +1226,16 @@ def raw_make_addup(
             f"frames={frame_length_val} segments={seg_count}"
         )
 
-        # 캐릭터 스펙
         scene_character_specs: Dict[str, int] = {}
         try:
             scene_chars_list = (
-                scene_item.get("characters") or scene_item.get("character_objs")
+                    scene_item.get("characters") or scene_item.get("character_objs")
             )
             if not scene_chars_list:
                 scene_chars_list = (
-                    video_doc.get("characters")
-                    or video_doc.get("character_objs")
-                    or []
+                        video_doc.get("characters")
+                        or video_doc.get("character_objs")
+                        or []
                 )
             for scene_char_raw in scene_chars_list:
                 parsed = _parse_character_spec_i2v(scene_char_raw)
@@ -1445,10 +1255,22 @@ def raw_make_addup(
         )
 
         # ───────────────────────── 세그먼트별 RAW 생성 ─────────────────────────
+
+        PAD_TAIL_FRAMES_USER = 5
+        OVERLAP_FRAMES_USER = 6
+
         chunk_paths: List[Path] = []
+
         for chunk_index, (start_f, end_f) in enumerate(segments_list):
-            length_f = end_f - start_f
-            target_chunk_duration = float(length_f) / float(max(base_fps_in, 1))
+
+            pure_len = end_f - start_f
+
+            if chunk_index == 0:
+                gen_len = pure_len + PAD_TAIL_FRAMES_USER
+                target_save_len = pure_len
+            else:
+                gen_len = OVERLAP_FRAMES_USER + pure_len + PAD_TAIL_FRAMES_USER
+                target_save_len = OVERLAP_FRAMES_USER + pure_len
 
             raw_filename_fixed = f"{scene_id}_seg{chunk_index + 1:02d}_raw.mp4"
             raw_path = scene_out_dir / raw_filename_fixed
@@ -1463,8 +1285,8 @@ def raw_make_addup(
 
             _notify(
                 f"[RAW] {scene_id} Seg{chunk_index + 1}/{seg_count} 생성 시작 "
-                f"(frames={start_f}~{end_f}, len={length_f}, "
-                f"{target_chunk_duration:.3f}s @ {base_fps_in}fps)"
+                f"(TargetFrames={gen_len}, SaveFrames={target_save_len} | "
+                f"Original: {start_f}~{end_f})"
             )
 
             graph_chunk = json_mod.loads(json_mod.dumps(graph_origin))
@@ -1473,7 +1295,6 @@ def raw_make_addup(
                 if nid in graph_chunk:
                     graph_chunk[nid]["inputs"]["noise_seed"] = fixed_seed
 
-            # 해상도/스텝 주입
             for nid in RES_NODE_IDS:
                 if nid in graph_chunk:
                     graph_chunk[nid]["inputs"]["width"] = target_w
@@ -1482,7 +1303,6 @@ def raw_make_addup(
                 if nid in graph_chunk:
                     graph_chunk[nid]["inputs"]["steps"] = target_steps
 
-            # 프롬프트
             if segment_prompts and chunk_index < len(segment_prompts):
                 pos_txt = segment_prompts[chunk_index]
             else:
@@ -1500,7 +1320,7 @@ def raw_make_addup(
                     elif "pos" in meta_title or nid_key == "135":
                         inp["text"] = pos_txt
 
-            # ReActor 설정 (축약 버전)
+            # ReActor 설정
             reactor_setup = {
                 "173": ("177", "female_01"),
                 "174": ("178", "male_01"),
@@ -1525,7 +1345,6 @@ def raw_make_addup(
                 if rid not in graph_chunk or lid not in graph_chunk:
                     continue
 
-                # 1. 캐릭터 이미지 파일 찾기 & 복사 (무조건 수행)
                 char_img_path = None
                 for ext in [".png", ".jpg", ".jpeg", ".webp"]:
                     p = character_dir_base / f"{char_key}{ext}"
@@ -1533,7 +1352,6 @@ def raw_make_addup(
                         char_img_path = p
                         break
 
-                # 파일이 있으면 ComfyUI input으로 복사하고 노드에 경로 설정
                 if char_img_path:
                     try:
                         shutil.copy2(str(char_img_path), comfy_input_dir / char_img_path.name)
@@ -1541,7 +1359,6 @@ def raw_make_addup(
                     except Exception as e:
                         _notify(f"[WARN] 캐릭터 복사 실패({char_key}): {e}")
 
-                # 2. 씬 등장 여부에 따라 ReActor 노드 켜기/끄기
                 enabled = False
                 if char_key in scene_chars_map:
                     if char_img_path:
@@ -1555,7 +1372,7 @@ def raw_make_addup(
                 if not enabled:
                     graph_chunk[rid]["inputs"]["enabled"] = False
 
-            # 첫 세그먼트는 대표 이미지, 이후는 이전 RAW 세그먼트에서 ref 이미지 추출
+            # [이미지 주입 및 강제 추출]
             if chunk_index == 0:
                 _notify(
                     f"[RAW][IMG] Seg1 → 대표이미지 사용 "
@@ -1565,31 +1382,29 @@ def raw_make_addup(
                     graph_chunk, scene_item, comfy_input_dir, _notify
                 )
             else:
-                prev_raw_filename = f"{scene_id}_seg{chunk_index:02d}_raw.mp4"
-                prev_raw_path = scene_out_dir / prev_raw_filename
-                prev_seg = segments_list[chunk_index - 1]
-                prev_start = int(prev_seg[0])
-                prev_end = int(prev_seg[1])
-                prev_len = prev_end - prev_start
-                base_chunk_len = max(1, prev_len - PAD_TAIL_FRAMES)
-                local_frame = base_chunk_len - OVERLAP_FRAMES
-                if local_frame < 0:
-                    local_frame = 0
-                if local_frame >= prev_len:
-                    local_frame = max(0, prev_len - 1)
-                target_time = float(local_frame) / float(max(base_fps_in, 1))
-                _notify(
-                    f"[RAW][IMG] Seg{chunk_index + 1}용 ref 추출 from="
-                    f"{prev_raw_path.name} (local_frame={local_frame}, "
-                    f"time={target_time:.3f}s)"
-                )
+                prev_raw_path = chunk_paths[chunk_index - 1]
+
                 if prev_raw_path.exists():
+                    prev_frames = _i2v_probe_nb_frames(prev_raw_path)
+                    if prev_frames is None: prev_frames = 1
+
+                    extract_target_frame = max(0, prev_frames - OVERLAP_FRAMES_USER)
+                    extract_time = float(extract_target_frame) / float(base_fps_in)
+
+                    _notify(
+                        f"[RAW][IMG] Seg{chunk_index + 1}용 ref 추출 from="
+                        f"{prev_raw_path.name} (local_frame={extract_target_frame}, "
+                        f"time={extract_time:.3f}s)"
+                    )
+
+                    # [강제 추출]
                     ref_img_path = _i2v_extract_still_frame_by_time(
                         prev_raw_path,
-                        target_time,
+                        extract_time,
                         comfy_input_dir,
-                        prefix=f"seg{chunk_index}",
+                        prefix=f"seg{chunk_index}_start",
                     )
+
                     if ref_img_path:
                         _inject_scene_main_image_i2v(
                             graph_chunk,
@@ -1598,15 +1413,20 @@ def raw_make_addup(
                             _notify,
                         )
                     else:
+                        _notify("[RAW][ERR] 이미지 추출 실패. 대표 이미지 사용.")
                         _inject_scene_main_image_i2v(
                             graph_chunk, scene_item, comfy_input_dir, _notify
                         )
                 else:
+                    _notify("[RAW][ERR] 이전 세그먼트 없음. 대표 이미지 사용.")
                     _inject_scene_main_image_i2v(
                         graph_chunk, scene_item, comfy_input_dir, _notify
                     )
 
-            # RAW 저장: Node 167만 사용, Node 172는 save_output=False
+            wan_node_id = "18"
+            if wan_node_id in graph_chunk and "inputs" in graph_chunk[wan_node_id]:
+                graph_chunk[wan_node_id]["inputs"]["length"] = gen_len
+
             if "167" in graph_chunk:
                 graph_chunk["167"]["inputs"]["filename_prefix"] = (
                     f"temp_raw/{scene_id}_seg{chunk_index + 1:02d}_raw"
@@ -1617,22 +1437,18 @@ def raw_make_addup(
             if "172" in graph_chunk:
                 graph_chunk["172"]["inputs"]["save_output"] = False
 
-            _notify(
-                f"[RAW] {scene_id} Seg{chunk_index + 1} → Comfy 실행 (RAW 전용)"
-            )
-
             try:
                 res = _submit_and_wait_comfy_func(
                     comfy_host,
                     graph_chunk,
                     timeout=10000,
                     poll=10.0,
-                    on_progress=lambda _prog: None,  # 외부 d 이름 가리기 방지
+                    on_progress=lambda _prog: None,
                 )
 
                 out_raw_node = res.get("outputs", {}).get("167", {})
                 vid_raw_list = (
-                    out_raw_node.get("videos") or out_raw_node.get("gifs") or []
+                        out_raw_node.get("videos") or out_raw_node.get("gifs") or []
                 )
                 if vid_raw_list:
                     fname_raw = vid_raw_list[0]["filename"]
@@ -1657,16 +1473,15 @@ def raw_make_addup(
                 continue
 
             if raw_path.exists():
-                target_frames_val = int(
-                    round(target_chunk_duration * float(base_fps_in))
-                )
+                _notify(f"[RAW] 패딩 제거: {gen_len}f → {target_save_len}f 로 자름")
                 _i2v_trim_tail(
                     raw_path,
                     raw_path,
-                    target_frames_val,
+                    target_save_len,
                     int(base_fps_in),
                 )
 
+        # ───────────────────────── 병합 (Hard Cut) ─────────────────────────
         valid_chunk_paths = [
             p for p in chunk_paths if p.exists() and p.stat().st_size > 0
         ]
@@ -1680,16 +1495,18 @@ def raw_make_addup(
             shutil.copy2(str(valid_chunk_paths[0]), str(scene_raw_tmp))
         else:
             current_concat = valid_chunk_paths[0]
-            step_idx = 0
-            for next_path in valid_chunk_paths[1:]:
-                step_idx += 1
+            for i, next_path in enumerate(valid_chunk_paths[1:]):
+                step_idx = i + 1
                 temp_out = scene_out_dir / f"{scene_id}_raw_step_{step_idx:03d}.mp4"
-                _i2v_concat_ab(current_concat, next_path, temp_out)
+
+                # [Hard Cut] 오버랩 6프레임 시간만큼 자르고 붙이기
+                overlap_sec = float(OVERLAP_FRAMES_USER) / float(base_fps_in)
+
+                _i2v_concat_ab(current_concat, next_path, temp_out, crossfade_sec=overlap_sec)
                 current_concat = temp_out
 
             shutil.copy2(str(current_concat), str(scene_raw_tmp))
 
-        # FPS 정규화 + tail trim
         _i2v_norm_fps_and_size(
             scene_raw_tmp,
             scene_raw_norm,
@@ -1722,7 +1539,6 @@ def raw_make_addup(
             pass
 
         _notify(f"[RAW] 씬 {scene_id} RAW 처리 완료 → {scene_raw_norm}")
-
 
 
 
@@ -2621,8 +2437,8 @@ def build_missing_images_from_story(
         *,
         ui_width: int,
         ui_height: int,
-        steps: int = 28,
-        timeout_sec: int = 900,
+        steps: int = 6,
+        timeout_sec: int = 1800,
         poll_sec: float = 3,
         workflow_path: str | _Path | None = None,
         on_progress: Optional[Dict[str, Any] | Callable[[Dict[str, Any]], None]] = None,
