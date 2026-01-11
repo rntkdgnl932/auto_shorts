@@ -91,7 +91,7 @@ I2V_WORKFLOW:         Path = JSONS_DIR / "No.48.WAN2.2-LightX2V-I2V.json"
 
 # 음악생성 대기시간 등
 _DEFAULT_ACE_WAIT_TIMEOUT_SEC = 900.0   # 15분
-_DEFAULT_ACE_POLL_INTERVAL_SEC = 2.0    # 2초
+_DEFAULT_ACE_POLL_INTERVAL_SEC = 3.0    # 3초
 
 _DEFAULT_WEIGHTS = {
     "verse": 1.0,
@@ -147,6 +147,11 @@ DEFAULT_IMG_SIZE = (405, 720)
 
 # 3. 이미지 생성 품질 (스텝 수)
 DEFAULT_T2I_STEPS = 6
+
+# [New] 자막 폰트 크기 기본값
+DEFAULT_FONT_FAMILY = "맑은 고딕"
+DEFAULT_TITLE_FONT_SIZE = 55
+DEFAULT_NARRATION_FONT_SIZE = 25
 
 # ───────── 로컬 오버라이드 파일 ─────────
 _SETTINGS_DIR: Path = BASE_DIR.parent / "app" / "_local"

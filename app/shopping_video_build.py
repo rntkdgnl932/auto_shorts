@@ -8,14 +8,15 @@ import shutil
 import os
 import random
 import requests
+import subprocess
 import time
 import uuid
 import math
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Callable, Dict, List, Optional
+from pydub import AudioSegment
 
-# [수정] 강력한 오디오 측정 함수(audio_duration_sec) 사용
 from app.utils import (
     AI,
     load_json,
@@ -976,6 +977,9 @@ class ShoppingImageGenerator:
 # -----------------------------------------------------------------------------
 # 6. 영상 생성/병합기
 # -----------------------------------------------------------------------------
+# -----------------------------------------------------------------------------
+# 6. 영상 생성/병합기 (pydub 오디오 믹싱 + 자막 합성 추가)
+# -----------------------------------------------------------------------------
 class ShoppingMovieGenerator:
     def __init__(self, on_progress: Optional[Callable[[str], None]] = None):
         self.on_progress = on_progress or (lambda msg: None)
@@ -1013,31 +1017,235 @@ class ShoppingMovieGenerator:
             if temp_video_json.exists():
                 try:
                     os.remove(temp_video_json)
-                    # self.on_progress("ℹ️ 임시 파일 정리 완료")
                 except:
                     pass
 
     def merge_movies(self, video_json_path: str | Path):
+        """
+        [3단계 병합 프로세스]
+        1. Visual: concatenate_scene_clips로 영상 트랙 병합 (temp_visual.mp4)
+        2. Audio: pydub로 BGM(20%, fadeout) + Voice(타임스탬프) 믹싱 (mixed_audio.wav)
+        3. Final: FFmpeg로 자막(.srt) 생성 후 영상+오디오+자막 합성 (final_shopping_video.mp4)
+        """
         vpath = Path(video_json_path)
         project_dir = vpath.parent
         clips_dir = project_dir / "clips"
+        voice_dir = project_dir / "voice"
+        bgm_path = project_dir / "bgm.mp3"
 
-        self.on_progress("[Merge] 영상 합치기...")
+        # 중간 산출물 경로
+        temp_visual_path = project_dir / "temp_visual_merged.mp4"
+        mixed_audio_path = project_dir / "mixed_audio.wav"
+        srt_path = project_dir / "subtitles.srt"
+        final_output_path = project_dir / "final_shopping_video.mp4"
+
+        ffmpeg_exe = getattr(settings, "FFMPEG_EXE", "ffmpeg")
+
+        self.on_progress("[Merge] 1/3단계: 영상 트랙 합치는 중...")
         data = load_json(vpath, {})
+        scenes = data.get("scenes", [])
+
+        # 1. 영상 트랙 병합 (Visual Only)
         clip_paths = []
-        for sc in data.get("scenes", []):
+        for sc in scenes:
             cpath = clips_dir / f"{sc['id']}.mp4"
             if cpath.exists():
                 clip_paths.append(cpath)
+            else:
+                self.on_progress(f"⚠️ 클립 누락됨: {cpath.name}")
 
         if not clip_paths:
-            self.on_progress("❌ 병합할 클립 없음")
+            self.on_progress("❌ 병합할 클립이 없습니다.")
             return
 
-        out_path = project_dir / "final_shopping_video.mp4"
-        ffmpeg_exe = getattr(settings, "FFMPEG_EXE", "ffmpeg")
-        concatenate_scene_clips(clip_paths, out_path, ffmpeg_exe)
-        self.on_progress(f"✅ 병합 완료: {out_path.name}")
+        try:
+            # 기존 함수 활용 (영상만 빠르게 이어붙임)
+            concatenate_scene_clips(clip_paths, temp_visual_path, ffmpeg_exe)
+        except Exception as e:
+            self.on_progress(f"❌ 영상 트랙 병합 실패: {e}")
+            return
+
+        # 2. 오디오 믹싱 (BGM + Voice)
+        self.on_progress("[Merge] 2/3단계: BGM 및 내레이션 믹싱 중...")
+        try:
+            total_duration = float(data.get("duration", 0))
+            if total_duration <= 0:
+                # 메타데이터에 없으면 씬 합계로 계산
+                total_duration = sum(float(s.get("end", 0)) - float(s.get("start", 0)) for s in scenes)
+
+            self._mix_audio_with_pydub(scenes, bgm_path, voice_dir, total_duration, mixed_audio_path)
+        except Exception as e:
+            self.on_progress(f"❌ 오디오 믹싱 실패: {e}")
+            return
+
+        # 3. 자막 생성 및 최종 렌더링
+        self.on_progress("[Merge] 3/3단계: 자막 생성 및 최종 렌더링...")
+        try:
+            # 3-1. SRT 파일 생성
+            self._create_srt_file(scenes, srt_path)
+
+            # 3-2. FFmpeg 최종 합성 (Visual + Mixed Audio + Subtitles)
+            self._finalize_with_ffmpeg(
+                ffmpeg_exe,
+                temp_visual_path,
+                mixed_audio_path,
+                srt_path,
+                final_output_path
+            )
+
+            self.on_progress(f"✅ 최종 병합 완료: {final_output_path.name}")
+
+            # (선택) 임시 파일 정리
+            # if temp_visual_path.exists(): os.remove(temp_visual_path)
+            # if mixed_audio_path.exists(): os.remove(mixed_audio_path)
+            # if srt_path.exists(): os.remove(srt_path)
+
+        except Exception as e:
+            self.on_progress(f"❌ 최종 렌더링 실패: {e}")
+
+    # --- 내부 헬퍼 메서드 ---
+
+    def _mix_audio_with_pydub(self, scenes: List[Dict], bgm_path: Path, voice_dir: Path, total_dur_sec: float,
+                              out_path: Path):
+        """pydub를 사용하여 BGM(20%볼륨, 페이드아웃)과 내레이션을 믹싱"""
+        if AudioSegment is None:
+            raise ImportError("pydub 라이브러리가 필요합니다.")
+
+        # pydub는 밀리초 단위 사용
+        total_ms = int(total_dur_sec * 1000)
+
+        # 1. 베이스 트랙 생성 (무음)
+        final_mix = AudioSegment.silent(duration=total_ms)
+
+        # 2. BGM 처리
+        if bgm_path.exists():
+            bgm = AudioSegment.from_file(str(bgm_path))
+
+            # 길이 맞추기 (짧으면 루프)
+            if len(bgm) < total_ms:
+                loops = int(total_ms / len(bgm)) + 1
+                bgm = bgm * loops
+
+            bgm = bgm[:total_ms]  # 길이 자르기
+
+            # 볼륨 20%로 줄이기 (약 -14dB)
+            # 20 * log10(0.2) ≈ -13.97 dB
+            bgm = bgm - 14
+
+            # 마지막 2초 페이드 아웃
+            bgm = bgm.fade_out(2000)
+
+            # 베이스에 BGM 합성
+            final_mix = final_mix.overlay(bgm)
+
+        # 3. 내레이션(Voice) 배치
+        for sc in scenes:
+            sid = sc.get("id")
+            voice_file = sc.get("voice_file")
+
+            # voice_file 경로가 절대경로가 아닐 경우 voice_dir 기준 탐색
+            v_path = None
+            if voice_file:
+                if Path(voice_file).exists():
+                    v_path = Path(voice_file)
+                elif (voice_dir / Path(voice_file).name).exists():
+                    v_path = voice_dir / Path(voice_file).name
+
+            # 없으면 id 기반으로 다시 찾기
+            if not v_path and (voice_dir / f"{sid}.wav").exists():
+                v_path = voice_dir / f"{sid}.wav"
+
+            if v_path and v_path.exists():
+                voice_seg = AudioSegment.from_file(str(v_path))
+                start_time = float(sc.get("start", 0))
+                start_ms = int(start_time * 1000)
+
+                # 믹싱 (position 인자로 위치 지정)
+                final_mix = final_mix.overlay(voice_seg, position=start_ms)
+
+        # 4. 저장
+        final_mix.export(str(out_path), format="wav")
+
+    def _create_srt_file(self, scenes: List[Dict], srt_path: Path):
+        """video.json 정보를 바탕으로 자막(SRT) 파일 생성"""
+
+        def sec_to_srt_fmt(seconds: float) -> str:
+            """초 단위를 SRT 시간 포맷(HH:MM:SS,mmm)으로 변환"""
+            millis = int((seconds % 1) * 1000)
+            seconds = int(seconds)
+            mins, secs = divmod(seconds, 60)
+            hrs, mins = divmod(mins, 60)
+            return f"{hrs:02}:{mins:02}:{secs:02},{millis:03}"
+
+        with open(srt_path, "w", encoding="utf-8") as f:
+            idx = 1
+            for sc in scenes:
+                text = sc.get("lyric") or sc.get("narration") or ""
+                text = text.strip()
+                if not text:
+                    continue
+
+                start = float(sc.get("start", 0))
+                end = float(sc.get("end", 0))
+
+                # 자막이 너무 짧게 지나가는 것 방지
+                if end - start < 0.5:
+                    end = start + 2.0
+
+                f.write(f"{idx}\n")
+                f.write(f"{sec_to_srt_fmt(start)} --> {sec_to_srt_fmt(end)}\n")
+                f.write(f"{text}\n\n")
+                idx += 1
+
+    def _finalize_with_ffmpeg(self, ffmpeg_exe: str, video_path: Path, audio_path: Path, srt_path: Path,
+                              out_path: Path):
+        """영상, 오디오, 자막을 최종 합성 (재인코딩 발생)"""
+
+        # FFmpeg filter에서 윈도우 경로 역슬래시(\)는 이스케이프가 까다로우므로 슬래시(/)로 변환
+        # 자막 경로 처리
+        srt_path_str = str(srt_path).replace("\\", "/").replace(":", "\\:")
+
+        # 명령어 구성
+        # -shortest: 영상/오디오 중 짧은 쪽에 맞춰 끝냄
+        # -c:v libx264: 자막 합성을 위해 비디오 재인코딩
+        # -c:a aac: 오디오 인코딩
+        # -vf subtitles=...: 자막 필터 (force_style로 폰트 크기/배경 등 스타일 지정 가능)
+
+        # 기본 자막 스타일: 폰트크기 20, 굵게, 흰색 글씨, 검은 테두리, 하단 여백 20
+        sub_style = "Fontname=Arial,FontSize=20,Bold=1,PrimaryColour=&H00FFFFFF,OutlineColour=&H00000000,BorderStyle=1,Outline=2,Shadow=0,MarginV=30"
+
+        cmd = [
+            ffmpeg_exe,
+            "-y",
+            "-i", str(video_path),
+            "-i", str(audio_path),
+            "-vf", f"subtitles='{srt_path_str}':force_style='{sub_style}'",
+            "-c:v", "libx264",
+            "-preset", "fast",
+            "-crf", "23",
+            "-c:a", "aac",
+            "-b:a", "192k",
+            "-shortest",
+            str(out_path)
+        ]
+
+        # 윈도우에서 subprocess 실행 시 콘솔 창 숨기기
+        startupinfo = None
+        if os.name == 'nt':
+            startupinfo = subprocess.STARTUPINFO()
+            startupinfo.dwFlags |= subprocess.STARTF_USESHOWWINDOW
+
+        result = subprocess.run(
+            cmd,
+            capture_output=True,
+            text=True,
+            encoding="utf-8",
+            errors="ignore",
+            startupinfo=startupinfo
+        )
+
+        if result.returncode != 0:
+            raise RuntimeError(f"FFmpeg Final Render Failed: {result.stderr}")
 
 
 # -----------------------------------------------------------------------------

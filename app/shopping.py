@@ -671,6 +671,42 @@ class VideoBuildDialog(QtWidgets.QDialog):
         self.spin_steps.setRange(1, 100)
         setting_layout.addWidget(self.spin_steps)
 
+        # ── [New] 4. 폰트 설정 (Font Family) ──
+        setting_layout.addWidget(QtWidgets.QLabel("폰트:"))
+        self.combo_font = QtWidgets.QFontComboBox()  # 시스템 폰트 자동 로드
+        self.combo_font.setEditable(False)  # 직접 입력 방지
+
+        # 폰트 필터: 모든 폰트 보여주기 (필요시 ScalableFonts 등으로 제한 가능)
+        self.combo_font.setFontFilters(QtWidgets.QFontComboBox.AllFonts)
+
+        # 기본값 선택 ("맑은 고딕" 등 settings 값 찾아서 선택)
+        def_font = getattr(settings, "DEFAULT_FONT_FAMILY", "Malgun Gothic")
+        self.combo_font.setCurrentFont(QtGui.QFont(def_font))
+
+        # 너비 제한 (너무 길어지지 않게)
+        self.combo_font.setMaximumWidth(150)
+        setting_layout.addWidget(self.combo_font)
+
+        # ── [New] 5. 제목 크기 (Title Size) ──
+        setting_layout.addWidget(QtWidgets.QLabel("제목:"))
+        self.spin_title_size = QtWidgets.QSpinBox()
+        self.spin_title_size.setRange(10, 300)
+        # settings 값 적용
+        def_title = getattr(settings, "DEFAULT_TITLE_FONT_SIZE", 55)
+        self.spin_title_size.setValue(def_title)
+        self.spin_title_size.setSuffix(" px")  # 단위 표시
+        setting_layout.addWidget(self.spin_title_size)
+
+        # ── [New] 6. 내레이션 크기 (Narration Size) ──
+        setting_layout.addWidget(QtWidgets.QLabel("자막:"))
+        self.spin_narr_size = QtWidgets.QSpinBox()
+        self.spin_narr_size.setRange(10, 200)
+        # settings 값 적용
+        def_narr = getattr(settings, "DEFAULT_NARRATION_FONT_SIZE", 25)
+        self.spin_narr_size.setValue(def_narr)
+        self.spin_narr_size.setSuffix(" px")
+        setting_layout.addWidget(self.spin_narr_size)
+
         setting_layout.addStretch(1)
         root.addWidget(setting_group)
 
@@ -857,6 +893,9 @@ class VideoBuildDialog(QtWidgets.QDialog):
         def_res = getattr(settings, "DEFAULT_IMG_SIZE", (405, 720))
         def_fps = int(getattr(settings, "DEFAULT_MOVIE_FPS", 16))
         def_steps = int(getattr(settings, "DEFAULT_T2I_STEPS", 6))
+        def_font_family = getattr(settings, "DEFAULT_FONT_FAMILY", "Malgun Gothic")
+        def_title_size = int(getattr(settings, "DEFAULT_TITLE_FONT_SIZE", 55))
+        def_narr_size = int(getattr(settings, "DEFAULT_NARRATION_FONT_SIZE", 25))
 
         # 2. video.json 파일 확인 (덮어쓰기)
         vpath = Path(self.target_video_json)
@@ -882,6 +921,18 @@ class VideoBuildDialog(QtWidgets.QDialog):
                 st = gen_def.get("steps")
                 if st:
                     def_steps = int(st)
+
+
+                sub_def = data.get("defaults", {}).get("subtitle", {})
+                # 폰트 읽기
+                if sub_def.get("font_family"):
+                    def_font_family = sub_def["font_family"]
+                # 제목 크기 읽기
+                if sub_def.get("title_size"):
+                    def_title_size = int(sub_def["title_size"])
+                # 내레이션 크기 읽기
+                if sub_def.get("narr_size"):
+                    def_narr_size = int(sub_def["narr_size"])
 
             except Exception as e:
                 self._append_log(f"⚠ video.json 설정 로드 실패 (기본값 사용): {e}")
@@ -922,6 +973,13 @@ class VideoBuildDialog(QtWidgets.QDialog):
         # (3) Steps 설정
         self.spin_steps.setValue(def_steps)
 
+        # (4) 폰트 설정
+        self.combo_font.setCurrentFont(QtGui.QFont(def_font_family))
+        # (5) 제목크기 설정
+        self.spin_title_size.setValue(def_title_size)
+        # (6) 내레이션 크기 설정
+        self.spin_narr_size.setValue(def_narr_size)
+
         # 로그 확인용
         # self._append_log(f"[Init] UI 설정 적용: {target_res_val}, {def_fps}fps, {def_steps}steps")
 
@@ -930,7 +988,10 @@ class VideoBuildDialog(QtWidgets.QDialog):
         w, h = self.combo_res.currentData()
         fps = self.combo_fps.currentData()
         steps = self.spin_steps.value()
-        return w, h, fps, steps
+        font_family = self.combo_font.currentFont().family()  # 폰트 이름 문자열
+        title_size = self.spin_title_size.value()
+        narr_size = self.spin_narr_size.value()
+        return w, h, fps, steps, font_family, title_size, narr_size
 
     # ── 헬퍼 함수들 ─────────────────────────
     def _append_log(self, msg: str):
@@ -1045,10 +1106,10 @@ class VideoBuildDialog(QtWidgets.QDialog):
             return
 
         # UI 설정값 가져오기
-        w, h, fps, steps = self._get_current_settings()
-        self._append_log(f"⚙ 설정 적용: {w}x{h}, {fps}fps, {steps}steps")
+        w, h, fps, steps, font, t_size, n_size = self._get_current_settings()
 
-        # 버튼 비활성화
+        self._append_log(f"⚙ 설정: {w}x{h}, {fps}fps, {steps}steps, 폰트={font}(T:{t_size}, N:{n_size})")
+
         self.btn_make_video_json.setEnabled(False)
 
         from app.shopping_video_build import convert_shopping_to_video_json_with_ai

@@ -48,7 +48,7 @@ _CANON_RE = re.compile(r"[^a-z0-9]+")
 
 import app.settings as _settings
 
-from app.settings import FFPROBE_EXE, BASE_DIR, CHARACTER_DIR, COMFY_HOST, JSONS_DIR, COMFY_INPUT_DIR, FFMPEG_EXE
+from app.settings import FFPROBE_EXE, BASE_DIR, CHARACTER_DIR, COMFY_HOST, JSONS_DIR, COMFY_INPUT_DIR, FFMPEG_EXE, _DEFAULT_ACE_WAIT_TIMEOUT_SEC, _DEFAULT_ACE_POLL_INTERVAL_SEC
 from app.lyrics_gen import create_project_files, normalize_sections, generate_title_lyrics_tags
 from json import loads, dumps
 from app.story_enrich import apply_gpt_to_story_v11
@@ -1760,7 +1760,7 @@ class MainWindow(QtWidgets.QMainWindow):
                             wf[SAVE_NODE_ID]["inputs"]["filename_prefix"] = f"qwen_kf/{scene_id}/{seg_index + 1}"
 
                         # 실행
-                        result = _submit_and_wait_comfy(COMFY_HOST, wf, timeout=900, poll=3.0)
+                        result = _submit_and_wait_comfy(COMFY_HOST, wf, timeout=_DEFAULT_ACE_WAIT_TIMEOUT_SEC, poll=_DEFAULT_ACE_POLL_INTERVAL_SEC)
 
                         # 결과 파싱
                         outputs_dict = result.get("outputs", {})
