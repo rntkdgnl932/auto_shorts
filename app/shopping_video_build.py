@@ -146,6 +146,13 @@ def generate_tts_zonos(
     if not text:
         return False
 
+    # [핵심 수정] Zonos 초기 잡음 방지용 '..' 자동 추가
+    # 원본 text는 건드리지 않고, ComfyUI에 보낼 때만 추가합니다.
+    # 자막에는 영향이 없으며, 오디오 생성 시에만 적용됩니다.
+    tts_prompt_text = text
+    if not tts_prompt_text.strip().startswith("."):
+        tts_prompt_text = ".." + tts_prompt_text
+
     wf_path = Path(settings.JSONS_DIR) / "who_voice.json"
     if not wf_path.exists():
         wf_path = Path(r"C:\my_games\shorts_make\app\jsons\who_voice.json")
@@ -175,9 +182,9 @@ def generate_tts_zonos(
     # 1. 텍스트/시드/속도 설정
     found_gen = False
     for nid, node in graph.items():
-        # Zonos 노드 찾기 (class_type에 Zonos 포함 & inputs에 speech가 있는 노드)
+        # Zonos 노드 찾기
         if "Zonos" in node.get("class_type", "") and "speech" in node.get("inputs", {}):
-            node["inputs"]["speech"] = text
+            node["inputs"]["speech"] = tts_prompt_text  # [수정] ..이 추가된 텍스트 주입
             node["inputs"]["seed"] = random.randint(1, 2 ** 32)
             if config and "speed" in config:
                 node["inputs"]["speed"] = config["speed"]
@@ -186,7 +193,7 @@ def generate_tts_zonos(
 
     # 만약 위 루프에서 못 찾았으면 ID 24번 시도 (fallback)
     if not found_gen and "24" in graph:
-        graph["24"]["inputs"]["speech"] = text
+        graph["24"]["inputs"]["speech"] = tts_prompt_text # [수정] ..이 추가된 텍스트 주입
         graph["24"]["inputs"]["seed"] = random.randint(1, 2 ** 32)
         if config and "speed" in config:
             graph["24"]["inputs"]["speed"] = config["speed"]
@@ -1023,9 +1030,9 @@ class ShoppingMovieGenerator:
     def merge_movies(self, video_json_path: str | Path):
         """
         [3단계 병합 프로세스]
-        1. Visual: concatenate_scene_clips로 영상 트랙 병합 (temp_visual.mp4)
-        2. Audio: pydub로 BGM(20%, fadeout) + Voice(타임스탬프) 믹싱 (mixed_audio.wav)
-        3. Final: FFmpeg로 자막(.srt) 생성 후 영상+오디오+자막 합성 (final_shopping_video.mp4)
+        1. Visual: concatenate_scene_clips로 영상 트랙 병합
+        2. Audio: BGM + Voice 믹싱
+        3. Final: FFmpeg drawtext로 제목/내레이션 하드코딩 (Shorts 방식)
         """
         vpath = Path(video_json_path)
         project_dir = vpath.parent
@@ -1033,10 +1040,10 @@ class ShoppingMovieGenerator:
         voice_dir = project_dir / "voice"
         bgm_path = project_dir / "bgm.mp3"
 
-        # 중간 산출물 경로
         temp_visual_path = project_dir / "temp_visual_merged.mp4"
         mixed_audio_path = project_dir / "mixed_audio.wav"
-        srt_path = project_dir / "subtitles.srt"
+
+        # drawtext 최종본 출력
         final_output_path = project_dir / "final_shopping_video.mp4"
 
         ffmpeg_exe = getattr(settings, "FFMPEG_EXE", "ffmpeg")
@@ -1045,8 +1052,18 @@ class ShoppingMovieGenerator:
         data = load_json(vpath, {})
         scenes = data.get("scenes", [])
 
-        # 1. 영상 트랙 병합 (Visual Only)
-        clip_paths = []
+        # 제목/자막 설정 로드(여기는 JSON 기준. UI 기준으로 하고 싶으면 on_merge_clicked에서 JSON에 주입해야 함)
+        defaults = data.get("defaults", {}) if isinstance(data.get("defaults", {}), dict) else {}
+        defaults_sub = defaults.get("subtitle", {}) if isinstance(defaults.get("subtitle", {}), dict) else {}
+
+        font_family = str(defaults_sub.get("font_family") or getattr(settings, "DEFAULT_FONT_FAMILY", "Malgun Gothic"))
+        title_size = int(defaults_sub.get("title_size") or getattr(settings, "DEFAULT_TITLE_FONT_SIZE", 55))
+        narr_size = int(defaults_sub.get("narr_size") or getattr(settings, "DEFAULT_NARRATION_FONT_SIZE", 25))
+
+        self.on_progress(f"[Merge] drawtext 적용값: font='{font_family}', title={title_size}, narr={narr_size}")
+
+        # 1) 영상 concat
+        clip_paths: List[Path] = []
         for sc in scenes:
             cpath = clips_dir / f"{sc['id']}.mp4"
             if cpath.exists():
@@ -1059,18 +1076,16 @@ class ShoppingMovieGenerator:
             return
 
         try:
-            # 기존 함수 활용 (영상만 빠르게 이어붙임)
             concatenate_scene_clips(clip_paths, temp_visual_path, ffmpeg_exe)
         except Exception as e:
             self.on_progress(f"❌ 영상 트랙 병합 실패: {e}")
             return
 
-        # 2. 오디오 믹싱 (BGM + Voice)
+        # 2) 오디오 믹싱
         self.on_progress("[Merge] 2/3단계: BGM 및 내레이션 믹싱 중...")
         try:
             total_duration = float(data.get("duration", 0))
             if total_duration <= 0:
-                # 메타데이터에 없으면 씬 합계로 계산
                 total_duration = sum(float(s.get("end", 0)) - float(s.get("start", 0)) for s in scenes)
 
             self._mix_audio_with_pydub(scenes, bgm_path, voice_dir, total_duration, mixed_audio_path)
@@ -1078,30 +1093,153 @@ class ShoppingMovieGenerator:
             self.on_progress(f"❌ 오디오 믹싱 실패: {e}")
             return
 
-        # 3. 자막 생성 및 최종 렌더링
-        self.on_progress("[Merge] 3/3단계: 자막 생성 및 최종 렌더링...")
+        # 3) 최종 렌더: drawtext로 제목 + 내레이션 입히기
+        self.on_progress("[Merge] 3/3단계: drawtext로 제목/내레이션 삽입 중...")
         try:
-            # 3-1. SRT 파일 생성
-            self._create_srt_file(scenes, srt_path)
-
-            # 3-2. FFmpeg 최종 합성 (Visual + Mixed Audio + Subtitles)
-            self._finalize_with_ffmpeg(
+            # (A) 오디오를 temp_visual에 먼저 합쳐 “영상+오디오” 파일을 만든 뒤,
+            # (B) 그 파일에 drawtext를 입히면 -c:a copy가 가능해서 빠르고 안정적입니다.
+            temp_av_path = project_dir / "_temp_av.mp4"
+            cmd_av = [
                 ffmpeg_exe,
-                temp_visual_path,
-                mixed_audio_path,
-                srt_path,
-                final_output_path
+                "-y",
+                "-i", str(temp_visual_path),
+                "-i", str(mixed_audio_path),
+                "-c:v", "copy",
+                "-c:a", "aac",
+                "-b:a", "192k",
+                "-shortest",
+                str(temp_av_path)
+            ]
+            r = subprocess.run(cmd_av, capture_output=True, text=True, encoding="utf-8", errors="ignore")
+            if r.returncode != 0:
+                raise RuntimeError(f"FFmpeg 오디오 합성 실패:\n{r.stderr}")
+
+            add_shopping_texts_with_drawtext(
+                video_in_path=temp_av_path,
+                video_json_path=vpath,
+                out_path=final_output_path,
+                ffmpeg_exe=ffmpeg_exe,
+                font_family=font_family,
+                title_fontsize=title_size,
+                narr_fontsize=narr_size,
             )
 
             self.on_progress(f"✅ 최종 병합 완료: {final_output_path.name}")
 
-            # (선택) 임시 파일 정리
-            # if temp_visual_path.exists(): os.remove(temp_visual_path)
-            # if mixed_audio_path.exists(): os.remove(mixed_audio_path)
-            # if srt_path.exists(): os.remove(srt_path)
-
         except Exception as e:
             self.on_progress(f"❌ 최종 렌더링 실패: {e}")
+
+    def _finalize_with_ffmpeg(
+            self,
+            ffmpeg_exe: str,
+            video_path: Path,
+            audio_path: Path,
+            srt_path: Path,
+            out_path: Path,
+            title_text: str = "",
+            font_settings: dict = None
+    ):
+        """
+        - drawtext(제목): fontfile 사용
+        - subtitles(SRT): fontsdir + force_style + original_size로 크기 스케일 문제 방지
+        """
+
+        if font_settings is None:
+            font_settings = {}
+
+        font_family = str(font_settings.get("family") or getattr(settings, "DEFAULT_FONT_FAMILY", "Malgun Gothic"))
+        title_size = int(font_settings.get("title_size") or getattr(settings, "DEFAULT_TITLE_FONT_SIZE", 55))
+        narr_size = int(font_settings.get("narr_size") or getattr(settings, "DEFAULT_NARRATION_FONT_SIZE", 25))
+        sub_original_size = str(font_settings.get("sub_original_size") or "").strip()
+
+        # drawtext용 폰트 파일 매핑
+        font_file = "C:/Windows/Fonts/malgun.ttf"
+        fam_lower = font_family.lower()
+
+        if "굴림" in fam_lower or "gulim" in fam_lower:
+            font_file = "C:/Windows/Fonts/gulim.ttc"
+        elif "바탕" in fam_lower or "batang" in fam_lower:
+            font_file = "C:/Windows/Fonts/batang.ttc"
+        elif "돋움" in fam_lower or "dotum" in fam_lower:
+            font_file = "C:/Windows/Fonts/dotum.ttc"
+        elif "궁서" in fam_lower or "gungsuh" in fam_lower:
+            font_file = "C:/Windows/Fonts/gungsuh.ttc"
+
+        font_path_ffmpeg = font_file.replace("\\", "/").replace(":", "\\:")
+
+        # subtitles 필터용 경로/스타일
+        srt_path_str = str(srt_path).replace("\\", "/").replace(":", "\\:")
+        fonts_dir = "C:/Windows/Fonts".replace("\\", "/").replace(":", "\\:")
+
+        sub_style_raw = (
+            f"FontName={font_family},FontSize={narr_size},Bold=1,"
+            f"PrimaryColour=&H00FFFFFF,OutlineColour=&H00000000,"
+            f"BorderStyle=1,Outline=2,Shadow=0,Alignment=2,MarginV=50"
+        )
+
+        # ✅ 매우 중요: force_style 내부 콤마는 \, 로 이스케이프 (필터 체인 콤마와 충돌 방지)
+        sub_style = sub_style_raw.replace(",", r"\,")
+
+        filters: List[str] = []
+
+        # (1) 자막 필터: fontsdir + force_style + original_size
+        # original_size를 주면 libass 스케일링이 “영상 기준”으로 잡혀서 25가 25처럼 보입니다.
+        if sub_original_size:
+            filters.append(
+                f"subtitles='{srt_path_str}':fontsdir='{fonts_dir}':original_size={sub_original_size}:force_style='{sub_style}'"
+            )
+        else:
+            filters.append(
+                f"subtitles='{srt_path_str}':fontsdir='{fonts_dir}':force_style='{sub_style}'"
+            )
+
+        # (2) 제목 drawtext
+        if title_text:
+            safe_title = title_text.replace("'", r"\'").replace(":", r"\:")
+
+            alpha_expr = "if(lt(t,1),0,if(lt(t,3),(t-1)/2,if(lt(t,4),1,if(lt(t,6),(6-t)/2,0))))"
+
+            drawtext_filter = (
+                f"drawtext=fontfile='{font_path_ffmpeg}':text='{safe_title}':"
+                f"fontsize={title_size}:fontcolor=white:borderw=2:bordercolor=black:"
+                f"x=(w-text_w)/2:y=h*0.15:"
+                f"alpha='{alpha_expr}'"
+            )
+            filters.append(drawtext_filter)
+
+        filter_complex = ",".join(filters)
+
+        cmd = [
+            ffmpeg_exe,
+            "-y",
+            "-i", str(video_path),
+            "-i", str(audio_path),
+            "-vf", filter_complex,
+            "-c:v", "libx264",
+            "-preset", "fast",
+            "-crf", "23",
+            "-c:a", "aac",
+            "-b:a", "192k",
+            "-shortest",
+            str(out_path)
+        ]
+
+        startupinfo = None
+        if os.name == 'nt':
+            startupinfo = subprocess.STARTUPINFO()
+            startupinfo.dwFlags |= subprocess.STARTF_USESHOWWINDOW
+
+        result = subprocess.run(
+            cmd,
+            capture_output=True,
+            text=True,
+            encoding="utf-8",
+            errors="ignore",
+            startupinfo=startupinfo
+        )
+
+        if result.returncode != 0:
+            raise RuntimeError(f"FFmpeg 렌더링 실패:\n{result.stderr}")
 
     # --- 내부 헬퍼 메서드 ---
 
@@ -1197,55 +1335,7 @@ class ShoppingMovieGenerator:
                 f.write(f"{text}\n\n")
                 idx += 1
 
-    def _finalize_with_ffmpeg(self, ffmpeg_exe: str, video_path: Path, audio_path: Path, srt_path: Path,
-                              out_path: Path):
-        """영상, 오디오, 자막을 최종 합성 (재인코딩 발생)"""
 
-        # FFmpeg filter에서 윈도우 경로 역슬래시(\)는 이스케이프가 까다로우므로 슬래시(/)로 변환
-        # 자막 경로 처리
-        srt_path_str = str(srt_path).replace("\\", "/").replace(":", "\\:")
-
-        # 명령어 구성
-        # -shortest: 영상/오디오 중 짧은 쪽에 맞춰 끝냄
-        # -c:v libx264: 자막 합성을 위해 비디오 재인코딩
-        # -c:a aac: 오디오 인코딩
-        # -vf subtitles=...: 자막 필터 (force_style로 폰트 크기/배경 등 스타일 지정 가능)
-
-        # 기본 자막 스타일: 폰트크기 20, 굵게, 흰색 글씨, 검은 테두리, 하단 여백 20
-        sub_style = "Fontname=Arial,FontSize=20,Bold=1,PrimaryColour=&H00FFFFFF,OutlineColour=&H00000000,BorderStyle=1,Outline=2,Shadow=0,MarginV=30"
-
-        cmd = [
-            ffmpeg_exe,
-            "-y",
-            "-i", str(video_path),
-            "-i", str(audio_path),
-            "-vf", f"subtitles='{srt_path_str}':force_style='{sub_style}'",
-            "-c:v", "libx264",
-            "-preset", "fast",
-            "-crf", "23",
-            "-c:a", "aac",
-            "-b:a", "192k",
-            "-shortest",
-            str(out_path)
-        ]
-
-        # 윈도우에서 subprocess 실행 시 콘솔 창 숨기기
-        startupinfo = None
-        if os.name == 'nt':
-            startupinfo = subprocess.STARTUPINFO()
-            startupinfo.dwFlags |= subprocess.STARTF_USESHOWWINDOW
-
-        result = subprocess.run(
-            cmd,
-            capture_output=True,
-            text=True,
-            encoding="utf-8",
-            errors="ignore",
-            startupinfo=startupinfo
-        )
-
-        if result.returncode != 0:
-            raise RuntimeError(f"FFmpeg Final Render Failed: {result.stderr}")
 
 
 # -----------------------------------------------------------------------------
@@ -1420,4 +1510,117 @@ def convert_shopping_to_video_json_with_ai(
             _log(f"❌ AI 상세화 실패: {e}")
 
     return str(dst_json_path)
+
+
+
+def add_shopping_texts_with_drawtext(
+        *,
+        video_in_path: Path,
+        video_json_path: Path,
+        out_path: Path,
+        ffmpeg_exe: str,
+        font_family: str,
+        title_fontsize: int,
+        narr_fontsize: int,
+) -> str:
+    """
+    Shopping 탭 최종 렌더링(drawtext):
+    - subtitles(libass) 사용 안 함
+    - drawtext로 제목 + 내레이션을 직접 하드코딩
+    - 제목: 1초 대기 -> 2초 fade in -> 1초 유지 -> 2초 fade out (상단)
+    - 내레이션: scene start~end 동안 하단 표시
+
+    [중요]
+    - drawtext는 일부 폰트(TTC/비트맵/컬렉션)를 "1bpp"로 판정하여 거부할 수 있음.
+    - 따라서 Windows에서는 안정적으로 동작하는 TTF(예: malgun.ttf)로 강제.
+    """
+
+    video_data = load_json(video_json_path, {}) or {}
+    scenes = video_data.get("scenes", [])
+
+    meta = video_data.get("meta", {}) if isinstance(video_data.get("meta", {}), dict) else {}
+    title = (meta.get("title") or video_data.get("title") or "").strip()
+
+    # ✅ drawtext 안정 폰트: malgun.ttf로 강제 (Shorts에서 검증된 방식)
+    # 굴림/바탕/돋움 등 TTC 계열은 drawtext에서 1bpp 판정 이슈가 발생할 수 있어 사용하지 않음.
+    font_file = "C:/Windows/Fonts/malgun.ttf"
+    font_path_ffmpeg = font_file.replace(os.path.sep, "/").replace(":", "\\:")
+
+    filters: list[str] = []
+
+    def _esc_ffmpeg_text(s: str) -> str:
+        return (
+            s.replace("\\", "\\\\")
+             .replace(":", "\\:")
+             .replace("'", "'\\\\''")
+        )
+
+    # 1) 제목 (페이드)
+    if title:
+        title_escaped = _esc_ffmpeg_text(title)
+        alpha_expr = "if(lt(t,1),0,if(lt(t,3),(t-1)/2,if(lt(t,4),1,if(lt(t,6),(6-t)/2,0))))"
+
+        filters.append(
+            "drawtext="
+            f"fontfile='{font_path_ffmpeg}':"
+            f"text='{title_escaped}':"
+            f"fontsize={int(title_fontsize)}:"
+            "fontcolor=white:"
+            "box=1:boxcolor=black@0.5:boxborderw=6:"
+            "x=(w-text_w)/2:y=h*0.12:"
+            f"alpha='{alpha_expr}'"
+        )
+
+    # 2) 내레이션(씬별)
+    for sc in scenes:
+        text = (sc.get("narration") or sc.get("lyric") or "").strip()
+        if not text:
+            continue
+
+        start = float(sc.get("start", 0.0) or 0.0)
+        end = float(sc.get("end", 0.0) or 0.0)
+        if end <= start:
+            continue
+
+        text_escaped = _esc_ffmpeg_text(text).replace("\n", "\\n")
+
+        filters.append(
+            "drawtext="
+            f"fontfile='{font_path_ffmpeg}':"
+            f"text='{text_escaped}':"
+            f"fontsize={int(narr_fontsize)}:"
+            "fontcolor=white:"
+            "box=1:boxcolor=black@0.5:boxborderw=5:"
+            "x=(w-text_w)/2:y=h*0.82:"
+            f"enable='between(t,{start},{end})'"
+        )
+
+    if not filters:
+        shutil.copy2(str(video_in_path), str(out_path))
+        return str(out_path)
+
+    filter_complex = ",".join(filters)
+
+    cmd = [
+        ffmpeg_exe,
+        "-y",
+        "-i", str(video_in_path),
+        "-vf", filter_complex,
+        "-c:a", "copy",
+        "-c:v", "libx264",
+        "-preset", "fast",
+        "-crf", "22",
+        "-pix_fmt", "yuv420p",
+        str(out_path)
+    ]
+
+    result = subprocess.run(cmd, capture_output=True, text=True, encoding="utf-8", errors="ignore")
+
+    if result.returncode != 0:
+        raise RuntimeError(f"FFMPEG(drawtext) 텍스트 삽입 실패:\n{result.stderr}")
+
+    return str(out_path)
+
+
+
 #

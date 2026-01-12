@@ -1008,8 +1008,8 @@ class VideoBuildDialog(QtWidgets.QDialog):
             self._append_log(f"⚠ 열기 실패: {e}")
 
     def _options(self) -> BuildOptions:
-        # FPS는 공통 설정에서 가져옴
-        _, _, fps, _ = self._get_current_settings()
+        # [수정] 반환값 7개 언패킹 (fps 사용)
+        _, _, fps, _, _, _, _ = self._get_current_settings()
         return BuildOptions(
             scene_count=int(self.sp_scene_count.value()),
             style=str(self.cb_style.currentText()),
@@ -1153,7 +1153,8 @@ class VideoBuildDialog(QtWidgets.QDialog):
             QtWidgets.QMessageBox.warning(self, "알림", "video.json이 없습니다.\n'4. 비디오 JSON 생성'을 먼저 진행해주세요.")
             return
 
-        w, h, _, steps = self._get_current_settings()
+        # [수정] 반환값 7개 언패킹 (w, h, steps 사용)
+        w, h, _, steps, _, _, _ = self._get_current_settings()
 
         def job(progress):
             progress(f"[Image] 이미지 생성 시작 ({w}x{h}, steps={steps})...")
@@ -1190,7 +1191,9 @@ class VideoBuildDialog(QtWidgets.QDialog):
             QtWidgets.QMessageBox.warning(self, "알림", "video.json이 없습니다.\n'4. 비디오 JSON 생성'을 먼저 진행해주세요.")
             return
 
-        _, _, fps, _ = self._get_current_settings()
+        # [수정] _get_current_settings() 반환값이 7개로 늘어났으므로 맞춰줍니다.
+        # (w, h, fps, steps, font, title_size, narr_size)
+        _, _, fps, _, _, _, _ = self._get_current_settings()
 
         def job(progress):
             progress(f"[Movie] I2V 영상 생성 시작 ({fps} fps)...")
@@ -1216,6 +1219,63 @@ class VideoBuildDialog(QtWidgets.QDialog):
         if not Path(self.target_video_json).exists():
             self._append_log("⚠ video.json이 없습니다.")
             return
+
+        # ✅ 핵심: "영상 합치기" 직전에 UI 설정값을 video.json에 강제로 반영
+        try:
+            w, h, fps, steps, font_family, title_size, narr_size = self._get_current_settings()
+
+            p = Path(self.target_video_json)
+            data = {}
+            try:
+                with open(p, "r", encoding="utf-8") as f:
+                    data = json.load(f) or {}
+            except Exception:
+                data = {}
+
+            defaults = data.get("defaults")
+            if not isinstance(defaults, dict):
+                defaults = {}
+                data["defaults"] = defaults
+
+            sub = defaults.get("subtitle")
+            if not isinstance(sub, dict):
+                sub = {}
+                defaults["subtitle"] = sub
+
+            # UI에서 읽은 값 저장 (merge_movies가 이 값을 읽도록 강제)
+            sub["font_family"] = str(font_family)
+            sub["title_size"] = int(title_size)
+            sub["narr_size"] = int(narr_size)
+
+            # (참고) 다른 설정도 같이 기록해두면 추후 일관성 유지에 도움
+            img = defaults.get("image")
+            if not isinstance(img, dict):
+                img = {}
+                defaults["image"] = img
+            img["width"] = int(w)
+            img["height"] = int(h)
+
+            mov = defaults.get("movie")
+            if not isinstance(mov, dict):
+                mov = {}
+                defaults["movie"] = mov
+            mov["fps"] = int(fps)
+
+            gen = defaults.get("generator")
+            if not isinstance(gen, dict):
+                gen = {}
+                defaults["generator"] = gen
+            gen["steps"] = int(steps)
+
+            with open(p, "w", encoding="utf-8") as f:
+                json.dump(data, f, ensure_ascii=False, indent=2)
+
+            self._append_log(
+                f"🧷 merge 직전 UI 설정 저장 완료: font='{font_family}', title={title_size}, narr={narr_size}"
+            )
+
+        except Exception as e:
+            self._append_log(f"⚠ UI 설정을 video.json에 반영 실패(그래도 merge는 시도): {e}")
 
         def job(progress):
             progress("[Merge] 영상 합치기 시작...")
