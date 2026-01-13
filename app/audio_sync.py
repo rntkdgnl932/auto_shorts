@@ -13,7 +13,7 @@ from app.settings import (
     ACE_STEP_PROMPT_JSON, FFMPEG_EXE, FINAL_OUT, SECTION_HEADER_RE
 )
 from app import settings as _s
-from app.utils import load_json, save_json, sanitize_title, effective_title, save_to_user_library, audio_duration_sec, _dlog, _submit_and_wait
+from app.utils import load_json, save_json, sanitize_title, effective_title, save_to_user_library, audio_duration_sec, _dlog, _submit_and_wait, get_duration
 from librosa.onset import onset_strength as lb_onset_strength, onset_detect as lb_onset_detect
 from librosa.effects import hpss as lb_hpss
 import tempfile
@@ -861,96 +861,96 @@ def _ensure_intro_at_head(
 # 0) 유틸: 오디오 길이 견고 획득(중앙값, 3배 튐 방지)
 # ─────────────────────────────────────────────────────────────
 # real_use
-def _probe_duration_ffprobe(path: str) -> float:
-    import json
-    try:
-        out = subprocess.check_output(
-            ["ffprobe", "-v", "error", "-show_entries", "format=duration", "-of", "json", path],
-            stderr=subprocess.STDOUT,
-        )
-        data = json.loads(out.decode("utf-8", "ignore"))
-        dur = float(data.get("format", {}).get("duration", 0.0) or 0.0)
-        return dur if math.isfinite(dur) and dur > 0 else 0.0
-    except Exception:
-        return 0.0
-# real_use
-def _probe_duration_mutagen(path: str) -> float:
-    try:
-          # type: ignore
-        mf = MutagenFile(path)
-        dur = float(getattr(mf, "info", None).length if mf and getattr(mf, "info", None) else 0.0)
-        return dur if math.isfinite(dur) and dur > 0 else 0.0
-    except Exception:
-        return 0.0
-# real_use
-def _probe_duration_pydub(path: str) -> float:
-    try:
-
-        dur_ms = len(AudioSegment.from_file(path))
-        dur = float(dur_ms) / 1000.0
-        return dur if math.isfinite(dur) and dur > 0 else 0.0
-    except Exception:
-        return 0.0
-# real_use
-def _probe_duration_soundfile(path: str) -> float:
-    try:
-        import soundfile as zsf  # type: ignore
-        with zsf.SoundFile(path) as f:
-            dur = float(len(f) / (f.samplerate or 1))
-            return dur if math.isfinite(dur) and dur > 0 else 0.0
-    except Exception:
-        return 0.0
-# real_use
-def _probe_duration_wave(path: str) -> float:
-    try:
-        import wave
-        with wave.open(path, "rb") as wf:
-            frames = wf.getnframes()
-            rate = wf.getframerate() or 1
-            dur = float(frames) / float(rate)
-            return dur if math.isfinite(dur) and dur > 0 else 0.0
-    except Exception:
-        return 0.0
-# real_use
-def _probe_duration_librosa(path: str) -> float:
-    try:
-        import librosa  # type: ignore
-        try:
-            dur = float(librosa.get_duration(path=path))
-        except TypeError:
-            dur = float(librosa.get_duration(filename=path))
-        return dur if math.isfinite(dur) and dur > 0 else 0.0
-    except Exception:
-        return 0.0
-# real_use
-def get_audio_duration(path: str) -> float:
-    p = str(path or "").strip()
-    if not p or not os.path.isfile(p):
-        return 0.0
-    cands: List[float] = []
-    for fn in (
-        _probe_duration_ffprobe,
-        _probe_duration_mutagen,
-        _probe_duration_pydub,
-        _probe_duration_soundfile,
-        _probe_duration_wave,
-        _probe_duration_librosa,
-    ):
-        v = fn(p)
-        if v and math.isfinite(v) and v > 0:
-            cands.append(v)
-    if not cands:
-        return 0.0
-    cands.sort()
-    mid = len(cands) // 2
-    if len(cands) % 2 == 1:
-        median = cands[mid]
-    else:
-        median = 0.5 * (cands[mid - 1] + cands[mid])
-    mn, mx = cands[0], cands[-1]
-    if mx / max(mn, 1e-9) >= 2.4 and mn > 0:
-        return mn
-    return median
+# def _probe_duration_ffprobe(path: str) -> float:
+#     import json
+#     try:
+#         out = subprocess.check_output(
+#             ["ffprobe", "-v", "error", "-show_entries", "format=duration", "-of", "json", path],
+#             stderr=subprocess.STDOUT,
+#         )
+#         data = json.loads(out.decode("utf-8", "ignore"))
+#         dur = float(data.get("format", {}).get("duration", 0.0) or 0.0)
+#         return dur if math.isfinite(dur) and dur > 0 else 0.0
+#     except Exception:
+#         return 0.0
+# # real_use
+# def _probe_duration_mutagen(path: str) -> float:
+#     try:
+#           # type: ignore
+#         mf = MutagenFile(path)
+#         dur = float(getattr(mf, "info", None).length if mf and getattr(mf, "info", None) else 0.0)
+#         return dur if math.isfinite(dur) and dur > 0 else 0.0
+#     except Exception:
+#         return 0.0
+# # real_use
+# def _probe_duration_pydub(path: str) -> float:
+#     try:
+#
+#         dur_ms = len(AudioSegment.from_file(path))
+#         dur = float(dur_ms) / 1000.0
+#         return dur if math.isfinite(dur) and dur > 0 else 0.0
+#     except Exception:
+#         return 0.0
+# # real_use
+# def _probe_duration_soundfile(path: str) -> float:
+#     try:
+#         import soundfile as zsf  # type: ignore
+#         with zsf.SoundFile(path) as f:
+#             dur = float(len(f) / (f.samplerate or 1))
+#             return dur if math.isfinite(dur) and dur > 0 else 0.0
+#     except Exception:
+#         return 0.0
+# # real_use
+# def _probe_duration_wave(path: str) -> float:
+#     try:
+#         import wave
+#         with wave.open(path, "rb") as wf:
+#             frames = wf.getnframes()
+#             rate = wf.getframerate() or 1
+#             dur = float(frames) / float(rate)
+#             return dur if math.isfinite(dur) and dur > 0 else 0.0
+#     except Exception:
+#         return 0.0
+# # real_use
+# def _probe_duration_librosa(path: str) -> float:
+#     try:
+#         import librosa  # type: ignore
+#         try:
+#             dur = float(librosa.get_duration(path=path))
+#         except TypeError:
+#             dur = float(librosa.get_duration(filename=path))
+#         return dur if math.isfinite(dur) and dur > 0 else 0.0
+#     except Exception:
+#         return 0.0
+# # real_use
+# def get_audio_duration(path: str) -> float:
+#     p = str(path or "").strip()
+#     if not p or not os.path.isfile(p):
+#         return 0.0
+#     cands: List[float] = []
+#     for fn in (
+#         _probe_duration_ffprobe,
+#         _probe_duration_mutagen,
+#         _probe_duration_pydub,
+#         _probe_duration_soundfile,
+#         _probe_duration_wave,
+#         _probe_duration_librosa,
+#     ):
+#         v = fn(p)
+#         if v and math.isfinite(v) and v > 0:
+#             cands.append(v)
+#     if not cands:
+#         return 0.0
+#     cands.sort()
+#     mid = len(cands) // 2
+#     if len(cands) % 2 == 1:
+#         median = cands[mid]
+#     else:
+#         median = 0.5 * (cands[mid - 1] + cands[mid])
+#     mn, mx = cands[0], cands[-1]
+#     if mx / max(mn, 1e-9) >= 2.4 and mn > 0:
+#         return mn
+#     return median
 
 
 # real use
@@ -1996,7 +1996,7 @@ def sync_lyrics_with_whisper_pro(
     except OSError as e:
         print(f"[WARN] 최종 seg.json 저장 실패: {e}")
 
-    final_audio_duration_after_processing = get_audio_duration(str(slp_audio_path))
+    final_audio_duration_after_processing = get_duration(str(slp_audio_path))
     summary_lines = [
         f"\n[음악분석 결과]",
         f"파일: {slp_audio_path.name}",
@@ -2845,7 +2845,7 @@ def _finalize_audio_and_update_time(
     # ---- 3. 오디오 처리 및 'time' 업데이트 ----
     last_lyric_end = _safe_float(organized_segments[-1].get("end", 0.0))
     target_duration = last_lyric_end + 5.0
-    actual_duration = get_audio_duration(audio_path)
+    actual_duration = get_duration(audio_path)
     final_audio_duration = actual_duration if actual_duration > 0 else target_duration
 
     print(

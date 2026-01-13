@@ -22,11 +22,11 @@ from app.utils import (
     load_json,
     save_json,
     ensure_dir,
-    _submit_and_wait as submit_and_wait
+    _submit_and_wait as submit_and_wait,
+    get_duration
 )
 from app import settings
-from app.video_build import build_shots_with_i2v, concatenate_scene_clips, fill_prompt_movie_with_ai_long
-from app.audio_sync import get_audio_duration
+from app.video_build import build_shots_with_i2v, concatenate_scene_clips, fill_prompt_movie_with_ai_long, concatenate_scene_clips_final_av
 
 def _now_str() -> str:
     return datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
@@ -887,7 +887,7 @@ class ShoppingVideoJsonBuilder:
                 # 파일 쓰기 완료 대기 겸 재시도
                 for _ in range(3):
                     try:
-                        d = get_audio_duration(str(v_path))
+                        d = get_duration(str(v_path))
                         if d > 0:
                             final_dur = d
                             break
@@ -1112,30 +1112,29 @@ class ShoppingMovieGenerator:
 
     def merge_movies(self, video_json_path: str | Path):
         """
-        [3단계 병합 프로세스]
-        1. Visual: concatenate_scene_clips로 영상 트랙 병합
-        2. Audio: BGM + Voice 믹싱
-        3. Final: FFmpeg drawtext로 제목/내레이션 하드코딩 (Shorts 방식)
+        [최종 병합]
+        - clips/*.mp4를 실제 길이 기준으로 재타임라인 구성
+        - 내레이션/자막을 각 씬(클립)의 중앙에 배치
+        - 내레이션이 길면 1.2배속 1회 시도 후, 그래도 길면 오류
+        - 최종 out: final_shopping_video.mp4
         """
         vpath = Path(video_json_path)
         project_dir = vpath.parent
         clips_dir = project_dir / "clips"
-        voice_dir = project_dir / "voice"
         bgm_path = project_dir / "bgm.mp3"
 
-        temp_visual_path = project_dir / "temp_visual_merged.mp4"
-        mixed_audio_path = project_dir / "mixed_audio.wav"
-
-        # drawtext 최종본 출력
+        # 최종본 출력
         final_output_path = project_dir / "final_shopping_video.mp4"
-
         ffmpeg_exe = getattr(settings, "FFMPEG_EXE", "ffmpeg")
 
-        self.on_progress("[Merge] 1/3단계: 영상 트랙 합치는 중...")
+        self.on_progress("[Merge] video.json 로드...")
         data = load_json(vpath, {})
         scenes = data.get("scenes", [])
+        if not isinstance(scenes, list) or not scenes:
+            self.on_progress("❌ scenes가 비었습니다.")
+            return
 
-        # 제목/자막 설정 로드(여기는 JSON 기준. UI 기준으로 하고 싶으면 on_merge_clicked에서 JSON에 주입해야 함)
+        # 자막/제목 설정 로드
         defaults = data.get("defaults", {}) if isinstance(data.get("defaults", {}), dict) else {}
         defaults_sub = defaults.get("subtitle", {}) if isinstance(defaults.get("subtitle", {}), dict) else {}
 
@@ -1143,74 +1142,70 @@ class ShoppingMovieGenerator:
         title_size = int(defaults_sub.get("title_size") or getattr(settings, "DEFAULT_TITLE_FONT_SIZE", 55))
         narr_size = int(defaults_sub.get("narr_size") or getattr(settings, "DEFAULT_NARRATION_FONT_SIZE", 25))
 
-        self.on_progress(f"[Merge] drawtext 적용값: font='{font_family}', title={title_size}, narr={narr_size}")
+        title_text = str(data.get("title") or "").strip()
 
-        # 1) 영상 concat
+        self.on_progress(
+            f"[Merge] 적용값: font='{font_family}', title={title_size}, narr={narr_size}, "
+            f"bgm={'YES' if bgm_path.exists() else 'NO'}"
+        )
+
+        # 1) 클립 수집(씬 순서대로)
         clip_paths: List[Path] = []
+        missing = False
         for sc in scenes:
-            cpath = clips_dir / f"{sc['id']}.mp4"
-            if cpath.exists():
+            sid = str(sc.get("id") or "").strip()
+            if not sid:
+                continue
+            cpath = clips_dir / f"{sid}.mp4"
+            if cpath.exists() and cpath.stat().st_size > 0:
                 clip_paths.append(cpath)
             else:
                 self.on_progress(f"⚠️ 클립 누락됨: {cpath.name}")
+                missing = True
 
         if not clip_paths:
             self.on_progress("❌ 병합할 클립이 없습니다.")
             return
+        if missing:
+            self.on_progress("⚠️ 일부 씬 클립이 누락되어, 존재하는 클립만으로 병합합니다.")
 
+        # 2) 최종 병합(영상+오디오+자막을 한 번에)
+        self.on_progress("[Merge] 최종 병합(실측 길이 기반 중앙 배치) 시작...")
         try:
-            concatenate_scene_clips(clip_paths, temp_visual_path, ffmpeg_exe)
-        except Exception as e:
-            self.on_progress(f"❌ 영상 트랙 병합 실패: {e}")
-            return
-
-        # 2) 오디오 믹싱
-        self.on_progress("[Merge] 2/3단계: BGM 및 내레이션 믹싱 중...")
-        try:
-            total_duration = float(data.get("duration", 0))
-            if total_duration <= 0:
-                total_duration = sum(float(s.get("end", 0)) - float(s.get("start", 0)) for s in scenes)
-
-            self._mix_audio_with_pydub(scenes, bgm_path, voice_dir, total_duration, mixed_audio_path)
-        except Exception as e:
-            self.on_progress(f"❌ 오디오 믹싱 실패: {e}")
-            return
-
-        # 3) 최종 렌더: drawtext로 제목 + 내레이션 입히기
-        self.on_progress("[Merge] 3/3단계: drawtext로 제목/내레이션 삽입 중...")
-        try:
-            # (A) 오디오를 temp_visual에 먼저 합쳐 “영상+오디오” 파일을 만든 뒤,
-            # (B) 그 파일에 drawtext를 입히면 -c:a copy가 가능해서 빠르고 안정적입니다.
-            temp_av_path = project_dir / "_temp_av.mp4"
-            cmd_av = [
-                ffmpeg_exe,
-                "-y",
-                "-i", str(temp_visual_path),
-                "-i", str(mixed_audio_path),
-                "-c:v", "copy",
-                "-c:a", "aac",
-                "-b:a", "192k",
-                "-shortest",
-                str(temp_av_path)
-            ]
-            r = subprocess.run(cmd_av, capture_output=True, text=True, encoding="utf-8", errors="ignore")
-            if r.returncode != 0:
-                raise RuntimeError(f"FFmpeg 오디오 합성 실패:\n{r.stderr}")
-
-            add_shopping_texts_with_drawtext(
-                video_in_path=temp_av_path,
-                video_json_path=vpath,
+            concatenate_scene_clips_final_av(
+                clip_paths=clip_paths,
                 out_path=final_output_path,
                 ffmpeg_exe=ffmpeg_exe,
-                font_family=font_family,
+                scenes=scenes,
+                bgm_path=(bgm_path if bgm_path.exists() else None),
+                bgm_volume=0.35,
+                narration_volume=1.0,
+                pad_in_sec=0.25,
+                pad_out_sec=0.25,
+                subtitle_font=font_family,
+                subtitle_fontsize=narr_size,
+                subtitle_y="h-140",
+                subtitle_box=True,
+                subtitle_boxcolor="black@0.45",
+                subtitle_boxborderw=18,
+                title_text=title_text,
                 title_fontsize=title_size,
-                narr_fontsize=narr_size,
+                title_y="h*0.12",
+                video_crf=18,
+                video_preset="medium",
+                audio_bitrate="192k",
             )
+
+            # scenes에는 movie_duration/narration_duration/start/end가 갱신되어 들어있음 → 필요하면 저장
+            try:
+                save_json(vpath, data)
+            except Exception:
+                pass
 
             self.on_progress(f"✅ 최종 병합 완료: {final_output_path.name}")
 
         except Exception as e:
-            self.on_progress(f"❌ 최종 렌더링 실패: {e}")
+            self.on_progress(f"❌ 최종 병합 실패: {e}")
 
     def _finalize_with_ffmpeg(
             self,
@@ -1463,7 +1458,7 @@ class ShoppingShortsPipeline:
 
         return vpath
 
-
+# video_shopping_build.json 에서 음성길이가 각 0.5초 추가된 것을 그대로 가져옴 (sc["seconds"] = round(final_dur + 0.5, 2)) 이 부분임.
 def convert_shopping_to_video_json_with_ai(
         project_dir: str,
         ai_client: Any = None,
@@ -1477,8 +1472,9 @@ def convert_shopping_to_video_json_with_ai(
     [쇼핑->쇼츠 변환 최종판]
     - 원본(video_shopping.json)의 ID(t_001) 계승
     - UI 설정값(fps, width, height, steps) 저장 (해상도 문제 해결)
-    - 기존 오디오 파일이 있으면 실제 길이 측정 (0초 문제 해결)
-    - fill_prompt_movie_with_ai_long 호출 (가변 프레임 상세화)
+    - [중요 변경] 여기서는 오디오 길이를 "재측정"하지 않는다.
+      -> video_shopping.json에 이미 기록된 duration/seconds를 그대로 사용한다.
+    - fill_prompt_movie_with_ai_long 호출 (가변 프레임 상세화 / prompt_1~ 생성)
     """
 
     def _log(msg: str):
@@ -1500,17 +1496,18 @@ def convert_shopping_to_video_json_with_ai(
     except Exception as e:
         raise ValueError(f"데이터 로드 실패: {e}")
 
-    _log(f"데이터 구조 변환 시작... (해상도: {width}x{height}, FPS: {fps})")
+    _log(f"데이터 구조 변환 시작. (해상도: {width}x{height}, FPS: {fps})")
 
     prod = src_data.get("product", {})
     project_name = prod.get("product_name") or src_data.get("project_name", "Shopping Project")
+
     src_scenes = src_data.get("scenes", [])
     if not src_scenes:
         src_scenes = src_data.get("groups", [])
 
-    new_scenes = []
+    new_scenes: List[Dict[str, Any]] = []
     current_time = 0.0
-    full_lyrics_parts = []
+    full_lyrics_parts: List[str] = []
 
     for idx, sc in enumerate(src_scenes):
         original_id = str(sc.get("id", "")).strip()
@@ -1521,35 +1518,32 @@ def convert_shopping_to_video_json_with_ai(
 
         target_img_name = f"{scene_id}.png"
 
-        # 1. 오디오 파일 확인 및 길이 측정 (Fix: 0초 문제 해결)
+        # 1) 오디오 경로는 유지(저장만). 길이(dur)는 재측정하지 않음.
         voice_file = sc.get("voice_file") or sc.get("audio_path") or ""
-        real_duration = 0.0
-
-        # 절대 경로 또는 상대 경로 처리
         voice_path_obj = None
         if voice_file:
             if Path(voice_file).is_absolute():
                 voice_path_obj = Path(voice_file)
             else:
                 voice_path_obj = proj_path / voice_file
+            if not voice_path_obj.exists():
+                voice_path_obj = None
 
-            if voice_path_obj and voice_path_obj.exists():
-                try:
-                    real_duration = get_audio_duration(str(voice_path_obj))
-                except Exception:
-                    real_duration = 0.0
-
-        # JSON에 있는 값보다 실제 오디오 길이를 우선함 (오디오가 있다면)
-        if real_duration > 0.1:
-            dur = real_duration
-        else:
-            dur = float(sc.get("seconds") or sc.get("duration") or 4.0)
+        # 2) duration 결정: video_shopping.json 값을 그대로 신뢰
+        #    - enrich에서 실제 측정값을 duration에 넣었다면 duration 우선
+        #    - 없으면 seconds 사용
+        try:
+            dur = float(sc.get("duration") or sc.get("seconds") or 4.0)
+        except Exception:
+            dur = 4.0
+        if dur <= 0:
+            dur = 4.0
 
         start_t = current_time
         end_t = current_time + dur
         current_time = end_t
 
-        narration = str(sc.get("narration") or sc.get("narration_text") or "")
+        narration = str(sc.get("lyric") or sc.get("subtitle") or sc.get("narration") or sc.get("narration_text") or "")
         full_lyrics_parts.append(narration)
 
         new_scene = {
@@ -1573,7 +1567,7 @@ def convert_shopping_to_video_json_with_ai(
     total_duration = current_time
     full_lyrics = "\n".join(full_lyrics_parts)
 
-    # 2. Defaults에 UI 설정값 강제 적용 (Fix: 해상도 문제 해결)
+    # Defaults에 UI 설정값 강제 적용
     video_data = {
         "title": project_name,
         "duration": round(total_duration, 3),
@@ -1594,16 +1588,14 @@ def convert_shopping_to_video_json_with_ai(
     with open(dst_json_path, "w", encoding="utf-8") as f:
         json.dump(video_data, f, indent=2, ensure_ascii=False)
 
-    _log(f"video.json 저장 완료 (ID: {scene_id} 등, 총 길이: {total_duration:.2f}초)")
-    _log("AI 상세화 (Long Take) 진행...")
+    _log(f"video.json 저장 완료 (ID: {new_scenes[0]['id'] if new_scenes else 'N/A'} 등, 총 길이: {total_duration:.2f}초)")
+    _log("AI 상세화 (Long Take) 진행.")
 
     if ai_client:
         try:
             def ask_wrapper(sys_msg, user_msg):
                 return ai_client.ask_smart(sys_msg, user_msg, prefer="openai")
 
-            # [변경] Long 버전 함수 호출
-            from app.video_build import fill_prompt_movie_with_ai_long
             fill_prompt_movie_with_ai_long(
                 str(dst_json_path.parent),
                 ask_wrapper,
@@ -1614,6 +1606,7 @@ def convert_shopping_to_video_json_with_ai(
             _log(f"❌ AI 상세화 실패: {e}")
 
     return str(dst_json_path)
+
 
 
 

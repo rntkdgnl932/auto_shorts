@@ -6,7 +6,7 @@ from pathlib import Path as _Path
 import os
 
 # ── 유연 임포트 ─────────────────────────────────────────────────────────────
-from app.utils import ensure_dir, load_json
+from app.utils import ensure_dir, load_json, get_duration
 from app.settings import BASE_DIR, I2V_WORKFLOW, FFMPEG_EXE, USE_HWACCEL, FINAL_OUT, COMFY_HOST
 # music_gen에 있는 견고한 함수들을 우선 재사용 (가능할 때)
 from app.utils import _submit_and_wait as _submit_and_wait_comfy_func
@@ -224,7 +224,7 @@ def build_and_merge_full_video(project_dir: str,
     _log(6, f"최종 영상 생성 완료: {final_output.name}")
     return str(final_output)
 
-
+# 영상 등 합치기 ; 음악 버젼
 def concatenate_scene_clips(clip_paths: List[Path], out_path: Path, ffmpeg_exe: str):
     """
     [신규] FFMPEG concat demuxer를 사용해 여러 비디오 클립을 순서대로 병합합니다.
@@ -263,6 +263,388 @@ def concatenate_scene_clips(clip_paths: List[Path], out_path: Path, ffmpeg_exe: 
         if list_file.exists():
             list_file.unlink()
 
+# 영상 등 합치기 ; 자막 가운데 정렬 버젼
+def _ffmpeg_escape_drawtext(s: str) -> str:
+    """
+    FFmpeg drawtext 안전 이스케이프(기본형).
+    - 큰따옴표/역슬래시/콜론/퍼센트/개행 등 최소치 처리
+    """
+    if s is None:
+        return ""
+    s = str(s)
+    s = s.replace("\\", "\\\\")
+    s = s.replace(":", "\\:")
+    s = s.replace("'", "\\'")
+    s = s.replace("%", "\\%")
+    s = s.replace("\n", "\\n")
+    s = s.replace("\r", "")
+    return s
+
+def concatenate_scene_clips_final_av(
+    *,
+    clip_paths: List[Path],
+    out_path: Path,
+    ffmpeg_exe: str,
+    scenes: List[Dict[str, Any]],
+    bgm_path: Optional[Path] = None,
+    bgm_volume: float = 0.35,
+    narration_volume: float = 1.0,
+    pad_in_sec: float = 0.25,
+    pad_out_sec: float = 0.25,
+    subtitle_font: str = "Gulim",
+    subtitle_fontsize: int = 36,
+    subtitle_y: str = "h-140",
+    subtitle_box: bool = True,
+    subtitle_boxcolor: str = "black@0.45",
+    subtitle_boxborderw: int = 18,
+    # 제목(상단)도 같이 넣고 싶으면 사용
+    title_text: str = "",
+    title_fontsize: int = 55,
+    title_y: str = "h*0.12",
+    video_crf: int = 18,
+    video_preset: str = "medium",
+    audio_bitrate: str = "192k",
+) -> None:
+    """
+    [최종 합치기]
+    - clip_paths를 concat demuxer로 이어붙여 temp_visual.mp4 생성(오디오는 제외)
+    - 각 클립의 "실제 길이"를 get_duration()으로 측정하여 scene별 movie_duration에 기록
+    - 각 voice_file의 "실제 길이"를 get_duration()으로 측정하여 narration_duration에 기록
+    - 내레이션/자막은 해당 씬(클립)의 "중앙"에 배치
+    - 내레이션이 너무 길면 atempo=1.2로 1회 시도, 그래도 길면 오류
+    - drawtext는 제목(선택) + 내레이션(씬별)을 enable 구간으로 표시
+    """
+
+    if not clip_paths:
+        raise ValueError("clip_paths가 비었습니다.")
+    out_path.parent.mkdir(parents=True, exist_ok=True)
+
+    work_dir = out_path.parent
+    list_file = work_dir / "ffmpeg_concat_list_final.txt"
+    temp_visual = work_dir / (out_path.stem + "_temp_visual.mp4")
+
+    # -----------------------------
+    # 1) concat list 생성
+    # -----------------------------
+    with open(list_file, "w", encoding="utf-8") as f:
+        for clip in clip_paths:
+            if not clip.exists():
+                raise FileNotFoundError(f"병합할 클립을 찾을 수 없습니다: {clip}")
+            f.write(f"file '{clip.as_posix()}'\n")
+
+    # -----------------------------
+    # 2) 비디오만 합쳐서 temp_visual 생성
+    #    (오디오는 최종 단계에서 필터로 붙임)
+    # -----------------------------
+    cmd_concat = [
+        ffmpeg_exe, "-y",
+        "-f", "concat",
+        "-safe", "0",
+        "-i", str(list_file),
+        "-an",
+        "-c:v", "libx264",
+        "-preset", video_preset,
+        "-crf", str(video_crf),
+        str(temp_visual),
+    ]
+
+    startupinfo = None
+    if os.name == "nt":
+        startupinfo = subprocess.STARTUPINFO()
+        startupinfo.dwFlags |= subprocess.STARTF_USESHOWWINDOW
+
+    r = subprocess.run(
+        cmd_concat,
+        capture_output=True,
+        text=True,
+        encoding="utf-8",
+        errors="ignore",
+        startupinfo=startupinfo,
+    )
+    if r.returncode != 0:
+        raise RuntimeError(f"FFMPEG concat(temp_visual) 실패:\n{r.stderr}")
+
+    # temp_visual 전체 길이(초) — 오디오 믹스 길이 기준
+    visual_dur = float(get_duration(str(temp_visual)) or 0.0)
+    if visual_dur <= 0:
+        visual_dur = 1.0
+
+    # -----------------------------
+    # 3) 각 씬별 "실제 영상 길이" 측정 → start/end 재구성
+    #    scenes 순서 == clip_paths 순서라고 가정
+    # -----------------------------
+    clip_durs: List[float] = []
+    for cp in clip_paths:
+        d = float(get_duration(str(cp)) or 0.0)
+        if d <= 0:
+            # 극단적 케이스 방어: 0이면 temp_visual 기준으로 균등 분배(최후 수단)
+            d = max(0.01, visual_dur / max(len(clip_paths), 1))
+        clip_durs.append(d)
+
+    # 누적 start/end 재구성 + movie_duration 기록
+    t_cursor = 0.0
+    for i, sc in enumerate(scenes):
+        if i >= len(clip_durs):
+            break
+        d = clip_durs[i]
+        sc["movie_duration"] = float(d)
+        sc["start"] = float(t_cursor)
+        sc["end"] = float(t_cursor + d)
+        t_cursor += d
+
+    # -----------------------------
+    # 4) 오디오 입력/필터 구성:
+    #    - bgm(선택) + narration(각 씬 voice_file)
+    #    - narration은 "중앙"에 배치
+    #    - 길면 atempo=1.2로 1회 시도, 그래도 길면 오류
+    # -----------------------------
+    inputs: List[str] = [str(temp_visual)]
+    audio_inputs_meta: List[Tuple[str, int]] = []  # (type, input_index)
+    # type: "bgm" or "nar"
+
+    if bgm_path and Path(bgm_path).is_file():
+        inputs.append(str(Path(bgm_path)))
+        audio_inputs_meta.append(("bgm", len(inputs) - 1))
+
+    narration_items: List[Dict[str, Any]] = []
+    for i, sc in enumerate(scenes):
+        vf = (sc.get("voice_file") or "").strip()
+        if not vf:
+            continue
+        vp = Path(vf)
+        if not vp.is_absolute():
+            cand = (work_dir / vf).resolve()
+            if cand.is_file():
+                vp = cand
+        if not vp.is_file():
+            continue
+
+        start_t = float(sc.get("start") or 0.0)
+        end_t = float(sc.get("end") or start_t)
+        clip_dur = float(sc.get("movie_duration") or (end_t - start_t) or 0.0)
+        if clip_dur <= 0:
+            continue
+
+        nar_dur = float(get_duration(str(vp)) or 0.0)
+        sc["narration_duration"] = float(nar_dur)
+
+        usable = max(0.01, clip_dur - float(pad_in_sec) - float(pad_out_sec))
+        speed = 1.0
+
+        # 내레이션이 씬에 안 들어가면 1.1배 → 1.2배 순으로 1회씩 시도
+        if nar_dur > usable:
+            tried = []
+            for cand_speed in (1.1, 1.2):
+                nar_dur2 = nar_dur / float(cand_speed)
+                tried.append((cand_speed, nar_dur2))
+                if nar_dur2 <= usable:
+                    speed = float(cand_speed)
+                    nar_dur = float(nar_dur2)
+                    break
+
+            if nar_dur > usable:
+                # 실패(1.1, 1.2 둘 다 안 들어감) → 에러
+                msg_parts = []
+                for sp, nd in tried:
+                    msg_parts.append(f"{sp:.1f}x -> {nd:.3f}s")
+                msg_try = ", ".join(msg_parts) if msg_parts else "no-try"
+
+                raise RuntimeError(
+                    f"내레이션이 씬 길이를 초과합니다. scene_id={sc.get('id')} "
+                    f"clip={clip_dur:.3f}s usable={usable:.3f}s nar={float(sc.get('narration_duration') or nar_dur):.3f}s "
+                    f"({msg_try})"
+                )
+
+        # 중앙 배치: (clip_dur - nar_dur)/2 만큼 오프셋 + start
+        center_offset = max(float(pad_in_sec), (clip_dur - nar_dur) * 0.5)
+        delay_sec = start_t + center_offset
+
+        narration_items.append({
+            "scene_index": i,
+            "delay_sec": float(delay_sec),
+            "path": vp,
+            "speed": float(speed),
+            "effective_dur": float(nar_dur),
+        })
+
+    for item in narration_items:
+        inputs.append(str(item["path"]))
+        audio_inputs_meta.append(("nar", len(inputs) - 1))
+
+    fc_parts: List[str] = []
+    mix_labels: List[str] = []
+
+    # bgm
+    bgm_label = None
+    for typ, idx in audio_inputs_meta:
+        if typ == "bgm":
+            bgm_label = "abgm"
+            fc_parts.append(f"[{idx}:a]volume={bgm_volume}[{bgm_label}]")
+            mix_labels.append(f"[{bgm_label}]")
+            break
+
+    # narration (adelay + (optional) atempo)
+    nar_count = 0
+    nar_input_base = 1 + (1 if bgm_label else 0)
+
+    for j, item in enumerate(narration_items):
+        idx = nar_input_base + j
+        ms = int(round(float(item["delay_sec"]) * 1000.0))
+        lbl = f"anar{nar_count}"
+        spd = float(item["speed"])
+
+        if abs(spd - 1.0) < 1e-6:
+            fc_parts.append(f"[{idx}:a]adelay={ms}|{ms},volume={narration_volume}[{lbl}]")
+        else:
+            # atempo는 0.5~2.0 범위
+            fc_parts.append(f"[{idx}:a]atempo={spd:.6f},adelay={ms}|{ms},volume={narration_volume}[{lbl}]")
+
+        mix_labels.append(f"[{lbl}]")
+        nar_count += 1
+
+    if not mix_labels:
+        fc_parts.append(f"anullsrc=r=48000:cl=stereo,atrim=0:{visual_dur:.6f}[aout]")
+    else:
+        mix_in = "".join(mix_labels)
+        fc_parts.append(f"{mix_in}amix=inputs={len(mix_labels)}:normalize=0:dropout_transition=0[aout]")
+
+    # -----------------------------
+    # 5) 자막(drawtext) 필터: "중앙" 구간에만 표시
+    #    - 텍스트는 narration/lyric/subtitle 중 우선순위로 선택
+    #    - 배경 묘사는 최소화(텍스트 자체는 이미 준비된 문장)
+    # -----------------------------
+    vf_parts: List[str] = []
+    vf_in = "[0:v]"
+    vf_out = "vout"
+
+    # (선택) 제목: 1초 대기 -> 2초 fade in -> 1초 유지 -> 2초 fade out
+    title_text = (title_text or "").strip()
+    if title_text:
+        title_escaped = _ffmpeg_escape_drawtext(title_text)
+
+        # alpha expr (t 기준)
+        # t<1:0
+        # 1~3: fade in
+        # 3~4: 1
+        # 4~6: fade out
+        alpha_expr = (
+            "if(lt(t,1),0,"
+            " if(lt(t,3),(t-1)/2,"
+            "  if(lt(t,4),1,"
+            "   if(lt(t,6),(6-t)/2,0)"
+            "  )"
+            " )"
+            ")"
+        )
+
+        vf_parts.append(
+            "drawtext="
+            f"font='{subtitle_font}':"
+            f"text='{title_escaped}':"
+            f"fontsize={int(title_fontsize)}:"
+            "fontcolor=white:"
+            "box=1:boxcolor=black@0.5:boxborderw=6:"
+            "x=(w-text_w)/2:"
+            f"y={title_y}:"
+            f"alpha='{alpha_expr}'"
+        )
+
+    # 씬별 내레이션/자막: 중앙 구간
+    for sc in scenes:
+        start_t = float(sc.get("start") or 0.0)
+        end_t = float(sc.get("end") or start_t)
+        clip_dur = float(sc.get("movie_duration") or (end_t - start_t) or 0.0)
+        if clip_dur <= 0:
+            continue
+
+        # 텍스트 소스 우선순위
+        txt = (sc.get("lyric") or sc.get("subtitle") or sc.get("narration") or "").strip()
+        if not txt:
+            continue
+
+        nar_dur_eff = float(sc.get("narration_duration") or 0.0)
+        usable = max(0.01, clip_dur - float(pad_in_sec) - float(pad_out_sec))
+        if nar_dur_eff <= 0:
+            # 내레이션 파일 없거나 길이 측정 실패면 usable의 70% 정도로 표시(가이드)
+            nar_dur_eff = usable * 0.7
+        if nar_dur_eff > usable:
+            nar_dur_eff = usable
+
+        show_t = start_t + max(float(pad_in_sec), (clip_dur - nar_dur_eff) * 0.5)
+        hide_t = min(end_t - float(pad_out_sec), show_t + nar_dur_eff)
+        if hide_t <= show_t:
+            hide_t = min(end_t, show_t + 0.10)
+
+        txt_escaped = _ffmpeg_escape_drawtext(txt)
+        box = "1" if subtitle_box else "0"
+
+        vf_parts.append(
+            "drawtext="
+            f"font='{subtitle_font}':"
+            f"text='{txt_escaped}':"
+            f"fontsize={int(subtitle_fontsize)}:"
+            "fontcolor=white:"
+            "x=(w-text_w)/2:"
+            f"y={subtitle_y}:"
+            f"box={box}:"
+            f"boxcolor={subtitle_boxcolor}:"
+            f"boxborderw={int(subtitle_boxborderw)}:"
+            f"enable='between(t,{show_t:.3f},{hide_t:.3f})'"
+        )
+
+    vf_chain = ",".join(vf_parts) if vf_parts else "null"
+    vf = f"{vf_in}{vf_chain}[{vf_out}]"
+
+    # -----------------------------
+    # 6) 최종 ffmpeg 렌더
+    # -----------------------------
+    cmd = [ffmpeg_exe, "-y"]
+    for p in inputs:
+        cmd += ["-i", p]
+
+    filter_complex = ";".join(fc_parts + [vf])
+    cmd += [
+        "-filter_complex", filter_complex,
+        "-map", f"[{vf_out}]",
+        "-map", "[aout]",
+        "-c:v", "libx264",
+        "-preset", video_preset,
+        "-crf", str(video_crf),
+        "-c:a", "aac",
+        "-b:a", audio_bitrate,
+        "-movflags", "+faststart",
+        "-shortest",
+        str(out_path),
+    ]
+
+    rr = subprocess.run(
+        cmd,
+        capture_output=True,
+        text=True,
+        encoding="utf-8",
+        errors="ignore",
+        startupinfo=startupinfo,
+    )
+    if rr.returncode != 0:
+        raise RuntimeError(f"FFMPEG 최종 렌더 실패:\n{rr.stderr}")
+
+    # -----------------------------
+    # 7) 임시 파일 정리
+    # -----------------------------
+    try:
+        if list_file.exists():
+            list_file.unlink()
+    except Exception:
+        pass
+    try:
+        if temp_visual.exists():
+            temp_visual.unlink()
+    except Exception:
+        pass
+
+
+
+# ===================[[[[[[[[여기까지 영상합치기]]]]]]]============
 
 def mux_video_and_audio(video_in_path: Path, audio_in_path: Path, out_path: Path, ffmpeg_exe: str):
     """

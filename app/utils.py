@@ -9,13 +9,16 @@ from datetime import datetime, timezone, timedelta
 import importlib.util
 import shutil
 import time
+import subprocess
+import math
 from typing import List, Tuple, Callable, Optional, Any, Dict, Union, Iterable, cast
 from app import settings as settings
 from dataclasses import dataclass
 from typing import Literal, Sequence
 import re, json
 from dotenv import load_dotenv
-
+from pydub import AudioSegment  # type: ignore
+from mutagen import File as MutagenFile
 from types import SimpleNamespace
 from google.generativeai.types import GenerationConfig
 from pathlib import Path
@@ -2526,5 +2529,102 @@ def _dlog(*args):
             f.write(line + "\n")
     except Exception:
         pass
+
+# ─────────────────────────────────────────────────────────────
+# 0) 유틸: 오디오, 영살 길이 견고 획득(중앙값, 3배 튐 방지)
+# ─────────────────────────────────────────────────────────────
+# real_use
+def _probe_duration_ffprobe(path: str) -> float:
+    import json
+    try:
+        out = subprocess.check_output(
+            ["ffprobe", "-v", "error", "-show_entries", "format=duration", "-of", "json", path],
+            stderr=subprocess.STDOUT,
+        )
+        data = json.loads(out.decode("utf-8", "ignore"))
+        dur = float(data.get("format", {}).get("duration", 0.0) or 0.0)
+        return dur if math.isfinite(dur) and dur > 0 else 0.0
+    except Exception:
+        return 0.0
+# real_use
+def _probe_duration_mutagen(path: str) -> float:
+    try:
+          # type: ignore
+        mf = MutagenFile(path)
+        dur = float(getattr(mf, "info", None).length if mf and getattr(mf, "info", None) else 0.0)
+        return dur if math.isfinite(dur) and dur > 0 else 0.0
+    except Exception:
+        return 0.0
+# real_use
+def _probe_duration_pydub(path: str) -> float:
+    try:
+
+        dur_ms = len(AudioSegment.from_file(path))
+        dur = float(dur_ms) / 1000.0
+        return dur if math.isfinite(dur) and dur > 0 else 0.0
+    except Exception:
+        return 0.0
+# real_use
+def _probe_duration_soundfile(path: str) -> float:
+    try:
+        import soundfile as zsf  # type: ignore
+        with zsf.SoundFile(path) as f:
+            dur = float(len(f) / (f.samplerate or 1))
+            return dur if math.isfinite(dur) and dur > 0 else 0.0
+    except Exception:
+        return 0.0
+# real_use
+def _probe_duration_wave(path: str) -> float:
+    try:
+        import wave
+        with wave.open(path, "rb") as wf:
+            frames = wf.getnframes()
+            rate = wf.getframerate() or 1
+            dur = float(frames) / float(rate)
+            return dur if math.isfinite(dur) and dur > 0 else 0.0
+    except Exception:
+        return 0.0
+# real_use
+def _probe_duration_librosa(path: str) -> float:
+    try:
+        import librosa  # type: ignore
+        try:
+            dur = float(librosa.get_duration(path=path))
+        except TypeError:
+            dur = float(librosa.get_duration(filename=path))
+        return dur if math.isfinite(dur) and dur > 0 else 0.0
+    except Exception:
+        return 0.0
+# real_use
+def get_duration(path: str) -> float:
+    p = str(path or "").strip()
+    if not p or not os.path.isfile(p):
+        return 0.0
+    cands: List[float] = []
+    for fn in (
+        _probe_duration_ffprobe,
+        _probe_duration_mutagen,
+        _probe_duration_pydub,
+        _probe_duration_soundfile,
+        _probe_duration_wave,
+        _probe_duration_librosa,
+    ):
+        v = fn(p)
+        if v and math.isfinite(v) and v > 0:
+            cands.append(v)
+    if not cands:
+        return 0.0
+    cands.sort()
+    mid = len(cands) // 2
+    if len(cands) % 2 == 1:
+        median = cands[mid]
+    else:
+        median = 0.5 * (cands[mid - 1] + cands[mid])
+    mn, mx = cands[0], cands[-1]
+    if mx / max(mn, 1e-9) >= 2.4 and mn > 0:
+        return mn
+    return median
+# ============================================================== #
+
 
 #

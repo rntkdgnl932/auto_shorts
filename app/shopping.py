@@ -1722,7 +1722,7 @@ class VideoBuildDialog(QtWidgets.QDialog):
             self._append_log("⚠ video.json이 없습니다.")
             return
 
-        # ✅ 핵심: "영상 합치기" 직전에 UI 설정값을 video.json에 강제로 반영
+        # merge 직전 UI 설정을 json에 강제로 반영
         try:
             w, h, fps, steps, font_family, title_size, narr_size = self._get_current_settings()
 
@@ -1780,7 +1780,7 @@ class VideoBuildDialog(QtWidgets.QDialog):
             self._append_log(f"⚠ UI 설정을 video.json에 반영 실패(그래도 merge는 시도): {e}")
 
         def job(progress):
-            progress("[Merge] 영상 합치기 시작...")
+            progress("[Merge] 영상 합치기 시작.")
             gen = ShoppingMovieGenerator(on_progress=progress)
             gen.merge_movies(self.target_video_json)
             return "OK"
