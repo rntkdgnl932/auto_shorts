@@ -21,7 +21,8 @@ from app.utils import (
     AI,
     load_json,
     save_json,
-    ensure_dir
+    ensure_dir,
+    _submit_and_wait as submit_and_wait
 )
 from app import settings
 from app.video_build import build_shots_with_i2v, concatenate_scene_clips, fill_prompt_movie_with_ai_long
@@ -34,39 +35,39 @@ def _now_str() -> str:
 # -----------------------------------------------------------------------------
 # [New] ComfyUI 제출 및 대기 함수 (독립형)
 # -----------------------------------------------------------------------------
-def _submit_and_wait_local(
-        base_url: str,
-        graph: dict,
-        timeout: int = 900,
-        poll: float = 2.0,
-        on_progress: Optional[Callable[[Dict[str, Any]], None]] = None
-) -> dict:
-    """ComfyUI 워크플로우 제출 및 대기"""
-    client_id = str(uuid.uuid4())
-    payload = {"prompt": graph, "client_id": client_id}
-
-    try:
-        resp = requests.post(f"{base_url}/prompt", json=payload, timeout=30)
-        resp.raise_for_status()
-        prompt_id = resp.json().get("prompt_id")
-    except Exception as e:
-        raise RuntimeError(f"ComfyUI 제출 실패: {e}")
-
-    start_t = time.time()
-    while True:
-        elapsed = time.time() - start_t
-        if elapsed > timeout:
-            raise TimeoutError(f"ComfyUI 시간 초과 ({elapsed:.1f}s)")
-
-        try:
-            h_resp = requests.get(f"{base_url}/history/{prompt_id}", timeout=10)
-            if h_resp.status_code == 200:
-                h_data = h_resp.json()
-                if prompt_id in h_data:
-                    return h_data[prompt_id]
-        except Exception:
-            pass
-        time.sleep(poll)
+# def _submit_and_wait_local(
+#         base_url: str,
+#         graph: dict,
+#         timeout: int = 900,
+#         poll: float = 2.0,
+#         on_progress: Optional[Callable[[Dict[str, Any]], None]] = None
+# ) -> dict:
+#     """ComfyUI 워크플로우 제출 및 대기"""
+#     client_id = str(uuid.uuid4())
+#     payload = {"prompt": graph, "client_id": client_id}
+#
+#     try:
+#         resp = requests.post(f"{base_url}/prompt", json=payload, timeout=30)
+#         resp.raise_for_status()
+#         prompt_id = resp.json().get("prompt_id")
+#     except Exception as e:
+#         raise RuntimeError(f"ComfyUI 제출 실패: {e}")
+#
+#     start_t = time.time()
+#     while True:
+#         elapsed = time.time() - start_t
+#         if elapsed > timeout:
+#             raise TimeoutError(f"ComfyUI 시간 초과 ({elapsed:.1f}s)")
+#
+#         try:
+#             h_resp = requests.get(f"{base_url}/history/{prompt_id}", timeout=10)
+#             if h_resp.status_code == 200:
+#                 h_data = h_resp.json()
+#                 if prompt_id in h_data:
+#                     return h_data[prompt_id]
+#         except Exception:
+#             pass
+#         time.sleep(poll)
 
 
 # -----------------------------------------------------------------------------
@@ -220,7 +221,7 @@ def generate_tts_zonos(
         graph["12"]["inputs"]["audio"] = ref_copy_name
 
     try:
-        res = _submit_and_wait_local(comfy_host, graph, timeout=300)
+        res = submit_and_wait(comfy_host, graph, timeout=300)
         outputs = res.get("outputs", {})
         for nid, out_d in outputs.items():
             if "audio" in out_d:
@@ -325,7 +326,7 @@ def generate_bgm_acestep(
 
     # 실행
     try:
-        res = _submit_and_wait_local(comfy_host, graph, timeout=600)  # 오디오 생성은 좀 걸릴 수 있음
+        res = submit_and_wait(comfy_host, graph, timeout=600)  # 오디오 생성은 좀 걸릴 수 있음
 
         # 결과 파일 다운로드 (move to out_path)
         outputs = res.get("outputs", {})
@@ -492,7 +493,7 @@ def build_shopping_images_2step(
                     node.setdefault("inputs", {})["filename_prefix"] = "Z_Base"
 
             try:
-                res = _submit_and_wait_local(comfy_host, graph, on_progress=on_progress)
+                res = submit_and_wait(comfy_host, graph, on_progress=on_progress)
                 outputs = res.get("outputs", {})
                 found = False
                 for _, out_d in outputs.items():
@@ -592,7 +593,7 @@ def build_shopping_images_2step(
 
         if on_progress: on_progress({"msg": f"[Step 2] 합성 진행({sid})..."})
         try:
-            res = _submit_and_wait_local(comfy_host, graph, on_progress=on_progress)
+            res = submit_and_wait(comfy_host, graph, on_progress=on_progress)
             outputs = res.get("outputs", {})
             found = False
             for _, out_d in outputs.items():
@@ -640,6 +641,7 @@ class BuildOptions:
 # 4. JSON 빌더
 # -----------------------------------------------------------------------------
 
+# ai 상세화
 class ShoppingVideoJsonBuilder:
     def __init__(self, on_progress: Optional[Callable[[str], None]] = None):
         self.on_progress = on_progress or (lambda msg: None)

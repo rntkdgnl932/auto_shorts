@@ -24,7 +24,7 @@ from app.issue_list_builder import (
     save_issue_list_for_shopping_ai_b_from_a,
 )
 
-
+from app.shopping_video_build import convert_shopping_to_video_json_with_ai
 
 from app.shopping_video_build import (
     ShoppingVideoJsonBuilder,
@@ -1598,7 +1598,7 @@ class VideoBuildDialog(QtWidgets.QDialog):
 
         self.btn_make_video_json.setEnabled(False)
 
-        from app.shopping_video_build import convert_shopping_to_video_json_with_ai
+
 
         def job(progress_callback):
             # AI 객체 확보
