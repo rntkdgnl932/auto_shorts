@@ -38,18 +38,32 @@ from app.shopping_video_build import (
 
 class SceneEditDialog(QtWidgets.QDialog):
     """
-    [수정됨] 씬별 기획 + 캐릭터/성별 + 배경음(BGM) 수정 (상단 배치)
+    씬별 기획 + 캐릭터/성별 + 배경음(BGM) 수정
+    + prompt_img_1_kor / prompt_img_2_kor 표시 및 저장
+    + 'AI 수정 요청' 버튼 클릭 시:
+        - prompt_img_1_kor, prompt_img_2_kor 는 그대로 저장
+        - prompt_img_1, prompt_img_2 는 각각 *_kor 를 영어 번역한 결과로 덮어써서 저장
+        - ai_edit_request 에 요청 텍스트 저장
     """
 
     def __init__(self, json_path: str, parent=None):
         super().__init__(parent)
         self.setWindowTitle("시나리오 초안 및 상세 설정 수정")
-        self.resize(950, 900)  # 높이 약간 증가
+        self.resize(950, 980)
         self.json_path = Path(json_path)
 
         self.data = load_json(self.json_path, {})
         self.meta = self.data.get("meta", {})
         self.scenes = self.data.get("scenes", [])
+
+        # (New) 번역용 AI 준비 (프로젝트에 있는 AI 유틸 사용)
+        # - app.utils.AI 가 이미 프로젝트에 존재하는 전제
+        # - 실패하면(ImportError 등) 번역은 "그대로 복사"로 폴백
+        try:
+            from app.utils import AI
+            self._ai = AI()
+        except Exception:
+            self._ai = None
 
         layout = QtWidgets.QVBoxLayout(self)
 
@@ -57,10 +71,10 @@ class SceneEditDialog(QtWidgets.QDialog):
         char_group = QtWidgets.QGroupBox("👤 기획 설정 (캐릭터/성별/BGM)", self)
         char_group.setStyleSheet(
             "QGroupBox { font-weight: bold; border: 2px solid #0078d7; margin-top: 10px; background-color: #f0f8ff; } "
-            "QGroupBox::title { subcontrol-origin: margin; left: 10px; padding: 0 5px; color: #0078d7; }")
+            "QGroupBox::title { subcontrol-origin: margin; left: 10px; padding: 0 5px; color: #0078d7; }"
+        )
         char_layout = QtWidgets.QFormLayout(char_group)
 
-        # 1. 성별 선택
         self.cb_gender = QtWidgets.QComboBox()
         self.cb_gender.addItems(["Female", "Male"])
         current_gender = str(self.meta.get("voice_gender", "female")).capitalize()
@@ -70,14 +84,12 @@ class SceneEditDialog(QtWidgets.QDialog):
             self.cb_gender.setCurrentText("Female")
         char_layout.addRow("성별 (Voice & Visual):", self.cb_gender)
 
-        # 2. 캐릭터 컨셉
         char_val = self.meta.get("character_prompt", "")
         self.le_char = QtWidgets.QLineEdit(char_val)
         self.le_char.setPlaceholderText("예: Stylish 30s urban news anchor")
         self.le_char.setStyleSheet("background-color: white; padding: 5px; font-weight: bold;")
         char_layout.addRow("캐릭터 컨셉 (EN):", self.le_char)
 
-        # [New] 3. 배경음(BGM) 프롬프트
         bgm_val = self.meta.get("bgm_prompt", "")
         self.te_bgm = QtWidgets.QPlainTextEdit(bgm_val)
         self.te_bgm.setPlaceholderText("예: instrumental, background music, calm, piano, loopable...")
@@ -85,20 +97,19 @@ class SceneEditDialog(QtWidgets.QDialog):
         self.te_bgm.setStyleSheet("background-color: white; padding: 5px;")
         char_layout.addRow("배경음(BGM) 설정:", self.te_bgm)
 
-        char_layout.addRow(QtWidgets.QLabel("* AI가 제안한 설정이 마음에 들지 않으면 여기서 수정하세요. BGM은 '상세화' 단계에서 생성됩니다."))
-
+        char_layout.addRow(QtWidgets.QLabel("* AI가 제안한 설정이 마음에 들지 않으면 여기서 수정하세요."))
         layout.addWidget(char_group)
 
-        # 안내 문구
         lbl_info = QtWidgets.QLabel(
             "아래에서 각 장면별(Scene) 세부 내용과 프롬프트를 수정하세요.\n"
-            "이미지 생성은 [Step 1: 배경/모델] -> [Step 2: 제품 합성]으로 진행됩니다."
+            "이미지 생성은 [Step 1: 배경/모델] -> [Step 2: 제품 합성]으로 진행됩니다.\n"
+            "AI 수정 요청 버튼을 누르면 KR 프롬프트는 저장하고, EN 프롬프트는 KR을 영어로 번역해 덮어씁니다."
         )
         lbl_info.setStyleSheet(
-            "color: #333; font-weight: bold; margin: 10px 0; background: #f0f0f0; padding: 10px; border-radius: 5px;")
+            "color: #333; font-weight: bold; margin: 10px 0; background: #f0f0f0; padding: 10px; border-radius: 5px;"
+        )
         layout.addWidget(lbl_info)
 
-        # 스크롤 영역
         scroll = QtWidgets.QScrollArea(self)
         scroll.setWidgetResizable(True)
         layout.addWidget(scroll, 1)
@@ -110,13 +121,41 @@ class SceneEditDialog(QtWidgets.QDialog):
 
         self.editors = []
 
+        def _translate_kor_to_en(kor_text: str) -> str:
+            kor_text = (kor_text or "").strip()
+            if not kor_text:
+                return ""
+
+            # AI 유틸 없으면 폴백(그대로)
+            if self._ai is None:
+                return kor_text
+
+            sys_msg = (
+                "You are a professional translator for AI image generation prompts.\n"
+                "Translate Korean to natural, concise English.\n"
+                "Do NOT add new details. Keep meaning faithful.\n"
+                "Output English ONLY."
+            )
+            user_msg = f'Korean:\n"{kor_text}"\n\nEnglish:'
+            try:
+                # ask_smart(sys, user, prefer="openai") 형태를 사용하던 프로젝트 패턴을 그대로 따름
+                out = self._ai.ask_smart(sys_msg, user_msg, prefer="openai")
+                out = (out or "").strip()
+                # 혹시 따옴표/코드블록 섞이면 정리
+                out = out.replace("```", "").strip()
+                # 너무 길게 오면 1줄로 정리(이미지프롬프트는 짧게)
+                return out
+            except Exception:
+                return kor_text
+
         for idx, sc in enumerate(self.scenes):
             sid = sc.get("id", f"{idx + 1:03d}")
 
             group = QtWidgets.QGroupBox(f"🎬 Scene {sid}", container)
             group.setStyleSheet(
                 "QGroupBox { font-weight: bold; border: 1px solid #ccc; margin-top: 10px; background-color: #ffffff; } "
-                "QGroupBox::title { subcontrol-origin: margin; left: 10px; padding: 0 5px; background-color: #ffffff; }")
+                "QGroupBox::title { subcontrol-origin: margin; left: 10px; padding: 0 5px; background-color: #ffffff; }"
+            )
             g_layout = QtWidgets.QFormLayout(group)
             g_layout.setLabelAlignment(QtCore.Qt.AlignRight)
             g_layout.setContentsMargins(15, 15, 15, 15)
@@ -124,9 +163,11 @@ class SceneEditDialog(QtWidgets.QDialog):
             le_banner = QtWidgets.QLineEdit(str(sc.get("banner") or ""))
             te_prompt = QtWidgets.QPlainTextEdit(str(sc.get("prompt") or ""))
             te_prompt.setMinimumHeight(60)
+
             te_narr = QtWidgets.QPlainTextEdit(str(sc.get("narration") or ""))
             te_narr.setMinimumHeight(60)
             te_narr.setStyleSheet("background-color: #fdfae8;")
+
             le_sub = QtWidgets.QLineEdit(str(sc.get("subtitle") or ""))
 
             g_layout.addRow("🚩 배너:", le_banner)
@@ -139,32 +180,113 @@ class SceneEditDialog(QtWidgets.QDialog):
             line.setFrameShadow(QtWidgets.QFrame.Sunken)
             g_layout.addRow(line)
 
-            p1_val = str(sc.get("prompt_img_1") or sc.get("prompt_img") or "")
-            te_p1 = QtWidgets.QPlainTextEdit(p1_val)
-            te_p1.setPlaceholderText("Step 1: 배경 및 모델 묘사")
+            # KR 프롬프트
+            te_p1_kor = QtWidgets.QPlainTextEdit(str(sc.get("prompt_img_1_kor") or ""))
+            te_p1_kor.setPlaceholderText("Step 1 (KR): 배경/모델 묘사 (한국어)")
+            te_p1_kor.setMinimumHeight(60)
+
+            te_p2_kor = QtWidgets.QPlainTextEdit(str(sc.get("prompt_img_2_kor") or ""))
+            te_p2_kor.setPlaceholderText("Step 2 (KR): 제품 합성 지시 (한국어)")
+            te_p2_kor.setMinimumHeight(60)
+
+            # EN 프롬프트
+            te_p1 = QtWidgets.QPlainTextEdit(str(sc.get("prompt_img_1") or sc.get("prompt_img") or ""))
+            te_p1.setPlaceholderText("Step 1 (EN): Base Prompt (Background/Model)")
             te_p1.setMinimumHeight(60)
 
-            p2_val = str(sc.get("prompt_img_2") or "")
-            te_p2 = QtWidgets.QPlainTextEdit(p2_val)
-            te_p2.setPlaceholderText("Step 2: 제품 합성 지시")
+            te_p2 = QtWidgets.QPlainTextEdit(str(sc.get("prompt_img_2") or ""))
+            te_p2.setPlaceholderText("Step 2 (EN): Merge Prompt (Product Synthesis)")
             te_p2.setMinimumHeight(60)
 
+            # AI 수정 요청 버튼
+            btn_ai_req = QtWidgets.QPushButton("🤖 AI 수정 요청")
+            btn_ai_req.setToolTip(
+                "클릭하면: (1) 요청 텍스트를 ai_edit_request에 저장\n"
+                "(2) prompt_img_1_kor/2_kor는 저장\n"
+                "(3) prompt_img_1/2는 각각 *_kor를 영어로 번역해 덮어쓰기\n"
+                "(4) 즉시 파일 저장까지 수행"
+            )
+            btn_ai_req.setMinimumHeight(34)
+
+            def _on_ai_req_clicked(
+                _sid=sid,
+                _sc=sc,
+                _te_p1_kor=te_p1_kor,
+                _te_p2_kor=te_p2_kor,
+                _te_p1=te_p1,
+                _te_p2=te_p2,
+            ):
+                txt, ok = QtWidgets.QInputDialog.getMultiLineText(
+                    self,
+                    "AI 수정 요청",
+                    f"Scene {_sid}에 대해 AI에게 요청할 수정 사항을 입력하세요.\n"
+                    "확인을 누르면 KR은 저장하고, EN은 KR->EN 번역으로 덮어써서 저장합니다.",
+                    str(_sc.get("ai_edit_request") or "")
+                )
+                if not ok:
+                    return
+
+                # 1) 요청 저장
+                _sc["ai_edit_request"] = (txt or "").strip()
+
+                # 2) 현재 KR 텍스트를 scene dict에 반영
+                p1_kor = _te_p1_kor.toPlainText().strip()
+                p2_kor = _te_p2_kor.toPlainText().strip()
+                _sc["prompt_img_1_kor"] = p1_kor
+                _sc["prompt_img_2_kor"] = p2_kor
+
+                # 3) KR -> EN 번역해서 EN 필드 덮어쓰기
+                p1_en = _translate_kor_to_en(p1_kor)
+                p2_en = _translate_kor_to_en(p2_kor)
+
+                _sc["prompt_img_1"] = p1_en
+                _sc["prompt_img_2"] = p2_en
+
+                # 호환성 동기화(prompt_img는 base로 유지)
+                _sc["prompt_img"] = p1_en
+
+                # UI에도 즉시 반영
+                _te_p1.setPlainText(p1_en)
+                _te_p2.setPlainText(p2_en)
+
+                # 4) 즉시 저장(버튼 한 번에 저장까지)
+                try:
+                    save_json(self.json_path, self.data)
+                    QtWidgets.QMessageBox.information(
+                        self,
+                        "저장 완료",
+                        "KR 저장 + KR→EN 번역 덮어쓰기 + 파일 저장까지 완료했습니다."
+                    )
+                except Exception as e:
+                    QtWidgets.QMessageBox.critical(self, "저장 실패", f"파일 저장 중 오류:\n{e}")
+
+            btn_ai_req.clicked.connect(_on_ai_req_clicked)
+
+            # 배치
+            g_layout.addRow("🇰🇷 Base Prompt:", te_p1_kor)
+            g_layout.addRow("🇰🇷 Merge Prompt:", te_p2_kor)
             g_layout.addRow("✨ Base Prompt:", te_p1)
             g_layout.addRow("🔗 Merge Prompt:", te_p2)
+            g_layout.addRow(" ", btn_ai_req)
 
             self.form_layout.addWidget(group)
 
             self.editors.append({
                 "sc": sc,
-                "banner": le_banner, "prompt": te_prompt, "narration": te_narr, "subtitle": le_sub,
-                "p1": te_p1, "p2": te_p2
+                "banner": le_banner,
+                "prompt": te_prompt,
+                "narration": te_narr,
+                "subtitle": le_sub,
+                "p1_kor": te_p1_kor,
+                "p2_kor": te_p2_kor,
+                "p1": te_p1,
+                "p2": te_p2,
             })
 
         btn_box = QtWidgets.QHBoxLayout()
         btn_save = QtWidgets.QPushButton("💾 저장 및 닫기", self)
         btn_save.setMinimumHeight(45)
-        btn_save.setStyleSheet(
-            "font-weight: bold; font-size: 14px; color: white; background-color: #0078d7; border-radius: 6px;")
+        btn_save.setStyleSheet("font-weight: bold; font-size: 14px; color: white; background-color: #0078d7; border-radius: 6px;")
 
         btn_cancel = QtWidgets.QPushButton("취소", self)
         btn_cancel.setMinimumHeight(45)
@@ -178,26 +300,30 @@ class SceneEditDialog(QtWidgets.QDialog):
         layout.addLayout(btn_box)
 
     def on_save(self):
-        # 1. 메인 설정 저장 (성별 & 캐릭터 & BGM)
+        # 1) 메인 설정 저장
         self.meta["voice_gender"] = self.cb_gender.currentText().lower()
 
         new_char = self.le_char.text().strip()
         if new_char:
             self.meta["character_prompt"] = new_char
 
-        # [New] BGM 저장
         new_bgm = self.te_bgm.toPlainText().strip()
         if new_bgm:
             self.meta["bgm_prompt"] = new_bgm
 
-        # 2. 씬별 내용 저장
+        # 2) 씬별 저장
         changed_count = 0
         for item in self.editors:
             sc = item["sc"]
+
             new_banner = item["banner"].text().strip()
             new_prompt = item["prompt"].toPlainText().strip()
             new_narr = item["narration"].toPlainText().strip()
             new_sub = item["subtitle"].text().strip()
+
+            new_p1_kor = item["p1_kor"].toPlainText().strip()
+            new_p2_kor = item["p2_kor"].toPlainText().strip()
+
             new_p1 = item["p1"].toPlainText().strip()
             new_p2 = item["p2"].toPlainText().strip()
 
@@ -205,15 +331,25 @@ class SceneEditDialog(QtWidgets.QDialog):
                     str(sc.get("prompt") or "") != new_prompt or
                     str(sc.get("narration") or "") != new_narr or
                     str(sc.get("subtitle") or "") != new_sub or
+                    str(sc.get("prompt_img_1_kor") or "") != new_p1_kor or
+                    str(sc.get("prompt_img_2_kor") or "") != new_p2_kor or
                     str(sc.get("prompt_img_1") or "") != new_p1 or
                     str(sc.get("prompt_img_2") or "") != new_p2):
+
                 sc["banner"] = new_banner
                 sc["prompt"] = new_prompt
                 sc["narration"] = new_narr
                 sc["subtitle"] = new_sub
+
+                sc["prompt_img_1_kor"] = new_p1_kor
+                sc["prompt_img_2_kor"] = new_p2_kor
+
                 sc["prompt_img_1"] = new_p1
                 sc["prompt_img_2"] = new_p2
+
+                # 호환성 동기화
                 sc["prompt_img"] = new_p1
+
                 changed_count += 1
 
         try:
@@ -222,6 +358,8 @@ class SceneEditDialog(QtWidgets.QDialog):
             self.accept()
         except Exception as e:
             QtWidgets.QMessageBox.critical(self, "저장 실패", f"파일 저장 중 오류가 발생했습니다:\n{e}")
+
+
 
 
 
@@ -566,6 +704,339 @@ class MediaEditDialog(QtWidgets.QDialog):
             QtWidgets.QMessageBox.warning(self, "알림", "확인할 이미지가 없습니다.")
 
 
+class FinalEditDialog(QtWidgets.QDialog):
+    """
+    video.json 전용 최종 프롬프트 편집기
+    - prompt_1_kor / prompt_2_kor / prompt_3_kor 편집 가능
+    - prompt_1 / prompt_2 / prompt_3 (영어)도 같이 표시/편집 가능
+    - 각 씬에 "AI 수정 요청(한글→영어 반영)" 버튼 제공:
+        클릭한 '해당 씬'만 수정됨.
+        kor 필드는 보존, en 필드는 kor를 기반으로 재생성/번역하여 덮어씀.
+    """
+
+    def __init__(self, video_json_path: str, project_dir: str, parent=None):
+        super().__init__(parent)
+        self.video_json_path = str(video_json_path)
+        self.project_dir = str(project_dir)
+
+        self.setWindowTitle("최종안 수정 (video.json)")
+        self.resize(980, 820)
+
+        self._ai = None  # lazy
+
+        root = QtWidgets.QVBoxLayout(self)
+
+        top_info = QtWidgets.QLabel(
+            "각 씬의 prompt_1_kor / prompt_2_kor / prompt_3_kor 를 편집한 뒤,\n"
+            "필요하면 'AI 수정 요청(한글→영어 반영)'을 눌러 영어(prompt_1/2/3)를 자동 반영하세요.\n"
+            "주의: AI 버튼은 클릭한 '해당 씬'만 수정됩니다."
+        )
+        root.addWidget(top_info)
+
+        self.scroll = QtWidgets.QScrollArea(self)
+        self.scroll.setWidgetResizable(True)
+        root.addWidget(self.scroll, 1)
+
+        self.inner = QtWidgets.QWidget()
+        self.scroll.setWidget(self.inner)
+        self.vbox = QtWidgets.QVBoxLayout(self.inner)
+        self.vbox.setContentsMargins(8, 8, 8, 8)
+        self.vbox.setSpacing(10)
+
+        btn_row = QtWidgets.QHBoxLayout()
+        root.addLayout(btn_row)
+
+        self.btn_save = QtWidgets.QPushButton("저장", self)
+        self.btn_close = QtWidgets.QPushButton("닫기", self)
+        btn_row.addStretch(1)
+        btn_row.addWidget(self.btn_save)
+        btn_row.addWidget(self.btn_close)
+
+        self.btn_close.clicked.connect(self.reject)
+        self.btn_save.clicked.connect(self._save)
+
+        self._scene_widgets = []  # [{sid, seg_count, te_p1_k, te_p1, ...}]
+
+        self._load()
+
+    def _lazy_ai(self):
+        if self._ai is None:
+            from app.utils import AI
+            self._ai = AI()
+        return self._ai
+
+    def _read_json(self):
+        import json
+        from pathlib import Path
+        p = Path(self.video_json_path)
+        return json.loads(p.read_text(encoding="utf-8"))
+
+    def _write_json(self, data):
+        import json
+        from pathlib import Path
+        p = Path(self.video_json_path)
+        p.write_text(json.dumps(data, indent=2, ensure_ascii=False), encoding="utf-8")
+
+    def _load(self):
+        import json
+
+        try:
+            data = self._read_json()
+        except Exception as e:
+            QtWidgets.QMessageBox.critical(self, "오류", f"video.json 로드 실패:\n{e}")
+            self.reject()
+            return
+
+        scenes = data.get("scenes", [])
+        if not isinstance(scenes, list):
+            QtWidgets.QMessageBox.critical(self, "오류", "video.json의 scenes가 리스트가 아닙니다.")
+            self.reject()
+            return
+
+        # 기존 위젯 제거
+        while self.vbox.count():
+            item = self.vbox.takeAt(0)
+            w = item.widget()
+            if w:
+                w.deleteLater()
+
+        self._scene_widgets.clear()
+
+        for sc in scenes:
+            if not isinstance(sc, dict):
+                continue
+
+            sid = str(sc.get("id", ""))
+            seg_count = int(sc.get("seg_count") or 1)
+            if seg_count < 1:
+                seg_count = 1
+            if seg_count > 3:
+                seg_count = 3
+
+            card = QtWidgets.QGroupBox(f"Scene: {sid}  (seg_count={seg_count})", self.inner)
+            form = QtWidgets.QVBoxLayout(card)
+
+            # 참고 정보(시작 이미지/자막) — 읽기 전용
+            ref_row = QtWidgets.QHBoxLayout()
+            form.addLayout(ref_row)
+
+            te_ref = QtWidgets.QPlainTextEdit(card)
+            te_ref.setReadOnly(True)
+            te_ref.setFixedHeight(90)
+            ref_txt = []
+            ref_txt.append(f"prompt_img: {sc.get('prompt_img','')}")
+            ref_txt.append(f"subtitle/lyric: {sc.get('subtitle') or sc.get('lyric') or ''}")
+            te_ref.setPlainText("\n".join(ref_txt))
+            ref_row.addWidget(te_ref, 1)
+
+            btn_ai = QtWidgets.QPushButton("AI 수정 요청 (한글→영어 반영)", card)
+            btn_ai.setMinimumWidth(220)
+            ref_row.addWidget(btn_ai)
+
+            # 편집 영역
+            grid = QtWidgets.QGridLayout()
+            form.addLayout(grid)
+
+            def _mk_pair(row_idx: int, title: str, kor_val: str, en_val: str):
+                lbl = QtWidgets.QLabel(title, card)
+                grid.addWidget(lbl, row_idx, 0)
+
+                te_k = QtWidgets.QPlainTextEdit(card)
+                te_k.setPlaceholderText(f"{title}_kor (한글)")
+                te_k.setPlainText(kor_val or "")
+                te_k.setFixedHeight(70)
+
+                te_en = QtWidgets.QPlainTextEdit(card)
+                te_en.setPlaceholderText(f"{title} (English)")
+                te_en.setPlainText(en_val or "")
+                te_en.setFixedHeight(70)
+
+                grid.addWidget(te_k, row_idx, 1)
+                grid.addWidget(te_en, row_idx, 2)
+                return te_k, te_en
+
+            te_p1_k, te_p1 = _mk_pair(
+                0, "prompt_1",
+                sc.get("prompt_1_kor", ""),
+                sc.get("prompt_1", "")
+            )
+            te_p2_k = te_p2 = None
+            te_p3_k = te_p3 = None
+
+            if seg_count >= 2:
+                te_p2_k, te_p2 = _mk_pair(
+                    1, "prompt_2",
+                    sc.get("prompt_2_kor", ""),
+                    sc.get("prompt_2", "")
+                )
+
+            if seg_count >= 3:
+                te_p3_k, te_p3 = _mk_pair(
+                    2, "prompt_3",
+                    sc.get("prompt_3_kor", ""),
+                    sc.get("prompt_3", "")
+                )
+
+            self.vbox.addWidget(card)
+
+            bundle = {
+                "sid": sid,
+                "seg_count": seg_count,
+                "btn_ai": btn_ai,
+                "te_p1_k": te_p1_k, "te_p1": te_p1,
+                "te_p2_k": te_p2_k, "te_p2": te_p2,
+                "te_p3_k": te_p3_k, "te_p3": te_p3,
+                "ref_visual": sc.get("prompt_img", ""),
+                "ref_story": sc.get("subtitle") or sc.get("lyric") or "",
+            }
+            self._scene_widgets.append(bundle)
+
+            # "해당 씬만" AI 반영
+            btn_ai.clicked.connect(lambda _=False, b=bundle: self._apply_ai_for_one_scene(b))
+
+        self.vbox.addStretch(1)
+
+    def _apply_ai_for_one_scene(self, bundle: dict):
+        """
+        클릭한 해당 씬만:
+        - kor 필드는 유지/보존
+        - en(prompt_1/2/3)은 kor를 기반으로 AI 번역/연출로 덮어씀
+        """
+        seg_count = int(bundle.get("seg_count", 1))
+        sid = bundle.get("sid", "")
+
+        p1_k = (bundle["te_p1_k"].toPlainText() or "").strip()
+        p2_k = (bundle["te_p2_k"].toPlainText() or "").strip() if seg_count >= 2 and bundle.get("te_p2_k") else ""
+        p3_k = (bundle["te_p3_k"].toPlainText() or "").strip() if seg_count >= 3 and bundle.get("te_p3_k") else ""
+
+        # kor가 비어있으면 의미가 없으니 중단
+        if not p1_k and (seg_count == 1):
+            QtWidgets.QMessageBox.warning(self, "알림", f"{sid}: prompt_1_kor가 비어있습니다.")
+            return
+        if seg_count >= 2 and not p2_k:
+            QtWidgets.QMessageBox.warning(self, "알림", f"{sid}: prompt_2_kor가 비어있습니다.")
+            return
+        if seg_count >= 3 and not p3_k:
+            QtWidgets.QMessageBox.warning(self, "알림", f"{sid}: prompt_3_kor가 비어있습니다.")
+            return
+
+        visual = bundle.get("ref_visual", "")
+        story = bundle.get("ref_story", "")
+
+        sys_msg = (
+            "You are a senior I2V prompt translator/director.\n"
+            "Task: translate the given Korean segment prompts into English for I2V generation.\n\n"
+            "Hard constraints:\n"
+            "1) English only in output.\n"
+            "2) Product reference MUST be ONLY: 'the object'.\n"
+            "3) Do NOT introduce new background/location/props/characters.\n"
+            "4) Keep camera moves subtle; avoid cuts/time jumps.\n"
+            "Return JSON only."
+        )
+
+        # 출력 키 구성
+        if seg_count == 1:
+            out_fmt = '{ "prompt_1": "..." }'
+        elif seg_count == 2:
+            out_fmt = '{ "prompt_1": "...", "prompt_2": "..." }'
+        else:
+            out_fmt = '{ "prompt_1": "...", "prompt_2": "...", "prompt_3": "..." }'
+
+        user_msg = f"""
+[Start Image Description 참고]
+{visual}
+
+[Story Context 참고]
+{story}
+
+[Korean Segment Prompts]
+prompt_1_kor: {p1_k}
+prompt_2_kor: {p2_k}
+prompt_3_kor: {p3_k}
+
+[Rules]
+- Translate faithfully.
+- Replace any product noun into ONLY 'the object'.
+- Keep continuity; each segment begins from previous end.
+- Minimal background description.
+
+[Output JSON]
+{out_fmt}
+"""
+
+        try:
+            ai = self._lazy_ai()
+            resp = ai.ask_smart(sys_msg, user_msg, prefer="openai")
+
+            import json, re
+            txt = re.sub(r"```json|```", "", resp).strip()
+            s = txt.find("{")
+            e = txt.rfind("}")
+            if s == -1 or e == -1 or e <= s:
+                raise ValueError("AI 응답에서 JSON 객체를 찾지 못했습니다.")
+            parsed = json.loads(txt[s:e + 1])
+
+            # 영어 필드만 덮어씀 (kor는 그대로 둠)
+            bundle["te_p1"].setPlainText(parsed.get("prompt_1", "") or bundle["te_p1"].toPlainText())
+            if seg_count >= 2 and bundle.get("te_p2"):
+                bundle["te_p2"].setPlainText(parsed.get("prompt_2", "") or bundle["te_p2"].toPlainText())
+            if seg_count >= 3 and bundle.get("te_p3"):
+                bundle["te_p3"].setPlainText(parsed.get("prompt_3", "") or bundle["te_p3"].toPlainText())
+
+        except Exception as e:
+            QtWidgets.QMessageBox.critical(self, "오류", f"{sid}: AI 반영 실패\n{e}")
+
+    def _save(self):
+        import json
+
+        try:
+            data = self._read_json()
+        except Exception as e:
+            QtWidgets.QMessageBox.critical(self, "오류", f"video.json 로드 실패:\n{e}")
+            return
+
+        scenes = data.get("scenes", [])
+        if not isinstance(scenes, list):
+            QtWidgets.QMessageBox.critical(self, "오류", "video.json의 scenes가 리스트가 아닙니다.")
+            return
+
+        # sid -> sc 매핑
+        sc_map = {}
+        for sc in scenes:
+            if isinstance(sc, dict):
+                sc_map[str(sc.get("id", ""))] = sc
+
+        # 위젯 -> JSON 반영
+        for b in self._scene_widgets:
+            sid = b.get("sid", "")
+            seg_count = int(b.get("seg_count", 1))
+            target = sc_map.get(sid)
+            if not target:
+                continue
+
+            # kor 저장
+            target["prompt_1_kor"] = (b["te_p1_k"].toPlainText() or "").strip()
+            if seg_count >= 2 and b.get("te_p2_k"):
+                target["prompt_2_kor"] = (b["te_p2_k"].toPlainText() or "").strip()
+            if seg_count >= 3 and b.get("te_p3_k"):
+                target["prompt_3_kor"] = (b["te_p3_k"].toPlainText() or "").strip()
+
+            # en 저장
+            target["prompt_1"] = (b["te_p1"].toPlainText() or "").strip()
+            if seg_count >= 2 and b.get("te_p2"):
+                target["prompt_2"] = (b["te_p2"].toPlainText() or "").strip()
+            if seg_count >= 3 and b.get("te_p3"):
+                target["prompt_3"] = (b["te_p3"].toPlainText() or "").strip()
+
+        try:
+            self._write_json(data)
+        except Exception as e:
+            QtWidgets.QMessageBox.critical(self, "오류", f"video.json 저장 실패:\n{e}")
+            return
+
+        QtWidgets.QMessageBox.information(self, "완료", "저장되었습니다.")
+
+
 class ImageViewerDialog(QtWidgets.QDialog):
     """
     [New] 이미지를 스크롤 가능한 원본 크기로 보여주는 다이얼로그
@@ -759,12 +1230,18 @@ class VideoBuildDialog(QtWidgets.QDialog):
             "상단의 설정(FPS, 해상도, Steps)을 적용하여 video.json을 생성하고,\n"
             "AI로 장면 연출(프롬프트)을 채웁니다."
         )
+
+        self.btn_final_edit = QtWidgets.QPushButton("5. 최종안 수정", self)
+        self.btn_final_edit.setToolTip("video.json의 prompt_1_kor/prompt_2_kor... 를 편집하고, 한글→영어 반영(AI) 가능")
+
         self.btn_make_video_json.clicked.connect(self.on_click_make_video_json)
+        self.btn_final_edit.clicked.connect(self.on_final_edit_clicked)
 
         btn_layout.addWidget(self.btn_draft)
         btn_layout.addWidget(self.btn_edit_json)
         btn_layout.addWidget(self.btn_enrich)
         btn_layout.addWidget(self.btn_make_video_json)
+        btn_layout.addWidget(self.btn_final_edit)
 
         t1.addWidget(btn_group)
 
@@ -1074,18 +1551,27 @@ class VideoBuildDialog(QtWidgets.QDialog):
             self._append_log("⚠ 수정할 JSON 파일이 없습니다. '초안 생성'을 먼저 하세요.")
             return
 
+        # [Fix] UI 설정값 읽기 (Width, Height, FPS, Steps)
+        w, h, fps, steps, _, _, _ = self._get_current_settings()
+
         def job(progress):
-            progress("[Enrich] AI 상세화 작업 시작...")
+            progress(f"[Enrich] AI 상세화 작업 시작 (FPS:{fps}, Size:{w}x{h})...")
             builder = ShoppingVideoJsonBuilder(on_progress=progress)
+
+            # [Fix] 설정값 전달
             out_path = builder.enrich_video_json(
                 video_json_path=self.video_json_path,
-                product_data=self.product_data
+                product_data=self.product_data,
+                ui_width=w,
+                ui_height=h,
+                ui_fps=fps,
+                ui_steps=steps
             )
             return str(out_path)
 
         def done(ok, res, err):
             if ok:
-                self._append_log(f"✅ AI 상세화 완료!")
+                self._append_log(f"✅ AI 상세화 완료! (오디오 시간 측정됨)")
                 self._refresh_preview_if_exists()
             else:
                 self._append_log(f"❌ AI 상세화 실패: {err}")
@@ -1148,6 +1634,22 @@ class VideoBuildDialog(QtWidgets.QDialog):
             on_done=done
         )
 
+    def on_final_edit_clicked(self):
+        """
+        5단계: 최종안 수정 (video.json의 prompt_1_kor/prompt_2_kor... 편집 + 한글→영어 반영)
+        """
+        from pathlib import Path
+        from PyQt5 import QtWidgets
+
+        if not Path(self.target_video_json).exists():
+            QtWidgets.QMessageBox.warning(self, "알림", "video.json이 없습니다.\n'4. 비디오 JSON 생성'을 먼저 진행해주세요.")
+            return
+
+        dlg = FinalEditDialog(self.target_video_json, self.product_dir, parent=self)
+        dlg.exec_()
+        self._append_log("🔧 최종안 수정 창을 닫았습니다.")
+        self._refresh_preview_if_exists()
+
     def on_gen_images_clicked(self):
         if not Path(self.target_video_json).exists():
             QtWidgets.QMessageBox.warning(self, "알림", "video.json이 없습니다.\n'4. 비디오 JSON 생성'을 먼저 진행해주세요.")
@@ -1191,17 +1693,17 @@ class VideoBuildDialog(QtWidgets.QDialog):
             QtWidgets.QMessageBox.warning(self, "알림", "video.json이 없습니다.\n'4. 비디오 JSON 생성'을 먼저 진행해주세요.")
             return
 
-        # [수정] _get_current_settings() 반환값이 7개로 늘어났으므로 맞춰줍니다.
-        # (w, h, fps, steps, font, title_size, narr_size)
+        # UI 설정값 읽기 (w, h, fps, steps, ...)
         _, _, fps, _, _, _, _ = self._get_current_settings()
 
         def job(progress):
-            progress(f"[Movie] I2V 영상 생성 시작 ({fps} fps)...")
-            from app.video_build import build_shots_with_i2v
+            progress(f"[Movie] I2V 영상 생성 시작 (Long Take, {fps} fps)...")
+            # [변경] Long 버전 빌드 함수 호출
+            from app.video_build import build_shots_with_i2v_long
 
-            build_shots_with_i2v(
+            build_shots_with_i2v_long(
                 project_dir=self.product_dir,
-                total_frames=0,
+                total_frames=0, # video.json 값 사용
                 ui_fps=fps,
                 on_progress=lambda d: progress(d.get("msg", ""))
             )
@@ -1209,7 +1711,7 @@ class VideoBuildDialog(QtWidgets.QDialog):
 
         def done(ok, res, err):
             if ok:
-                self._append_log("✅ 영상 생성 완료")
+                self._append_log("✅ 영상 생성 및 업스케일 완료")
             else:
                 self._append_log(f"❌ 영상 생성 실패: {err}")
 

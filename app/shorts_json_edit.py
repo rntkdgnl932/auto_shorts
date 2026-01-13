@@ -15,7 +15,7 @@ from PyQt5.QtCore import Qt
 
 # --- App 모듈 Import ---
 from app.utils import load_json, save_json, run_job_with_progress_async, AI
-from app.audio_sync import _submit_and_wait as _submit_and_wait_comfy
+from app.utils import _submit_and_wait as _submit_and_wait_comfy
 from app.video_build import retry_cut_audio_for_scene
 import app.settings as settings_mod
 

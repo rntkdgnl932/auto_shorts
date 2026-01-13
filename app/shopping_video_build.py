@@ -24,7 +24,7 @@ from app.utils import (
     ensure_dir
 )
 from app import settings
-from app.video_build import build_shots_with_i2v, concatenate_scene_clips, fill_prompt_movie_with_ai
+from app.video_build import build_shots_with_i2v, concatenate_scene_clips, fill_prompt_movie_with_ai_long
 from app.audio_sync import get_audio_duration
 
 def _now_str() -> str:
@@ -136,6 +136,9 @@ def _get_zonos_config(scene: Dict[str, Any], ai: AI = None) -> Dict[str, Any]:
     return {"speed": 1.0, "emotion": {"neutral": 1.0}}
 
 
+# [shopping_video_build.py]
+# generate_tts_zonos 함수 전체를 아래 코드로 교체하세요.
+
 def generate_tts_zonos(
         text: str,
         out_path: Path,
@@ -146,9 +149,8 @@ def generate_tts_zonos(
     if not text:
         return False
 
-    # [핵심 수정] Zonos 초기 잡음 방지용 '..' 자동 추가
-    # 원본 text는 건드리지 않고, ComfyUI에 보낼 때만 추가합니다.
-    # 자막에는 영향이 없으며, 오디오 생성 시에만 적용됩니다.
+    # 1. Zonos 초기 잡음 방지용 '..' 자동 추가
+    # (앞에 점을 찍으면 호흡음이 줄어드는 효과가 있지만, 완벽하지 않아 트리밍도 병행합니다)
     tts_prompt_text = text
     if not tts_prompt_text.strip().startswith("."):
         tts_prompt_text = ".." + tts_prompt_text
@@ -179,26 +181,24 @@ def generate_tts_zonos(
     dst_ref = comfy_input_dir / ref_copy_name
     shutil.copy2(ref_audio, dst_ref)
 
-    # 1. 텍스트/시드/속도 설정
+    # 2. 노드 값 설정 (텍스트, 시드, 속도)
     found_gen = False
     for nid, node in graph.items():
-        # Zonos 노드 찾기
         if "Zonos" in node.get("class_type", "") and "speech" in node.get("inputs", {}):
-            node["inputs"]["speech"] = tts_prompt_text  # [수정] ..이 추가된 텍스트 주입
+            node["inputs"]["speech"] = tts_prompt_text
             node["inputs"]["seed"] = random.randint(1, 2 ** 32)
             if config and "speed" in config:
                 node["inputs"]["speed"] = config["speed"]
             found_gen = True
             break
 
-    # 만약 위 루프에서 못 찾았으면 ID 24번 시도 (fallback)
     if not found_gen and "24" in graph:
-        graph["24"]["inputs"]["speech"] = tts_prompt_text # [수정] ..이 추가된 텍스트 주입
+        graph["24"]["inputs"]["speech"] = tts_prompt_text
         graph["24"]["inputs"]["seed"] = random.randint(1, 2 ** 32)
         if config and "speed" in config:
             graph["24"]["inputs"]["speed"] = config["speed"]
 
-    # 2. 감정 설정 (Zonos Emotion 노드)
+    # 감정 설정
     if config and "emotion" in config:
         emotions = config["emotion"]
         for nid, node in graph.items():
@@ -208,7 +208,7 @@ def generate_tts_zonos(
                         node["inputs"][k] = v
                 break
 
-    # 3. 참조 오디오 설정
+    # 참조 오디오 설정
     found_audio = False
     for nid, node in graph.items():
         if node.get("class_type") == "LoadAudio":
@@ -229,10 +229,24 @@ def generate_tts_zonos(
                     params = {"filename": fname, "subfolder": item.get("subfolder", ""),
                               "type": item.get("type", "output")}
                     resp = requests.get(f"{comfy_host}/view", params=params)
+
                     if resp.status_code == 200:
                         ensure_dir(out_path.parent)
+                        # 일단 원본 저장
                         with open(out_path, "wb") as f:
                             f.write(resp.content)
+
+                        # [New] 앞부분 0.2초(200ms) 트리밍 로직
+                        try:
+                            audio = AudioSegment.from_file(str(out_path))
+                            # 길이가 충분할 때만 자름
+                            if len(audio) > 300:  # 최소 0.3초는 되어야 0.2초를 자름
+                                trimmed = audio[350:]  # 200ms 부터 끝까지
+                                trimmed.export(str(out_path), format="wav")
+                                # print(f"✂️ Audio trimmed 0.2s: {out_path.name}")
+                        except Exception as e:
+                            print(f"⚠️ 오디오 트리밍 실패 (원본 유지): {e}")
+
                         return True
         return False
     except Exception as e:
@@ -634,7 +648,8 @@ class ShoppingVideoJsonBuilder:
     def create_draft(self, product_dir: str | Path, product_data: Dict[str, Any], options: BuildOptions) -> Path:
         """
         [1단계] 기획 초안 생성
-        [수정] 시작부터 ID를 't_001' 포맷으로 고정하여 파이프라인 전체 통일성을 보장합니다.
+        - 초안 생성 단계에서 prompt_img_1/2 + 한글 버전(prompt_img_1_kor/2_kor)까지 같이 생성
+        - ID는 t_001 포맷으로 고정
         """
         p_dir = Path(product_dir)
         vpath = p_dir / "video_shopping.json"
@@ -663,6 +678,19 @@ class ShoppingVideoJsonBuilder:
             "   - Reason: The actual product image will be composited later, so text descriptions of details cause hallucinations."
         )
 
+        # 이미지 프롬프트 생성 규칙 (초안 단계에서 바로 생성)
+        img_prompt_rules = (
+            "6. **Image Prompt Rules (Two-Language Output)**:\n"
+            "   - You MUST output BOTH Korean and English versions.\n"
+            "   - `prompt_img_1_kor`: 장면의 인물/배경/상황을 한국어로 간단히 묘사. (제품의 로고/텍스트/라벨/색상 같은 디테일 금지)\n"
+            "   - `prompt_img_1`: 위 `prompt_img_1_kor`를 자연스러운 영어로 번역한 문장.\n"
+            "   - `prompt_img_2_kor`: 합성(제품 끼워넣기) 단계 지시를 한국어로 간단히 작성.\n"
+            "   - `prompt_img_2`: 반드시 아래 영어 고정 문장 구조를 지켜 작성:\n"
+            "       \"[Subject] from image 1 [action] the object from image 2\"\n"
+            "     예: \"The woman from image 1 holds the object from image 2 in her hand.\"\n"
+            "   - `prompt_img_2`에서는 object를 절대 구체적으로 묘사하지 말 것(색/라벨/텍스트/로고 금지).\n"
+        )
+
         system_prompt = (
             "당신은 AI 영상 생성(I2V)을 위한 숏폼 기획 전문가이자 음악 감독입니다. "
             "상품을 분석하여 기획안을 작성하세요.\n\n"
@@ -671,7 +699,9 @@ class ShoppingVideoJsonBuilder:
             "2. **No Split Screens**: 전체 화면 구성.\n"
             "3. **Focus on Impact**: 결정적 순간 포착.\n"
             f"{bgm_guide}\n"
-            f"{visual_rules}"
+            f"{visual_rules}\n"
+            f"{img_prompt_rules}\n\n"
+            "중요: 출력은 반드시 JSON만. 코드블록/설명문 금지."
         )
 
         user_prompt = f"""
@@ -685,24 +715,32 @@ class ShoppingVideoJsonBuilder:
 
         [출력 포맷 (JSON)]
         {{
-            "meta": {{ 
-                "title": "...", 
-                "voice_gender": "female", 
-                "character_prompt": "...", 
+            "meta": {{
+                "title": "...",
+                "voice_gender": "female",
+                "character_prompt": "...",
                 "bgm_prompt": "instrumental, background music, ... (English Only)"
             }},
             "scenes": [
                 {{
-                    "id": "t_001",  <-- AI에게 예시도 t_포맷으로 제시
+                    "id": "t_001",
                     "banner": "...",
                     "prompt": "화면 묘사 (한글, 절대 시퀀스/단계 나열 금지, 단일 동작 위주, 로고/텍스트 묘사 금지)",
                     "narration": "실제 읽을 대사 (지시문 제외)",
                     "sfx": "효과음",
                     "voice_config": {{
-                        "speed": 1.0, 
+                        "speed": 1.0,
                         "emotion": {{ "neutral": 1.0, "happy": 0.0, "sad": 0.0, "disgust": 0.0, "fear": 0.0, "surprise": 0.0, "anger": 0.0, "other": 0.0 }}
                     }},
-                    "subtitle": "..."
+                    "subtitle": "...",
+
+                    "prompt_img_1_kor": "장면의 인물/배경/상황 (한글)",
+                    "prompt_img_2_kor": "합성 단계 지시 (한글)",
+                    "prompt_img_1": "English translation of prompt_img_1_kor",
+                    "prompt_img_2": "MUST follow: \\"[Subject] from image 1 [action] the object from image 2\\"",
+
+                    "prompt_movie": "Simple camera movement in English",
+                    "prompt_negative": "negative prompt in English (short)"
                 }},
                 ...
             ]
@@ -734,9 +772,12 @@ class ShoppingVideoJsonBuilder:
         ensure_dir(voice_dir)
 
         for idx, sc in enumerate(data.get("scenes", [])):
-            # [핵심 수정] AI가 001로 주든 1로 주든, 무조건 t_001 포맷으로 강제 변환
-            # 이제 video_shopping.json 단계부터 t_001로 저장됩니다.
             sid = f"t_{idx + 1:03d}"
+
+            p1_kor = (sc.get("prompt_img_1_kor") or "").strip()
+            p2_kor = (sc.get("prompt_img_2_kor") or "").strip()
+            p1_eng = (sc.get("prompt_img_1") or "").strip()
+            p2_eng = (sc.get("prompt_img_2") or "").strip()
 
             new_scene = {
                 "id": sid,
@@ -747,11 +788,20 @@ class ShoppingVideoJsonBuilder:
                 "voice_config": sc.get("voice_config", {"speed": 1.0, "emotion": {"neutral": 1.0}}),
                 "subtitle": sc.get("subtitle", ""),
                 "seconds": 0,
-                "prompt_img_1": "",
-                "prompt_img_2": "",
-                "prompt_movie": "",
-                "prompt_negative": "",
-                # 이미지 경로도 t_001.png 로 통일
+
+                # --- 한글/영문 이미지 프롬프트 동시 저장 ---
+                "prompt_img_1_kor": p1_kor,
+                "prompt_img_2_kor": p2_kor,
+                "prompt_img_1": p1_eng,
+                "prompt_img_2": p2_eng,
+
+                "prompt_movie": (sc.get("prompt_movie") or ""),
+                "prompt_negative": (sc.get("prompt_negative") or ""),
+
+                # 호환용: 기존 로직에서 prompt_img를 참조할 수도 있으니 유지
+                "prompt_img": p1_eng,
+
+                # 이미지/영상/보이스 경로
                 "img_file": str(imgs_dir / f"{sid}.png"),
                 "movie_file": str(clips_dir / f"{sid}.mp4"),
                 "voice_file": str(voice_dir / f"{sid}.wav")
@@ -759,14 +809,25 @@ class ShoppingVideoJsonBuilder:
             final_json["scenes"].append(new_scene)
 
         save_json(vpath, final_json)
-        self.on_progress(f"[Draft] 초안 완료. (ID 포맷: t_001)")
+        self.on_progress("[Draft] 초안 완료. (prompt_img_1/2 + _kor 포함)")
         return vpath
 
-    def enrich_video_json(self, video_json_path: str | Path, product_data: Dict[str, Any]) -> Path:
+    def enrich_video_json(
+            self,
+            video_json_path: str | Path,
+            product_data: Dict[str, Any],
+            # [New] UI 설정값을 받을 인자 추가
+            ui_width: int = 720,
+            ui_height: int = 1280,
+            ui_fps: int = 24,
+            ui_steps: int = 20
+    ) -> Path:
         """
         [2단계] 상세화 (음성 -> BGM -> 영어 프롬프트)
         - ID 매칭: t_001 포맷 지원
         - 프롬프트 2: 복잡한 묘사 제거하고 "Subject from image 1 ... object from image 2" 공식 강제
+        - [Fix] 오디오 파일이 있어도 길이(duration)를 강제 재측정하여 0초 문제 해결
+        - [Fix] UI 설정(해상도, FPS 등)을 defaults에 저장
         """
         vpath = Path(video_json_path)
         p_dir = vpath.parent
@@ -777,8 +838,16 @@ class ShoppingVideoJsonBuilder:
         scenes = data.get("scenes", [])
         meta = data.get("meta", {})
 
+        # [Fix] UI 설정값 저장 (defaults 업데이트)
+        data.setdefault("defaults", {})
+        data["defaults"].update({
+            "image": {"width": ui_width, "height": ui_height, "fps": ui_fps},
+            "movie": {"fps": ui_fps, "target_fps": ui_fps},
+            "generator": {"steps": ui_steps}
+        })
+
         # ---------------------------------------------------------------------
-        # 1. 음성 생성 (유지)
+        # 1. 음성 생성 (유지) 및 시간 측정
         # ---------------------------------------------------------------------
         gender = meta.get("voice_gender", "female").lower()
         if "male" == gender:
@@ -796,28 +865,40 @@ class ShoppingVideoJsonBuilder:
             narr = sc.get("narration", "").strip()
             v_path = Path(sc.get("voice_file") or str(voice_dir / f"{sid}.wav"))
 
+            # 내레이션이 없으면 기본 3초
             if not narr:
                 if sc.get("seconds", 0) == 0: sc["seconds"] = 3
                 total_dur += sc["seconds"]
                 continue
 
+            # (A) 파일이 없으면 생성
             if not v_path.exists() or v_path.stat().st_size == 0:
                 self.on_progress(f"   🎙️ Scene {sid} 음성 생성...")
                 success = generate_tts_zonos(narr, v_path, ref_voice, comfy_host, config)
                 if not success:
-                    sc["seconds"] = 4
+                    # 실패 시 임시 4초 (다음 단계에서 재시도 가능)
+                    if sc.get("seconds", 0) <= 0: sc["seconds"] = 4.0
+
+            # (B) [Fix] 파일이 존재하면(생성 직후든 원래 있었든) 무조건 길이 측정
+            if v_path.exists() and v_path.stat().st_size > 0:
+                final_dur = 0.0
+                # 파일 쓰기 완료 대기 겸 재시도
+                for _ in range(3):
+                    try:
+                        d = get_audio_duration(str(v_path))
+                        if d > 0:
+                            final_dur = d
+                            break
+                    except:
+                        pass
+                    time.sleep(0.1)
+
+                if final_dur > 0:
+                    # [Fix] 오디오 길이 + 0.5초 여유
+                    sc["seconds"] = round(final_dur + 0.5, 2)
                 else:
-                    final_dur = 0.0
-                    for _ in range(5):
-                        try:
-                            d = get_audio_duration(str(v_path))
-                            if d > 0:
-                                final_dur = d
-                                break
-                        except:
-                            pass
-                        time.sleep(0.2)
-                    sc["seconds"] = round(final_dur + 0.5, 2) if final_dur > 0 else 4
+                    # 측정 실패 시 안전장치
+                    if sc.get("seconds", 0) <= 0: sc["seconds"] = 4.0
 
             total_dur += sc["seconds"]
             sc["voice_file"] = str(v_path)
@@ -1392,8 +1473,10 @@ def convert_shopping_to_video_json_with_ai(
 ) -> str:
     """
     [쇼핑->쇼츠 변환 최종판]
-    - 원본(video_shopping.json)의 ID가 't_001'이면 그대로 계승합니다.
-    - 억지로 인덱스 기준으로 ID를 새로 만들지 않습니다. (삭제/순서변경 대응)
+    - 원본(video_shopping.json)의 ID(t_001) 계승
+    - UI 설정값(fps, width, height, steps) 저장 (해상도 문제 해결)
+    - 기존 오디오 파일이 있으면 실제 길이 측정 (0초 문제 해결)
+    - fill_prompt_movie_with_ai_long 호출 (가변 프레임 상세화)
     """
 
     def _log(msg: str):
@@ -1415,7 +1498,7 @@ def convert_shopping_to_video_json_with_ai(
     except Exception as e:
         raise ValueError(f"데이터 로드 실패: {e}")
 
-    _log("데이터 구조 변환 시작 (ID 계승 모드)...")
+    _log(f"데이터 구조 변환 시작... (해상도: {width}x{height}, FPS: {fps})")
 
     prod = src_data.get("product", {})
     project_name = prod.get("product_name") or src_data.get("project_name", "Shopping Project")
@@ -1428,21 +1511,38 @@ def convert_shopping_to_video_json_with_ai(
     full_lyrics_parts = []
 
     for idx, sc in enumerate(src_scenes):
-        # [핵심 수정]
-        # video_shopping.json에 있는 ID를 최우선으로 사용한다.
-        # 초안 생성 단계에서 이미 't_001'로 만들어졌으므로 그대로 가져온다.
         original_id = str(sc.get("id", "")).strip()
-
         if original_id:
             scene_id = original_id
         else:
-            # 만약 구버전 데이터라 ID가 없다면 안전장치로 생성
             scene_id = f"t_{idx + 1:03d}"
 
-        # 이미지는 ID와 동일한 이름의 png 파일
         target_img_name = f"{scene_id}.png"
 
-        dur = float(sc.get("seconds") or sc.get("duration") or 4.0)
+        # 1. 오디오 파일 확인 및 길이 측정 (Fix: 0초 문제 해결)
+        voice_file = sc.get("voice_file") or sc.get("audio_path") or ""
+        real_duration = 0.0
+
+        # 절대 경로 또는 상대 경로 처리
+        voice_path_obj = None
+        if voice_file:
+            if Path(voice_file).is_absolute():
+                voice_path_obj = Path(voice_file)
+            else:
+                voice_path_obj = proj_path / voice_file
+
+            if voice_path_obj and voice_path_obj.exists():
+                try:
+                    real_duration = get_audio_duration(str(voice_path_obj))
+                except Exception:
+                    real_duration = 0.0
+
+        # JSON에 있는 값보다 실제 오디오 길이를 우선함 (오디오가 있다면)
+        if real_duration > 0.1:
+            dur = real_duration
+        else:
+            dur = float(sc.get("seconds") or sc.get("duration") or 4.0)
+
         start_t = current_time
         end_t = current_time + dur
         current_time = end_t
@@ -1451,13 +1551,13 @@ def convert_shopping_to_video_json_with_ai(
         full_lyrics_parts.append(narration)
 
         new_scene = {
-            "id": scene_id,  # t_001 그대로 유지
+            "id": scene_id,
             "section": "main",
             "start": round(start_t, 3),
             "end": round(end_t, 3),
             "duration": round(dur, 3),
-            "img_file": str(imgs_dir / target_img_name),  # imgs/t_001.png
-            "voice_file": sc.get("voice_file") or sc.get("audio_path") or "",
+            "img_file": str(imgs_dir / target_img_name),
+            "voice_file": str(voice_path_obj) if voice_path_obj else "",
             "lyric": narration,
             "prompt": sc.get("prompt", ""),
             "prompt_movie": sc.get("prompt_movie", ""),
@@ -1471,6 +1571,7 @@ def convert_shopping_to_video_json_with_ai(
     total_duration = current_time
     full_lyrics = "\n".join(full_lyrics_parts)
 
+    # 2. Defaults에 UI 설정값 강제 적용 (Fix: 해상도 문제 해결)
     video_data = {
         "title": project_name,
         "duration": round(total_duration, 3),
@@ -1491,16 +1592,17 @@ def convert_shopping_to_video_json_with_ai(
     with open(dst_json_path, "w", encoding="utf-8") as f:
         json.dump(video_data, f, indent=2, ensure_ascii=False)
 
-    _log(f"video.json 저장 완료 (ID: {scene_id} 등)")
-    _log("AI 상세화 진행...")
+    _log(f"video.json 저장 완료 (ID: {scene_id} 등, 총 길이: {total_duration:.2f}초)")
+    _log("AI 상세화 (Long Take) 진행...")
 
     if ai_client:
         try:
             def ask_wrapper(sys_msg, user_msg):
                 return ai_client.ask_smart(sys_msg, user_msg, prefer="openai")
 
-            # ID가 t_001 형식이므로 세그먼트 분할 AI가 정상적으로 작동합니다.
-            fill_prompt_movie_with_ai(
+            # [변경] Long 버전 함수 호출
+            from app.video_build import fill_prompt_movie_with_ai_long
+            fill_prompt_movie_with_ai_long(
                 str(dst_json_path.parent),
                 ask_wrapper,
                 log_fn=_log

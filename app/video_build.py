@@ -9,7 +9,7 @@ import os
 from app.utils import ensure_dir, load_json
 from app.settings import BASE_DIR, I2V_WORKFLOW, FFMPEG_EXE, USE_HWACCEL, FINAL_OUT, COMFY_HOST
 # music_gen에 있는 견고한 함수들을 우선 재사용 (가능할 때)
-from app.audio_sync import _submit_and_wait as _submit_and_wait_comfy_func
+from app.utils import _submit_and_wait as _submit_and_wait_comfy_func
 try:
     from app.audio_sync import (
         _http_get as _http_get_audio,
@@ -584,6 +584,100 @@ def build_shots_with_i2v(
     )
 
 
+def build_shots_with_i2v_long(
+        project_dir: str,
+        total_frames: int = 0,  # video.json 값 사용
+        ui_fps: int = 24,
+        on_progress: Callable = print
+):
+    """
+    [New] 영상 생성 메인 파이프라인 (Long Take 버전)
+    1. 75번 워크플로우를 이용해 가변 프레임 Raw 영상 생성
+    2. 생성된 Raw 영상 일괄 업스케일 (Interpolation_upscale)
+    """
+    p_dir = Path(project_dir)
+    v_path = p_dir / "video.json"
+    clips_dir = p_dir / "clips"
+    clips_dir.mkdir(parents=True, exist_ok=True)
+
+    # 75번 워크플로우 로드
+    from app import settings
+    wf_path = Path(settings.JSONS_DIR) / "75.wan22_SVI_Pro.json"
+    if not wf_path.exists():
+        wf_path = Path(r"C:\my_games\shorts_make\app\jsons\75.wan22_SVI_Pro.json")
+
+    with open(wf_path, "r", encoding="utf-8") as f:
+        wf_template = json.load(f)
+
+    comfy_url = getattr(settings, "COMFY_HOST", "http://127.0.0.1:8188")
+
+    # video.json 로드
+    data = json.loads(v_path.read_text(encoding="utf-8"))
+
+    # UI 설정값 우선 (video.json에 저장된 defaults 값 사용)
+    defaults = data.get("defaults", {})
+    width = int(defaults.get("image", {}).get("width", 720))
+    height = int(defaults.get("image", {}).get("height", 1280))
+
+    scenes = data.get("scenes", [])
+
+    # 1. Raw 영상 생성 루프
+    on_progress({"msg": "🎬 [Step 1] RAW 영상 생성 시작 (Long Take Mode)..."})
+
+    raw_created_count = 0
+
+    for sc in scenes:
+        sid = sc.get("id")
+        raw_path = clips_dir / f"{sid}_raw.mp4"
+        final_path = clips_dir / f"{sid}.mp4"
+
+        # 최종본 있으면 스킵
+        if final_path.exists() and final_path.stat().st_size > 1000:
+            on_progress({"msg": f"   ⏭️ Skip {sid} (Final exists)"})
+            continue
+
+        # Raw 있으면 스킵 (업스케일 대기)
+        if raw_path.exists() and raw_path.stat().st_size > 1000:
+            on_progress({"msg": f"   ⏭️ Skip Gen {sid} (Raw exists)"})
+            raw_created_count += 1
+            continue
+
+        # 생성
+        on_progress({"msg": f"   🎥 Generating {sid}..."})
+        success = raw_make_addup_long(
+            scene_data=sc,
+            workflow_template=wf_template,
+            ui_width=width,
+            ui_height=height,
+            comfy_url=comfy_url,
+            output_dir=clips_dir,
+            log_fn=lambda m: on_progress({"msg": m})
+        )
+        if success:
+            raw_created_count += 1
+        else:
+            on_progress({"msg": f"   ❌ Failed {sid}"})
+
+    # 2. 일괄 업스케일 (기존 함수 재사용)
+    if raw_created_count > 0:
+        on_progress({"msg": "✨ [Step 2] 업스케일링 (Interpolation) 시작..."})
+        try:
+            # Interpolation_upscale은 video_build.py 상단에 정의되어 있다고 가정
+            from app.video_build import Interpolation_upscale
+            Interpolation_upscale(
+                str(p_dir),
+                total_frames=0,
+                ui_width=width,
+                ui_height=height,
+                ui_fps=ui_fps,
+                on_progress=on_progress,
+            )
+
+            on_progress({"msg": "✅ 모든 영상 생성 및 업스케일 완료!"})
+        except Exception as e:
+            on_progress({"msg": f"❌ 업스케일 중 오류: {e}"})
+    else:
+        on_progress({"msg": "✅ 생성할 신규 영상이 없습니다."})
 
 
 
@@ -1540,6 +1634,266 @@ def raw_make_addup(
 
         _notify(f"[RAW] 씬 {scene_id} RAW 처리 완료 → {scene_raw_norm}")
 
+
+def raw_make_addup_long(
+        scene_data: Dict[str, Any],
+        workflow_template: Dict[str, Any],
+        ui_width: int,
+        ui_height: int,
+        comfy_url: str,
+        output_dir: Path,
+        log_fn: Callable = print
+) -> bool:
+    """
+    [New] 75번 워크플로우(Long Take) 실행 함수 (Strict Output Version)
+    - 오직 최종 병합된 영상(Node 204)만 기다리고 가져옵니다.
+    - scene_data의 total_frames / seg_count / prompt_1~3 를 활용합니다.
+    - 세그먼트 간 overlap(워크플로우의 ImageBatchExtendWithOverlap=5)을 고려하여
+      최종 프레임 수가 total_frames가 되도록 세그 length를 계산합니다.
+    """
+    import json
+    import random
+    import shutil
+    import requests
+    from pathlib import Path
+    from app import settings
+
+    sid = scene_data.get("id", "unknown")
+
+    # ---------------------------------------------------------
+    # 0. total_frames / seg_count 결정
+    # ---------------------------------------------------------
+    duration = float(scene_data.get("duration", 0) or scene_data.get("seconds", 0) or 0.0)
+
+    # video.json이 total_frames를 이미 갖는 구조(당신 설명)라면 그 값을 우선 신뢰
+    if int(scene_data.get("total_frames", 0) or 0) > 0:
+        total_frames = int(scene_data["total_frames"])
+    else:
+        # 혹시 fps가 제공되면 그걸 우선, 없으면 24
+        fps = float(scene_data.get("fps", 0) or 24.0)
+        total_frames = max(1, int(round(duration * fps)))
+
+    # seg_count도 scene_data에 있으면 우선 신뢰, 없으면 규칙으로 산출
+    if int(scene_data.get("seg_count", 0) or 0) in (1, 2, 3):
+        seg_count = int(scene_data["seg_count"])
+    else:
+        if total_frames > 162:
+            seg_count = 3
+        elif total_frames > 81:
+            seg_count = 2
+        else:
+            seg_count = 1
+
+    # 워크플로우의 overlap 값(기본 템플릿이 5로 설정되어 있음) :contentReference[oaicite:3]{index=3}
+    overlap = int(scene_data.get("overlap_frames", 0) or 5)
+
+    # ---------------------------------------------------------
+    # 0-b. 세그먼트 길이 계산 (최종 프레임이 total_frames가 되도록)
+    #
+    # 결합 후 최종 길이:
+    # 2세그: L1 + L2 - overlap = total_frames  => L1 + L2 = total_frames + overlap
+    # 3세그: L1 + L2 + L3 - 2*overlap = total_frames => 합 = total_frames + 2*overlap
+    # ---------------------------------------------------------
+    target_sum = total_frames + (seg_count - 1) * overlap
+
+    # 균등 분배(정수) + 나머지 분배
+    base = target_sum // seg_count
+    rem = target_sum % seg_count
+    lens = []
+    for i in range(seg_count):
+        lens.append(base + (1 if i < rem else 0))
+
+    # 안전장치: 너무 짧으면(특히 overlap보다 짧으면) overlap 블렌딩이 의미 없어질 수 있음
+    # 최소 1프레임은 보장, 가능하면 overlap+1 이상이 되도록 조정
+    # (극단적으로 total_frames가 작을 때만 발동)
+    for i in range(len(lens)):
+        if lens[i] < 1:
+            lens[i] = 1
+    if seg_count >= 2:
+        min_len = overlap + 1
+        # lens 중 min_len 미만이 있으면, 가능한 범위에서 다른 세그에서 빼서 보정
+        for i in range(seg_count):
+            if lens[i] < min_len:
+                need = min_len - lens[i]
+                lens[i] = min_len
+                # 다른 세그에서 need만큼 차감
+                for j in range(seg_count):
+                    if j == i:
+                        continue
+                    give = min(need, max(0, lens[j] - min_len))
+                    if give > 0:
+                        lens[j] -= give
+                        need -= give
+                    if need <= 0:
+                        break
+                # 그래도 need가 남으면(전체가 너무 짧은 케이스), 그냥 둔다.
+
+    log_fn(f"   [Gen] Scene {sid}: total_frames={total_frames}f, seg_count={seg_count}, "
+           f"overlap={overlap}, seg_lengths={lens} (sum={sum(lens)})")
+
+    # ---------------------------------------------------------
+    # 1. 이미지 복사 (필수)
+    # ---------------------------------------------------------
+    img_path_str = scene_data.get("img_file", "")
+    target_image_name = ""
+
+    if img_path_str:
+        src_path = Path(img_path_str)
+        if src_path.exists():
+            comfy_input_dir = Path(settings.COMFY_INPUT_DIR)
+            if not comfy_input_dir.is_absolute():
+                comfy_input_dir = Path(settings.BASE_DIR) / settings.COMFY_INPUT_DIR
+
+            comfy_input_dir.mkdir(parents=True, exist_ok=True)
+            target_image_name = f"{sid}_{src_path.name}"
+            try:
+                shutil.copy2(src_path, comfy_input_dir / target_image_name)
+            except Exception as e:
+                log_fn(f"   ⚠️ Image copy failed: {e}")
+
+    # ---------------------------------------------------------
+    # 2. 워크플로우 수정 (중간 저장 끄기 & 입력 주입)
+    # ---------------------------------------------------------
+    graph = json.loads(json.dumps(workflow_template))
+
+    final_node_id = "204"
+
+    # [중요] 중간 저장 노드 비활성화 (204번 제외)
+    for nid, node in graph.items():
+        if nid != final_node_id and isinstance(node, dict) and "inputs" in node:
+            inputs = node.get("inputs", {})
+            if "save_output" in inputs:
+                inputs["save_output"] = False
+            if "filename_prefix" in inputs:
+                inputs["filename_prefix"] = "TEMP_IGNORE_"
+
+    # (A) 공통 입력 설정
+    if "136" in graph and "inputs" in graph["136"]:
+        graph["136"]["inputs"]["width"] = ui_width
+        graph["136"]["inputs"]["height"] = ui_height
+
+    if "97" in graph and target_image_name and "inputs" in graph["97"]:
+        graph["97"]["inputs"]["image"] = target_image_name
+
+    # Negative prompt 주입
+    neg_text = scene_data.get("prompt_negative", "") or ""
+    for nid in ("193:182", "181:182", "203:182"):
+        if nid in graph and "inputs" in graph[nid]:
+            graph[nid]["inputs"]["text"] = neg_text
+
+    # overlap 값도 워크플로우에 주입(템플릿은 5) :contentReference[oaicite:4]{index=4}
+    if seg_count >= 2 and "181:168" in graph and "inputs" in graph["181:168"]:
+        graph["181:168"]["inputs"]["overlap"] = overlap
+    if seg_count >= 3 and "203:168" in graph and "inputs" in graph["203:168"]:
+        graph["203:168"]["inputs"]["overlap"] = overlap
+
+    # (B) 세그먼트별 설정: prompt_n + length_n
+    base_prompt = scene_data.get("prompt_1") or scene_data.get("prompt") or ""
+    if "193:160" in graph and "inputs" in graph["193:160"]:
+        graph["193:160"]["inputs"]["length"] = int(lens[0])
+    if "193:152" in graph and "inputs" in graph["193:152"]:
+        graph["193:152"]["inputs"]["text"] = base_prompt
+    if "189" in graph and "inputs" in graph["189"]:
+        graph["189"]["inputs"]["noise_seed"] = random.randint(1, 10 ** 14)
+
+    if seg_count >= 2:
+        p2 = scene_data.get("prompt_2") or base_prompt
+        if "181:160" in graph and "inputs" in graph["181:160"]:
+            graph["181:160"]["inputs"]["length"] = int(lens[1])
+        if "181:152" in graph and "inputs" in graph["181:152"]:
+            graph["181:152"]["inputs"]["text"] = p2
+        if "182" in graph and "inputs" in graph["182"]:
+            graph["182"]["inputs"]["noise_seed"] = random.randint(1, 10 ** 14)
+
+    if seg_count >= 3:
+        p3 = scene_data.get("prompt_3") or base_prompt
+        if "203:160" in graph and "inputs" in graph["203:160"]:
+            graph["203:160"]["inputs"]["length"] = int(lens[2])
+        if "203:152" in graph and "inputs" in graph["203:152"]:
+            graph["203:152"]["inputs"]["text"] = p3
+        if "199" in graph and "inputs" in graph["199"]:
+            graph["199"]["inputs"]["noise_seed"] = random.randint(1, 10 ** 14)
+
+    # (C) 최종 연결 (Rewiring)
+    # 템플릿에서 최종 204는 "203:168"의 2번 출력 포트를 입력으로 사용 :contentReference[oaicite:5]{index=5}
+    # 2세그일 때는 "181:168"의 '배치 출력' 포트를 넣어야 seg2 경로가 pruning되지 않음.
+    if final_node_id in graph and "inputs" in graph[final_node_id]:
+        if seg_count == 1:
+            graph[final_node_id]["inputs"]["images"] = ["193:162", 0]
+        elif seg_count == 2:
+            # 핵심 수정: 포트 인덱스를 2로 맞춤(템플릿 계열)
+            graph[final_node_id]["inputs"]["images"] = ["181:168", 2]
+        else:
+            # 3세그는 템플릿 기본(203:168, 2) 그대로 사용
+            graph[final_node_id]["inputs"]["images"] = ["203:168", 2]
+
+        graph[final_node_id]["inputs"]["filename_prefix"] = f"LONG_{sid}"
+        # 저장은 최종만 True로(템플릿상 save_output False로 되어있을 수 있어 강제)
+        if "save_output" in graph[final_node_id]["inputs"]:
+            graph[final_node_id]["inputs"]["save_output"] = True
+
+    # ---------------------------------------------------------
+    # 3. 제출 및 최종 결과물만 회수
+    # ---------------------------------------------------------
+    try:
+        res = _submit_and_wait_comfy_func(
+            comfy_url,
+            graph,
+            timeout=10000,
+            poll=5.0,
+            on_progress=lambda x: None
+        )
+
+        outputs = res.get("outputs", {}) if isinstance(res, dict) else {}
+        target_out = outputs.get(final_node_id)
+
+        if not target_out:
+            # 혹시 ID가 바뀌었을 경우: 첫 VHS_VideoCombine 노드 찾기
+            combine_node_id = None
+            for nid, node in graph.items():
+                if isinstance(node, dict) and node.get("class_type") == "VHS_VideoCombine":
+                    combine_node_id = nid
+                    break
+            if combine_node_id:
+                target_out = outputs.get(combine_node_id)
+
+        if not target_out:
+            log_fn("   ❌ 최종 병합 노드(VHS_VideoCombine)의 결과를 찾을 수 없습니다.")
+            log_fn(f"      outputs keys: {list(outputs.keys())}")
+            return False
+
+        files = target_out.get("gifs", []) + target_out.get("videos", [])
+        if not files:
+            log_fn("   ❌ 최종 노드는 찾았으나 출력 파일 목록이 비었습니다.")
+            return False
+
+        item = files[0]
+        fname = item.get("filename")
+        subfolder = item.get("subfolder", "")
+        ftype = item.get("type", "output")
+
+        if not fname:
+            log_fn("   ❌ 출력 파일 항목에 filename이 없습니다.")
+            return False
+
+        params = {"filename": fname, "subfolder": subfolder, "type": ftype}
+        resp = requests.get(f"{comfy_url}/view", params=params, timeout=120)
+
+        if resp.status_code != 200:
+            log_fn(f"   ❌ Download Failed: {resp.status_code}")
+            return False
+
+        output_dir.mkdir(parents=True, exist_ok=True)
+        target_path = output_dir / f"{sid}_raw.mp4"
+        with open(target_path, "wb") as f:
+            f.write(resp.content)
+
+        log_fn(f"   ✅ Saved Final: {target_path.name} (frames={total_frames}, segs={seg_count}, lens={lens}, overlap={overlap})")
+        return True
+
+    except Exception as e:
+        log_fn(f"❌ Generation Failed {sid}: {e}")
+        return False
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -3234,7 +3588,7 @@ def build_video_json_with_gap_policy(
 
 
 
-# 사용중
+# No.48 전용
 def fill_prompt_movie_with_ai(
         project_dir: "Path",
         ask: "Callable[[str, str], str]",
@@ -3462,7 +3816,198 @@ def fill_prompt_movie_with_ai(
         save_json(vpath, vdoc)
         _log("[fill_prompt_movie_with_ai] 변경 사항 없음 (기본 저장)")
 
+# 75 워크플로우 전용
+def fill_prompt_movie_with_ai_long(
+        project_dir: str,
+        ai_ask_func: Callable[[str, str], str],
+        log_fn: Callable[[str], None] = print
+):
+    """
+    [New] video.json의 장면 정보를 읽어 FPS 기반 총 프레임을 계산하고,
+    1~3개 세그먼트로 균등 분할하여 각 프롬프트를 AI로 생성합니다.
 
+    [수정사항]
+    - 프롬프트 생성 시 'prompt_img_1'(비주얼)과 'subtitle'(스토리)을 참고합니다.
+    - 세그먼트 프롬프트는 한국어/영어 쌍으로 저장합니다:
+        prompt_1_kor, prompt_2_kor, prompt_3_kor (사람용)
+        prompt_1,     prompt_2,     prompt_3     (모델용: 위 한글의 충실 번역)
+    - 세그먼트 프롬프트에서는 제품을 반드시 "the object"로만 지칭하도록 강제합니다.
+    """
+    from pathlib import Path
+    import json
+    import re
+
+    p_dir = Path(project_dir)
+    v_path = p_dir / "video.json"
+
+    if not v_path.exists():
+        log_fn("❌ video.json not found.")
+        return
+
+    try:
+        data = json.loads(v_path.read_text(encoding="utf-8"))
+    except Exception as e:
+        log_fn(f"❌ JSON Load Error: {e}")
+        return
+
+    # video.json의 defaults 값 참조
+    defaults = data.get("defaults", {})
+    movie_def = defaults.get("movie", {})
+    fps = int(movie_def.get("fps", 24))
+
+    scenes = data.get("scenes", [])
+
+    log_fn(f"🚀 [AI Long-Take] 프롬프트 상세화 시작 (FPS: {fps})")
+
+    for sc in scenes:
+        sid = sc.get("id")
+
+        # 실제 오디오 길이가 있으면 우선 사용, 없으면 설정된 seconds 사용
+        duration = float(sc.get("duration", 0) or 0.0)
+        if duration <= 0:
+            duration = float(sc.get("seconds", 4.0) or 4.0)
+
+        # 프롬프트 생성을 위한 소스 데이터 확보
+        # 1. 시각적 베이스 (이미지 프롬프트)
+        visual_desc = sc.get("prompt_img_1") or sc.get("prompt_img") or sc.get("prompt", "")
+        # 2. 스토리 맥락 (자막/내레이션)
+        story_context = sc.get("subtitle") or sc.get("lyric") or sc.get("narration") or ""
+
+        # 1. 총 프레임 및 세그먼트 수 계산 (81프레임 기준)
+        total_frames = int(duration * fps)
+
+        seg_count = 1
+        if total_frames > 162:  # 163 ~ : 3분할
+            seg_count = 3
+        elif total_frames > 81:  # 82 ~ 162 : 2분할
+            seg_count = 2
+        else:  # ~ 81 : 1분할
+            seg_count = 1
+
+        sc["total_frames"] = total_frames
+        sc["seg_count"] = seg_count
+
+        log_fn(f"   - Scene {sid}: {duration:.2f}s * {fps}fps = {total_frames} frames -> {seg_count} segments")
+
+        # 2. AI 프롬프트 생성 (조건 강화 + kor/en 쌍 생성)
+        sys_msg = (
+            "You are a bilingual I2V prompt director for long-take continuity.\n"
+            "You MUST produce segment prompts that feel like ONE continuous shot.\n"
+            "The start image already contains the real product appearance via compositing.\n"
+            "From segment prompts onward, you MUST refer to the product ONLY as: 'the object'.\n\n"
+            "STRICT CONTINUITY RULES (non-negotiable)\n"
+            "1) For EACH segment, write Korean first, then English.\n"
+            "2) English must be a faithful translation of the Korean. Do NOT add new actions.\n"
+            "3) Do NOT introduce new locations, new props, new characters, or new background elements.\n"
+            "4) Keep the SAME setting/background as the start image. Minimal background description.\n"
+            "5) Use ONLY the phrase 'the object' for the product in BOTH Korean and English.\n"
+            "   - Do NOT say extinguisher, phone, toilet, device, product name, etc.\n"
+            "   - In Korean, also avoid naming the product; describe it as '물체' 수준으로만 표현.\n"
+            "6) Each segment MUST begin from the exact end state of the previous segment.\n"
+            "7) Prefer subtle camera moves only: slow push-in, slight dolly, gentle rack focus. Avoid fast cuts.\n"
+            "8) Focus on clear, simple, physically plausible actions. No magic spawning unless already implied.\n\n"
+            f"Split the action into exactly {seg_count} sequential segments.\n"
+            "Return JSON ONLY with the required keys."
+        )
+
+        # 조건부 JSON 포맷 문자열 미리 생성 (kor/en 쌍)
+        p2_json = '"prompt_2_kor": "...", "prompt_2": "...",' if seg_count >= 2 else ""
+        p3_json = '"prompt_3_kor": "...", "prompt_3": "...",' if seg_count >= 3 else ""
+
+        user_msg = f"""
+[Start Image Description]
+{visual_desc}
+
+[Story Context]
+{story_context}
+
+[Segment Goal Template]
+- Segment 1: transition from the start image into the first clear action featuring the object.
+- Segment 2: continue seamlessly; reveal one key feature/visual emphasis of the object (e.g., glow, highlight, focus shift).
+- Segment 3: continue seamlessly; resolve with a clean hero moment of the object (stable pose, hold).
+
+[Hard Constraints]
+- Keep the same setting/background as the start image. Do not re-describe the background.
+- Product reference must be ONLY: "the object" (English) / "물체" (Korean).
+- Do NOT use any other product noun (no extinguisher/phone/toilet/device/product name).
+- No new scene cuts. No time jumps.
+
+[Output JSON Format]
+{{
+  "prompt_1_kor": "한국어로 1번 세그먼트 동작 (물체로만 지칭)",
+  "prompt_1": "English translation of prompt_1_kor (must include 'the object')",
+  {p2_json}
+  {p3_json}
+  "last_state_kor": "마지막 프레임 상태를 한국어 1문장으로 요약 (물체로만 지칭)",
+  "last_state": "English translation of last_state_kor (must include 'the object')"
+}}
+"""
+
+        try:
+            resp = ai_ask_func(sys_msg, user_msg)
+
+            # JSON 파싱 안전 처리
+            resp_clean = re.sub(r"```json|```", "", resp).strip()
+            # 첫 '{' 부터 마지막 '}' 까지만 추출
+            l = resp_clean.find("{")
+            r = resp_clean.rfind("}")
+            if l == -1 or r == -1 or r <= l:
+                raise ValueError("AI 응답에서 JSON 객체를 찾지 못했습니다.")
+            json_str = resp_clean[l:r + 1]
+            parsed = json.loads(json_str)
+
+            # kor/en 저장 (영문은 반드시 존재하도록 fallback 처리)
+            sc["prompt_1_kor"] = (parsed.get("prompt_1_kor") or "").strip()
+            sc["prompt_1"] = (parsed.get("prompt_1") or "").strip()
+            if not sc["prompt_1"]:
+                sc["prompt_1"] = (parsed.get("prompt_1_kor") or "").strip()
+
+            if seg_count >= 2:
+                sc["prompt_2_kor"] = (parsed.get("prompt_2_kor") or "").strip()
+                sc["prompt_2"] = (parsed.get("prompt_2") or "").strip()
+                if not sc["prompt_2"]:
+                    sc["prompt_2"] = (parsed.get("prompt_2_kor") or "").strip()
+
+            if seg_count >= 3:
+                sc["prompt_3_kor"] = (parsed.get("prompt_3_kor") or "").strip()
+                sc["prompt_3"] = (parsed.get("prompt_3") or "").strip()
+                if not sc["prompt_3"]:
+                    sc["prompt_3"] = (parsed.get("prompt_3_kor") or "").strip()
+
+            # last_state도 저장(추후 디버깅/연속성 튜닝에 유용)
+            sc["last_state_kor"] = (parsed.get("last_state_kor") or "").strip()
+            sc["last_state"] = (parsed.get("last_state") or "").strip()
+
+            # 최후 안전장치: 최소값 채우기
+            if not sc.get("prompt_1"):
+                sc["prompt_1"] = visual_desc or "The subject continues holding the object."
+            if seg_count >= 2 and not sc.get("prompt_2"):
+                sc["prompt_2"] = "The action continues seamlessly with the object."
+            if seg_count >= 3 and not sc.get("prompt_3"):
+                sc["prompt_3"] = "The action resolves in a clean hero moment with the object."
+
+        except Exception as e:
+            log_fn(f"⚠️ Scene {sid} AI Error: {e}")
+
+            # 에러 시 기본값
+            sc["prompt_1_kor"] = "시작 이미지 상태에서 자연스럽게 물체를 강조하는 동작으로 이어진다."
+            sc["prompt_1"] = "From the start image, continue with a natural action that emphasizes the object."
+
+            if seg_count >= 2:
+                sc["prompt_2_kor"] = "직전 동작을 이어받아 물체를 더 강하게 부각한다."
+                sc["prompt_2"] = "Continue seamlessly and emphasize the object more clearly."
+
+            if seg_count >= 3:
+                sc["prompt_3_kor"] = "자연스럽게 마무리 포즈로 이어지며 물체를 안정적으로 보여준다."
+                sc["prompt_3"] = "Resolve into a clean finishing pose while presenting the object steadily."
+
+            sc["last_state_kor"] = "마지막 프레임에서 인물은 물체를 안정적으로 보여주고 있다."
+            sc["last_state"] = "In the final frame, the subject presents the object steadily."
+
+    with open(v_path, "w", encoding="utf-8") as f:
+        json.dump(data, f, indent=2, ensure_ascii=False)
+
+    log_fn("✅ [AI Long-Take] 프롬프트 상세화 완료. (prompt_n_kor + prompt_n 저장)")
 
 
 def retry_cut_audio_for_scene(project_dir: str, scene_id: str, offset: float) -> str:
