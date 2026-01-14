@@ -6,7 +6,7 @@ from pathlib import Path as _Path
 import os
 from app import settings
 # ── 유연 임포트 ─────────────────────────────────────────────────────────────
-from app.utils import ensure_dir, load_json, get_duration
+from app.utils import ensure_dir, load_json, get_duration, _ffmpeg_escape_drawtext, SubtitleComposer, SubtitleStyle
 from app.settings import BASE_DIR, I2V_WORKFLOW, FFMPEG_EXE, USE_HWACCEL, FINAL_OUT, COMFY_HOST
 # music_gen에 있는 견고한 함수들을 우선 재사용 (가능할 때)
 from app.utils import _submit_and_wait as _submit_and_wait_comfy_func
@@ -265,26 +265,430 @@ def concatenate_scene_clips(clip_paths: List[Path], out_path: Path, ffmpeg_exe: 
         if list_file.exists():
             list_file.unlink()
 
-# 영상 등 합치기 ; 자막 가운데 정렬 버젼 _ffmpeg_escape_filter_path
-def _ffmpeg_escape_drawtext(s: str) -> str:
-    """
-    FFmpeg drawtext 안전 이스케이프(기본형).
-    - 백슬래시/콜론/작은따옴표/퍼센트/개행 처리
-    - 개행은 filtergraph 파서 단계 때문에 '\\\\n' 으로 넣어야 drawtext에서 '\n'으로 인식됨
-    """
-    if s is None:
-        return ""
-    s = str(s)
-    s = s.replace("\\", "\\\\")
-    s = s.replace(":", "\\:")
-    s = s.replace("'", "\\'")
-    s = s.replace("%", "\\%")
-    # ✅ 여기 중요: \n -> \\n 로 “필터 파서용” 이스케이프
-    s = s.replace("\r\n", "\n")
-    s = s.replace("\n", "\\\\n")
-    s = s.replace("\r", "")
-    return s
 
+# def concatenate_scene_clips_final_av_ex(
+#     *,
+#     clip_paths: List[Path],
+#     out_path: Path,
+#     ffmpeg_exe: str,
+#     scenes: List[Dict[str, Any]],
+#     bgm_path: Optional[Path] = None,
+#     bgm_volume: float = 0.35,
+#     narration_volume: float = 1.0,
+#
+#     # (호환 유지: 최종 병합에서는 0으로 넘기는 것을 권장)
+#     pad_in_sec: float = 0.0,
+#     pad_out_sec: float = 0.0,
+#
+#     subtitle_font: str = "Gulim",
+#     subtitle_fontsize: int = 36,
+#     subtitle_y: str = "h-140",
+#     subtitle_box: bool = True,
+#     subtitle_boxcolor: str = "black@0.45",
+#     subtitle_boxborderw: int = 18,
+#
+#     # ✅ 자막 페이드 전용
+#     subtitle_fade_in_sec: float = 0.25,
+#     subtitle_fade_out_sec: float = 0.25,
+#
+#     title_text: str = "",
+#     title_fontsize: int = 55,
+#     title_y: str = "h*0.12",
+#     video_crf: int = 18,
+#     video_preset: str = "medium",
+#     audio_bitrate: str = "192k",
+#
+#     # ✅ 내레이션 가속 상한
+#     max_narration_speed: float = 1.30,
+#
+#     # ✅ 진행 로그(비동기 창)
+#     on_progress=None,
+# ) -> None:
+#     """
+#     [최종 합치기 - 오버랩 없음, 자막 페이드]
+#     - clip_paths를 concat demuxer로 이어붙여 temp_visual.mp4 생성(오디오는 제외)
+#     - 각 클립의 "실제 길이"를 get_duration()으로 측정하여 scene별 movie_duration에 기록
+#     - 각 voice_file의 "실제 길이"를 get_duration()으로 측정하여 narration_duration에 기록
+#     - 내레이션/자막은 해당 씬(클립)의 중앙에 배치
+#     - 내레이션이 너무 길면 필요한 만큼 atempo로 줄임(상한 max_narration_speed)
+#     - drawtext는 제목(선택) + 자막(씬별)에 alpha 기반 fade-in/out 적용
+#     - ✅ 자막 줄바꿈은 텍스트에 개행을 넣지 않고 drawtext 2개로 처리(Windows 안정)
+#     """
+#
+#     def _p(msg: str) -> None:
+#         if callable(on_progress):
+#             try:
+#                 on_progress(msg)
+#             except Exception:
+#                 pass
+#
+#     if not clip_paths:
+#         raise ValueError("clip_paths가 비었습니다.")
+#     out_path.parent.mkdir(parents=True, exist_ok=True)
+#
+#     work_dir = out_path.parent
+#     list_file = work_dir / "ffmpeg_concat_list_final.txt"
+#     temp_visual = work_dir / (out_path.stem + "_temp_visual.mp4")
+#
+#     # 1) concat list 생성
+#     with open(list_file, "w", encoding="utf-8") as f:
+#         for clip in clip_paths:
+#             if not clip.exists():
+#                 raise FileNotFoundError(f"병합할 클립을 찾을 수 없습니다: {clip}")
+#             f.write(f"file '{clip.as_posix()}'\n")
+#
+#     # 2) 비디오만 합쳐서 temp_visual 생성
+#     cmd_concat = [
+#         ffmpeg_exe, "-y",
+#         "-f", "concat",
+#         "-safe", "0",
+#         "-i", str(list_file),
+#         "-an",
+#         "-c:v", "libx264",
+#         "-preset", video_preset,
+#         "-crf", str(video_crf),
+#         str(temp_visual),
+#     ]
+#
+#     startupinfo = None
+#     if os.name == "nt":
+#         startupinfo = subprocess.STARTUPINFO()
+#         startupinfo.dwFlags |= subprocess.STARTF_USESHOWWINDOW
+#
+#     r = subprocess.run(
+#         cmd_concat,
+#         capture_output=True,
+#         text=True,
+#         encoding="utf-8",
+#         errors="ignore",
+#         startupinfo=startupinfo,
+#     )
+#     if r.returncode != 0:
+#         raise RuntimeError(f"FFMPEG concat(temp_visual) 실패:\n{r.stderr}")
+#
+#     visual_dur = float(get_duration(str(temp_visual)) or 0.0)
+#     if visual_dur <= 0:
+#         visual_dur = 1.0
+#
+#     # 3) 각 씬별 실제 영상 길이 측정 → start/end 재구성
+#     clip_durs: List[float] = []
+#     for cp in clip_paths:
+#         d = float(get_duration(str(cp)) or 0.0)
+#         if d <= 0:
+#             d = max(0.01, visual_dur / max(len(clip_paths), 1))
+#         clip_durs.append(d)
+#
+#     t_cursor = 0.0
+#     for i, sc in enumerate(scenes):
+#         if i >= len(clip_durs):
+#             break
+#         d = clip_durs[i]
+#         sc["movie_duration"] = float(d)
+#         sc["start"] = float(t_cursor)
+#         sc["end"] = float(t_cursor + d)
+#         t_cursor += d
+#
+#     _p(f"[Merge][DBG] total_visual={visual_dur:.3f}s, scenes_used={min(len(scenes), len(clip_durs))}")
+#
+#     # 4) 오디오 입력/필터 구성
+#     inputs: List[str] = [str(temp_visual)]
+#     audio_inputs_meta: List[Tuple[str, int]] = []  # (type, input_index)
+#
+#     if bgm_path and Path(bgm_path).is_file():
+#         inputs.append(str(Path(bgm_path)))
+#         audio_inputs_meta.append(("bgm", len(inputs) - 1))
+#
+#     narration_items: List[Dict[str, Any]] = []
+#
+#     # 허용 오차(초) — duration 측정 오차 방지(예: 50ms)
+#     EPS_SEC = 0.05
+#
+#     for i, sc in enumerate(scenes):
+#         vf = (sc.get("voice_file") or "").strip()
+#         if not vf:
+#             continue
+#
+#         vp = Path(vf)
+#         if not vp.is_absolute():
+#             cand = (work_dir / vf).resolve()
+#             if cand.is_file():
+#                 vp = cand
+#         if not vp.is_file():
+#             continue
+#
+#         start_t = float(sc.get("start") or 0.0)
+#         end_t = float(sc.get("end") or start_t)
+#         clip_dur = float(sc.get("movie_duration") or (end_t - start_t) or 0.0)
+#         if clip_dur <= 0:
+#             continue
+#
+#         nar_dur_raw = float(get_duration(str(vp)) or 0.0)
+#         sc["narration_duration"] = float(nar_dur_raw)
+#
+#         speed = 1.0
+#         nar_dur_eff = float(nar_dur_raw)
+#         required = (nar_dur_raw / max(0.001, clip_dur)) if clip_dur > 0 else 1.0
+#
+#         if nar_dur_raw > clip_dur + EPS_SEC:
+#             speed = min(float(max_narration_speed), max(1.0, round(required + 0.01, 2)))
+#             nar_dur_eff = nar_dur_raw / speed
+#
+#             _p(
+#                 f"[Merge][DBG] scene={sc.get('id')} clip={clip_dur:.3f}s nar={nar_dur_raw:.3f}s "
+#                 f"required≈{required:.3f} -> speed={speed:.2f} eff={nar_dur_eff:.3f}s"
+#             )
+#
+#             if nar_dur_eff > clip_dur + EPS_SEC:
+#                 raise RuntimeError(
+#                     f"내레이션이 씬 길이를 초과합니다. scene_id={sc.get('id')} "
+#                     f"clip={clip_dur:.3f}s nar={nar_dur_raw:.3f}s "
+#                     f"speed={speed:.2f} eff={nar_dur_eff:.3f}s (max={max_narration_speed:.2f})"
+#                 )
+#         else:
+#             _p(f"[Merge][DBG] scene={sc.get('id')} clip={clip_dur:.3f}s nar={nar_dur_raw:.3f}s -> OK(no speed)")
+#
+#         center_offset = max(0.0, (clip_dur - nar_dur_eff) * 0.5)
+#         delay_sec = start_t + center_offset
+#
+#         sc["narration_speed"] = float(speed)
+#         sc["narration_effective_duration"] = float(nar_dur_eff)
+#
+#         narration_items.append({
+#             "scene_index": i,
+#             "delay_sec": float(delay_sec),
+#             "path": vp,
+#             "speed": float(speed),
+#             "effective_dur": float(nar_dur_eff),
+#         })
+#
+#     for item in narration_items:
+#         inputs.append(str(item["path"]))
+#         audio_inputs_meta.append(("nar", len(inputs) - 1))
+#
+#     fc_parts: List[str] = []
+#     mix_labels: List[str] = []
+#
+#     # bgm
+#     bgm_label = None
+#     for typ, idx in audio_inputs_meta:
+#         if typ == "bgm":
+#             bgm_label = "abgm"
+#             fc_parts.append(f"[{idx}:a]volume={bgm_volume}[{bgm_label}]")
+#             mix_labels.append(f"[{bgm_label}]")
+#             break
+#
+#     # narration (adelay + (optional) atempo)
+#     nar_count = 0
+#     nar_input_base = 1 + (1 if bgm_label else 0)
+#
+#     for j, item in enumerate(narration_items):
+#         idx = nar_input_base + j
+#         ms = int(round(float(item["delay_sec"]) * 1000.0))
+#         lbl = f"anar{nar_count}"
+#         spd = float(item["speed"])
+#
+#         if abs(spd - 1.0) < 1e-6:
+#             fc_parts.append(f"[{idx}:a]adelay={ms}|{ms},volume={narration_volume}[{lbl}]")
+#         else:
+#             fc_parts.append(f"[{idx}:a]atempo={spd:.6f},adelay={ms}|{ms},volume={narration_volume}[{lbl}]")
+#
+#         mix_labels.append(f"[{lbl}]")
+#         nar_count += 1
+#
+#     if not mix_labels:
+#         fc_parts.append(f"anullsrc=r=48000:cl=stereo,atrim=0:{visual_dur:.6f}[aout]")
+#     else:
+#         mix_in = "".join(mix_labels)
+#         fc_parts.append(f"{mix_in}amix=inputs={len(mix_labels)}:normalize=0:dropout_transition=0[aout]")
+#
+#     # --- drawtext 폰트 지정: fontconfig 회피를 위해 fontfile 사용 ---
+#     fontfile = resolve_windows_fontfile(subtitle_font)
+#
+#     _p(f"[Merge][DBG] subtitle_font input='{subtitle_font}' norm='{''.join(ch for ch in subtitle_font if ch.isalnum())}'")
+#     _p(f"[Merge][DBG] resolved fontfile='{fontfile}'")
+#
+#     if fontfile:
+#         fontfile_ff = _ffmpeg_escape_filter_path(str(fontfile))
+#         font_arg = f"fontfile='{fontfile_ff}'"
+#     else:
+#         font_arg = f"font='{subtitle_font}'"
+#
+#     if callable(on_progress):
+#         on_progress(f"[Merge][DBG] drawtext fontfile={'OK' if fontfile else 'NONE'} : {fontfile or subtitle_font}")
+#
+#     # 5) 자막(drawtext) 필터: 중앙 구간 + alpha fade
+#     vf_parts: List[str] = []
+#     vf_in = "[0:v]"
+#     vf_out = "vout"
+#
+#     # 제목(기존 alpha 유지)
+#     title_text = (title_text or "").strip()
+#     if title_text:
+#         title_escaped = _ffmpeg_escape_drawtext(title_text)
+#         alpha_expr = (
+#             "if(lt(t,1),0,"
+#             " if(lt(t,3),(t-1)/2,"
+#             "  if(lt(t,4),1,"
+#             "   if(lt(t,6),(6-t)/2,0)"
+#             "  )"
+#             " )"
+#             ")"
+#         )
+#         vf_parts.append(
+#             "drawtext="
+#             f"{font_arg}:"
+#             f"text='{title_escaped}':"
+#             f"fontsize={int(title_fontsize)}:"
+#             "fontcolor=white:"
+#             "box=1:boxcolor=black@0.5:boxborderw=6:"
+#             "x=(w-text_w)/2:"
+#             f"y={title_y}:"
+#             f"alpha='{alpha_expr}'"
+#         )
+#
+#     fade_in = max(0.0, float(subtitle_fade_in_sec))
+#     fade_out = max(0.0, float(subtitle_fade_out_sec))
+#
+#     # ✅ 2줄 y 오프셋(픽셀): 폰트 크기 기반으로 합리적으로
+#     base_gap = int(round(float(subtitle_fontsize) * 1.65))
+#     border_pad = int(max(0, subtitle_boxborderw)) * 2
+#     line_gap_px = max(32, base_gap + border_pad)
+#
+#     for sc in scenes:
+#         start_t = float(sc.get("start") or 0.0)
+#         end_t = float(sc.get("end") or start_t)
+#         clip_dur = float(sc.get("movie_duration") or (end_t - start_t) or 0.0)
+#         if clip_dur <= 0:
+#             continue
+#
+#         txt = (sc.get("lyric") or sc.get("subtitle") or sc.get("narration") or "").strip()
+#         if not txt:
+#             continue
+#
+#         nar_dur_eff = float(sc.get("narration_effective_duration") or sc.get("narration_duration") or 0.0)
+#         if nar_dur_eff <= 0:
+#             nar_dur_eff = clip_dur * 0.7
+#         if nar_dur_eff > clip_dur:
+#             nar_dur_eff = clip_dur
+#
+#         show_t = start_t + max(0.0, (clip_dur - nar_dur_eff) * 0.5)
+#         hide_t = min(end_t, show_t + nar_dur_eff)
+#         if hide_t <= show_t:
+#             hide_t = min(end_t, show_t + 0.10)
+#
+#         if fade_in <= 1e-6 and fade_out <= 1e-6:
+#             alpha_expr = "1"
+#         else:
+#             fi = max(1e-6, fade_in)
+#             fo = max(1e-6, fade_out)
+#             alpha_expr = (
+#                 f"if(lt(t,{show_t:.3f}),0,"
+#                 f" if(lt(t,{(show_t+fade_in):.3f}), (t-{show_t:.3f})/{fi:.6f},"
+#                 f"  if(lt(t,{(hide_t-fade_out):.3f}), 1,"
+#                 f"   if(lt(t,{hide_t:.3f}), ({hide_t:.3f}-t)/{fo:.6f}, 0)"
+#                 f"  )"
+#                 f" )"
+#                 f")"
+#             )
+#
+#         # ✅ 여기서 '개행 삽입'을 완전히 버리고, 2줄로 분해해서 drawtext 2개를 쌓는다.
+#         # utils.py: split_subtitle_two_lines(text, max_units=20.0) -> (line1, line2)
+#         line1, line2 = split_subtitle_two_lines(txt, max_units=20.0)
+#
+#         y_line1 = str(subtitle_y)
+#         if line2:
+#             # subtitle_y가 "h-140" 패턴일 때만 자동 보정
+#             m = re.match(r"^\s*h\s*-\s*(\d+)\s*$", y_line1)
+#             if m:
+#                 base = int(m.group(1))
+#                 # lift: 줄간격의 55~70%가 보통 안전. 우선 0.60 적용.
+#                 lift = int(round(line_gap_px * 0.60))
+#                 y_line1 = f"h-{base + lift}"
+#
+#         y_line2 = f"{y_line1}+{line_gap_px}"
+#
+#         box = "1" if subtitle_box else "0"
+#
+#         if line1:
+#             line1_esc = _ffmpeg_escape_drawtext(line1)
+#             vf_parts.append(
+#                 "drawtext="
+#                 f"{font_arg}:"
+#                 f"text='{line1_esc}':"
+#                 f"fontsize={int(subtitle_fontsize)}:"
+#                 "fontcolor=white:"
+#                 "x=(w-text_w)/2:"
+#                 f"y={y_line1}:"
+#                 f"box={box}:"
+#                 f"boxcolor={subtitle_boxcolor}:"
+#                 f"boxborderw={int(subtitle_boxborderw)}:"
+#                 f"enable='between(t,{show_t:.3f},{hide_t:.3f})':"
+#                 f"alpha='{alpha_expr}'"
+#             )
+#
+#         if line2:
+#             # 두 번째 줄: y를 아래로
+#             line2_esc = _ffmpeg_escape_drawtext(line2)
+#             vf_parts.append(
+#                 "drawtext="
+#                 f"{font_arg}:"
+#                 f"text='{line2_esc}':"
+#                 f"fontsize={int(subtitle_fontsize)}:"
+#                 "fontcolor=white:"
+#                 "x=(w-text_w)/2:"
+#                 f"y={y_line2}:"
+#                 f"box={box}:"
+#                 f"boxcolor={subtitle_boxcolor}:"
+#                 f"boxborderw={int(subtitle_boxborderw)}:"
+#                 f"enable='between(t,{show_t:.3f},{hide_t:.3f})':"
+#                 f"alpha='{alpha_expr}'"
+#             )
+#
+#     vf_chain = ",".join(vf_parts) if vf_parts else "null"
+#     vf = f"{vf_in}{vf_chain}[{vf_out}]"
+#
+#     # 6) 최종 ffmpeg 렌더
+#     cmd = [ffmpeg_exe, "-y"]
+#     for p in inputs:
+#         cmd += ["-i", p]
+#
+#     filter_complex = ";".join(fc_parts + [vf])
+#     cmd += [
+#         "-filter_complex", filter_complex,
+#         "-map", f"[{vf_out}]",
+#         "-map", "[aout]",
+#         "-c:v", "libx264",
+#         "-preset", video_preset,
+#         "-crf", str(video_crf),
+#         "-c:a", "aac",
+#         "-b:a", audio_bitrate,
+#         "-movflags", "+faststart",
+#         "-shortest",
+#         str(out_path),
+#     ]
+#
+#     rr = subprocess.run(
+#         cmd,
+#         capture_output=True,
+#         text=True,
+#         encoding="utf-8",
+#         errors="ignore",
+#         startupinfo=startupinfo,
+#     )
+#     if rr.returncode != 0:
+#         raise RuntimeError(f"FFMPEG 최종 렌더 실패:\n{rr.stderr}")
+#
+#     # 7) 임시 파일 정리
+#     try:
+#         if list_file.exists():
+#             list_file.unlink()
+#     except Exception:
+#         pass
+#     try:
+#         if temp_visual.exists():
+#             temp_visual.unlink()
+#     except Exception:
+#         pass
 
 def concatenate_scene_clips_final_av(
     *,
@@ -332,7 +736,8 @@ def concatenate_scene_clips_final_av(
     - 내레이션/자막은 해당 씬(클립)의 중앙에 배치
     - 내레이션이 너무 길면 필요한 만큼 atempo로 줄임(상한 max_narration_speed)
     - drawtext는 제목(선택) + 자막(씬별)에 alpha 기반 fade-in/out 적용
-    - ✅ 자막 줄바꿈은 텍스트에 개행을 넣지 않고 drawtext 2개로 처리(Windows 안정)
+    - ✅ 자막 줄바꿈은 텍스트에 개행을 넣지 않고 drawtext 여러 개로 처리(Windows 안정)
+    - ✅ 폰트 해결/줄나눔/줄간격/y올림은 SubtitleComposer가 전담(재사용 목적)
     """
 
     def _p(msg: str) -> None:
@@ -521,31 +926,44 @@ def concatenate_scene_clips_final_av(
         mix_in = "".join(mix_labels)
         fc_parts.append(f"{mix_in}amix=inputs={len(mix_labels)}:normalize=0:dropout_transition=0[aout]")
 
-    # --- drawtext 폰트 지정: fontconfig 회피를 위해 fontfile 사용 ---
-    fontfile = resolve_windows_fontfile(subtitle_font)
-
-    _p(f"[Merge][DBG] subtitle_font input='{subtitle_font}' norm='{''.join(ch for ch in subtitle_font if ch.isalnum())}'")
-    _p(f"[Merge][DBG] resolved fontfile='{fontfile}'")
-
-    if fontfile:
-        fontfile_ff = _ffmpeg_escape_filter_path(str(fontfile))
-        font_arg = f"fontfile='{fontfile_ff}'"
-    else:
-        font_arg = f"font='{subtitle_font}'"
-
-    if callable(on_progress):
-        on_progress(f"[Merge][DBG] drawtext fontfile={'OK' if fontfile else 'NONE'} : {fontfile or subtitle_font}")
-
+    # ============================================================
     # 5) 자막(drawtext) 필터: 중앙 구간 + alpha fade
+    #    - SubtitleComposer가 폰트 resolve + 줄 나눔 + y 자동올림까지 전부 책임
+    #    - 여기서는 "씬별로 show/hide/alpha만 계산해서 composer에 넘긴다"
+    # ============================================================
+
     vf_parts: List[str] = []
     vf_in = "[0:v]"
     vf_out = "vout"
 
-    # 제목(기존 alpha 유지)
+    # (1) Composer 생성: 여기 값만 바꾸면 "자막 정책"이 통째로 바뀜
+    #     max_units=20.0  : 실제 화면 기준 한 줄 제한(기본 20)
+    #     max_lines=2     : UX 망가짐 방지. 필요하면 3/4로 호출자가 변경 가능
+    #     line_gap_px=None: None이면 fontsize/boxborderw 기반 자동 계산
+    #     lift_ratio=0.62 : 줄 수가 늘어날 때 블록을 위로 끌어올리는 비율
+    composer = SubtitleComposer(
+        font_family=subtitle_font,
+        fontsize=subtitle_fontsize,
+        y=subtitle_y,
+        box=subtitle_box,
+        boxcolor=subtitle_boxcolor,
+        boxborderw=subtitle_boxborderw,
+        max_units=20.0,  # ✅ 여기 숫자만 바꾸면 됨
+        max_lines=2,  # ✅ 기본값 2 유지 (호출 시 3으로도 가능)
+        line_gap_px=None,
+        lift_ratio=0.62,
+    )
+
+    # 디버그 로그: 폰트가 실제 파일로 떨어졌는지 확인 가능
+    _p(f"[Merge][DBG] subtitle_font='{subtitle_font}' resolved_fontfile='{composer.fontfile}'")
+    if callable(on_progress):
+        on_progress(
+            f"[Merge][DBG] drawtext fontfile={'OK' if composer.fontfile else 'NONE'} : {composer.fontfile or subtitle_font}")
+
+    # (2) 제목 drawtext(기존 alpha 유지) — font_arg도 composer가 책임
     title_text = (title_text or "").strip()
     if title_text:
-        title_escaped = _ffmpeg_escape_drawtext(title_text)
-        alpha_expr = (
+        title_alpha = (
             "if(lt(t,1),0,"
             " if(lt(t,3),(t-1)/2,"
             "  if(lt(t,4),1,"
@@ -554,26 +972,19 @@ def concatenate_scene_clips_final_av(
             " )"
             ")"
         )
-        vf_parts.append(
-            "drawtext="
-            f"{font_arg}:"
-            f"text='{title_escaped}':"
-            f"fontsize={int(title_fontsize)}:"
-            "fontcolor=white:"
-            "box=1:boxcolor=black@0.5:boxborderw=6:"
-            "x=(w-text_w)/2:"
-            f"y={title_y}:"
-            f"alpha='{alpha_expr}'"
+        title_dt = composer.build_title_drawtext(
+            title_text=title_text,
+            title_fontsize=int(title_fontsize),
+            title_y=str(title_y),
+            alpha_expr=title_alpha,
         )
+        if title_dt:
+            vf_parts.append(title_dt)
 
     fade_in = max(0.0, float(subtitle_fade_in_sec))
     fade_out = max(0.0, float(subtitle_fade_out_sec))
 
-    # ✅ 2줄 y 오프셋(픽셀): 폰트 크기 기반으로 합리적으로
-    base_gap = int(round(float(subtitle_fontsize) * 1.65))
-    border_pad = int(max(0, subtitle_boxborderw)) * 2
-    line_gap_px = max(32, base_gap + border_pad)
-
+    # (3) 씬별 자막 처리: 여기 목표는 "3~6줄" 수준으로 유지
     for sc in scenes:
         start_t = float(sc.get("start") or 0.0)
         end_t = float(sc.get("end") or start_t)
@@ -581,10 +992,12 @@ def concatenate_scene_clips_final_av(
         if clip_dur <= 0:
             continue
 
+        # 씬에서 표시할 텍스트 선택(우선순위 유지)
         txt = (sc.get("lyric") or sc.get("subtitle") or sc.get("narration") or "").strip()
         if not txt:
             continue
 
+        # 표시 길이 계산(내레이션 유효길이 우선, 없으면 clip의 70%)
         nar_dur_eff = float(sc.get("narration_effective_duration") or sc.get("narration_duration") or 0.0)
         if nar_dur_eff <= 0:
             nar_dur_eff = clip_dur * 0.7
@@ -596,6 +1009,7 @@ def concatenate_scene_clips_final_av(
         if hide_t <= show_t:
             hide_t = min(end_t, show_t + 0.10)
 
+        # alpha 페이드 표현식
         if fade_in <= 1e-6 and fade_out <= 1e-6:
             alpha_expr = "1"
         else:
@@ -603,67 +1017,23 @@ def concatenate_scene_clips_final_av(
             fo = max(1e-6, fade_out)
             alpha_expr = (
                 f"if(lt(t,{show_t:.3f}),0,"
-                f" if(lt(t,{(show_t+fade_in):.3f}), (t-{show_t:.3f})/{fi:.6f},"
-                f"  if(lt(t,{(hide_t-fade_out):.3f}), 1,"
+                f" if(lt(t,{(show_t + fade_in):.3f}), (t-{show_t:.3f})/{fi:.6f},"
+                f"  if(lt(t,{(hide_t - fade_out):.3f}), 1,"
                 f"   if(lt(t,{hide_t:.3f}), ({hide_t:.3f}-t)/{fo:.6f}, 0)"
                 f"  )"
                 f" )"
                 f")"
             )
 
-        # ✅ 여기서 '개행 삽입'을 완전히 버리고, 2줄로 분해해서 drawtext 2개를 쌓는다.
-        # utils.py: split_subtitle_two_lines(text, max_units=20.0) -> (line1, line2)
-        line1, line2 = split_subtitle_two_lines(txt, max_units=20.0)
-
-        y_line1 = str(subtitle_y)
-        if line2:
-            # subtitle_y가 "h-140" 패턴일 때만 자동 보정
-            m = re.match(r"^\s*h\s*-\s*(\d+)\s*$", y_line1)
-            if m:
-                base = int(m.group(1))
-                # lift: 줄간격의 55~70%가 보통 안전. 우선 0.60 적용.
-                lift = int(round(line_gap_px * 0.60))
-                y_line1 = f"h-{base + lift}"
-
-        y_line2 = f"{y_line1}+{line_gap_px}"
-
-        box = "1" if subtitle_box else "0"
-
-        if line1:
-            line1_esc = _ffmpeg_escape_drawtext(line1)
-            vf_parts.append(
-                "drawtext="
-                f"{font_arg}:"
-                f"text='{line1_esc}':"
-                f"fontsize={int(subtitle_fontsize)}:"
-                "fontcolor=white:"
-                "x=(w-text_w)/2:"
-                f"y={y_line1}:"
-                f"box={box}:"
-                f"boxcolor={subtitle_boxcolor}:"
-                f"boxborderw={int(subtitle_boxborderw)}:"
-                f"enable='between(t,{show_t:.3f},{hide_t:.3f})':"
-                f"alpha='{alpha_expr}'"
+        # ✅ 자막 drawtext 생성: (줄 나눔/균형/y 자동올림) 전부 composer가 처리
+        vf_parts.extend(
+            composer.build_subtitle_drawtexts(
+                text=txt,
+                show_t=show_t,
+                hide_t=hide_t,
+                alpha_expr=alpha_expr,
             )
-
-        if line2:
-            # 두 번째 줄: y를 아래로
-            y2 = f"{subtitle_y}+{line_gap_px}"
-            line2_esc = _ffmpeg_escape_drawtext(line2)
-            vf_parts.append(
-                "drawtext="
-                f"{font_arg}:"
-                f"text='{line2_esc}':"
-                f"fontsize={int(subtitle_fontsize)}:"
-                "fontcolor=white:"
-                "x=(w-text_w)/2:"
-                f"y={y_line2}:"
-                f"box={box}:"
-                f"boxcolor={subtitle_boxcolor}:"
-                f"boxborderw={int(subtitle_boxborderw)}:"
-                f"enable='between(t,{show_t:.3f},{hide_t:.3f})':"
-                f"alpha='{alpha_expr}'"
-            )
+        )
 
     vf_chain = ",".join(vf_parts) if vf_parts else "null"
     vf = f"{vf_in}{vf_chain}[{vf_out}]"
@@ -710,6 +1080,7 @@ def concatenate_scene_clips_final_av(
             temp_visual.unlink()
     except Exception:
         pass
+
 
 
 
