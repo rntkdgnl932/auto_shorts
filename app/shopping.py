@@ -3,7 +3,7 @@ from __future__ import annotations
 
 import shutil
 import datetime
-
+import time
 import json
 import os
 import re
@@ -15,8 +15,9 @@ from app import settings
 from app.utils import (
     run_job_with_progress_async,
     sanitize_title,
-    load_json,   # <─ 추가
-    save_json    # <─ 추가
+    load_json,
+    save_json,
+    get_duration
 )
 
 from app.issue_list_builder import (
@@ -32,6 +33,8 @@ from app.shopping_video_build import (
     ShoppingMovieGenerator,
     ShoppingShortsPipeline,
     BuildOptions,
+    generate_tts_zonos as _tts_generate_zonos,
+    _get_zonos_config as _zonos_get_config,
 )
 
 
@@ -44,6 +47,11 @@ class SceneEditDialog(QtWidgets.QDialog):
         - prompt_img_1_kor, prompt_img_2_kor 는 그대로 저장
         - prompt_img_1, prompt_img_2 는 각각 *_kor 를 영어 번역한 결과로 덮어써서 저장
         - ai_edit_request 에 요청 텍스트 저장
+
+    (추가)
+    + '내레이션 생성' 버튼:
+        - 클릭한 해당 씬만 narration 기반으로 TTS 생성
+        - voice_file / seconds 를 즉시 갱신 저장
     """
 
     def __init__(self, json_path: str, parent=None):
@@ -56,9 +64,7 @@ class SceneEditDialog(QtWidgets.QDialog):
         self.meta = self.data.get("meta", {})
         self.scenes = self.data.get("scenes", [])
 
-        # (New) 번역용 AI 준비 (프로젝트에 있는 AI 유틸 사용)
-        # - app.utils.AI 가 이미 프로젝트에 존재하는 전제
-        # - 실패하면(ImportError 등) 번역은 "그대로 복사"로 폴백
+        # 번역용 AI (prompt_img_*_kor -> EN)
         try:
             from app.utils import AI
             self._ai = AI()
@@ -102,8 +108,8 @@ class SceneEditDialog(QtWidgets.QDialog):
 
         lbl_info = QtWidgets.QLabel(
             "아래에서 각 장면별(Scene) 세부 내용과 프롬프트를 수정하세요.\n"
-            "이미지 생성은 [Step 1: 배경/모델] -> [Step 2: 제품 합성]으로 진행됩니다.\n"
-            "AI 수정 요청 버튼을 누르면 KR 프롬프트는 저장하고, EN 프롬프트는 KR을 영어로 번역해 덮어씁니다."
+            "AI 수정 요청 버튼을 누르면 KR 프롬프트는 저장하고, EN 프롬프트는 KR을 영어로 번역해 덮어씁니다.\n"
+            "내레이션 생성 버튼은 클릭한 씬만 음성을 생성하고 seconds/voice_file을 즉시 갱신합니다."
         )
         lbl_info.setStyleSheet(
             "color: #333; font-weight: bold; margin: 10px 0; background: #f0f0f0; padding: 10px; border-radius: 5px;"
@@ -126,7 +132,6 @@ class SceneEditDialog(QtWidgets.QDialog):
             if not kor_text:
                 return ""
 
-            # AI 유틸 없으면 폴백(그대로)
             if self._ai is None:
                 return kor_text
 
@@ -138,15 +143,23 @@ class SceneEditDialog(QtWidgets.QDialog):
             )
             user_msg = f'Korean:\n"{kor_text}"\n\nEnglish:'
             try:
-                # ask_smart(sys, user, prefer="openai") 형태를 사용하던 프로젝트 패턴을 그대로 따름
                 out = self._ai.ask_smart(sys_msg, user_msg, prefer="openai")
                 out = (out or "").strip()
-                # 혹시 따옴표/코드블록 섞이면 정리
                 out = out.replace("```", "").strip()
-                # 너무 길게 오면 1줄로 정리(이미지프롬프트는 짧게)
                 return out
             except Exception:
                 return kor_text
+
+        def _pick_ref_audio_by_gender(voice_gender: str) -> Path:
+            """
+            [고정 규칙] 초안생성(Enrich)과 동일한 레퍼런스 보이스 선택
+            - male  : C:\\my_games\\shorts_make\\voice\\남자성우1.mp3
+            - female: C:\\my_games\\shorts_make\\voice\\꼬꼬 음성.m4a
+            """
+            g = (voice_gender or "female").strip().lower()
+            if g == "male":
+                return Path(r"C:\my_games\shorts_make\voice\남자성우1.mp3")
+            return Path(r"C:\my_games\shorts_make\voice\꼬꼬 음성.m4a")
 
         for idx, sc in enumerate(self.scenes):
             sid = sc.get("id", f"{idx + 1:03d}")
@@ -170,10 +183,15 @@ class SceneEditDialog(QtWidgets.QDialog):
 
             le_sub = QtWidgets.QLineEdit(str(sc.get("subtitle") or ""))
 
+            # seconds 표시(간단 라벨)
+            lbl_seconds = QtWidgets.QLabel(f"⏱ seconds: {sc.get('seconds', 0)}")
+            lbl_seconds.setStyleSheet("color:#444; font-weight:bold;")
+
             g_layout.addRow("🚩 배너:", le_banner)
             g_layout.addRow("🖼️ 화면설명(KR):", te_prompt)
             g_layout.addRow("🎙️ 내레이션:", te_narr)
             g_layout.addRow("💬 자막:", le_sub)
+            g_layout.addRow(" ", lbl_seconds)
 
             line = QtWidgets.QFrame()
             line.setFrameShape(QtWidgets.QFrame.HLine)
@@ -209,12 +227,13 @@ class SceneEditDialog(QtWidgets.QDialog):
             btn_ai_req.setMinimumHeight(34)
 
             def _on_ai_req_clicked(
-                _sid=sid,
-                _sc=sc,
-                _te_p1_kor=te_p1_kor,
-                _te_p2_kor=te_p2_kor,
-                _te_p1=te_p1,
-                _te_p2=te_p2,
+                    checked: bool = False,
+                    _sid=sid,
+                    _sc=sc,
+                    _te_p1_kor=te_p1_kor,
+                    _te_p2_kor=te_p2_kor,
+                    _te_p1=te_p1,
+                    _te_p2=te_p2,
             ):
                 txt, ok = QtWidgets.QInputDialog.getMultiLineText(
                     self,
@@ -226,30 +245,23 @@ class SceneEditDialog(QtWidgets.QDialog):
                 if not ok:
                     return
 
-                # 1) 요청 저장
                 _sc["ai_edit_request"] = (txt or "").strip()
 
-                # 2) 현재 KR 텍스트를 scene dict에 반영
                 p1_kor = _te_p1_kor.toPlainText().strip()
                 p2_kor = _te_p2_kor.toPlainText().strip()
                 _sc["prompt_img_1_kor"] = p1_kor
                 _sc["prompt_img_2_kor"] = p2_kor
 
-                # 3) KR -> EN 번역해서 EN 필드 덮어쓰기
                 p1_en = _translate_kor_to_en(p1_kor)
                 p2_en = _translate_kor_to_en(p2_kor)
 
                 _sc["prompt_img_1"] = p1_en
                 _sc["prompt_img_2"] = p2_en
+                _sc["prompt_img"] = p1_en  # 호환성
 
-                # 호환성 동기화(prompt_img는 base로 유지)
-                _sc["prompt_img"] = p1_en
-
-                # UI에도 즉시 반영
                 _te_p1.setPlainText(p1_en)
                 _te_p2.setPlainText(p2_en)
 
-                # 4) 즉시 저장(버튼 한 번에 저장까지)
                 try:
                     save_json(self.json_path, self.data)
                     QtWidgets.QMessageBox.information(
@@ -262,12 +274,142 @@ class SceneEditDialog(QtWidgets.QDialog):
 
             btn_ai_req.clicked.connect(_on_ai_req_clicked)
 
+            # ✅ (추가) 내레이션 생성 버튼
+            btn_make_narr = QtWidgets.QPushButton("🎙️ 내레이션 생성")
+            btn_make_narr.setToolTip(
+                "클릭한 씬만 내레이션 음성을 생성합니다.\n"
+                "- narration 텍스트로 TTS 생성\n"
+                "- voice_file / seconds(실측 +0.5s) 갱신 후 즉시 저장"
+            )
+            btn_make_narr.setMinimumHeight(34)
+
+            def _on_make_narr_clicked(
+                    checked: bool = False,
+                    _sid=sid,
+                    _sc=sc,
+                    _te_narr=te_narr,
+                    _lbl_seconds=lbl_seconds,
+            ):
+                narration_text = (_te_narr.toPlainText() or "").strip()
+                if not narration_text:
+                    QtWidgets.QMessageBox.warning(self, "알림", "내레이션 텍스트가 비어있습니다.")
+                    return
+
+                def job(on_progress=None):
+                    # 1) 최신 json 다시 로드 후 scene 재매칭
+                    data = load_json(self.json_path, {})
+                    meta = data.get("meta", {}) if isinstance(data, dict) else {}
+                    scenes = data.get("scenes", []) if isinstance(data, dict) else []
+                    if not isinstance(scenes, list):
+                        raise RuntimeError("video_shopping.json scenes가 리스트가 아닙니다.")
+
+                    target = None
+                    for s in scenes:
+                        if str(s.get("id")) == str(_sid):
+                            target = s
+                            break
+                    if target is None:
+                        raise RuntimeError(f"scene id를 찾을 수 없습니다: {_sid}")
+
+                    # 2) narration 저장
+                    target["narration"] = narration_text
+
+                    # 3) voice_file 경로 결정
+                    prod_dir = self.json_path.parent
+                    voice_dir = prod_dir / "voice"
+                    voice_dir.mkdir(parents=True, exist_ok=True)
+
+                    vf = (target.get("voice_file") or "").strip()
+                    if vf:
+                        out_wav = Path(vf)
+                        if not out_wav.is_absolute():
+                            out_wav = (prod_dir / out_wav).resolve()
+                    else:
+                        out_wav = (voice_dir / f"{_sid}.wav").resolve()
+                        target["voice_file"] = str(out_wav.relative_to(prod_dir).as_posix())
+
+                    # 4) ref voice 선택 (초안생성과 동일)
+                    gender = str(meta.get("voice_gender", "female")).lower()
+                    ref_voice = _pick_ref_audio_by_gender(gender)
+                    if not ref_voice.exists() or ref_voice.stat().st_size == 0:
+                        raise RuntimeError(f"레퍼런스 보이스 파일이 없습니다: {ref_voice}")
+
+                    # 5) zonos config
+                    cfg = _zonos_get_config(target, self._ai)
+
+                    # 6) TTS 생성 (초안생성과 동일 시그니처)
+                    comfy_host = getattr(settings, "COMFY_HOST", "http://127.0.0.1:8188")
+
+                    # (A) 파일이 없으면 생성
+                    if not out_wav.exists() or out_wav.stat().st_size == 0:
+                        ok = _tts_generate_zonos(narration_text, out_wav, ref_voice, comfy_host, cfg)
+                        if not ok:
+                            # 실패 시 seconds 안전값
+                            if float(target.get("seconds") or 0) <= 0:
+                                target["seconds"] = 4.0
+                            save_json(self.json_path, data)
+                            raise RuntimeError("내레이션 음성 생성 실패")
+
+                    # (B) 파일이 존재하면 무조건 길이 측정 (3회 재시도)
+                    final_dur = 0.0
+                    for _ in range(3):
+                        try:
+                            d = float(get_duration(str(out_wav)) or 0.0)
+                            if d > 0:
+                                final_dur = d
+                                break
+                        except Exception:
+                            pass
+                        time.sleep(0.1)
+
+                    if final_dur > 0:
+                        target["seconds"] = round(final_dur + 0.5, 2)
+                    else:
+                        if float(target.get("seconds") or 0) <= 0:
+                            target["seconds"] = 4.0
+
+                    # voice_file는 상대경로 유지(이미 위에서 세팅됨)
+                    save_json(self.json_path, data)
+
+                    return {
+                        "scene_id": _sid,
+                        "voice_file": str(out_wav),
+                        "duration": final_dur,
+                        "seconds": target["seconds"],
+                    }
+
+                def done(ok: bool, result=None):
+                    if not ok:
+                        QtWidgets.QMessageBox.critical(self, "실패", f"내레이션 생성 실패:\n{result}")
+                        return
+
+                    sec = result.get("seconds", 0) if isinstance(result, dict) else 0
+                    _lbl_seconds.setText(f"⏱ seconds: {sec}")
+
+                    QtWidgets.QMessageBox.information(
+                        self,
+                        "완료",
+                        f"Scene {_sid} 내레이션 생성 완료\n"
+                        f"- seconds: {sec}\n"
+                        f"- voice_file: {result.get('voice_file', '')}"
+                    )
+
+                run_job_with_progress_async(
+                    owner=self,
+                    title=f"[Scene {_sid}] 내레이션 생성",
+                    job=job,
+                    on_done=done,
+                )
+
+            btn_make_narr.clicked.connect(_on_make_narr_clicked)
+
             # 배치
             g_layout.addRow("🇰🇷 Base Prompt:", te_p1_kor)
             g_layout.addRow("🇰🇷 Merge Prompt:", te_p2_kor)
             g_layout.addRow("✨ Base Prompt:", te_p1)
             g_layout.addRow("🔗 Merge Prompt:", te_p2)
             g_layout.addRow(" ", btn_ai_req)
+            g_layout.addRow(" ", btn_make_narr)  # ✅ AI 버튼 아래 추가
 
             self.form_layout.addWidget(group)
 
@@ -358,6 +500,7 @@ class SceneEditDialog(QtWidgets.QDialog):
             self.accept()
         except Exception as e:
             QtWidgets.QMessageBox.critical(self, "저장 실패", f"파일 저장 중 오류가 발생했습니다:\n{e}")
+
 
 
 

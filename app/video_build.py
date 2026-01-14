@@ -4,7 +4,7 @@ from __future__ import annotations
 
 from pathlib import Path as _Path
 import os
-
+from app import settings
 # ── 유연 임포트 ─────────────────────────────────────────────────────────────
 from app.utils import ensure_dir, load_json, get_duration
 from app.settings import BASE_DIR, I2V_WORKFLOW, FFMPEG_EXE, USE_HWACCEL, FINAL_OUT, COMFY_HOST
@@ -30,6 +30,8 @@ import json
 from app.utils import (
     load_json as _load_json_func,
     ensure_dir as _ensure_dir_func,
+    _ffmpeg_escape_filter_path,
+    split_subtitle_two_lines
 )
 
 from app.settings import JSONS_DIR
@@ -46,7 +48,7 @@ from app import settings as settings_obj
 
 from app.settings import CHARACTER_DIR, COMFY_INPUT_DIR, I2V_CHUNK_BASE_FRAMES, I2V_OVERLAP_FRAMES, I2V_PAD_TAIL_FRAMES
 
-from app.utils import load_json, save_json
+from app.utils import load_json, save_json, resolve_windows_fontfile
 
 
 WF_T2I    = JSONS_DIR / "nunchaku_t2i.json"
@@ -263,11 +265,12 @@ def concatenate_scene_clips(clip_paths: List[Path], out_path: Path, ffmpeg_exe: 
         if list_file.exists():
             list_file.unlink()
 
-# 영상 등 합치기 ; 자막 가운데 정렬 버젼
+# 영상 등 합치기 ; 자막 가운데 정렬 버젼 _ffmpeg_escape_filter_path
 def _ffmpeg_escape_drawtext(s: str) -> str:
     """
     FFmpeg drawtext 안전 이스케이프(기본형).
-    - 큰따옴표/역슬래시/콜론/퍼센트/개행 등 최소치 처리
+    - 백슬래시/콜론/작은따옴표/퍼센트/개행 처리
+    - 개행은 filtergraph 파서 단계 때문에 '\\\\n' 으로 넣어야 drawtext에서 '\n'으로 인식됨
     """
     if s is None:
         return ""
@@ -276,9 +279,12 @@ def _ffmpeg_escape_drawtext(s: str) -> str:
     s = s.replace(":", "\\:")
     s = s.replace("'", "\\'")
     s = s.replace("%", "\\%")
-    s = s.replace("\n", "\\n")
+    # ✅ 여기 중요: \n -> \\n 로 “필터 파서용” 이스케이프
+    s = s.replace("\r\n", "\n")
+    s = s.replace("\n", "\\\\n")
     s = s.replace("\r", "")
     return s
+
 
 def concatenate_scene_clips_final_av(
     *,
@@ -289,31 +295,52 @@ def concatenate_scene_clips_final_av(
     bgm_path: Optional[Path] = None,
     bgm_volume: float = 0.35,
     narration_volume: float = 1.0,
-    pad_in_sec: float = 0.25,
-    pad_out_sec: float = 0.25,
+
+    # (호환 유지: 최종 병합에서는 0으로 넘기는 것을 권장)
+    pad_in_sec: float = 0.0,
+    pad_out_sec: float = 0.0,
+
     subtitle_font: str = "Gulim",
     subtitle_fontsize: int = 36,
     subtitle_y: str = "h-140",
     subtitle_box: bool = True,
     subtitle_boxcolor: str = "black@0.45",
     subtitle_boxborderw: int = 18,
-    # 제목(상단)도 같이 넣고 싶으면 사용
+
+    # ✅ 자막 페이드 전용
+    subtitle_fade_in_sec: float = 0.25,
+    subtitle_fade_out_sec: float = 0.25,
+
     title_text: str = "",
     title_fontsize: int = 55,
     title_y: str = "h*0.12",
     video_crf: int = 18,
     video_preset: str = "medium",
     audio_bitrate: str = "192k",
+
+    # ✅ 내레이션 가속 상한
+    max_narration_speed: float = 1.30,
+
+    # ✅ 진행 로그(비동기 창)
+    on_progress=None,
 ) -> None:
     """
-    [최종 합치기]
+    [최종 합치기 - 오버랩 없음, 자막 페이드]
     - clip_paths를 concat demuxer로 이어붙여 temp_visual.mp4 생성(오디오는 제외)
     - 각 클립의 "실제 길이"를 get_duration()으로 측정하여 scene별 movie_duration에 기록
     - 각 voice_file의 "실제 길이"를 get_duration()으로 측정하여 narration_duration에 기록
-    - 내레이션/자막은 해당 씬(클립)의 "중앙"에 배치
-    - 내레이션이 너무 길면 atempo=1.2로 1회 시도, 그래도 길면 오류
-    - drawtext는 제목(선택) + 내레이션(씬별)을 enable 구간으로 표시
+    - 내레이션/자막은 해당 씬(클립)의 중앙에 배치
+    - 내레이션이 너무 길면 필요한 만큼 atempo로 줄임(상한 max_narration_speed)
+    - drawtext는 제목(선택) + 자막(씬별)에 alpha 기반 fade-in/out 적용
+    - ✅ 자막 줄바꿈은 텍스트에 개행을 넣지 않고 drawtext 2개로 처리(Windows 안정)
     """
+
+    def _p(msg: str) -> None:
+        if callable(on_progress):
+            try:
+                on_progress(msg)
+            except Exception:
+                pass
 
     if not clip_paths:
         raise ValueError("clip_paths가 비었습니다.")
@@ -323,19 +350,14 @@ def concatenate_scene_clips_final_av(
     list_file = work_dir / "ffmpeg_concat_list_final.txt"
     temp_visual = work_dir / (out_path.stem + "_temp_visual.mp4")
 
-    # -----------------------------
     # 1) concat list 생성
-    # -----------------------------
     with open(list_file, "w", encoding="utf-8") as f:
         for clip in clip_paths:
             if not clip.exists():
                 raise FileNotFoundError(f"병합할 클립을 찾을 수 없습니다: {clip}")
             f.write(f"file '{clip.as_posix()}'\n")
 
-    # -----------------------------
     # 2) 비디오만 합쳐서 temp_visual 생성
-    #    (오디오는 최종 단계에서 필터로 붙임)
-    # -----------------------------
     cmd_concat = [
         ffmpeg_exe, "-y",
         "-f", "concat",
@@ -364,24 +386,18 @@ def concatenate_scene_clips_final_av(
     if r.returncode != 0:
         raise RuntimeError(f"FFMPEG concat(temp_visual) 실패:\n{r.stderr}")
 
-    # temp_visual 전체 길이(초) — 오디오 믹스 길이 기준
     visual_dur = float(get_duration(str(temp_visual)) or 0.0)
     if visual_dur <= 0:
         visual_dur = 1.0
 
-    # -----------------------------
-    # 3) 각 씬별 "실제 영상 길이" 측정 → start/end 재구성
-    #    scenes 순서 == clip_paths 순서라고 가정
-    # -----------------------------
+    # 3) 각 씬별 실제 영상 길이 측정 → start/end 재구성
     clip_durs: List[float] = []
     for cp in clip_paths:
         d = float(get_duration(str(cp)) or 0.0)
         if d <= 0:
-            # 극단적 케이스 방어: 0이면 temp_visual 기준으로 균등 분배(최후 수단)
             d = max(0.01, visual_dur / max(len(clip_paths), 1))
         clip_durs.append(d)
 
-    # 누적 start/end 재구성 + movie_duration 기록
     t_cursor = 0.0
     for i, sc in enumerate(scenes):
         if i >= len(clip_durs):
@@ -392,25 +408,26 @@ def concatenate_scene_clips_final_av(
         sc["end"] = float(t_cursor + d)
         t_cursor += d
 
-    # -----------------------------
-    # 4) 오디오 입력/필터 구성:
-    #    - bgm(선택) + narration(각 씬 voice_file)
-    #    - narration은 "중앙"에 배치
-    #    - 길면 atempo=1.2로 1회 시도, 그래도 길면 오류
-    # -----------------------------
+    _p(f"[Merge][DBG] total_visual={visual_dur:.3f}s, scenes_used={min(len(scenes), len(clip_durs))}")
+
+    # 4) 오디오 입력/필터 구성
     inputs: List[str] = [str(temp_visual)]
     audio_inputs_meta: List[Tuple[str, int]] = []  # (type, input_index)
-    # type: "bgm" or "nar"
 
     if bgm_path and Path(bgm_path).is_file():
         inputs.append(str(Path(bgm_path)))
         audio_inputs_meta.append(("bgm", len(inputs) - 1))
 
     narration_items: List[Dict[str, Any]] = []
+
+    # 허용 오차(초) — duration 측정 오차 방지(예: 50ms)
+    EPS_SEC = 0.05
+
     for i, sc in enumerate(scenes):
         vf = (sc.get("voice_file") or "").strip()
         if not vf:
             continue
+
         vp = Path(vf)
         if not vp.is_absolute():
             cand = (work_dir / vf).resolve()
@@ -425,46 +442,43 @@ def concatenate_scene_clips_final_av(
         if clip_dur <= 0:
             continue
 
-        nar_dur = float(get_duration(str(vp)) or 0.0)
-        sc["narration_duration"] = float(nar_dur)
+        nar_dur_raw = float(get_duration(str(vp)) or 0.0)
+        sc["narration_duration"] = float(nar_dur_raw)
 
-        usable = max(0.01, clip_dur - float(pad_in_sec) - float(pad_out_sec))
         speed = 1.0
+        nar_dur_eff = float(nar_dur_raw)
+        required = (nar_dur_raw / max(0.001, clip_dur)) if clip_dur > 0 else 1.0
 
-        # 내레이션이 씬에 안 들어가면 1.1배 → 1.2배 순으로 1회씩 시도
-        if nar_dur > usable:
-            tried = []
-            for cand_speed in (1.1, 1.2):
-                nar_dur2 = nar_dur / float(cand_speed)
-                tried.append((cand_speed, nar_dur2))
-                if nar_dur2 <= usable:
-                    speed = float(cand_speed)
-                    nar_dur = float(nar_dur2)
-                    break
+        if nar_dur_raw > clip_dur + EPS_SEC:
+            speed = min(float(max_narration_speed), max(1.0, round(required + 0.01, 2)))
+            nar_dur_eff = nar_dur_raw / speed
 
-            if nar_dur > usable:
-                # 실패(1.1, 1.2 둘 다 안 들어감) → 에러
-                msg_parts = []
-                for sp, nd in tried:
-                    msg_parts.append(f"{sp:.1f}x -> {nd:.3f}s")
-                msg_try = ", ".join(msg_parts) if msg_parts else "no-try"
+            _p(
+                f"[Merge][DBG] scene={sc.get('id')} clip={clip_dur:.3f}s nar={nar_dur_raw:.3f}s "
+                f"required≈{required:.3f} -> speed={speed:.2f} eff={nar_dur_eff:.3f}s"
+            )
 
+            if nar_dur_eff > clip_dur + EPS_SEC:
                 raise RuntimeError(
                     f"내레이션이 씬 길이를 초과합니다. scene_id={sc.get('id')} "
-                    f"clip={clip_dur:.3f}s usable={usable:.3f}s nar={float(sc.get('narration_duration') or nar_dur):.3f}s "
-                    f"({msg_try})"
+                    f"clip={clip_dur:.3f}s nar={nar_dur_raw:.3f}s "
+                    f"speed={speed:.2f} eff={nar_dur_eff:.3f}s (max={max_narration_speed:.2f})"
                 )
+        else:
+            _p(f"[Merge][DBG] scene={sc.get('id')} clip={clip_dur:.3f}s nar={nar_dur_raw:.3f}s -> OK(no speed)")
 
-        # 중앙 배치: (clip_dur - nar_dur)/2 만큼 오프셋 + start
-        center_offset = max(float(pad_in_sec), (clip_dur - nar_dur) * 0.5)
+        center_offset = max(0.0, (clip_dur - nar_dur_eff) * 0.5)
         delay_sec = start_t + center_offset
+
+        sc["narration_speed"] = float(speed)
+        sc["narration_effective_duration"] = float(nar_dur_eff)
 
         narration_items.append({
             "scene_index": i,
             "delay_sec": float(delay_sec),
             "path": vp,
             "speed": float(speed),
-            "effective_dur": float(nar_dur),
+            "effective_dur": float(nar_dur_eff),
         })
 
     for item in narration_items:
@@ -496,7 +510,6 @@ def concatenate_scene_clips_final_av(
         if abs(spd - 1.0) < 1e-6:
             fc_parts.append(f"[{idx}:a]adelay={ms}|{ms},volume={narration_volume}[{lbl}]")
         else:
-            # atempo는 0.5~2.0 범위
             fc_parts.append(f"[{idx}:a]atempo={spd:.6f},adelay={ms}|{ms},volume={narration_volume}[{lbl}]")
 
         mix_labels.append(f"[{lbl}]")
@@ -508,25 +521,30 @@ def concatenate_scene_clips_final_av(
         mix_in = "".join(mix_labels)
         fc_parts.append(f"{mix_in}amix=inputs={len(mix_labels)}:normalize=0:dropout_transition=0[aout]")
 
-    # -----------------------------
-    # 5) 자막(drawtext) 필터: "중앙" 구간에만 표시
-    #    - 텍스트는 narration/lyric/subtitle 중 우선순위로 선택
-    #    - 배경 묘사는 최소화(텍스트 자체는 이미 준비된 문장)
-    # -----------------------------
+    # --- drawtext 폰트 지정: fontconfig 회피를 위해 fontfile 사용 ---
+    fontfile = resolve_windows_fontfile(subtitle_font)
+
+    _p(f"[Merge][DBG] subtitle_font input='{subtitle_font}' norm='{''.join(ch for ch in subtitle_font if ch.isalnum())}'")
+    _p(f"[Merge][DBG] resolved fontfile='{fontfile}'")
+
+    if fontfile:
+        fontfile_ff = _ffmpeg_escape_filter_path(str(fontfile))
+        font_arg = f"fontfile='{fontfile_ff}'"
+    else:
+        font_arg = f"font='{subtitle_font}'"
+
+    if callable(on_progress):
+        on_progress(f"[Merge][DBG] drawtext fontfile={'OK' if fontfile else 'NONE'} : {fontfile or subtitle_font}")
+
+    # 5) 자막(drawtext) 필터: 중앙 구간 + alpha fade
     vf_parts: List[str] = []
     vf_in = "[0:v]"
     vf_out = "vout"
 
-    # (선택) 제목: 1초 대기 -> 2초 fade in -> 1초 유지 -> 2초 fade out
+    # 제목(기존 alpha 유지)
     title_text = (title_text or "").strip()
     if title_text:
         title_escaped = _ffmpeg_escape_drawtext(title_text)
-
-        # alpha expr (t 기준)
-        # t<1:0
-        # 1~3: fade in
-        # 3~4: 1
-        # 4~6: fade out
         alpha_expr = (
             "if(lt(t,1),0,"
             " if(lt(t,3),(t-1)/2,"
@@ -536,10 +554,9 @@ def concatenate_scene_clips_final_av(
             " )"
             ")"
         )
-
         vf_parts.append(
             "drawtext="
-            f"font='{subtitle_font}':"
+            f"{font_arg}:"
             f"text='{title_escaped}':"
             f"fontsize={int(title_fontsize)}:"
             "fontcolor=white:"
@@ -549,7 +566,14 @@ def concatenate_scene_clips_final_av(
             f"alpha='{alpha_expr}'"
         )
 
-    # 씬별 내레이션/자막: 중앙 구간
+    fade_in = max(0.0, float(subtitle_fade_in_sec))
+    fade_out = max(0.0, float(subtitle_fade_out_sec))
+
+    # ✅ 2줄 y 오프셋(픽셀): 폰트 크기 기반으로 합리적으로
+    base_gap = int(round(float(subtitle_fontsize) * 1.65))
+    border_pad = int(max(0, subtitle_boxborderw)) * 2
+    line_gap_px = max(32, base_gap + border_pad)
+
     for sc in scenes:
         start_t = float(sc.get("start") or 0.0)
         end_t = float(sc.get("end") or start_t)
@@ -557,47 +581,94 @@ def concatenate_scene_clips_final_av(
         if clip_dur <= 0:
             continue
 
-        # 텍스트 소스 우선순위
         txt = (sc.get("lyric") or sc.get("subtitle") or sc.get("narration") or "").strip()
         if not txt:
             continue
 
-        nar_dur_eff = float(sc.get("narration_duration") or 0.0)
-        usable = max(0.01, clip_dur - float(pad_in_sec) - float(pad_out_sec))
+        nar_dur_eff = float(sc.get("narration_effective_duration") or sc.get("narration_duration") or 0.0)
         if nar_dur_eff <= 0:
-            # 내레이션 파일 없거나 길이 측정 실패면 usable의 70% 정도로 표시(가이드)
-            nar_dur_eff = usable * 0.7
-        if nar_dur_eff > usable:
-            nar_dur_eff = usable
+            nar_dur_eff = clip_dur * 0.7
+        if nar_dur_eff > clip_dur:
+            nar_dur_eff = clip_dur
 
-        show_t = start_t + max(float(pad_in_sec), (clip_dur - nar_dur_eff) * 0.5)
-        hide_t = min(end_t - float(pad_out_sec), show_t + nar_dur_eff)
+        show_t = start_t + max(0.0, (clip_dur - nar_dur_eff) * 0.5)
+        hide_t = min(end_t, show_t + nar_dur_eff)
         if hide_t <= show_t:
             hide_t = min(end_t, show_t + 0.10)
 
-        txt_escaped = _ffmpeg_escape_drawtext(txt)
+        if fade_in <= 1e-6 and fade_out <= 1e-6:
+            alpha_expr = "1"
+        else:
+            fi = max(1e-6, fade_in)
+            fo = max(1e-6, fade_out)
+            alpha_expr = (
+                f"if(lt(t,{show_t:.3f}),0,"
+                f" if(lt(t,{(show_t+fade_in):.3f}), (t-{show_t:.3f})/{fi:.6f},"
+                f"  if(lt(t,{(hide_t-fade_out):.3f}), 1,"
+                f"   if(lt(t,{hide_t:.3f}), ({hide_t:.3f}-t)/{fo:.6f}, 0)"
+                f"  )"
+                f" )"
+                f")"
+            )
+
+        # ✅ 여기서 '개행 삽입'을 완전히 버리고, 2줄로 분해해서 drawtext 2개를 쌓는다.
+        # utils.py: split_subtitle_two_lines(text, max_units=20.0) -> (line1, line2)
+        line1, line2 = split_subtitle_two_lines(txt, max_units=20.0)
+
+        y_line1 = str(subtitle_y)
+        if line2:
+            # subtitle_y가 "h-140" 패턴일 때만 자동 보정
+            m = re.match(r"^\s*h\s*-\s*(\d+)\s*$", y_line1)
+            if m:
+                base = int(m.group(1))
+                # lift: 줄간격의 55~70%가 보통 안전. 우선 0.60 적용.
+                lift = int(round(line_gap_px * 0.60))
+                y_line1 = f"h-{base + lift}"
+
+        y_line2 = f"{y_line1}+{line_gap_px}"
+
         box = "1" if subtitle_box else "0"
 
-        vf_parts.append(
-            "drawtext="
-            f"font='{subtitle_font}':"
-            f"text='{txt_escaped}':"
-            f"fontsize={int(subtitle_fontsize)}:"
-            "fontcolor=white:"
-            "x=(w-text_w)/2:"
-            f"y={subtitle_y}:"
-            f"box={box}:"
-            f"boxcolor={subtitle_boxcolor}:"
-            f"boxborderw={int(subtitle_boxborderw)}:"
-            f"enable='between(t,{show_t:.3f},{hide_t:.3f})'"
-        )
+        if line1:
+            line1_esc = _ffmpeg_escape_drawtext(line1)
+            vf_parts.append(
+                "drawtext="
+                f"{font_arg}:"
+                f"text='{line1_esc}':"
+                f"fontsize={int(subtitle_fontsize)}:"
+                "fontcolor=white:"
+                "x=(w-text_w)/2:"
+                f"y={y_line1}:"
+                f"box={box}:"
+                f"boxcolor={subtitle_boxcolor}:"
+                f"boxborderw={int(subtitle_boxborderw)}:"
+                f"enable='between(t,{show_t:.3f},{hide_t:.3f})':"
+                f"alpha='{alpha_expr}'"
+            )
+
+        if line2:
+            # 두 번째 줄: y를 아래로
+            y2 = f"{subtitle_y}+{line_gap_px}"
+            line2_esc = _ffmpeg_escape_drawtext(line2)
+            vf_parts.append(
+                "drawtext="
+                f"{font_arg}:"
+                f"text='{line2_esc}':"
+                f"fontsize={int(subtitle_fontsize)}:"
+                "fontcolor=white:"
+                "x=(w-text_w)/2:"
+                f"y={y_line2}:"
+                f"box={box}:"
+                f"boxcolor={subtitle_boxcolor}:"
+                f"boxborderw={int(subtitle_boxborderw)}:"
+                f"enable='between(t,{show_t:.3f},{hide_t:.3f})':"
+                f"alpha='{alpha_expr}'"
+            )
 
     vf_chain = ",".join(vf_parts) if vf_parts else "null"
     vf = f"{vf_in}{vf_chain}[{vf_out}]"
 
-    # -----------------------------
     # 6) 최종 ffmpeg 렌더
-    # -----------------------------
     cmd = [ffmpeg_exe, "-y"]
     for p in inputs:
         cmd += ["-i", p]
@@ -628,9 +699,7 @@ def concatenate_scene_clips_final_av(
     if rr.returncode != 0:
         raise RuntimeError(f"FFMPEG 최종 렌더 실패:\n{rr.stderr}")
 
-    # -----------------------------
     # 7) 임시 파일 정리
-    # -----------------------------
     try:
         if list_file.exists():
             list_file.unlink()
@@ -641,6 +710,8 @@ def concatenate_scene_clips_final_av(
             temp_visual.unlink()
     except Exception:
         pass
+
+
 
 
 
@@ -982,8 +1053,6 @@ def build_shots_with_i2v_long(
     clips_dir = p_dir / "clips"
     clips_dir.mkdir(parents=True, exist_ok=True)
 
-    # 75번 워크플로우 로드
-    from app import settings
     wf_path = Path(settings.JSONS_DIR) / "75.wan22_SVI_Pro.json"
     if not wf_path.exists():
         wf_path = Path(r"C:\my_games\shorts_make\app\jsons\75.wan22_SVI_Pro.json")
@@ -1044,8 +1113,7 @@ def build_shots_with_i2v_long(
     if raw_created_count > 0:
         on_progress({"msg": "✨ [Step 2] 업스케일링 (Interpolation) 시작..."})
         try:
-            # Interpolation_upscale은 video_build.py 상단에 정의되어 있다고 가정
-            from app.video_build import Interpolation_upscale
+
             Interpolation_upscale(
                 str(p_dir),
                 total_frames=0,
@@ -2033,12 +2101,7 @@ def raw_make_addup_long(
     - 세그먼트 간 overlap(워크플로우의 ImageBatchExtendWithOverlap=5)을 고려하여
       최종 프레임 수가 total_frames가 되도록 세그 length를 계산합니다.
     """
-    import json
-    import random
-    import shutil
-    import requests
-    from pathlib import Path
-    from app import settings
+
 
     sid = scene_data.get("id", "unknown")
 
@@ -4215,9 +4278,7 @@ def fill_prompt_movie_with_ai_long(
         prompt_1,     prompt_2,     prompt_3     (모델용: 위 한글의 충실 번역)
     - 세그먼트 프롬프트에서는 제품을 반드시 "the object"로만 지칭하도록 강제합니다.
     """
-    from pathlib import Path
-    import json
-    import re
+
 
     p_dir = Path(project_dir)
     v_path = p_dir / "video.json"

@@ -23,7 +23,8 @@ from app.utils import (
     save_json,
     ensure_dir,
     _submit_and_wait as submit_and_wait,
-    get_duration
+    get_duration,
+
 )
 from app import settings
 from app.video_build import build_shots_with_i2v, concatenate_scene_clips, fill_prompt_movie_with_ai_long, concatenate_scene_clips_final_av
@@ -1112,10 +1113,11 @@ class ShoppingMovieGenerator:
 
     def merge_movies(self, video_json_path: str | Path):
         """
-        [최종 병합]
+        [최종 병합 - 오버랩 없음]
         - clips/*.mp4를 실제 길이 기준으로 재타임라인 구성
         - 내레이션/자막을 각 씬(클립)의 중앙에 배치
-        - 내레이션이 길면 1.2배속 1회 시도 후, 그래도 길면 오류
+        - 내레이션이 길면 필요한 만큼 atempo로 줄임(상한 1.30)
+        - 자막은 pad가 아니라 fade-in/out(alpha)로 처리
         - 최종 out: final_shopping_video.mp4
         """
         vpath = Path(video_json_path)
@@ -1123,7 +1125,6 @@ class ShoppingMovieGenerator:
         clips_dir = project_dir / "clips"
         bgm_path = project_dir / "bgm.mp3"
 
-        # 최종본 출력
         final_output_path = project_dir / "final_shopping_video.mp4"
         ffmpeg_exe = getattr(settings, "FFMPEG_EXE", "ffmpeg")
 
@@ -1134,7 +1135,6 @@ class ShoppingMovieGenerator:
             self.on_progress("❌ scenes가 비었습니다.")
             return
 
-        # 자막/제목 설정 로드
         defaults = data.get("defaults", {}) if isinstance(data.get("defaults", {}), dict) else {}
         defaults_sub = defaults.get("subtitle", {}) if isinstance(defaults.get("subtitle", {}), dict) else {}
 
@@ -1144,9 +1144,14 @@ class ShoppingMovieGenerator:
 
         title_text = str(data.get("title") or "").strip()
 
+        # 자막 페이드(초) — 기본 0.25
+        subtitle_fade_in_sec = float(defaults_sub.get("fade_in_sec") or 0.25)
+        subtitle_fade_out_sec = float(defaults_sub.get("fade_out_sec") or 0.25)
+
         self.on_progress(
             f"[Merge] 적용값: font='{font_family}', title={title_size}, narr={narr_size}, "
-            f"bgm={'YES' if bgm_path.exists() else 'NO'}"
+            f"bgm={'YES' if bgm_path.exists() else 'NO'}, "
+            f"subtitle_fade_in={subtitle_fade_in_sec:.2f}, subtitle_fade_out={subtitle_fade_out_sec:.2f}"
         )
 
         # 1) 클립 수집(씬 순서대로)
@@ -1170,7 +1175,7 @@ class ShoppingMovieGenerator:
             self.on_progress("⚠️ 일부 씬 클립이 누락되어, 존재하는 클립만으로 병합합니다.")
 
         # 2) 최종 병합(영상+오디오+자막을 한 번에)
-        self.on_progress("[Merge] 최종 병합(실측 길이 기반 중앙 배치) 시작...")
+        self.on_progress("[Merge] 최종 병합(실측 길이 기반, 오버랩 없음, 자막 페이드) 시작...")
         try:
             concatenate_scene_clips_final_av(
                 clip_paths=clip_paths,
@@ -1180,8 +1185,15 @@ class ShoppingMovieGenerator:
                 bgm_path=(bgm_path if bgm_path.exists() else None),
                 bgm_volume=0.35,
                 narration_volume=1.0,
-                pad_in_sec=0.25,
-                pad_out_sec=0.25,
+
+                # ✅ 최종 병합은 오버랩/usable 축소 없음
+                pad_in_sec=0.0,
+                pad_out_sec=0.0,
+
+                # ✅ 자막 페이드는 별도 파라미터로
+                subtitle_fade_in_sec=subtitle_fade_in_sec,
+                subtitle_fade_out_sec=subtitle_fade_out_sec,
+
                 subtitle_font=font_family,
                 subtitle_fontsize=narr_size,
                 subtitle_y="h-140",
@@ -1194,9 +1206,11 @@ class ShoppingMovieGenerator:
                 video_crf=18,
                 video_preset="medium",
                 audio_bitrate="192k",
+
+                # ✅ 병합 중 상세 로그를 비동기창에 출력
+                on_progress=self.on_progress,
             )
 
-            # scenes에는 movie_duration/narration_duration/start/end가 갱신되어 들어있음 → 필요하면 저장
             try:
                 save_json(vpath, data)
             except Exception:

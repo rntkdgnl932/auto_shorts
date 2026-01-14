@@ -2339,8 +2339,8 @@ def _submit_and_wait(
 
 
     # 안전한 기본값 결정
-    timeout_val = float(timeout if timeout is not None else _DEFAULT_ACE_WAIT_TIMEOUT_SEC())
-    poll_val = float(poll if poll is not None else _DEFAULT_ACE_POLL_INTERVAL_SEC())
+    timeout_val = float(timeout if timeout is not None else _DEFAULT_ACE_WAIT_TIMEOUT_SEC)
+    poll_val = float(poll if poll is not None else _DEFAULT_ACE_POLL_INTERVAL_SEC)
 
     _dlog("WAIT-START", f"timeout={timeout_val}", f"poll={poll_val}")
 
@@ -2507,6 +2507,9 @@ def _submit_and_wait(
 
     # 타입 체커 안심용 (정상 흐름상 도달 불가)
     return {}  # type: ignore[return-value]
+
+
+
 _LOG_PATH = Path(BASE_DIR) / "music_gen.log"  # 언제나 여기로도 기록
 def _dlog(*args):
     msg = " ".join(str(a) for a in args)
@@ -2531,14 +2534,44 @@ def _dlog(*args):
         pass
 
 # ─────────────────────────────────────────────────────────────
-# 0) 유틸: 오디오, 영살 길이 견고 획득(중앙값, 3배 튐 방지)
+# 유틸: 오디오, 영살 길이 견고 획득(중앙값, 3배 튐 방지)
 # ─────────────────────────────────────────────────────────────
 # real_use
+def _guess_ffprobe_exe() -> str:
+    """
+    ffprobe 실행 파일 경로 추정.
+    1) settings.FFPROBE_EXE 있으면 사용
+    2) settings.FFMPEG_EXE가 ffmpeg.exe면 같은 폴더의 ffprobe.exe로 추정
+    3) 최후: 'ffprobe'
+    """
+    try:
+        ffprobe_exe = getattr(settings, "FFPROBE_EXE", "")  # type: ignore
+        if ffprobe_exe and os.path.isfile(ffprobe_exe):
+            return ffprobe_exe
+    except Exception:
+        pass
+
+    try:
+        ffmpeg_exe = getattr(settings, "FFMPEG_EXE", "")  # type: ignore
+        if ffmpeg_exe:
+            ffmpeg_exe = str(ffmpeg_exe)
+            if os.path.isfile(ffmpeg_exe):
+                d = os.path.dirname(ffmpeg_exe)
+                cand = os.path.join(d, "ffprobe.exe" if os.name == "nt" else "ffprobe")
+                if os.path.isfile(cand):
+                    return cand
+    except Exception:
+        pass
+
+    return "ffprobe"
+
+
 def _probe_duration_ffprobe(path: str) -> float:
     import json
     try:
+        ffprobe = _guess_ffprobe_exe()
         out = subprocess.check_output(
-            ["ffprobe", "-v", "error", "-show_entries", "format=duration", "-of", "json", path],
+            [ffprobe, "-v", "error", "-show_entries", "format=duration", "-of", "json", path],
             stderr=subprocess.STDOUT,
         )
         data = json.loads(out.decode("utf-8", "ignore"))
@@ -2546,6 +2579,7 @@ def _probe_duration_ffprobe(path: str) -> float:
         return dur if math.isfinite(dur) and dur > 0 else 0.0
     except Exception:
         return 0.0
+
 # real_use
 def _probe_duration_mutagen(path: str) -> float:
     try:
@@ -2607,7 +2641,7 @@ def get_duration(path: str) -> float:
         _probe_duration_pydub,
         _probe_duration_soundfile,
         _probe_duration_wave,
-        _probe_duration_librosa,
+        # _probe_duration_librosa,
     ):
         v = fn(p)
         if v and math.isfinite(v) and v > 0:
@@ -2625,6 +2659,362 @@ def get_duration(path: str) -> float:
         return mn
     return median
 # ============================================================== #
+# ===========폰트 가져오기============== #
+
+# utils.py
+
+# 폰트 유틸
+def resolve_windows_fontfile(font_family: str) -> Optional[str]:
+    """
+    Windows 폰트 패밀리/표시명(예: '맑은 고딕', 'Malgun Gothic')을
+    실제 폰트 파일 경로(C:\\Windows\\Fonts\\...)로 해석한다.
+
+    - 1) alias(한글/영문/별칭) 기반으로 Fonts 폴더에서 빠르게 탐색
+    - 2) 레지스트리(Fonts)에서 표시명/값 매칭
+    - 3) 최후수단: Fonts 폴더 파일명 근사검색
+
+    설치되어 있지 않으면 None
+    """
+    if not font_family:
+        return None
+
+    s = str(font_family).strip()
+    if not s:
+        return None
+
+    # 이미 파일 경로가 들어온 경우
+    try:
+        p = Path(s)
+        if p.is_file():
+            return str(p)
+    except Exception:
+        pass
+
+    # 캐시(함수 속성 이용: 모듈 전역 오염 최소화)
+    cache: Dict[str, Optional[str]] = getattr(resolve_windows_fontfile, "_cache", {})
+    if s in cache:
+        return cache[s]
+
+    def _norm(x: str) -> str:
+        return "".join(ch.lower() for ch in x if ch.isalnum())
+
+    fonts_dir = Path(os.environ.get("WINDIR", r"C:\Windows")) / "Fonts"
+    target = _norm(s)
+
+    # -----------------------------
+    # 0) Alias/파일 후보 (핵심)
+    # -----------------------------
+    # UI가 한글/영문/다른 표기 무엇을 주더라도, 실제 파일로 떨어지게 만든다.
+    alias_to_files: Dict[str, List[str]] = {
+        # Gulim
+        "굴림": ["gulim.ttc"],
+        "gulim": ["gulim.ttc"],
+        "gulimche": ["gulim.ttc"],
+
+        # Malgun Gothic
+        "맑은고딕": ["malgun.ttf", "malgunbd.ttf", "malgunsl.ttf"],
+        "맑은": ["malgun.ttf", "malgunbd.ttf", "malgunsl.ttf"],
+        "malgungothic": ["malgun.ttf", "malgunbd.ttf", "malgunsl.ttf"],
+        "malgun": ["malgun.ttf", "malgunbd.ttf", "malgunsl.ttf"],
+
+        # Dotum
+        "돋움": ["dotum.ttf", "dotumche.ttf"],
+        "dotum": ["dotum.ttf", "dotumche.ttf"],
+
+        # Batang
+        "바탕": ["batang.ttc"],
+        "batang": ["batang.ttc"],
+
+        # Gungsuh
+        "궁서": ["gungsuh.ttc"],
+        "gungsuh": ["gungsuh.ttc"],
+    }
+
+    # target이 완전히 일치하거나(예: '굴림'), 공백 제거 형태('맑은 고딕'->'맑은고딕')도 고려
+    target_no_space = _norm(s.replace(" ", ""))
+
+    # alias 키 후보(우선순위 높은 것부터)
+    alias_keys = []
+    for k in {target, target_no_space}:
+        if k in alias_to_files:
+            alias_keys.append(k)
+
+    # alias 후보가 있으면 Fonts 폴더에서 즉시 탐색
+    if fonts_dir.is_dir() and alias_keys:
+        for ak in alias_keys:
+            for fn in alias_to_files.get(ak, []):
+                fp = (fonts_dir / fn)
+                if fp.is_file():
+                    cache[s] = str(fp)
+                    setattr(resolve_windows_fontfile, "_cache", cache)
+                    return str(fp)
+
+    # -----------------------------
+    # 1) 레지스트리에서 폰트 목록 수집
+    # -----------------------------
+    entries: Dict[str, str] = {}
+    try:
+        import winreg  # Windows 전용
+
+        reg_paths = [
+            (winreg.HKEY_LOCAL_MACHINE, r"SOFTWARE\Microsoft\Windows NT\CurrentVersion\Fonts"),
+            (winreg.HKEY_CURRENT_USER,  r"SOFTWARE\Microsoft\Windows NT\CurrentVersion\Fonts"),
+        ]
+
+        for root, subkey in reg_paths:
+            try:
+                with winreg.OpenKey(root, subkey) as k:
+                    i = 0
+                    while True:
+                        try:
+                            name, value, _ = winreg.EnumValue(k, i)
+                            i += 1
+                            if not name or not value:
+                                continue
+                            entries[name] = str(value)
+                        except OSError:
+                            break
+            except OSError:
+                pass
+    except Exception:
+        entries = {}
+
+    # -----------------------------
+    # 2) 레지스트리 이름/값에서 매칭
+    # -----------------------------
+    best: Optional[Tuple[int, str]] = None  # (score, path)
+
+    # alias가 있으면 그 alias도 같이 target 후보로 추가
+    target_candidates = {target, target_no_space}
+    if alias_keys:
+        target_candidates.update(alias_keys)
+
+    for disp_name, val in entries.items():
+        disp_norm = _norm(disp_name)
+        val_norm = _norm(val)
+
+        score = 0
+        # 여러 후보 중 하나라도 매칭되면 점수 부여
+        for tc in target_candidates:
+            if not tc:
+                continue
+            if disp_norm == tc:
+                score = max(score, 100)
+            elif tc in disp_norm:
+                score = max(score, 80)
+            elif tc in val_norm:
+                score = max(score, 60)
+
+        if score <= 0:
+            continue
+
+        vp = Path(val)
+        if not vp.is_absolute():
+            vp = (fonts_dir / val).resolve()
+
+        if vp.is_file():
+            if best is None or score > best[0]:
+                best = (score, str(vp))
+
+    if best:
+        cache[s] = best[1]
+        setattr(resolve_windows_fontfile, "_cache", cache)
+        return best[1]
+
+    # -----------------------------
+    # 3) 최후수단: Fonts 폴더 파일명 근사검색
+    # -----------------------------
+    try:
+        if fonts_dir.is_dir() and target:
+            # (중요) target이 한글이면 파일명이 영문일 가능성이 높다.
+            # 그래서 alias가 있으면 alias 후보 파일도 한 번 더 시도한다.
+            if alias_keys:
+                for ak in alias_keys:
+                    for fn in alias_to_files.get(ak, []):
+                        fp = (fonts_dir / fn)
+                        if fp.is_file():
+                            cache[s] = str(fp)
+                            setattr(resolve_windows_fontfile, "_cache", cache)
+                            return str(fp)
+
+            for fp in fonts_dir.iterdir():
+                if not fp.is_file():
+                    continue
+                if fp.suffix.lower() not in (".ttf", ".ttc", ".otf"):
+                    continue
+                if target in _norm(fp.name):
+                    cache[s] = str(fp)
+                    setattr(resolve_windows_fontfile, "_cache", cache)
+                    return str(fp)
+    except Exception:
+        pass
+
+    cache[s] = None
+    setattr(resolve_windows_fontfile, "_cache", cache)
+    return None
+# 자막 두줄 처리
+
+
+def _char_units(ch: str) -> float:
+    if ch.isspace():
+        return 0.5
+    code = ord(ch)
+    if (
+        0xAC00 <= code <= 0xD7A3
+        or 0x1100 <= code <= 0x11FF
+        or 0x3130 <= code <= 0x318F
+        or 0x4E00 <= code <= 0x9FFF
+        or 0x3040 <= code <= 0x309F
+        or 0x30A0 <= code <= 0x30FF
+        or 0x3400 <= code <= 0x4DBF
+    ):
+        return 1.0
+    return 0.5
+
+def _text_units(s: str) -> float:
+    return sum(_char_units(ch) for ch in (s or ""))
+
+
+def split_subtitle_two_lines(text: str, max_units: float = 20.0) -> Tuple[str, str]:
+    """
+    자막을 2줄로 분할한다.
+    - 한글/비ASCII: 1.0
+    - 영어/숫자/ASCII: 0.5
+    - 공백: 0.5
+    - max_units 초과하면 2줄로 나누되, 두 줄의 유닛 수가 최대한 비슷하게(균형)
+    - 나누는 위치는 가능하면 쉼표/마침표/공백 등 자연스러운 경계 우선
+    - 2줄로도 2번째 줄이 max_units를 넘으면, 2번째 줄을 max_units에 맞춰 잘라 '…' 추가
+    """
+    s = (text or "").strip()
+    if not s:
+        return "", ""
+
+    # normalize whitespace
+    s = re.sub(r"\s+", " ", s).strip()
+
+    def _unit(ch: str) -> float:
+        if ch == " ":
+            return 0.5
+        o = ord(ch)
+        # ASCII(영문/숫자/기호) = 0.5
+        if o < 128:
+            return 0.5
+        # 그 외(한글 포함) = 1.0
+        return 1.0
+
+    def _units(t: str) -> float:
+        return sum(_unit(c) for c in t)
+
+    def _cut_to_units(t: str, lim: float) -> str:
+        acc = 0.0
+        out = []
+        for c in t:
+            u = _unit(c)
+            if acc + u > lim:
+                break
+            out.append(c)
+            acc += u
+        return "".join(out).rstrip()
+
+    total = _units(s)
+    if total <= max_units:
+        return s, ""
+
+    # 후보 분할점: 문장부호/공백 근처를 우선
+    # "자연스러움" 가중치: 문장부호(최고) > 쉼표류 > 공백 > 그 외
+    punct_strong = set(".!?。！？")
+    punct_mid = set(",，、;:：·")
+
+    # 목표: 반으로 나누되 line1이 max_units 넘지 않게
+    target = total * 0.5
+
+    # 모든 인덱스에서 누적 유닛 계산(한 번만)
+    cum = [0.0]
+    for c in s:
+        cum.append(cum[-1] + _unit(c))
+
+    # 가능한 분할점: 1..len-1
+    candidates = []
+    for i in range(1, len(s)):
+        left_u = cum[i]
+        right_u = total - left_u
+        if left_u > max_units:  # 1줄 max 초과는 불가
+            break
+
+        prev = s[i - 1]
+        nxt = s[i] if i < len(s) else ""
+
+        # 경계 점수(낮을수록 좋음)
+        # 기본: 균형(왼/오 차이)
+        balance_pen = abs(left_u - right_u)
+
+        # 자연스러운 끊김 보너스(패널티를 줄임)
+        cut_bonus = 0.0
+        if prev in punct_strong:
+            cut_bonus = 4.0
+        elif prev in punct_mid:
+            cut_bonus = 3.0
+        elif prev == " ":
+            cut_bonus = 2.0
+        elif nxt == " ":
+            cut_bonus = 1.5
+
+        # 너무 짧은 줄 방지(각 줄 최소 4유닛 정도는 유지하려고 약한 패널티)
+        short_pen = 0.0
+        if left_u < 4.0 or right_u < 4.0:
+            short_pen = 3.0
+
+        score = balance_pen + short_pen - cut_bonus
+        candidates.append((score, i))
+
+    # 후보가 없으면 강제 컷
+    if not candidates:
+        line1 = _cut_to_units(s, max_units)
+        line2 = s[len(line1):].lstrip()
+        if _units(line2) > max_units:
+            line2 = _cut_to_units(line2, max(0.0, max_units - 0.5)).rstrip() + "…"
+        return line1, line2
+
+    candidates.sort(key=lambda x: x[0])
+    _, best_i = candidates[0]
+
+    line1 = s[:best_i].rstrip()
+    line2 = s[best_i:].lstrip()
+
+    # 2번째 줄이 너무 길면 잘라서 말줄임
+    if _units(line2) > max_units:
+        line2 = _cut_to_units(line2, max(0.0, max_units - 0.5)).rstrip() + "…"
+
+    return line1, line2
+
+
+
+
+def normalize_newlines(s: str) -> str:
+    if s is None:
+        return ""
+    s = str(s)
+    s = s.replace("/n", "\n")
+    s = s.replace("\r\n", "\n")
+    s = s.replace("\r", "\n")
+    return s
+
+
+
+# 경로 유틸
+def _ffmpeg_escape_filter_path(p: str) -> str:
+    """
+    FFmpeg filter 옵션 값으로 들어가는 '경로' 이스케이프
+    - Windows 드라이브 콜론 C: 를 \: 로 이스케이프해야 함
+    """
+    if p is None:
+        return ""
+    p = str(p).replace("\\", "/")
+    p = p.replace("\\", "\\\\")
+    p = p.replace(":", "\\:")
+    p = p.replace("'", "\\'")
+    return p
+
 
 
 #
