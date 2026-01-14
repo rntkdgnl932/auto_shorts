@@ -3024,7 +3024,6 @@ def _ffmpeg_escape_filter_path(p: str) -> str:
 
 @dataclass
 class SubtitleStyle:
-    # 폰트/스타일
     font_family: str = "Gulim"
     fontsize: int = 36
     y: str = "h-140"
@@ -3033,13 +3032,15 @@ class SubtitleStyle:
     boxcolor: str = "black@0.45"
     boxborderw: int = 18
 
-    # 줄바꿈 규칙
-    max_units: float = 20.0           # "20" 같은 값: 여기만 바꾸면 화면 기준 조절 가능
-    max_lines: int = 2                # 기본 2줄(UX), 호출자가 override 가능
+    max_units: float = 20.0
+    max_lines: int = 2
 
-    # 레이아웃
-    line_gap_px: Optional[int] = None # None이면 fontsize/box 기반 자동
-    lift_ratio: float = 0.62          # 줄이 늘어날수록 전체 블록을 위로 끌어올리는 비율
+    line_gap_px: Optional[int] = None
+
+    # ✅ 3줄 이상에서 화면 밖으로 나가는 문제를 줄이기 위해 기본 lift 강화
+    # (원래 0.62는 2줄엔 좋지만 3줄에 부족한 케이스가 많음)
+    lift_ratio: float = 0.88
+
 
 
 class SubtitleComposer:
@@ -3059,12 +3060,12 @@ class SubtitleComposer:
         *,
         font_family: str = "Gulim",
         fontsize: int = 36,
-        y: str = "h-140",
+        y: str = "h-120",
         box: bool = True,
         boxcolor: str = "black@0.45",
         boxborderw: int = 18,
         max_units: float = 20.0,
-        max_lines: int = 2,
+        max_lines: int = 3,
         line_gap_px: Optional[int] = None,
         lift_ratio: float = 0.62,
     ) -> None:
@@ -3277,188 +3278,164 @@ class SubtitleComposer:
     # ----------------------------
     def split_lines(self, text: str) -> List[str]:
         """
-        - 기본은 "띄어쓰기(단어) 기준"으로만 분할 → '인테리 /n 어도' 같은 분해 방지
-        - 문장부호(.,!? 등) 뒤에서 끊는 것을 선호
-        - max_lines 내에서 각 줄 max_units를 넘지 않게 배치
-        - max_lines로도 다 못 담으면 마지막 줄을 '…'로 트렁케이트
+        ✅ 요구사항 반영
+        1) max_lines는 '최대 줄 수' (억지로 3줄 맞추지 않음)
+        2) 2줄 이상이면 위/아래 글자수가 비슷하도록(균형) 분할
+        3) max_lines로도 못 담으면 마지막 줄 끝에 '...' 처리
+        4) 공백뿐 아니라 / - · : 등도 토큰 경계로 취급
+        5) 공백 없는 긴 문자열도 강제 래핑(여러 줄) 가능
         """
+        import math
+        import re
+
         s = (text or "").strip()
         if not s:
             return []
-
-        # 여러 공백/개행/탭 등 정규화
         s = re.sub(r"\s+", " ", s).strip()
 
-        max_units = float(self.style.max_units)
-        max_lines = int(self.style.max_lines)
+        max_units = float(self.style.max_units)  # 한 줄 폭 제한
+        max_lines = max(1, int(self.style.max_lines))  # 최대 줄 수
 
-        # 이미 한 줄에 들어가면 종료
-        if self._units(s) <= max_units:
-            return [s]
+        # -----------------------------
+        # 토큰화: 공백 + 구분자 경계
+        # -----------------------------
+        seps = set("/-·:|,;()[]{}")
+        tokens: List[str] = []
+        buf: List[str] = []
 
-        # ✅ 단어 토큰화: 공백으로 분리(단어 유지)
-        words = s.split(" ")
-        if not words:
+        for ch in s:
+            if ch == " ":
+                if buf:
+                    tokens.append("".join(buf))
+                    buf = []
+                continue
+            if ch in seps:
+                if buf:
+                    buf.append(ch)  # 구분자는 앞 토큰에 붙임
+                    tokens.append("".join(buf))
+                    buf = []
+                else:
+                    tokens.append(ch)
+                continue
+            buf.append(ch)
+
+        if buf:
+            tokens.append("".join(buf))
+
+        if not tokens:
             return []
 
-        # 각 단어 유닛(단어 자체만)
-        w_units = [self._units(w) for w in words]
+        # ✅ 이 클래스에 존재하는 유닛 함수는 _units / _unit / _cut_to_units 이다.
+        # ( _calc_units 같은 건 없음 )
+        tok_units = [self._units(t) for t in tokens]
+        n = len(tokens)
 
-        # "단어 하나가 max_units를 초과"하는 경우는 예외:
-        # 해당 단어를 강제로 잘라 넣고(… 처리), 나머지는 뒤로 보냄.
-        # (이 케이스는 흔치 않지만 깨지면 UX 최악이라 안전장치)
-        for i, u in enumerate(w_units):
-            if u > max_units:
-                head = self._cut_to_units(words[i], max(0.0, max_units - 0.5)).rstrip() + "…"
-                rest_words = words[i+1:]
-                rest = " ".join(rest_words).strip()
-                lines = [head]
-                if rest:
-                    # 남은 텍스트를 max_lines-1 줄로 재귀 처리
-                    tail = SubtitleComposer(
-                        font_family=self.style.font_family,
-                        fontsize=self.style.fontsize,
-                        y=self.style.y,
-                        box=self.style.box,
-                        boxcolor=self.style.boxcolor,
-                        boxborderw=self.style.boxborderw,
-                        max_units=max_units,
-                        max_lines=max(1, max_lines - 1),
-                        line_gap_px=self.style.line_gap_px,
-                        lift_ratio=self.style.lift_ratio,
-                    ).split_lines(rest)
-                    lines.extend(tail)
-                return lines[:max_lines]
-
-        # 단어 사이 공백 유닛은 0.5로 간주
+        # 토큰 사이 공백 유닛(이 클래스 정책: 공백 0.5)
         space_u = 0.5
 
-        # DP: i번째 단어부터 k번째 줄까지 최소 cost
-        # 줄 유닛 한도(max_units) 지키면서 "균형 + 자연스러운 끊김" 점수 최소화
-        n = len(words)
-
-        # 누적합으로 구간 유닛 빠르게 계산(단어 유닛 + (단어-1)*space_u)
-        prefix = [0.0]
-        for u in w_units:
-            prefix.append(prefix[-1] + u)
-
         def seg_units(i: int, j: int) -> float:
-            # words[i:j] (i 포함, j 제외)
-            if j <= i:
+            if i >= j:
                 return 0.0
-            base = prefix[j] - prefix[i]
-            gaps = (j - i - 1)
-            return base + (gaps * space_u)
+            u = sum(tok_units[i:j])
+            u += space_u * max(0, (j - i - 1))
+            return float(u)
 
-        # 자연스러운 끊김 보너스(문장부호 뒤, 쉼표 뒤 등)
-        punct_strong = set(".!?。！？")
-        punct_mid = set(",，、;:：·")
-
-        def cut_bonus(last_word: str) -> float:
-            if not last_word:
-                return 0.0
-            c = last_word[-1]
-            if c in punct_strong:
-                return 3.5
-            if c in punct_mid:
-                return 2.5
-            return 0.0
-
-        # 목표 균형: 전체 유닛을 max_lines로 나눈 값 근처로
         total_u = seg_units(0, n)
-        target_per_line = max(1.0, total_u / max(1, min(max_lines, 4)))  # 과도한 목표 분산 방지
 
-        INF = 10**18
-        dp = [[INF] * (max_lines + 1) for _ in range(n + 1)]
-        nxt = [[-1] * (max_lines + 1) for _ in range(n + 1)]
-        dp[n][0] = 0.0
+        # ✅ 1줄로 들어가면 1줄 (억지 분할 금지)
+        if total_u <= max_units + 1e-9:
+            return [" ".join(tokens).strip()]
 
-        # 뒤에서 앞으로
-        for i in range(n, -1, -1):
-            for k in range(1, max_lines + 1):
-                # i에서 시작해 j까지를 한 줄로 잡기
-                best_cost = INF
-                best_j = -1
+        # ✅ 필요한 최소 줄 수 (max_lines 초과 금지)
+        needed = int(math.ceil(total_u / max_units))
+        target_max = min(max_lines, max(2, needed))
 
-                # j를 늘려가며 max_units 넘기 전까지 탐색
-                for j in range(i + 1, n + 1):
-                    u = seg_units(i, j)
-                    if u > max_units + 1e-9:
-                        break
+        INF = 10 ** 18
 
-                    # 남은 단어 수/줄 수로 불가능한 경우 스킵
-                    if (n - j) < 0:
-                        continue
+        def solve_exact_lines(L: int) -> Optional[List[str]]:
+            # 정확히 L줄로 배치하는 DP (각 줄 slack^2 최소화)
+            dp = [[INF] * (n + 1) for _ in range(L + 1)]
+            nxt = [[-1] * (n + 1) for _ in range(L + 1)]
+            dp[L][n] = 0
 
-                    # 줄 길이 균형 패널티(제곱)
-                    balance_pen = (u - target_per_line) ** 2
+            for k in range(L - 1, -1, -1):
+                for i in range(n - 1, -1, -1):
+                    best_cost = INF
+                    best_j = -1
+                    for j in range(i + 1, n + 1):
+                        u = seg_units(i, j)
+                        if u > max_units + 1e-9:
+                            break
+                        slack = max_units - u
+                        pen = slack * slack
 
-                    # 너무 짧은 줄 방지(유닛 4 미만이면 패널티)
-                    short_pen = 0.0
-                    if u < 4.0:
-                        short_pen = 6.0
+                        prev_tok = tokens[j - 1]
+                        if prev_tok and prev_tok[-1] in (".", "!", "?", ",", "…"):
+                            pen *= 0.92
 
-                    # 문장부호 뒤에서 자르면 보너스(= 비용 감소)
-                    bonus = cut_bonus(words[j - 1])
+                        cand = pen + dp[k + 1][j]
+                        if cand < best_cost:
+                            best_cost = cand
+                            best_j = j
 
-                    cost_here = balance_pen + short_pen - bonus
+                    dp[k][i] = best_cost
+                    nxt[k][i] = best_j
 
-                    tail_cost = dp[j][k - 1]
-                    if tail_cost >= INF:
-                        continue
+            if nxt[0][0] == -1:
+                return None
 
-                    total_cost = cost_here + tail_cost
-                    if total_cost < best_cost:
-                        best_cost = total_cost
-                        best_j = j
+            out: List[str] = []
+            i = 0
+            for k in range(L):
+                j = nxt[k][i]
+                if j <= i:
+                    return None
+                out.append(" ".join(tokens[i:j]).strip())
+                i = j
+            if i != n:
+                return None
+            return out
 
-                dp[i][k] = best_cost
-                nxt[i][k] = best_j
-
-        # k=max_lines로 시작, 가능한 최적 경로 복원
-        lines: List[str] = []
-        i = 0
-        k = max_lines
-        while i < n and k > 0:
-            j = nxt[i][k]
-            if j <= i:
+        # ✅ 가능한 최소 줄 수부터 시도 (억지 max_lines 맞춤 금지)
+        lines: Optional[List[str]] = None
+        for L in range(2, target_max + 1):
+            got = solve_exact_lines(L)
+            if got is not None:
+                lines = got
                 break
-            line = " ".join(words[i:j]).strip()
-            if line:
-                lines.append(line)
-            i = j
-            k -= 1
 
-        # 남은 단어가 있으면 마지막 줄 트렁케이트
-        if i < n:
-            tail = " ".join(words[i:]).strip()
-            if lines:
-                # 마지막 줄에 tail을 합쳐보고 넘치면 자르기
-                merged = (lines[-1] + " " + tail).strip()
-                if self._units(merged) <= max_units:
-                    lines[-1] = merged
+        # DP 실패(주로 공백 없는 긴 토큰) → 문자 단위 강제 래핑
+        if lines is None:
+            hard: List[str] = []
+            cur = ""
+            cur_u = 0.0
+            for ch in s:
+                u = self._unit(ch)  # ✅ 단일 문자 유닛은 _unit 사용
+                if cur and cur_u + u > max_units + 1e-9:
+                    hard.append(cur.rstrip())
+                    cur = ch
+                    cur_u = u
                 else:
-                    # 마지막 줄을 max_units에 맞춰 자르고 …
-                    cut = self._cut_to_units(merged, max(0.0, max_units - 0.5)).rstrip()
-                    lines[-1] = (cut + "…") if cut else "…"
-            else:
-                cut = self._cut_to_units(tail, max(0.0, max_units - 0.5)).rstrip()
-                lines = [(cut + "…") if cut else "…"]
+                    cur += ch
+                    cur_u += u
+            if cur.strip():
+                hard.append(cur.rstrip())
+            lines = hard
 
-        # 최대 줄수 강제
-        lines = [re.sub(r"\s+", " ", ln).strip() for ln in lines if ln.strip()]
+        # ✅ max_lines 초과면: 마지막 줄에 ... (정확히 요구사항)
         if len(lines) > max_lines:
             lines = lines[:max_lines]
-            # 마지막 줄이 너무 길면 보정
-            if self._units(lines[-1]) > max_units:
-                cut = self._cut_to_units(lines[-1], max(0.0, max_units - 0.5)).rstrip()
-                lines[-1] = (cut + "…") if cut else "…"
+            last = lines[-1]
+            last_cut = self._cut_to_units(last, max(0.0, max_units - 3.0)).rstrip()
+            lines[-1] = (last_cut + "...") if last_cut else "..."
+            return lines
 
-        # 마지막 방어: 각 줄이 max_units 초과하면 강제 컷
-        for idx in range(len(lines)):
-            if self._units(lines[idx]) > max_units:
-                cut = self._cut_to_units(lines[idx], max(0.0, max_units - 0.5)).rstrip()
-                lines[idx] = (cut + "…") if cut else "…"
+        # ✅ 마지막 줄이 혹시 제한을 넘으면 안전하게 ... 처리
+        if lines:
+            last = lines[-1]
+            if self._units(last) > max_units + 1e-9:
+                last_cut = self._cut_to_units(last, max(0.0, max_units - 3.0)).rstrip()
+                lines[-1] = (last_cut + "...") if last_cut else "..."
 
         return lines
 
@@ -3466,57 +3443,72 @@ class SubtitleComposer:
     # (D) 줄 간격 계산 + y 자동 올림(화면 잘림 방지)
     # ----------------------------
     def _calc_line_gap_px(self) -> int:
+        """
+        ✅ 줄간격: 더 넓게(체감 개선)
+        - style.line_gap_px가 있으면 그 값을 최우선
+        - 자동일 때는 fontsize 기반으로 이전보다 확실히 띄움
+        """
         if self.style.line_gap_px is not None:
-            return max(12, int(self.style.line_gap_px))
+            return max(16, int(self.style.line_gap_px))
 
-        base_gap = int(round(float(self.style.fontsize) * 1.65))
-        border_pad = int(max(0, self.style.boxborderw)) * 2
-        return max(32, base_gap + border_pad)
+        # 이전이 빡빡했다면, 1.45 수준으로 올려야 체감이 납니다.
+        base_gap = int(round(float(self.style.fontsize) * 1.45))
+        border_pad = int(max(0, self.style.boxborderw))
+        return max(34, base_gap + int(round(border_pad * 0.5)))
 
-    def calc_y_lines(self, line_count: int) -> List[str]:
+    def calc_y_lines(self, base_y: str, line_count: Optional[int] = None, line_gap_px: Optional[int] = None) -> List[str]:
         """
-        y가 "h-140" 같은 패턴일 때:
-          - line_count가 2 이상이면 전체 블록이 아래로 튀어나가지 않도록 y를 위로 끌어올림
-          - line_count가 늘어날수록 lift도 증가( (line_count-1) 배 )
+        줄 수가 늘어날수록 첫 줄을 더 위로 올려서 블록이 화면 아래로 밀리지 않게 한다.
+        - base_y는 'h-140' 같은 ffmpeg 표현 또는 숫자 문자열/정수 모두 허용
+        - line_count/line_gap_px가 None이면 안전한 기본값으로 계산 (호출부 실수로 인한 크래시 방지)
         """
-        y0 = str(self.style.y)
-        gap = self._calc_line_gap_px()
+        import re
 
-        # 기본은 y0 그대로, 아래로 gap씩 누적
-        y_list = [y0]
-        for i in range(1, max(1, line_count)):
-            y_list.append(f"{y0}+{gap * i}")
+        n = max(1, int(line_count) if line_count is not None else 1)
+        gap = max(1, int(line_gap_px) if line_gap_px is not None else self._calc_line_gap_px())
 
-        if line_count <= 1:
-            return y_list
-
-        # y가 h-숫자 패턴이면 자동 lift 적용
-        m = re.match(r"^\s*h\s*-\s*(\d+)\s*$", y0)
+        # base_y 파싱: "h-140" 형태면 140을 base로 사용
+        m = re.match(r"^\s*h\s*-\s*(\d+)\s*$", str(base_y))
         if not m:
-            return y_list
+            # 파싱 실패(예: "200") → 그대로 사용, n줄이면 +gap 누적
+            ys = [str(base_y)]
+            for k in range(1, n):
+                ys.append(f"{base_y}+{k * gap}")
+            return ys
 
         base = int(m.group(1))
-        # ✅ 줄이 늘어날수록 lift 증가: (line_count-1) * gap * lift_ratio
-        lift = int(round(gap * (line_count - 1) * float(self.style.lift_ratio)))
-        y1 = f"h-{base + lift}"
 
-        y_list = [y1]
-        for i in range(1, max(1, line_count)):
-            y_list.append(f"{y1}+{gap * i}")
-        return y_list
+        # 전체 블록 높이(대략): n줄이면 (n-1)*gap 만큼 아래로 확장
+        total_h = (n - 1) * gap
+
+        # 기본 lift: 블록의 절반 정도를 위로 당김(3줄 이상 안전)
+        lift_ratio = float(getattr(self.style, "lift_ratio", 0.88))
+        lift_px = int(round(total_h * 0.5 * lift_ratio))
+
+        # 3줄 이상은 추가로 더 올림(화면 밖으로 나가는 문제 방지)
+        if n >= 3:
+            lift_px += int(round((n - 2) * gap * 0.65))
+
+        y0 = base + lift_px
+
+        ys = [f"h-{y0}"]
+        for k in range(1, n):
+            ys.append(f"h-{y0}+{k * gap}")
+        return ys
+
 
     # ----------------------------
     # (E) drawtext 문자열 생성(여기가 재사용의 핵심)
     # ----------------------------
     def build_subtitle_drawtexts(
-        self,
-        *,
-        text: str,
-        show_t: float,
-        hide_t: float,
-        alpha_expr: str,
-        fontcolor: str = "white",
-        x_expr: str = "(w-text_w)/2",
+            self,
+            *,
+            text: str,
+            show_t: float,
+            hide_t: float,
+            alpha_expr: str,
+            fontcolor: str = "white",
+            x_expr: str = "(w-text_w)/2",
     ) -> List[str]:
         """
         입력 텍스트를 max_lines로 분할 → 각 줄 drawtext 필터를 만들어 반환.
@@ -3533,7 +3525,10 @@ class SubtitleComposer:
         # ✅ 강제 max_lines 적용(안전)
         lines = lines[: max(1, int(self.style.max_lines))]
 
-        y_list = self.calc_y_lines(len(lines))
+        # ✅ line_gap / y 계산 (여기가 이번 오류의 원인 수정 포인트)
+        gap = int(self._calc_line_gap_px())
+        y_list = self.calc_y_lines(self.style.y, len(lines), gap)
+
         box = "1" if self.style.box else "0"
 
         out: List[str] = []

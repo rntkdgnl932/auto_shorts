@@ -949,7 +949,7 @@ def concatenate_scene_clips_final_av(
         boxcolor=subtitle_boxcolor,
         boxborderw=subtitle_boxborderw,
         max_units=20.0,  # ✅ 여기 숫자만 바꾸면 됨
-        max_lines=2,  # ✅ 기본값 2 유지 (호출 시 3으로도 가능)
+        max_lines=3,  # ✅ 기본값 2 유지 (호출 시 3으로도 가능)
         line_gap_px=None,
         lift_ratio=0.62,
     )
