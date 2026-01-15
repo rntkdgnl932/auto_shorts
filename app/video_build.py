@@ -697,7 +697,7 @@ def concatenate_scene_clips_final_av(
     ffmpeg_exe: str,
     scenes: List[Dict[str, Any]],
     bgm_path: Optional[Path] = None,
-    bgm_volume: float = 0.35,
+    bgm_volume: float = 0.0,
     narration_volume: float = 1.0,
 
     # (호환 유지: 최종 병합에서는 0으로 넘기는 것을 권장)

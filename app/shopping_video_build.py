@@ -1183,7 +1183,7 @@ class ShoppingMovieGenerator:
                 ffmpeg_exe=ffmpeg_exe,
                 scenes=scenes,
                 bgm_path=(bgm_path if bgm_path.exists() else None),
-                bgm_volume=0.35,
+                bgm_volume=0.1,
                 narration_volume=1.0,
 
                 # ✅ 최종 병합은 오버랩/usable 축소 없음
