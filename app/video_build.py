@@ -38,11 +38,18 @@ from app.settings import JSONS_DIR
 from pathlib import Path
 
 
-import json as _json
 
 import json as _json_loader
-import shutil
+
+import json as _json
+import random as _random
+import time as _time
+import urllib.parse as _urlparse
+import uuid as _uuid
+from pathlib import Path as _P
 import requests
+import shutil
+
 import random as _img_seed_random
 from app import settings as settings_obj
 
@@ -226,7 +233,7 @@ def build_and_merge_full_video(project_dir: str,
     _log(6, f"최종 영상 생성 완료: {final_output.name}")
     return str(final_output)
 
-# 영상 등 합치기 ; 음악 버젼
+# 영상 등 합치기 ; shorts 탭 음악 버젼
 def concatenate_scene_clips(clip_paths: List[Path], out_path: Path, ffmpeg_exe: str):
     """
     [신규] FFMPEG concat demuxer를 사용해 여러 비디오 클립을 순서대로 병합합니다.
@@ -266,430 +273,7 @@ def concatenate_scene_clips(clip_paths: List[Path], out_path: Path, ffmpeg_exe: 
             list_file.unlink()
 
 
-# def concatenate_scene_clips_final_av_ex(
-#     *,
-#     clip_paths: List[Path],
-#     out_path: Path,
-#     ffmpeg_exe: str,
-#     scenes: List[Dict[str, Any]],
-#     bgm_path: Optional[Path] = None,
-#     bgm_volume: float = 0.35,
-#     narration_volume: float = 1.0,
-#
-#     # (호환 유지: 최종 병합에서는 0으로 넘기는 것을 권장)
-#     pad_in_sec: float = 0.0,
-#     pad_out_sec: float = 0.0,
-#
-#     subtitle_font: str = "Gulim",
-#     subtitle_fontsize: int = 36,
-#     subtitle_y: str = "h-140",
-#     subtitle_box: bool = True,
-#     subtitle_boxcolor: str = "black@0.45",
-#     subtitle_boxborderw: int = 18,
-#
-#     # ✅ 자막 페이드 전용
-#     subtitle_fade_in_sec: float = 0.25,
-#     subtitle_fade_out_sec: float = 0.25,
-#
-#     title_text: str = "",
-#     title_fontsize: int = 55,
-#     title_y: str = "h*0.12",
-#     video_crf: int = 18,
-#     video_preset: str = "medium",
-#     audio_bitrate: str = "192k",
-#
-#     # ✅ 내레이션 가속 상한
-#     max_narration_speed: float = 1.30,
-#
-#     # ✅ 진행 로그(비동기 창)
-#     on_progress=None,
-# ) -> None:
-#     """
-#     [최종 합치기 - 오버랩 없음, 자막 페이드]
-#     - clip_paths를 concat demuxer로 이어붙여 temp_visual.mp4 생성(오디오는 제외)
-#     - 각 클립의 "실제 길이"를 get_duration()으로 측정하여 scene별 movie_duration에 기록
-#     - 각 voice_file의 "실제 길이"를 get_duration()으로 측정하여 narration_duration에 기록
-#     - 내레이션/자막은 해당 씬(클립)의 중앙에 배치
-#     - 내레이션이 너무 길면 필요한 만큼 atempo로 줄임(상한 max_narration_speed)
-#     - drawtext는 제목(선택) + 자막(씬별)에 alpha 기반 fade-in/out 적용
-#     - ✅ 자막 줄바꿈은 텍스트에 개행을 넣지 않고 drawtext 2개로 처리(Windows 안정)
-#     """
-#
-#     def _p(msg: str) -> None:
-#         if callable(on_progress):
-#             try:
-#                 on_progress(msg)
-#             except Exception:
-#                 pass
-#
-#     if not clip_paths:
-#         raise ValueError("clip_paths가 비었습니다.")
-#     out_path.parent.mkdir(parents=True, exist_ok=True)
-#
-#     work_dir = out_path.parent
-#     list_file = work_dir / "ffmpeg_concat_list_final.txt"
-#     temp_visual = work_dir / (out_path.stem + "_temp_visual.mp4")
-#
-#     # 1) concat list 생성
-#     with open(list_file, "w", encoding="utf-8") as f:
-#         for clip in clip_paths:
-#             if not clip.exists():
-#                 raise FileNotFoundError(f"병합할 클립을 찾을 수 없습니다: {clip}")
-#             f.write(f"file '{clip.as_posix()}'\n")
-#
-#     # 2) 비디오만 합쳐서 temp_visual 생성
-#     cmd_concat = [
-#         ffmpeg_exe, "-y",
-#         "-f", "concat",
-#         "-safe", "0",
-#         "-i", str(list_file),
-#         "-an",
-#         "-c:v", "libx264",
-#         "-preset", video_preset,
-#         "-crf", str(video_crf),
-#         str(temp_visual),
-#     ]
-#
-#     startupinfo = None
-#     if os.name == "nt":
-#         startupinfo = subprocess.STARTUPINFO()
-#         startupinfo.dwFlags |= subprocess.STARTF_USESHOWWINDOW
-#
-#     r = subprocess.run(
-#         cmd_concat,
-#         capture_output=True,
-#         text=True,
-#         encoding="utf-8",
-#         errors="ignore",
-#         startupinfo=startupinfo,
-#     )
-#     if r.returncode != 0:
-#         raise RuntimeError(f"FFMPEG concat(temp_visual) 실패:\n{r.stderr}")
-#
-#     visual_dur = float(get_duration(str(temp_visual)) or 0.0)
-#     if visual_dur <= 0:
-#         visual_dur = 1.0
-#
-#     # 3) 각 씬별 실제 영상 길이 측정 → start/end 재구성
-#     clip_durs: List[float] = []
-#     for cp in clip_paths:
-#         d = float(get_duration(str(cp)) or 0.0)
-#         if d <= 0:
-#             d = max(0.01, visual_dur / max(len(clip_paths), 1))
-#         clip_durs.append(d)
-#
-#     t_cursor = 0.0
-#     for i, sc in enumerate(scenes):
-#         if i >= len(clip_durs):
-#             break
-#         d = clip_durs[i]
-#         sc["movie_duration"] = float(d)
-#         sc["start"] = float(t_cursor)
-#         sc["end"] = float(t_cursor + d)
-#         t_cursor += d
-#
-#     _p(f"[Merge][DBG] total_visual={visual_dur:.3f}s, scenes_used={min(len(scenes), len(clip_durs))}")
-#
-#     # 4) 오디오 입력/필터 구성
-#     inputs: List[str] = [str(temp_visual)]
-#     audio_inputs_meta: List[Tuple[str, int]] = []  # (type, input_index)
-#
-#     if bgm_path and Path(bgm_path).is_file():
-#         inputs.append(str(Path(bgm_path)))
-#         audio_inputs_meta.append(("bgm", len(inputs) - 1))
-#
-#     narration_items: List[Dict[str, Any]] = []
-#
-#     # 허용 오차(초) — duration 측정 오차 방지(예: 50ms)
-#     EPS_SEC = 0.05
-#
-#     for i, sc in enumerate(scenes):
-#         vf = (sc.get("voice_file") or "").strip()
-#         if not vf:
-#             continue
-#
-#         vp = Path(vf)
-#         if not vp.is_absolute():
-#             cand = (work_dir / vf).resolve()
-#             if cand.is_file():
-#                 vp = cand
-#         if not vp.is_file():
-#             continue
-#
-#         start_t = float(sc.get("start") or 0.0)
-#         end_t = float(sc.get("end") or start_t)
-#         clip_dur = float(sc.get("movie_duration") or (end_t - start_t) or 0.0)
-#         if clip_dur <= 0:
-#             continue
-#
-#         nar_dur_raw = float(get_duration(str(vp)) or 0.0)
-#         sc["narration_duration"] = float(nar_dur_raw)
-#
-#         speed = 1.0
-#         nar_dur_eff = float(nar_dur_raw)
-#         required = (nar_dur_raw / max(0.001, clip_dur)) if clip_dur > 0 else 1.0
-#
-#         if nar_dur_raw > clip_dur + EPS_SEC:
-#             speed = min(float(max_narration_speed), max(1.0, round(required + 0.01, 2)))
-#             nar_dur_eff = nar_dur_raw / speed
-#
-#             _p(
-#                 f"[Merge][DBG] scene={sc.get('id')} clip={clip_dur:.3f}s nar={nar_dur_raw:.3f}s "
-#                 f"required≈{required:.3f} -> speed={speed:.2f} eff={nar_dur_eff:.3f}s"
-#             )
-#
-#             if nar_dur_eff > clip_dur + EPS_SEC:
-#                 raise RuntimeError(
-#                     f"내레이션이 씬 길이를 초과합니다. scene_id={sc.get('id')} "
-#                     f"clip={clip_dur:.3f}s nar={nar_dur_raw:.3f}s "
-#                     f"speed={speed:.2f} eff={nar_dur_eff:.3f}s (max={max_narration_speed:.2f})"
-#                 )
-#         else:
-#             _p(f"[Merge][DBG] scene={sc.get('id')} clip={clip_dur:.3f}s nar={nar_dur_raw:.3f}s -> OK(no speed)")
-#
-#         center_offset = max(0.0, (clip_dur - nar_dur_eff) * 0.5)
-#         delay_sec = start_t + center_offset
-#
-#         sc["narration_speed"] = float(speed)
-#         sc["narration_effective_duration"] = float(nar_dur_eff)
-#
-#         narration_items.append({
-#             "scene_index": i,
-#             "delay_sec": float(delay_sec),
-#             "path": vp,
-#             "speed": float(speed),
-#             "effective_dur": float(nar_dur_eff),
-#         })
-#
-#     for item in narration_items:
-#         inputs.append(str(item["path"]))
-#         audio_inputs_meta.append(("nar", len(inputs) - 1))
-#
-#     fc_parts: List[str] = []
-#     mix_labels: List[str] = []
-#
-#     # bgm
-#     bgm_label = None
-#     for typ, idx in audio_inputs_meta:
-#         if typ == "bgm":
-#             bgm_label = "abgm"
-#             fc_parts.append(f"[{idx}:a]volume={bgm_volume}[{bgm_label}]")
-#             mix_labels.append(f"[{bgm_label}]")
-#             break
-#
-#     # narration (adelay + (optional) atempo)
-#     nar_count = 0
-#     nar_input_base = 1 + (1 if bgm_label else 0)
-#
-#     for j, item in enumerate(narration_items):
-#         idx = nar_input_base + j
-#         ms = int(round(float(item["delay_sec"]) * 1000.0))
-#         lbl = f"anar{nar_count}"
-#         spd = float(item["speed"])
-#
-#         if abs(spd - 1.0) < 1e-6:
-#             fc_parts.append(f"[{idx}:a]adelay={ms}|{ms},volume={narration_volume}[{lbl}]")
-#         else:
-#             fc_parts.append(f"[{idx}:a]atempo={spd:.6f},adelay={ms}|{ms},volume={narration_volume}[{lbl}]")
-#
-#         mix_labels.append(f"[{lbl}]")
-#         nar_count += 1
-#
-#     if not mix_labels:
-#         fc_parts.append(f"anullsrc=r=48000:cl=stereo,atrim=0:{visual_dur:.6f}[aout]")
-#     else:
-#         mix_in = "".join(mix_labels)
-#         fc_parts.append(f"{mix_in}amix=inputs={len(mix_labels)}:normalize=0:dropout_transition=0[aout]")
-#
-#     # --- drawtext 폰트 지정: fontconfig 회피를 위해 fontfile 사용 ---
-#     fontfile = resolve_windows_fontfile(subtitle_font)
-#
-#     _p(f"[Merge][DBG] subtitle_font input='{subtitle_font}' norm='{''.join(ch for ch in subtitle_font if ch.isalnum())}'")
-#     _p(f"[Merge][DBG] resolved fontfile='{fontfile}'")
-#
-#     if fontfile:
-#         fontfile_ff = _ffmpeg_escape_filter_path(str(fontfile))
-#         font_arg = f"fontfile='{fontfile_ff}'"
-#     else:
-#         font_arg = f"font='{subtitle_font}'"
-#
-#     if callable(on_progress):
-#         on_progress(f"[Merge][DBG] drawtext fontfile={'OK' if fontfile else 'NONE'} : {fontfile or subtitle_font}")
-#
-#     # 5) 자막(drawtext) 필터: 중앙 구간 + alpha fade
-#     vf_parts: List[str] = []
-#     vf_in = "[0:v]"
-#     vf_out = "vout"
-#
-#     # 제목(기존 alpha 유지)
-#     title_text = (title_text or "").strip()
-#     if title_text:
-#         title_escaped = _ffmpeg_escape_drawtext(title_text)
-#         alpha_expr = (
-#             "if(lt(t,1),0,"
-#             " if(lt(t,3),(t-1)/2,"
-#             "  if(lt(t,4),1,"
-#             "   if(lt(t,6),(6-t)/2,0)"
-#             "  )"
-#             " )"
-#             ")"
-#         )
-#         vf_parts.append(
-#             "drawtext="
-#             f"{font_arg}:"
-#             f"text='{title_escaped}':"
-#             f"fontsize={int(title_fontsize)}:"
-#             "fontcolor=white:"
-#             "box=1:boxcolor=black@0.5:boxborderw=6:"
-#             "x=(w-text_w)/2:"
-#             f"y={title_y}:"
-#             f"alpha='{alpha_expr}'"
-#         )
-#
-#     fade_in = max(0.0, float(subtitle_fade_in_sec))
-#     fade_out = max(0.0, float(subtitle_fade_out_sec))
-#
-#     # ✅ 2줄 y 오프셋(픽셀): 폰트 크기 기반으로 합리적으로
-#     base_gap = int(round(float(subtitle_fontsize) * 1.65))
-#     border_pad = int(max(0, subtitle_boxborderw)) * 2
-#     line_gap_px = max(32, base_gap + border_pad)
-#
-#     for sc in scenes:
-#         start_t = float(sc.get("start") or 0.0)
-#         end_t = float(sc.get("end") or start_t)
-#         clip_dur = float(sc.get("movie_duration") or (end_t - start_t) or 0.0)
-#         if clip_dur <= 0:
-#             continue
-#
-#         txt = (sc.get("lyric") or sc.get("subtitle") or sc.get("narration") or "").strip()
-#         if not txt:
-#             continue
-#
-#         nar_dur_eff = float(sc.get("narration_effective_duration") or sc.get("narration_duration") or 0.0)
-#         if nar_dur_eff <= 0:
-#             nar_dur_eff = clip_dur * 0.7
-#         if nar_dur_eff > clip_dur:
-#             nar_dur_eff = clip_dur
-#
-#         show_t = start_t + max(0.0, (clip_dur - nar_dur_eff) * 0.5)
-#         hide_t = min(end_t, show_t + nar_dur_eff)
-#         if hide_t <= show_t:
-#             hide_t = min(end_t, show_t + 0.10)
-#
-#         if fade_in <= 1e-6 and fade_out <= 1e-6:
-#             alpha_expr = "1"
-#         else:
-#             fi = max(1e-6, fade_in)
-#             fo = max(1e-6, fade_out)
-#             alpha_expr = (
-#                 f"if(lt(t,{show_t:.3f}),0,"
-#                 f" if(lt(t,{(show_t+fade_in):.3f}), (t-{show_t:.3f})/{fi:.6f},"
-#                 f"  if(lt(t,{(hide_t-fade_out):.3f}), 1,"
-#                 f"   if(lt(t,{hide_t:.3f}), ({hide_t:.3f}-t)/{fo:.6f}, 0)"
-#                 f"  )"
-#                 f" )"
-#                 f")"
-#             )
-#
-#         # ✅ 여기서 '개행 삽입'을 완전히 버리고, 2줄로 분해해서 drawtext 2개를 쌓는다.
-#         # utils.py: split_subtitle_two_lines(text, max_units=20.0) -> (line1, line2)
-#         line1, line2 = split_subtitle_two_lines(txt, max_units=20.0)
-#
-#         y_line1 = str(subtitle_y)
-#         if line2:
-#             # subtitle_y가 "h-140" 패턴일 때만 자동 보정
-#             m = re.match(r"^\s*h\s*-\s*(\d+)\s*$", y_line1)
-#             if m:
-#                 base = int(m.group(1))
-#                 # lift: 줄간격의 55~70%가 보통 안전. 우선 0.60 적용.
-#                 lift = int(round(line_gap_px * 0.60))
-#                 y_line1 = f"h-{base + lift}"
-#
-#         y_line2 = f"{y_line1}+{line_gap_px}"
-#
-#         box = "1" if subtitle_box else "0"
-#
-#         if line1:
-#             line1_esc = _ffmpeg_escape_drawtext(line1)
-#             vf_parts.append(
-#                 "drawtext="
-#                 f"{font_arg}:"
-#                 f"text='{line1_esc}':"
-#                 f"fontsize={int(subtitle_fontsize)}:"
-#                 "fontcolor=white:"
-#                 "x=(w-text_w)/2:"
-#                 f"y={y_line1}:"
-#                 f"box={box}:"
-#                 f"boxcolor={subtitle_boxcolor}:"
-#                 f"boxborderw={int(subtitle_boxborderw)}:"
-#                 f"enable='between(t,{show_t:.3f},{hide_t:.3f})':"
-#                 f"alpha='{alpha_expr}'"
-#             )
-#
-#         if line2:
-#             # 두 번째 줄: y를 아래로
-#             line2_esc = _ffmpeg_escape_drawtext(line2)
-#             vf_parts.append(
-#                 "drawtext="
-#                 f"{font_arg}:"
-#                 f"text='{line2_esc}':"
-#                 f"fontsize={int(subtitle_fontsize)}:"
-#                 "fontcolor=white:"
-#                 "x=(w-text_w)/2:"
-#                 f"y={y_line2}:"
-#                 f"box={box}:"
-#                 f"boxcolor={subtitle_boxcolor}:"
-#                 f"boxborderw={int(subtitle_boxborderw)}:"
-#                 f"enable='between(t,{show_t:.3f},{hide_t:.3f})':"
-#                 f"alpha='{alpha_expr}'"
-#             )
-#
-#     vf_chain = ",".join(vf_parts) if vf_parts else "null"
-#     vf = f"{vf_in}{vf_chain}[{vf_out}]"
-#
-#     # 6) 최종 ffmpeg 렌더
-#     cmd = [ffmpeg_exe, "-y"]
-#     for p in inputs:
-#         cmd += ["-i", p]
-#
-#     filter_complex = ";".join(fc_parts + [vf])
-#     cmd += [
-#         "-filter_complex", filter_complex,
-#         "-map", f"[{vf_out}]",
-#         "-map", "[aout]",
-#         "-c:v", "libx264",
-#         "-preset", video_preset,
-#         "-crf", str(video_crf),
-#         "-c:a", "aac",
-#         "-b:a", audio_bitrate,
-#         "-movflags", "+faststart",
-#         "-shortest",
-#         str(out_path),
-#     ]
-#
-#     rr = subprocess.run(
-#         cmd,
-#         capture_output=True,
-#         text=True,
-#         encoding="utf-8",
-#         errors="ignore",
-#         startupinfo=startupinfo,
-#     )
-#     if rr.returncode != 0:
-#         raise RuntimeError(f"FFMPEG 최종 렌더 실패:\n{rr.stderr}")
-#
-#     # 7) 임시 파일 정리
-#     try:
-#         if list_file.exists():
-#             list_file.unlink()
-#     except Exception:
-#         pass
-#     try:
-#         if temp_visual.exists():
-#             temp_visual.unlink()
-#     except Exception:
-#         pass
-
+# 영상합치기 shopping 탭
 def concatenate_scene_clips_final_av(
     *,
     clip_paths: List[Path],
@@ -4065,9 +3649,607 @@ def build_missing_images_from_story(
     return created
 
 
+def build_step1_zimage_base(
+        *,
+        video_json_path: str | _Path,
+        source_json_path: str | _Path,
+        workflow_path: str | _Path | None = None,
+        ui_width: int = 720,
+        ui_height: int = 1280,
+        steps: int = 28,
+        skip_if_exists: bool = True,
+        timeout_sec: int = 1800,
+        poll_sec: float = 1.0,
+        # 프롬프트 키 우선순위(탭마다 다르게 주입)
+        pos_keys: List[str] | None = None,
+        neg_keys: List[str] | None = None,
+        # faceswap: 기본 OFF, 필요 시 enable ids로 ON
+        reactor_disable_all_by_default: bool = True,
+        reactor_enable_node_ids: List[str] | None = None,
+        # 워크플로우의 positive/negative 주입을 "링크 기반"으로 하되,
+        # 필요하면 노드ID fallback도 지정 가능
+        fallback_positive_clip_node_id: str | None = "6",
+        fallback_negative_clip_node_id: str | None = "217",
+        # 출력 다운로드 파일 prefix
+        out_prefix: str = "temp_",
+        out_ext: str = ".png",
+        on_progress: Optional[Dict[str, Any] | Callable[[Dict[str, Any]], None]] = None,
+) -> Dict[str, _Path]:
+    """
+    공통 Step1 (Z-Image 베이스 생성) 엔진
+
+    - source_json_path(프롬프트 원본)에서 scene별 prompt를 읽어서
+      workflow_path(Z-Image 계열 워크플로우)에 주입하고,
+      imgs/{out_prefix}{scene_id}{out_ext} 로 저장한다.
+    - faceswap(ReActorFaceSwap)는 디폴트 OFF, reactor_enable_node_ids로 지정한 노드만 ON 가능.
+    - 반환: {scene_id: 생성된 이미지 경로}
+    """
+
+    def _notify(stage: str, msg: str = "", **extra: Any) -> None:
+        if not on_progress:
+            return
+        data: Dict[str, Any] = {"stage": stage, "msg": msg}
+        if extra:
+            data.update(extra)
+        try:
+            if callable(on_progress):
+                on_progress(data)
+            elif isinstance(on_progress, dict):
+                cb = on_progress.get("callback")
+                if callable(cb):
+                    cb(data)
+        except Exception:
+            pass
+
+    def _normalize_host(raw: str) -> str:
+        s = (raw or "").strip()
+        if not s:
+            s = "http://127.0.0.1:8188"
+        pr = _urlparse.urlparse(s)
+        if not pr.scheme:
+            s = "http://" + s.lstrip("/")
+        return s.rstrip("/")
+
+    def _submit_and_wait(base_url: str, graph: Dict[str, Any], *, timeout: int, poll: float) -> Dict[str, Any]:
+        r = requests.post(f"{base_url}/prompt", json={"prompt": graph}, timeout=60)
+        r.raise_for_status()
+        j = r.json() or {}
+        pid = j.get("prompt_id")
+        if not pid:
+            raise RuntimeError(f"ComfyUI prompt_id 없음: {j}")
+
+        t0 = _time.time()
+        while True:
+            if _time.time() - t0 > timeout:
+                raise TimeoutError(f"ComfyUI timeout({timeout}s): prompt_id={pid}")
+            rr = requests.get(f"{base_url}/history/{pid}", timeout=30)
+            rr.raise_for_status()
+            h = rr.json() or {}
+            if pid in h:
+                return h[pid]
+            _time.sleep(max(0.05, float(poll)))
+
+    def _download_first_image(base_url: str, outputs: Dict[str, Any], out_path: _Path) -> None:
+        for _, out_d in (outputs or {}).items():
+            if not isinstance(out_d, dict):
+                continue
+            imgs = out_d.get("images", []) or []
+            if not isinstance(imgs, list):
+                continue
+            for img in imgs:
+                if not isinstance(img, dict):
+                    continue
+                fname = img.get("filename")
+                if not fname:
+                    continue
+                params = {"filename": fname, "type": img.get("type", "output")}
+                sub = img.get("subfolder", None)
+                if sub is not None:
+                    params["subfolder"] = sub
+                resp = requests.get(f"{base_url}/view", params=params, timeout=60)
+                resp.raise_for_status()
+                ensure_dir(out_path.parent)
+                out_path.write_bytes(resp.content)
+                return
+        raise RuntimeError("outputs에 images가 없습니다(SaveImage/PreviewImage 출력 확인 필요)")
+
+    def _linked_node_id(v: Any) -> Optional[str]:
+        if isinstance(v, list) and len(v) >= 1:
+            return str(v[0])
+        return None
+
+    def _infer_ksamplers(graph: Dict[str, Any]) -> List[tuple[str, Dict[str, Any]]]:
+        out: List[tuple[str, Dict[str, Any]]] = []
+        for nid, node in (graph or {}).items():
+            if isinstance(node, dict) and str(node.get("class_type")) == "KSampler":
+                out.append((str(nid), node))
+        return out
+
+    def _set_cliptext(graph: Dict[str, Any], clip_nid: Optional[str], text: str) -> bool:
+        if not clip_nid:
+            return False
+        node = graph.get(str(clip_nid))
+        if not isinstance(node, dict):
+            return False
+        if str(node.get("class_type")) != "CLIPTextEncode":
+            return False
+        node.setdefault("inputs", {})["text"] = text
+        return True
+
+    # ------------------------
+    # paths / docs
+    # ------------------------
+    p_video = _P(video_json_path).resolve()
+    if not p_video.exists():
+        raise FileNotFoundError(f"video.json 없음: {p_video}")
+    proj_dir = p_video.parent
+    video_doc = load_json(p_video, {}) or {}
+    scenes = (video_doc.get("scenes") or []) or []
+
+    p_src = _P(source_json_path).resolve()
+    if not p_src.exists():
+        raise FileNotFoundError(f"source json 없음: {p_src}")
+    src_doc = load_json(p_src, {}) or {}
+    src_scenes = (src_doc.get("scenes") or []) or []
+
+    # id 매핑(t_001 / 001 / 1 모두)
+    src_map: Dict[str, Dict[str, Any]] = {}
+    for s in src_scenes:
+        if not isinstance(s, dict):
+            continue
+        rid = str(s.get("id", "")).strip()
+        if not rid:
+            continue
+        src_map[rid] = s
+        if rid.startswith("t_"):
+            src_map[rid.replace("t_", "")] = s
+            x = rid.replace("t_", "")
+            if x.isdigit():
+                src_map[str(int(x))] = s
+        if rid.isdigit():
+            src_map[str(int(rid))] = s
+            src_map[f"t_{int(rid):03d}"] = s
+
+    paths_v = video_doc.get("paths") or {}
+    root_dir = _P(paths_v.get("root") or proj_dir)
+    imgs_dir_name = str(paths_v.get("imgs_dir") or "imgs")
+    img_root = ensure_dir(root_dir / imgs_dir_name)
+
+    # workflow
+    try:
+        base_jsons = _P(JSONS_DIR)
+    except Exception:
+        base_jsons = _P(r"C:\my_games\shorts_make\app\jsons")
+
+    wf = _P(workflow_path) if workflow_path else (base_jsons / "Z-Image-lora.json")
+    if not wf.exists():
+        raise FileNotFoundError(f"Step1 workflow 없음: {wf}")
+
+    graph_origin: Dict[str, Any] = _json.loads(wf.read_text(encoding="utf-8"))
+
+    # comfy host
+    try:
+        from app import settings as _settings
+        comfy_host_raw = getattr(_settings, "COMFY_HOST", "")
+    except Exception:
+        comfy_host_raw = ""
+    base_url = _normalize_host(comfy_host_raw)
+
+    # keys default
+    if pos_keys is None:
+        pos_keys = ["prompt_img_1", "prompt_img", "prompt"]
+    if neg_keys is None:
+        neg_keys = ["prompt_negative", "prompt_img_neg", "prompt_neg"]
+
+    # ------------------------
+    # run
+    # ------------------------
+    created: Dict[str, _Path] = {}
+    enable_set = set((reactor_enable_node_ids or []))
+
+    _notify("step1", f"[Step1] start source={p_src.name} workflow={wf.name}")
+
+    for sc in scenes:
+        if not isinstance(sc, dict):
+            continue
+        sid = str(sc.get("id", "")).strip()
+        if not sid:
+            continue
+
+        src_sc = src_map.get(sid)
+        if not src_sc and sid.startswith("t_"):
+            src_sc = src_map.get(sid.replace("t_", ""))
+            if not src_sc and sid.replace("t_", "").isdigit():
+                src_sc = src_map.get(str(int(sid.replace("t_", ""))))
+
+        if not src_sc:
+            continue
+
+        pos = ""
+        for k in pos_keys:
+            v = src_sc.get(k)
+            if isinstance(v, str) and v.strip():
+                pos = v.strip()
+                break
+
+        neg = ""
+        for k in neg_keys:
+            v = src_sc.get(k)
+            if isinstance(v, str) and v.strip():
+                neg = v.strip()
+                break
+
+        if not pos:
+            continue
+
+        out_path = img_root / f"{out_prefix}{sid}{out_ext}"
+        if skip_if_exists and out_path.exists() and out_path.stat().st_size > 0:
+            created[sid] = out_path
+            continue
+
+        _notify("step1_scene", f"[Step1] {sid} generating...")
+
+        graph = _json.loads(_json.dumps(graph_origin))
+
+        # 0) width/height/steps + Preview->Save
+        for nid, node in (graph or {}).items():
+            if not isinstance(node, dict):
+                continue
+            ctype = str(node.get("class_type") or "")
+            inputs = node.get("inputs", {}) or {}
+
+            if (
+                    "width" in inputs and "height" in inputs
+                    and isinstance(inputs.get("width"), int) and isinstance(inputs.get("height"), int)
+            ):
+                inputs["width"] = int(ui_width)
+                inputs["height"] = int(ui_height)
+
+            if ctype == "KSampler":
+                if "steps" in inputs:
+                    inputs["steps"] = int(steps)
+
+            if ctype == "PreviewImage":
+                node["class_type"] = "SaveImage"
+                node.setdefault("inputs", {})["filename_prefix"] = "Z_Base"
+
+        # 1) positive/negative (KSampler link 기반)
+        ok_pos = False
+        ok_neg = False
+        for _, ksampler in _infer_ksamplers(graph):
+            inp = (ksampler.get("inputs") or {})
+            if not ok_pos:
+                ok_pos = _set_cliptext(graph, _linked_node_id(inp.get("positive")), pos)
+            if neg and (not ok_neg):
+                ok_neg = _set_cliptext(graph, _linked_node_id(inp.get("negative")), neg)
+
+        # fallback by node id
+        if (not ok_pos) and fallback_positive_clip_node_id:
+            _set_cliptext(graph, fallback_positive_clip_node_id, pos)
+        if neg and (not ok_neg) and fallback_negative_clip_node_id:
+            _set_cliptext(graph, fallback_negative_clip_node_id, neg)
+
+        # 2) seed (KSampler.seed int만 갱신; 링크 seed는 워크플로우쪽이 필요하면 별도 확장)
+        for _, ksampler in _infer_ksamplers(graph):
+            inp = (ksampler.get("inputs") or {})
+            if "seed" in inp and isinstance(inp.get("seed"), int):
+                inp["seed"] = _random.randint(1, 2_147_483_646)
+
+        # 3) ReActorFaceSwap 디폴트 OFF + 선택 ON
+        for nid, node in (graph or {}).items():
+            if not isinstance(node, dict):
+                continue
+            if str(node.get("class_type") or "") == "ReActorFaceSwap":
+                inp = node.setdefault("inputs", {})
+                if reactor_disable_all_by_default:
+                    inp["enabled"] = False
+                if str(nid) in enable_set:
+                    inp["enabled"] = True
+
+        result = _submit_and_wait(base_url, graph, timeout=timeout_sec, poll=poll_sec)
+        outputs = result.get("outputs") or {}
+        _download_first_image(base_url, outputs, out_path)
+        created[sid] = out_path
+
+    _notify("step1_done", f"[Step1] done created={len(created)}")
+    return created
 
 
 
+def build_step2_qwen_composite(
+        *,
+        video_json_path: str | _Path,
+        source_json_path: str | _Path,
+        workflow_path: str | _Path | None = None,
+        # 베이스 이미지 경로 규칙(쇼츠는 Step2만 쓰니, base_from_key를 쓸 수도 있음)
+        base_prefix: str = "temp_",
+        base_ext: str = ".png",
+        # 쇼츠에서 “메인이미지 만들기”로 Step2만 쓸 경우:
+        # source_json에서 베이스 이미지를 직접 지정하는 키를 쓰고 싶으면 base_from_key 사용
+        base_from_key: str | None = None,  # 예: "img_file" 또는 "base_img_file"
+        # product image는 쇼핑에서만 필요. 없으면 Step2를 "단순 편집"으로도 사용 가능하게 둠.
+        product_image_path: str | _Path | None = None,
+        # 워크플로우의 입력 주입 노드ID(기본은 네 QwenEdit2511-V1 구조)
+        node_id_base_image: str = "9",
+        node_id_product_image: str = "32",
+        node_id_prompt_value: str = "88",
+        node_id_sampler: str = "107",  # QwenImageIntegratedKSampler
+        sampler_steps_key: str = "steps",
+        sampler_seed_key: str = "seed",
+        # 프롬프트 키 우선순위
+        edit_keys: List[str] | None = None,
+        ui_width: int = 720,
+        ui_height: int = 1280,
+        steps: int = 28,
+        skip_if_exists: bool = True,
+        timeout_sec: int = 1800,
+        poll_sec: float = 1.0,
+        on_progress: Optional[Dict[str, Any] | Callable[[Dict[str, Any]], None]] = None,
+) -> None:
+    """
+    공통 Step2 (QwenEdit 합성/편집) 엔진
+
+    - source_json_path(프롬프트 원본)에서 scene별 edit prompt를 읽어서
+      workflow_path(QwenEdit 계열)에 주입하고,
+      imgs/{scene_id}.png 로 저장하며 video.json의 scene.img_file 갱신
+    - product_image_path가 None이면, product 입력 노드는 건드리지 않고 “편집만” 수행 가능
+    """
+
+
+    def _notify(stage: str, msg: str = "", **extra: Any) -> None:
+        if not on_progress:
+            return
+        data: Dict[str, Any] = {"stage": stage, "msg": msg}
+        if extra:
+            data.update(extra)
+        try:
+            if callable(on_progress):
+                on_progress(data)
+            elif isinstance(on_progress, dict):
+                cb = on_progress.get("callback")
+                if callable(cb):
+                    cb(data)
+        except Exception:
+            pass
+
+    def _normalize_host(raw: str) -> str:
+        s = (raw or "").strip()
+        if not s:
+            s = "http://127.0.0.1:8188"
+        pr = _urlparse.urlparse(s)
+        if not pr.scheme:
+            s = "http://" + s.lstrip("/")
+        return s.rstrip("/")
+
+    def _submit_and_wait(base_url: str, graph: Dict[str, Any], *, timeout: int, poll: float) -> Dict[str, Any]:
+        r = requests.post(f"{base_url}/prompt", json={"prompt": graph}, timeout=60)
+        r.raise_for_status()
+        j = r.json() or {}
+        pid = j.get("prompt_id")
+        if not pid:
+            raise RuntimeError(f"ComfyUI prompt_id 없음: {j}")
+
+        t0 = _time.time()
+        while True:
+            if _time.time() - t0 > timeout:
+                raise TimeoutError(f"ComfyUI timeout({timeout}s): prompt_id={pid}")
+            rr = requests.get(f"{base_url}/history/{pid}", timeout=30)
+            rr.raise_for_status()
+            h = rr.json() or {}
+            if pid in h:
+                return h[pid]
+            _time.sleep(max(0.05, float(poll)))
+
+    def _download_first_image(base_url: str, outputs: Dict[str, Any], out_path: _Path) -> None:
+        for _, out_d in (outputs or {}).items():
+            if not isinstance(out_d, dict):
+                continue
+            imgs = out_d.get("images", []) or []
+            if not isinstance(imgs, list):
+                continue
+            for img in imgs:
+                if not isinstance(img, dict):
+                    continue
+                fname = img.get("filename")
+                if not fname:
+                    continue
+                params = {"filename": fname, "type": img.get("type", "output")}
+                sub = img.get("subfolder", None)
+                if sub is not None:
+                    params["subfolder"] = sub
+                resp = requests.get(f"{base_url}/view", params=params, timeout=60)
+                resp.raise_for_status()
+                ensure_dir(out_path.parent)
+                out_path.write_bytes(resp.content)
+                return
+        raise RuntimeError("outputs에 images가 없습니다(SaveImage/PreviewImage 출력 확인 필요)")
+
+    p_video = _P(video_json_path).resolve()
+    if not p_video.exists():
+        raise FileNotFoundError(f"video.json 없음: {p_video}")
+    proj_dir = p_video.parent
+    video_doc = load_json(p_video, {}) or {}
+    scenes = (video_doc.get("scenes") or []) or []
+
+    p_src = _P(source_json_path).resolve()
+    if not p_src.exists():
+        raise FileNotFoundError(f"source json 없음: {p_src}")
+    src_doc = load_json(p_src, {}) or {}
+    src_scenes = (src_doc.get("scenes") or []) or []
+
+    src_map: Dict[str, Dict[str, Any]] = {}
+    for s in src_scenes:
+        if not isinstance(s, dict):
+            continue
+        rid = str(s.get("id", "")).strip()
+        if not rid:
+            continue
+        src_map[rid] = s
+        if rid.startswith("t_"):
+            src_map[rid.replace("t_", "")] = s
+            x = rid.replace("t_", "")
+            if x.isdigit():
+                src_map[str(int(x))] = s
+        if rid.isdigit():
+            src_map[str(int(rid))] = s
+            src_map[f"t_{int(rid):03d}"] = s
+
+    paths_v = video_doc.get("paths") or {}
+    root_dir = _P(paths_v.get("root") or proj_dir)
+    imgs_dir_name = str(paths_v.get("imgs_dir") or "imgs")
+    img_root = ensure_dir(root_dir / imgs_dir_name)
+
+    # workflow
+    try:
+        base_jsons = _P(JSONS_DIR)
+    except Exception:
+        base_jsons = _P(r"C:\my_games\shorts_make\app\jsons")
+
+    wf = _P(workflow_path) if workflow_path else (base_jsons / "QwenEdit2511-V1.json")
+    if not wf.exists():
+        raise FileNotFoundError(f"Step2 workflow 없음: {wf}")
+    graph_origin: Dict[str, Any] = _json.loads(wf.read_text(encoding="utf-8"))
+
+    # comfy input dir + host
+    try:
+        from app import settings as _settings
+        comfy_host_raw = getattr(_settings, "COMFY_HOST", "")
+        comfy_input_dir = _P(getattr(_settings, "COMFY_INPUT_DIR", str(proj_dir / "input")))
+    except Exception:
+        comfy_host_raw = ""
+        comfy_input_dir = _P(proj_dir / "input")
+
+    base_url = _normalize_host(comfy_host_raw)
+    comfy_input_dir.mkdir(parents=True, exist_ok=True)
+
+    # edit keys default
+    if edit_keys is None:
+        edit_keys = ["prompt_img_2", "prompt_edit", "prompt"]
+
+    # product image input 준비(있으면)
+    prod_input_name: Optional[str] = None
+    if product_image_path:
+        p_prod = _P(product_image_path).resolve()
+        if not p_prod.exists():
+            raise FileNotFoundError(f"product image 없음: {p_prod}")
+        prod_input_name = f"prod_{_uuid.uuid4().hex[:6]}.png"
+        shutil.copy2(str(p_prod), str(comfy_input_dir / prod_input_name))
+
+    _notify("step2", f"[Step2] start source={p_src.name} workflow={wf.name}")
+
+    for sc in scenes:
+        if not isinstance(sc, dict):
+            continue
+        sid = str(sc.get("id", "")).strip()
+        if not sid:
+            continue
+
+        src_sc = src_map.get(sid)
+        if not src_sc and sid.startswith("t_"):
+            src_sc = src_map.get(sid.replace("t_", ""))
+            if not src_sc and sid.replace("t_", "").isdigit():
+                src_sc = src_map.get(str(int(sid.replace("t_", ""))))
+
+        if not src_sc:
+            continue
+
+        # edit prompt
+        p_edit = ""
+        for k in edit_keys:
+            v = src_sc.get(k)
+            if isinstance(v, str) and v.strip():
+                p_edit = v.strip()
+                break
+        if not p_edit:
+            continue
+
+        # base image 결정
+        base_file: Optional[_P] = None
+        if base_from_key:
+            v = src_sc.get(base_from_key)
+            if isinstance(v, str) and v.strip():
+                cand = (proj_dir / v).resolve() if not _P(v).is_absolute() else _P(v).resolve()
+                if cand.exists():
+                    base_file = cand
+
+        if base_file is None:
+            base_file = img_root / f"{base_prefix}{sid}{base_ext}"
+
+        if not base_file.exists():
+            # Step2만 쓰는 경우엔 base_from_key 지정해줘야 함.
+            continue
+
+        final_file = img_root / f"{sid}.png"
+        if skip_if_exists and final_file.exists() and final_file.stat().st_size > 0:
+            sc["img_file"] = str(final_file)
+            continue
+
+        _notify("step2_scene", f"[Step2] {sid} editing...")
+
+        base_input_name = f"base_{sid}_{_uuid.uuid4().hex[:6]}.png"
+        shutil.copy2(str(base_file), str(comfy_input_dir / base_input_name))
+
+        graph = _json.loads(_json.dumps(graph_origin))
+
+        # 주입: base image
+        if node_id_base_image in graph:
+            try:
+                graph[node_id_base_image].setdefault("inputs", {})["image"] = base_input_name
+            except Exception:
+                pass
+
+        # 주입: product image (있을 때만)
+        if prod_input_name and node_id_product_image in graph:
+            try:
+                graph[node_id_product_image].setdefault("inputs", {})["image"] = prod_input_name
+            except Exception:
+                pass
+
+        # 주입: prompt value
+        if node_id_prompt_value in graph:
+            try:
+                graph[node_id_prompt_value].setdefault("inputs", {})["value"] = p_edit
+            except Exception:
+                pass
+
+        # steps/seed (QwenImageIntegratedKSampler 포함)
+        if node_id_sampler in graph:
+            try:
+                inp = graph[node_id_sampler].setdefault("inputs", {})
+                if sampler_steps_key in inp:
+                    inp[sampler_steps_key] = int(steps)
+                if sampler_seed_key in inp and isinstance(inp.get(sampler_seed_key), int):
+                    inp[sampler_seed_key] = _random.randint(1, 2_147_483_646)
+            except Exception:
+                pass
+
+        # 폭넓게 width/height 처리 + Preview->Save
+        for nid, node in (graph or {}).items():
+            if not isinstance(node, dict):
+                continue
+            ctype = str(node.get("class_type") or "")
+            inputs = node.get("inputs", {}) or {}
+
+            if (
+                    "width" in inputs and "height" in inputs
+                    and isinstance(inputs.get("width"), int) and isinstance(inputs.get("height"), int)
+            ):
+                inputs["width"] = int(ui_width)
+                inputs["height"] = int(ui_height)
+
+            if ctype == "PreviewImage":
+                node["class_type"] = "SaveImage"
+                node.setdefault("inputs", {})["filename_prefix"] = "Step2_Out"
+
+        result = _submit_and_wait(base_url, graph, timeout=timeout_sec, poll=poll_sec)
+        outputs = result.get("outputs") or {}
+        _download_first_image(base_url, outputs, final_file)
+
+        sc["img_file"] = str(final_file)
+
+    # video.json 저장
+    save_json(p_video, video_doc)
+    _notify("step2_done", "[Step2] done")
 
 
 

@@ -28,6 +28,7 @@ from app.utils import (
 )
 from app import settings
 from app.video_build import build_shots_with_i2v, concatenate_scene_clips, fill_prompt_movie_with_ai_long, concatenate_scene_clips_final_av
+from app.video_build import build_step1_zimage_base, build_step2_qwen_composite
 
 def _now_str() -> str:
     return datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
@@ -356,274 +357,75 @@ def generate_bgm_acestep(
 # -----------------------------------------------------------------------------
 
 
+
+
 def build_shopping_images_2step(
-        video_json_path: str | Path,
-        *,
-        ui_width: int = 720,
-        ui_height: int = 1280,
-        steps: int = 28,
-        skip_if_exists: bool = True,
-        on_progress: Optional[Callable[[Dict], None]] = None
+    video_json_path: str | Path,
+    *,
+    ui_width: Optional[int],
+    ui_height: Optional[int],
+    steps: Optional[int],
+    skip_if_exists: bool = True,
+    on_progress: Optional[Callable[[Dict], None]] = None,
 ) -> None:
     """
-    [최종 수정] 이미지 생성 함수
-    - 원칙: 프롬프트는 무조건 'video_shopping.json'(원본)에서만 가져옵니다.
-    - video.json은 생성된 이미지 경로를 저장하는 용도로만 사용합니다.
+    기존 동작 유지: Step1(Z-Image) -> Step2(QwenEdit) 순차 실행.
+    단, 내부 구현은 공통 함수(build_step1_zimage_base, build_step2_qwen_composite)를 호출하도록 구성.
+
+    - video_json_path : C:\...\maked_title\[title]\video.json 경로
+    - product_dir     : video.json이 있는 폴더 (상품 폴더)
     """
-    print(f"\n======== [Image Build Start (Source: video_shopping.json)] ========")
-    print(f"Target: {video_json_path}")
 
-    vpath = Path(video_json_path)
-    product_dir = vpath.parent
-    imgs_dir = ensure_dir(product_dir / "imgs")
+    # 경로 정규화
+    vpath = Path(video_json_path).resolve()
+    product_dir = vpath.parent  # ex) C:\my_games\shorts_make\maked_title\[title]
 
-    # 1. 제품 이미지 찾기
-    product_json_path = product_dir / "product.json"
-    product_img_file = None
-    if product_json_path.exists():
-        try:
-            pj = json.loads(product_json_path.read_text(encoding="utf-8"))
-            if pj.get("image_file"):
-                pi = product_dir / pj["image_file"]
-                if pi.exists():
-                    product_img_file = pi
-        except:
-            pass
+    # settings에서 JSONS_DIR 가져오기 (없으면 product_dir/jsons 사용)
+    jsons_dir_conf = getattr(settings, "JSONS_DIR", product_dir / "jsons")
+    jsons_dir = Path(str(jsons_dir_conf))
 
-    if product_img_file:
-        print(f"✅ Product Image Found: {product_img_file.name}")
-    else:
-        print(f"❌ Product Image NOT FOUND! Step 2 will be skipped.")
+    # 워크플로우 경로 결정
+    wf_zimage = jsons_dir / "Z-Image-lora.json"
+    wf_qwen = jsons_dir / "QwenEdit2511-V1.json"
 
-    # 2. [핵심] 원본 데이터(video_shopping.json) 로드 -> 프롬프트의 유일한 출처
-    shopping_source_map = {}
-    shop_json_path = product_dir / "video_shopping.json"
+    # 소스 JSON / 상품 이미지 경로
+    source_json_path = product_dir / "video_shopping.json"
+    product_image_path = product_dir / "image.png"
 
-    if not shop_json_path.exists():
-        print(f"❌ Critical Error: video_shopping.json not found!")
-        if on_progress: on_progress({"msg": "❌ 원본 데이터(video_shopping.json)가 없습니다."})
-        return
+    # -------------------------
+    # Step1: Z-Image (베이스 이미지 생성)
+    # -------------------------
+    build_step1_zimage_base(
+        video_json_path=vpath,
+        source_json_path=source_json_path,
+        workflow_path=wf_zimage,
+        ui_width=ui_width,
+        ui_height=ui_height,
+        steps=steps,
+        skip_if_exists=skip_if_exists,
+        pos_keys=["prompt_img_1", "prompt_img"],
+        neg_keys=["prompt_negative", "prompt_img_neg"],
+        reactor_disable_all_by_default=True,
+        reactor_enable_node_ids=None,  # 기본 OFF
+        on_progress=on_progress,
+    )
 
-    try:
-        shop_data = load_json(shop_json_path, {})
-        shop_scenes = shop_data.get("scenes", [])
+    # -------------------------
+    # Step2: QwenEdit (상품 합성)
+    # -------------------------
+    build_step2_qwen_composite(
+        video_json_path=vpath,
+        source_json_path=source_json_path,
+        workflow_path=wf_qwen,
+        product_image_path=product_image_path,
+        ui_width=ui_width,
+        ui_height=ui_height,
+        steps=steps,
+        skip_if_exists=skip_if_exists,
+        edit_keys=["prompt_img_2", "prompt_edit"],
+        on_progress=on_progress,
+    )
 
-        # ID 매핑 (001, 1, t_001 등 다양한 포맷 대응)
-        for ss in shop_scenes:
-            raw_id = str(ss.get("id", ""))
-            # 그대로 저장
-            shopping_source_map[raw_id] = ss
-            # 숫자만 추출해서 저장 (001 -> 1)
-            if raw_id.isdigit():
-                shopping_source_map[str(int(raw_id))] = ss
-                shopping_source_map[f"t_{int(raw_id):03d}"] = ss
-            # t_ 제거 버전 저장
-            if raw_id.startswith("t_"):
-                shopping_source_map[raw_id.replace("t_", "")] = ss
-
-        print(f"✅ Source Data Loaded: {len(shop_scenes)} scenes from video_shopping.json")
-    except Exception as e:
-        print(f"❌ Failed to load video_shopping.json: {e}")
-        return
-
-    # 3. 타겟 데이터(video.json) 로드
-    video_doc = load_json(vpath, {})
-    scenes = video_doc.get("scenes", [])
-
-    comfy_host = getattr(settings, "COMFY_HOST", "http://127.0.0.1:8188").rstrip("/")
-    comfy_input_dir = Path(settings.COMFY_INPUT_DIR)
-    comfy_input_dir.mkdir(parents=True, exist_ok=True)
-
-    # -----------------------------------------------------------
-    # Step 1: Z-Image Batch (베이스 생성)
-    # -----------------------------------------------------------
-    if on_progress: on_progress({"msg": "=== [Step 1] 베이스 이미지 생성 (Source 참조) ==="})
-
-    wf_z_path = Path(settings.JSONS_DIR) / "Z-Image-lora.json"
-    if not wf_z_path.exists():
-        wf_z_path = Path(r"C:\my_games\shorts_make\app\jsons\Z-Image-lora.json")
-
-    if wf_z_path.exists():
-        with open(wf_z_path, "r", encoding="utf-8") as f:
-            graph_z_origin = json.load(f)
-
-        for sc in scenes:
-            sid = sc.get("id")
-            temp_file = imgs_dir / f"temp_{sid}.png"
-
-            # [핵심] 무조건 원본(video_shopping.json)에서 프롬프트 가져옴
-            source_scene = shopping_source_map.get(sid)
-            if not source_scene:
-                # 매핑 실패 시 다른 키 시도
-                if sid.startswith("t_"):
-                    source_scene = shopping_source_map.get(sid.replace("t_", ""))
-                    if not source_scene and sid.replace("t_", "").isdigit():
-                        source_scene = shopping_source_map.get(str(int(sid.replace("t_", ""))))
-
-            p1 = ""
-            if source_scene:
-                p1 = source_scene.get("prompt_img_1") or source_scene.get("prompt_img", "")
-
-            if not p1:
-                print(f"⚠️ [Step 1] No prompt in video_shopping.json for {sid} (Skipping)")
-                continue
-
-            # 파일 존재 시 스킵
-            if skip_if_exists and temp_file.exists() and temp_file.stat().st_size > 0:
-                print(f"[Step 1] Skip existing: {sid}")
-                continue
-
-            if on_progress: on_progress({"msg": f"[Step 1] 베이스 생성: {sid}..."})
-            print(f"[Step 1] Generating {sid} using prompt from Source...")
-
-            graph = json.loads(json.dumps(graph_z_origin))
-            for nid, node in graph.items():
-                ctype = node.get("class_type", "")
-                inputs = node.get("inputs", {})
-
-                if ctype == "CLIPTextEncode" and nid == "6":
-                    inputs["text"] = p1
-                if "LatentImage" in ctype:
-                    inputs["width"] = ui_width
-                    inputs["height"] = ui_height
-                if ctype == "KSampler" and "seed" in inputs:
-                    inputs["seed"] = random.randint(1, 10 ** 9)
-                    if "steps" in inputs: inputs["steps"] = steps
-                if ctype == "PreviewImage":
-                    node["class_type"] = "SaveImage"
-                    node.setdefault("inputs", {})["filename_prefix"] = "Z_Base"
-
-            try:
-                res = submit_and_wait(comfy_host, graph, on_progress=on_progress)
-                outputs = res.get("outputs", {})
-                found = False
-                for _, out_d in outputs.items():
-                    for img in out_d.get("images", []):
-                        fname = img["filename"]
-                        resp = requests.get(f"{comfy_host}/view", params={"filename": fname, "type": img["type"]})
-                        with open(temp_file, "wb") as f:
-                            f.write(resp.content)
-                        found = True
-                        break
-                    if found: break
-                if found:
-                    print(f"✅ [Step 1] Created: {temp_file.name}")
-            except Exception as e:
-                print(f"❌ [Step 1] Error {sid}: {e}")
-
-    # -----------------------------------------------------------
-    # Step 2: Qwen Batch (제품 합성)
-    # -----------------------------------------------------------
-    if on_progress: on_progress({"msg": "=== [Step 2] 제품 합성 (Source 참조) ==="})
-    print("\n-------- Starting Step 2 (Qwen Edit) --------")
-
-    wf_q_path = Path(settings.JSONS_DIR) / "QwenEdit2511-V1.json"
-    if not wf_q_path.exists():
-        wf_q_path = Path(r"C:\my_games\shorts_make\app\jsons\QwenEdit2511-V1.json")
-
-    if not wf_q_path.exists() or not product_img_file:
-        print("❌ Step 2 Aborted: Missing workflow or product image.")
-        return
-
-    with open(wf_q_path, "r", encoding="utf-8") as f:
-        graph_q_origin = json.load(f)
-
-    prod_input_name = f"prod_{uuid.uuid4().hex[:6]}.png"
-    shutil.copy2(product_img_file, comfy_input_dir / prod_input_name)
-
-    for sc in scenes:
-        sid = sc.get("id")
-        final_file = imgs_dir / f"{sid}.png"
-        temp_file = imgs_dir / f"temp_{sid}.png"
-
-        # 파일 존재 시 스킵
-        if skip_if_exists and final_file.exists() and final_file.stat().st_size > 0:
-            sc["img_file"] = str(final_file)
-            print(f"[Step 2] Skip existing: {sid}")
-            continue
-
-        if not temp_file.exists():
-            print(f"⚠️ [Step 2] Base image missing for {sid}. Skipping.")
-            continue
-
-        # [핵심] 무조건 원본(video_shopping.json)에서 프롬프트 가져옴
-        source_scene = shopping_source_map.get(sid)
-        if not source_scene:
-            if sid.startswith("t_"):
-                source_scene = shopping_source_map.get(sid.replace("t_", ""))
-                if not source_scene and sid.replace("t_", "").isdigit():
-                    source_scene = shopping_source_map.get(str(int(sid.replace("t_", ""))))
-
-        raw_p2 = ""
-        if source_scene:
-            raw_p2 = source_scene.get("prompt_img_2") or ""
-
-        if not raw_p2:
-            print(f"  - No Prompt 2 in Source. Copying Step 1 image.")
-            shutil.copy2(temp_file, final_file)
-            sc["img_file"] = str(final_file)
-            continue
-
-        # [Auto-Fix] 선생님이 가르쳐주신 문법 적용 ('from image 1' 필수)
-        p2_fixed = raw_p2
-        if "from image 1" not in raw_p2.lower():
-            pattern = re.compile(r"^(The|A|An)\s+([a-zA-Z0-9\s]+?)\s+(holding|has|is|with|placing|looking)",
-                                 re.IGNORECASE)
-            match = pattern.search(raw_p2)
-            if match:
-                p2_fixed = raw_p2.replace(match.group(2), f"{match.group(2)} from image 1", 1)
-            else:
-                p2_fixed = f"The subject from image 1 {raw_p2}"
-            print(f"🔧 [Auto-Fix] {sid}: {p2_fixed}")
-        else:
-            print(f"👍 [Prompt OK] {sid} (Source)")
-
-        base_input_name = f"base_{sid}_{uuid.uuid4().hex[:6]}.png"
-        shutil.copy2(temp_file, comfy_input_dir / base_input_name)
-
-        graph = json.loads(json.dumps(graph_q_origin))
-
-        if "9" in graph: graph["9"]["inputs"]["image"] = base_input_name
-        if "32" in graph: graph["32"]["inputs"]["image"] = prod_input_name
-        if "88" in graph: graph["88"]["inputs"]["value"] = p2_fixed
-
-        for nid, node in graph.items():
-            if node.get("class_type") == "PreviewImage":
-                node["class_type"] = "SaveImage"
-                node.setdefault("inputs", {})["filename_prefix"] = "ShopFinal"
-
-        if on_progress: on_progress({"msg": f"[Step 2] 합성 진행({sid})..."})
-        try:
-            res = submit_and_wait(comfy_host, graph, on_progress=on_progress)
-            outputs = res.get("outputs", {})
-            found = False
-            for _, out_d in outputs.items():
-                for img in out_d.get("images", []):
-                    fname = img["filename"]
-                    resp = requests.get(f"{comfy_host}/view", params={"filename": fname, "type": img["type"]})
-                    with open(final_file, "wb") as f:
-                        f.write(resp.content)
-                    sc["img_file"] = str(final_file)
-                    found = True
-                    break
-                if found: break
-
-            if found:
-                print(f"✅ Scene {sid} Synthesis Done.")
-            else:
-                print(f"❌ Scene {sid} Failed (No output).")
-
-        except Exception as e:
-            print(f"❌ Scene {sid} Error: {e}")
-
-    # 최종 결과 업데이트 (이미지 경로 등)
-    try:
-        with open(vpath, "w", encoding="utf-8") as f:
-            json.dump(video_doc, f, indent=2, ensure_ascii=False)
-    except:
-        pass
-
-    print("======== [Image Build End] ========\n")
 
 
 # -----------------------------------------------------------------------------
