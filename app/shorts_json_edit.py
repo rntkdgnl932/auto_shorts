@@ -873,6 +873,7 @@ class ScenePromptEditDialog(QtWidgets.QDialog):
         return group
 
     def on_ai_request(self):
+        # 1) UI FPS → video.json 동기화 (기존 유지)
         try:
             main_window = self.parent()
             if main_window and hasattr(main_window, "cmb_movie_fps"):
@@ -889,6 +890,7 @@ class ScenePromptEditDialog(QtWidgets.QDialog):
         except Exception as e_fps_sync:
             print(f"[JSON Edit] AI 요청 중 FPS 동기화 실패: {e_fps_sync}")
 
+        # 2) original_vibe (project.json에서 가져오되, 실패해도 진행)
         original_vibe_prompt = ""
         try:
             pj_path = self.json_path.parent / "project.json"
@@ -899,6 +901,7 @@ class ScenePromptEditDialog(QtWidgets.QDialog):
         except Exception as e_load_pj:
             print(f"[JSON Edit] project.json 로드 실패: {e_load_pj}")
 
+        # 3) AI 요청 대상 씬 수집 (direct_prompt 입력된 씬만)
         scenes_to_process: list[tuple[dict, str]] = []
         scenes_map = {scene.get("id"): scene for scene in self.scenes_data if isinstance(scene, dict) and "id" in scene}
         for scene_id, text_edit_widget in self.widget_map:
@@ -908,7 +911,10 @@ class ScenePromptEditDialog(QtWidgets.QDialog):
                     scenes_to_process.append((scenes_map[scene_id], direct_prompt_text))
 
         if not scenes_to_process:
-            QtWidgets.QMessageBox.information(self, "알림", "AI로 요청할 'direct_prompt' 내용이 없습니다.\n(UI의 FPS 설정값은 video.json에 저장됩니다.)")
+            QtWidgets.QMessageBox.information(
+                self, "알림",
+                "AI로 요청할 'direct_prompt' 내용이 없습니다.\n(UI의 FPS 설정값은 video.json에 저장됩니다.)"
+            )
             try:
                 save_json(self.json_path, self.full_video_data)
                 print(f"[JSON Edit] 프롬프트는 비어있으나, FPS 값({self.full_video_data.get('fps')})을 저장했습니다.")
@@ -920,37 +926,138 @@ class ScenePromptEditDialog(QtWidgets.QDialog):
         self.btn_update.setEnabled(False)
         self.btn_cancel.setEnabled(False)
 
+        def _guess_gender_word(char_id: str) -> str:
+            cid = (char_id or "").lower()
+            if "female" in cid or "woman" in cid or "girl" in cid:
+                return "woman"
+            if "male" in cid or "man" in cid or "boy" in cid:
+                return "man"
+            return "person"
+
+        def _build_slot_mapping_text(scene_chars, char_styles: dict) -> tuple[str, list[tuple[int, str, str]]]:
+            """
+            return:
+              mapping_text: system prompt에 넣을 텍스트
+              slot_items: [(image_num, char_id, gender_word), ...]
+            """
+            slot_map: dict[int, str] = {}
+
+            for c in (scene_chars or []):
+                cid = ""
+                slot_idx = None
+
+                if isinstance(c, str):
+                    parts = c.split(":")
+                    cid = parts[0].strip()
+                    if len(parts) > 1:
+                        try:
+                            slot_idx = int(parts[1].strip())
+                        except Exception:
+                            slot_idx = 0
+                    else:
+                        slot_idx = 0
+
+                elif isinstance(c, dict):
+                    cid = str(c.get("id", "")).strip()
+                    if "slot" in c:
+                        try:
+                            slot_idx = int(c.get("slot"))
+                        except Exception:
+                            slot_idx = 0
+                    elif "index" in c:
+                        try:
+                            slot_idx = int(c.get("index", 0) or 0)
+                        except Exception:
+                            slot_idx = 0
+                    else:
+                        slot_idx = 0
+
+                if cid and slot_idx is not None and slot_idx not in slot_map:
+                    slot_map[slot_idx] = cid
+
+            if not slot_map:
+                return "", []
+
+            lines = []
+            slot_items = []
+            for slot_idx in sorted(slot_map.keys()):
+                cid = slot_map[slot_idx]
+                image_num = slot_idx + 1
+                style = char_styles.get(cid, "Unknown style")
+                gender_word = _guess_gender_word(cid)
+                slot_items.append((image_num, cid, gender_word))
+
+                lines.append(f"   - **Image {image_num} Source**: '{cid}' ({style})")
+                lines.append(
+                    f"     -> RULE: When describing this character in English, you MUST refer to them as "
+                    f"**'the {gender_word} from image {image_num}'** (NOT just '{gender_word}' or '{cid}')."
+                )
+
+            mapping_text = "\n".join(lines)
+            return mapping_text, slot_items
+
+        def _ensure_from_image(prompt: str, slot_items: list[tuple[int, str, str]]) -> str:
+            """
+            AI가 'from image X'를 빼먹어도 최소한 1줄에서 강제로 보정.
+            - 이미 'from image'가 들어가 있으면 그대로 둠
+            - 없으면 "the {gender} from image {X}"를 앞에 프리픽스로 삽입
+            """
+            p = (prompt or "").strip()
+            if not p:
+                return p
+            low = p.lower()
+            if "from image" in low:
+                return p
+
+            if not slot_items:
+                return p
+
+            # 여러 캐릭이면 "the ... from image 1 and the ... from image 2" 형태로 앞에 붙임
+            refs = []
+            for image_num, _cid, gender_word in slot_items[:3]:
+                refs.append(f"the {gender_word} from image {image_num}")
+
+            if len(refs) == 1:
+                prefix = refs[0]
+            else:
+                prefix = " and ".join(refs)
+
+            # 기존 프롬프트가 "woman on rooftop, ..." 같은 태그형이어도 앞에 강제 삽입
+            return f"{prefix}, {p}"
+
         def job(progress_callback):
             _log = lambda msg: progress_callback({"msg": msg})
-            _log(f"총 {len(scenes_to_process)}개 씬에 대해 프롬프트를 AI로 갱신합니다...")
+            _log(f"총 {len(scenes_to_process)}개 씬에 대해 프롬프트를 AI로 갱신합니다.")
+
             quality_tags = self._AI_QUALITY_TAGS
             default_negative_tags = self._AI_DEFAULT_NEGATIVE_TAGS
             updated_count = 0
 
-            base_system_prompt = (
+            # 🔥 핵심: 이제 on_ai_request는 '태그 5~12'가 아니라
+            #         'prompt_img_core' / 'prompt_movie_core'를 "문장형"으로 받는다.
+            base_system_prompt_template = (
                 "You are a creative Music Video Director.\n"
-                "Your most important goal is to create **dynamic character action** that matches the **lyrics**. Avoid static, mannequin-like images.\n\n"
+                "Your most important goal is to create dynamic, cinematic prompts for an AI image/video model that match the **lyrics**.\n"
+                "Avoid static, mannequin-like images.\n\n"
                 "[Context Provided]\n"
                 "1. `original_vibe`: The overall theme of the entire song.\n"
                 "2. `scene_lyric`: The lyric for THIS scene (THIS IS THE MOST IMPORTANT).\n"
-                "3. `base_visual` (direct_prompt): The user's core visual idea for THIS scene (use this for the SETTING only, but you can change it creatively).\n"
-                "4. `characters`: The characters in THIS scene (e.g., 'female_01').\n"
+                "3. `base_visual` (direct_prompt): The user's concept text for THIS scene.\n"
+                "   - Treat it as background/setting + anchor action if it contains explicit pose/action.\n"
+                "4. `characters`: The characters in THIS scene (e.g., 'female_01:0').\n"
                 "5. `time_structure`: The frame segments for THIS scene (e.g., [\"0-65f\", \"49-125f\"]).\n"
                 "6. `next_scene_lyric`: The lyric for the *next* scene (for transition context).\n\n"
                 "[Your Task (Return JSON ONLY)]\n"
-                "1. \"prompt_ko\": Korean description of the whole scene (based on all context).\n"
-                "2. \"prompt_img_base\": English, comma-separated visual tags for the whole scene (5-12 words).\n"
+                "1. \"prompt_ko\": Korean description of the whole scene.\n"
+                "2. \"prompt_img_core\": English full image prompt sentence(s). MUST include character references using IMAGE SLOT MAPPING.\n"
                 "3. \"motion_hint\": short English motion/camera hint (e.g. \"slow zoom in\"). Can be \"\".\n"
-                "4. \"segment_prompts\": an array of English **scene descriptions**.\n"
+                "4. \"segment_prompts\": an array of English scene descriptions for each segment.\n"
                 "   The array length MUST exactly match the `time_structure` list length.\n\n"
                 "[!! CRITICAL RULES !!]\n"
-                "1.  **New Action (Most Important):** Based on the `scene_lyric` and `original_vibe`, you MUST describe a specific, creative **new pose and action** for the `characters` in *each* `segment_prompts` description.\n"
-                "    (Examples: \"female_01 starts walking down the autumn path\", \"female_01 stops and picks up an autumn leaf, smiling\", \"female_01 spins around, throwing leaves in the air\").\n"
-                "2.  **Background:** Use `base_visual` as the background, but change it creatively (e.g., \"The red autumn background becomes darker\").\n"
-                "3.  **Progression:** Design the actions to be continuous and logical, telling a small story that matches the lyric's emotion.\n"
-                "4.  **Camera:** Include dynamic camera work in each description (e.g., \"close up on her face\", \"camera rotates around her\", \"from a top-down view\").\n"
-                "5.  **Emotion:** Describe the character's expression (e.g., \"smiling happily\", \"peaceful expression\").\n"
-                "6.  **Prohibition:** NO \"mannequins\". Every prompt must describe a **change in the character's action or pose**."
+                "1. If `base_visual` contains explicit pose/action from the user, you MUST preserve that pose/action in ALL segment_prompts unless it contradicts the lyric.\n"
+                "2. For each segment_prompts item: describe a clear change of action/pose and camera (close-up, orbit, dolly, etc.).\n"
+                "3. Every segment prompt must be action-driven. NO mannequin/static.\n"
+                "4. You MUST follow IMAGE SLOT MAPPING when referring to characters in English.\n"
             )
 
             for scene_dict, dp_text in scenes_to_process:
@@ -958,8 +1065,10 @@ class ScenePromptEditDialog(QtWidgets.QDialog):
                 frame_segments = scene_dict.get("frame_segments") or []
                 seg_count = len(frame_segments)
                 frame_ranges_info = [f"{s.get('start_frame')}-{s.get('end_frame')}f" for s in frame_segments]
+
                 scene_lyric = scene_dict.get("lyric", "")
-                characters = scene_dict.get("characters", [])
+                characters = scene_dict.get("characters", []) or []
+
                 next_scene_lyric = "(Scene End)"
                 current_index = -1
                 for idx, s in enumerate(self.scenes_data):
@@ -971,6 +1080,20 @@ class ScenePromptEditDialog(QtWidgets.QDialog):
                     if isinstance(next_sc, dict):
                         next_scene_lyric = next_sc.get("lyric", "") or "(Next scene has no lyric)"
 
+                # ✅ video.json에서 character_styles 읽어와 매핑 설명에 사용
+                char_styles = self.full_video_data.get("character_styles", {}) or {}
+                mapping_text, slot_items = _build_slot_mapping_text(characters, char_styles)
+
+                system_prompt = base_system_prompt_template
+                if mapping_text:
+                    system_prompt += (
+                        "\n[IMPORTANT: IMAGE SLOT MAPPING]\n"
+                        "This workflow uses specific image slots for character images. You MUST follow these rules:\n"
+                        f"{mapping_text}\n"
+                        "- In English prompts (prompt_img_core, segment_prompts), DO NOT say just 'woman'/'man'.\n"
+                        "- Always say: 'the woman/man from image X'.\n"
+                    )
+
                 _log(f"[{current_scene_id}] AI 요청 중... (segments={seg_count})")
 
                 user_prompt_payload = {
@@ -979,12 +1102,17 @@ class ScenePromptEditDialog(QtWidgets.QDialog):
                     "base_visual": dp_text,
                     "characters": characters,
                     "time_structure": frame_ranges_info,
-                    "next_scene_lyric": next_scene_lyric
+                    "next_scene_lyric": next_scene_lyric,
                 }
                 user_prompt = json.dumps(user_prompt_payload, ensure_ascii=False)
 
                 try:
-                    ai_raw = self.ai_instance.ask_smart(base_system_prompt, user_prompt, prefer="gemini", allow_fallback=True)
+                    ai_raw = self.ai_instance.ask_smart(
+                        system_prompt,
+                        user_prompt,
+                        prefer="gemini",
+                        allow_fallback=True,
+                    )
                 except Exception as e_ai:
                     _log(f"[{current_scene_id}] AI 호출 실패: {e_ai}")
                     continue
@@ -994,6 +1122,7 @@ class ScenePromptEditDialog(QtWidgets.QDialog):
                 if not (0 <= json_start < json_end):
                     _log(f"[{current_scene_id}] AI가 JSON을 반환하지 않았습니다.")
                     continue
+
                 try:
                     ai_json = json.loads(ai_raw[json_start:json_end])
                 except Exception as e_json:
@@ -1001,21 +1130,31 @@ class ScenePromptEditDialog(QtWidgets.QDialog):
                     continue
 
                 prompt_ko = (ai_json.get("prompt_ko") or "").strip()
-                prompt_img_base = (ai_json.get("prompt_img_base") or "").strip()
+                prompt_img_core = (ai_json.get("prompt_img_core") or "").strip()
                 motion_hint = (ai_json.get("motion_hint") or "").strip()
                 seg_prompts = ai_json.get("segment_prompts", [])
 
-                if prompt_ko and prompt_img_base:
+                # 🔒 from image 누락 시 강제 보정
+                prompt_img_core = _ensure_from_image(prompt_img_core, slot_items)
+
+                # prompt / prompt_img / prompt_movie / negative 세팅
+                if prompt_ko and prompt_img_core:
                     scene_dict["prompt"] = prompt_ko
-                    scene_dict["prompt_img"] = f"{prompt_img_base}, {quality_tags}"
+
+                    # prompt_img / prompt_movie는 "문장형 + 퀄리티 태그"로 고정
+                    scene_dict["prompt_img"] = f"{prompt_img_core}, {quality_tags}".strip().strip(",")
                     if motion_hint:
-                        scene_dict["prompt_movie"] = f"{prompt_img_base}, {quality_tags}, motion: {motion_hint}"
+                        scene_dict[
+                            "prompt_movie"] = f"{prompt_img_core}, {quality_tags}, motion: {motion_hint}".strip().strip(
+                            ",")
                     else:
                         scene_dict["prompt_movie"] = scene_dict["prompt_img"]
+
                     scene_dict["prompt_negative"] = default_negative_tags
                     updated_count += 1
                     _log(f"[{current_scene_id}] 기본 프롬프트 갱신 완료")
 
+                # 세그먼트별 prompt_movie 세팅
                 if seg_count > 0:
                     filled = 0
                     if isinstance(seg_prompts, list) and len(seg_prompts) >= seg_count:
@@ -1023,19 +1162,23 @@ class ScenePromptEditDialog(QtWidgets.QDialog):
                             seg_item = frame_segments[i]
                             prompt_text = seg_prompts[i]
                             if isinstance(prompt_text, dict):
-                                prompt_text = (prompt_text.get("prompt_movie") or prompt_text.get("text") or "")
+                                prompt_text = prompt_text.get("prompt_movie") or prompt_text.get("text") or ""
                             prompt_text = str(prompt_text).strip()
                             if prompt_text:
-                                seg_item["prompt_movie"] = prompt_text
+                                # 세그먼트도 from image 보정
+                                seg_item["prompt_movie"] = _ensure_from_image(prompt_text, slot_items)
                                 filled += 1
                         _log(f"[{current_scene_id}] 세그먼트 묘사 {filled}/{seg_count}개 AI로 채움")
-                    elif filled == 0:
-                        base_cmd = dp_text
+                    else:
+                        # 응답이 부족하면 base로 채우되 from image 보정 유지
+                        base_cmd = _ensure_from_image(dp_text, slot_items)
                         for seg_item in frame_segments:
                             seg_item["prompt_movie"] = base_cmd
-                        _log(f"[{current_scene_id}] AI 세그먼트 묘사 응답 없음 → Direct Prompt로 일괄 채움")
+                        _log(f"[{current_scene_id}] AI 세그먼트 묘사 응답 부족 → Direct Prompt로 일괄 채움")
+
                     scene_dict["frame_segments"] = frame_segments
 
+            # 저장
             if updated_count > 0:
                 _log("변경 내용을 video.json 에 저장합니다...")
                 self.full_video_data["scenes"] = self.scenes_data
@@ -1057,7 +1200,7 @@ class ScenePromptEditDialog(QtWidgets.QDialog):
             if count > 0:
                 QtWidgets.QMessageBox.information(
                     self, "AI 요청 완료",
-                    f"총 {count}개 씬의 프롬프트를 갱신했습니다.\n세그먼트 프롬프트(행동 묘사)도 함께 저장되었습니다.",
+                    f"총 {count}개 씬의 프롬프트를 갱신했습니다.\n(캐릭터는 'from image N' 규칙이 강제 적용됩니다.)"
                 )
             else:
                 QtWidgets.QMessageBox.warning(self, "AI 요청", "AI가 갱신한 내용이 없거나 저장에 실패했습니다.")
