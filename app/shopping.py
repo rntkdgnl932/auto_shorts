@@ -25,6 +25,7 @@ from app.issue_list_builder import (
     save_issue_list_for_shopping_ai_b_from_a,
 )
 
+from app.shopping_video_build import build_shopping_images_2step
 from app.shopping_video_build import convert_shopping_to_video_json_with_ai
 
 from app.shopping_video_build import (
@@ -1429,7 +1430,7 @@ class VideoBuildDialog(QtWidgets.QDialog):
         lay_actions = QtWidgets.QHBoxLayout(grp_actions)
         lay_actions.setSpacing(10)
 
-        self.btn_gen_images = QtWidgets.QPushButton("2. 이미지 생성 (Z-Image)", tab2)
+        self.btn_gen_images = QtWidgets.QPushButton("2. 이미지 생성", tab2)
         self.btn_gen_images.setMinimumHeight(40)
 
         self.btn_gen_movies = QtWidgets.QPushButton("3. 영상 생성 (I2V)", tab2)
@@ -1794,19 +1795,45 @@ class VideoBuildDialog(QtWidgets.QDialog):
         self._refresh_preview_if_exists()
 
     def on_gen_images_clicked(self):
-        if not Path(self.target_video_json).exists():
-            QtWidgets.QMessageBox.warning(self, "알림", "video.json이 없습니다.\n'4. 비디오 JSON 생성'을 먼저 진행해주세요.")
+        """
+        쇼핑탭 이미지 생성은 video_shopping.json 기준으로 수행해야 함.
+        - Step1: prompt_img_1 (Z-image)
+        - Step2: prompt_img_2 (Qwen composite, image1=Step1결과, image2=제품 image.png)
+        """
+        if not Path(self.video_json_path).exists():
+            QtWidgets.QMessageBox.warning(self, "알림", "video_shopping.json이 없습니다.\n'1~3단계'를 먼저 진행해주세요.")
             return
 
-        # [수정] 반환값 7개 언패킹 (w, h, steps 사용)
+        # UI 설정값
         w, h, _, steps, _, _, _ = self._get_current_settings()
 
         def job(progress):
-            progress(f"[Image] 이미지 생성 시작 ({w}x{h}, steps={steps})...")
+            progress(f"[Image] (SHOP) 2-Step 이미지 생성 시작 ({w}x{h}, steps={steps})")
+            progress(f"[Image][DBG] video_shopping_json={self.video_json_path}")
+
+            from app.utils import load_json
+            from pathlib import Path
+
+            # ✅ 제품 이미지 경로 계산: product_dir / product.image_file
+            prod_path = None
+            try:
+                doc = load_json(self.video_json_path, {}) or {}
+                product = doc.get("product") or {}
+                img_file = (product.get("image_file") or "").strip()  # 보통 image.png
+                if img_file:
+                    cand = (Path(self.product_dir) / img_file).resolve()
+                    prod_path = str(cand)
+            except Exception:
+                prod_path = None
+
+            progress(f"[Image][DBG] product_image_path={prod_path}")
+
             from app.shopping_video_build import build_shopping_images_2step
 
             build_shopping_images_2step(
-                video_json_path=self.target_video_json,
+                video_json_path=self.video_json_path,  # ✅ video_shopping.json 사용
+                source_json_path=self.video_json_path,  # ✅ prompt_img_1/2도 여기서 읽음
+                product_image_path=prod_path,  # ✅ Step2 image2(제품)로 들어갈 경로
                 ui_width=w,
                 ui_height=h,
                 steps=steps,
@@ -1816,9 +1843,9 @@ class VideoBuildDialog(QtWidgets.QDialog):
 
         def done(ok, res, err):
             if ok:
-                self._append_log("✅ 이미지 생성 완료")
+                self._append_log("✅ (SHOP) 이미지 생성 완료")
             else:
-                self._append_log(f"❌ 이미지 생성 실패: {err}")
+                self._append_log(f"❌ (SHOP) 이미지 생성 실패: {err}")
 
         run_job_with_progress_async(self, "이미지 생성", job, on_done=done)
 

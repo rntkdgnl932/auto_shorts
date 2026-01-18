@@ -27,9 +27,9 @@ from app.utils import (
 
 )
 from app import settings
-from app.video_build import build_shots_with_i2v, concatenate_scene_clips, fill_prompt_movie_with_ai_long, concatenate_scene_clips_final_av
+from app.video_build import build_shots_with_i2v, concatenate_scene_clips, concatenate_scene_clips_final_av
 from app.video_build import build_step1_zimage_base, build_step2_qwen_composite
-
+from app.story_enrich import fill_prompt_movie_with_ai_long
 def _now_str() -> str:
     return datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
 
@@ -357,74 +357,151 @@ def generate_bgm_acestep(
 # -----------------------------------------------------------------------------
 
 
-
-
 def build_shopping_images_2step(
-    video_json_path: str | Path,
-    *,
-    ui_width: Optional[int],
-    ui_height: Optional[int],
-    steps: Optional[int],
-    skip_if_exists: bool = True,
-    on_progress: Optional[Callable[[Dict], None]] = None,
+        video_json_path: str | object,
+        *,
+        source_json_path: str | object | None = None,
+        product_image_path: str | object | None = None,
+        ui_width: int | None = 720,
+        ui_height: int | None = 1280,
+        steps: int | None = 20,
+        skip_if_exists: bool = True,
+        on_progress: object = None,
 ) -> None:
     """
-    기존 동작 유지: Step1(Z-Image) -> Step2(QwenEdit) 순차 실행.
-    단, 내부 구현은 공통 함수(build_step1_zimage_base, build_step2_qwen_composite)를 호출하도록 구성.
-
-    - video_json_path : C:\...\maked_title\[title]\video.json 경로
-    - product_dir     : video.json이 있는 폴더 (상품 폴더)
+    쇼핑 2단계 이미지 생성 (정상 동작 버전)
+    - 기준 JSON: video_shopping.json
+    - Step1: prompt_img_1 기반 Z-Image → imgs/temp_{sid}.png
+    - Step2: prompt_img_2 기반 QwenEdit 합성
+        * slot1 (image1) = temp_{sid}.png (배경/인물)
+        * slot2 (image2) = product_image_path (제품)
     """
+    from pathlib import Path
+    from app.utils import load_json
+    from app.video_build import build_step1_zimage_base, build_step2_qwen_composite
 
-    # 경로 정규화
-    vpath = Path(video_json_path).resolve()
-    product_dir = vpath.parent  # ex) C:\my_games\shorts_make\maked_title\[title]
+    def _emit(msg: str) -> None:
+        if not on_progress:
+            return
+        try:
+            if callable(on_progress):
+                on_progress({"stage": "debug", "msg": msg})
+            elif isinstance(on_progress, dict) and callable(on_progress.get("callback")):
+                on_progress["callback"]({"stage": "debug", "msg": msg})
+        except Exception:
+            pass
 
-    # settings에서 JSONS_DIR 가져오기 (없으면 product_dir/jsons 사용)
-    jsons_dir_conf = getattr(settings, "JSONS_DIR", product_dir / "jsons")
-    jsons_dir = Path(str(jsons_dir_conf))
+    if not video_json_path:
+        _emit("[Image][ERR] video_json_path is None")
+        return
 
-    # 워크플로우 경로 결정
-    wf_zimage = jsons_dir / "Z-Image-lora.json"
-    wf_qwen = jsons_dir / "QwenEdit2511-V1.json"
+    vpath = Path(str(video_json_path)).resolve()
+    if not vpath.exists():
+        _emit(f"[Image][ERR] video_shopping.json 없음: {vpath}")
+        return
 
-    # 소스 JSON / 상품 이미지 경로
-    source_json_path = product_dir / "video_shopping.json"
-    product_image_path = product_dir / "image.png"
+    if source_json_path is None:
+        source_json_path = vpath
+
+    proj_dir = vpath.parent
+    imgs_dir = proj_dir / "imgs"
+
+    doc = load_json(vpath, {}) or {}
+    scenes = doc.get("scenes", []) or []
+
+    prod_path = None
+    if product_image_path:
+        prod_path = Path(str(product_image_path)).resolve()
+    _emit(f"[Image][DBG] product_image_path={str(prod_path) if prod_path else None} exists={prod_path.exists() if prod_path else False}")
 
     # -------------------------
-    # Step1: Z-Image (베이스 이미지 생성)
+    # Step1: Z-Image
     # -------------------------
-    build_step1_zimage_base(
-        video_json_path=vpath,
-        source_json_path=source_json_path,
-        workflow_path=wf_zimage,
-        ui_width=ui_width,
-        ui_height=ui_height,
-        steps=steps,
-        skip_if_exists=skip_if_exists,
-        pos_keys=["prompt_img_1", "prompt_img"],
-        neg_keys=["prompt_negative", "prompt_img_neg"],
-        reactor_disable_all_by_default=True,
-        reactor_enable_node_ids=None,  # 기본 OFF
-        on_progress=on_progress,
-    )
+    _emit(f"[Image] Step1(Z-Image) 시작 ({ui_width}x{ui_height}, steps={steps})")
+    try:
+        build_step1_zimage_base(
+            video_json_path=vpath,
+            source_json_path=source_json_path,
+            ui_width=ui_width,
+            ui_height=ui_height,
+            steps=steps,
+            skip_if_exists=skip_if_exists,
+            on_progress=on_progress,
+        )
+    except Exception as e:
+        _emit(f"[Image][WARN] Step1 실패(계속 진행): {e}")
+
+    src_map = {}
+    try:
+        p_src = Path(str(source_json_path)).resolve() if source_json_path else None
+        if p_src and p_src.exists():
+            sdoc = load_json(p_src, {}) or {}
+            for s in (sdoc.get("scenes", []) or []):
+                sid = str(s.get("id", "")).strip()
+                if sid:
+                    src_map[sid] = s
+    except Exception as e:
+        _emit(f"[Image][WARN] source_json_path 매핑 실패: {e}")
 
     # -------------------------
-    # Step2: QwenEdit (상품 합성)
+    # Step2: Qwen Composite
     # -------------------------
-    build_step2_qwen_composite(
-        video_json_path=vpath,
-        source_json_path=source_json_path,
-        workflow_path=wf_qwen,
-        product_image_path=product_image_path,
-        ui_width=ui_width,
-        ui_height=ui_height,
-        steps=steps,
-        skip_if_exists=skip_if_exists,
-        edit_keys=["prompt_img_2", "prompt_edit"],
-        on_progress=on_progress,
-    )
+    _emit("[Image] Step2(Qwen Composite) 시작")
+
+    for sc in scenes:
+        sid = str(sc.get("id", "")).strip()
+        if not sid:
+            continue
+
+        src_sc = src_map.get(sid, sc)
+
+        p_edit = ""
+        for k in ["prompt_img_2", "prompt_edit", "prompt"]:
+            val = src_sc.get(k)
+            if isinstance(val, str) and val.strip():
+                p_edit = val.strip()
+                break
+
+        # [수정] 사용자가 요청한 대로 slot1, slot2로 명확히 구분
+        # slot1 = Z-Image 결과 (배경/인물) -> ComfyUI Load Image 1에 매핑됨 (리스트 인덱스 0)
+        step1_img_path = imgs_dir / f"temp_{sid}.png"
+        slot1 = str(step1_img_path) if step1_img_path.exists() else None
+
+        # slot2 = 제품 이미지 -> ComfyUI Load Image 2에 매핑됨 (리스트 인덱스 1)
+        slot2 = str(prod_path) if (prod_path and prod_path.exists()) else None
+
+        _emit(f"[Image][DBG] sid={sid}")
+        _emit(f"[Image][DBG]  slot1(z-image/image1)={slot1} exists={bool(slot1 and Path(slot1).exists())}")
+        _emit(f"[Image][DBG]  slot2(product/image2)={slot2} exists={bool(slot2 and Path(slot2).exists())}")
+        _emit(f"[Image][DBG]  prompt_img_2(actual)={p_edit}")
+
+        try:
+            build_step2_qwen_composite(
+                video_json_path=vpath,
+                source_json_path=source_json_path,
+                workflow_path=None,
+                ui_width=int(ui_width or 720),
+                ui_height=int(ui_height or 1280),
+                steps=int(steps or 20),
+                edit_keys=["prompt_img_2", "prompt_edit", "prompt"],
+                skip_if_exists=skip_if_exists,
+                on_progress=on_progress,
+                # [수정] slot1(Z-Image)을 첫 번째, slot2(제품)를 두 번째로 전달
+                slot_images=[slot1, slot2],
+                # [중요] 현재 처리 중인 씬 ID만 지정하여 해당 씬만 합성하도록 제한
+                target_scene_ids=[sid]
+            )
+        except Exception as e:
+            _emit(f"[Image][ERR] sid={sid} Step2 실패: {e}")
+            continue
+
+    _emit("[Image] 쇼핑 이미지 생성 완료")
+
+
+
+
+
+
 
 
 
@@ -844,28 +921,53 @@ class ShoppingImageGenerator:
         self.on_progress = on_progress or (lambda msg: None)
 
     def generate_images(self, video_json_path: str | Path, skip_if_exists: bool = True) -> None:
+
+
         def _cb(d):
             self.on_progress(d.get("msg", ""))
 
+        vpath = Path(video_json_path).resolve()
+        proj_dir = vpath.parent
+
         # 1. 해상도 가져오기 (기본값 안전장치 포함)
         img_size = settings.DEFAULT_IMG_SIZE
-        width_val = img_size[0]  # 가로
-        height_val = img_size[1]  # 세로
+        width_val = img_size[0]
+        height_val = img_size[1]
 
         # 2. 스텝 수 가져오기
         steps_val = settings.DEFAULT_T2I_STEPS
 
+        # 3. 제품 이미지 경로 계산 (shopping.py on_gen_images_clicked와 동일 로직)
+        prod_path: str | None = None
+        try:
+            doc = load_json(vpath, {}) or {}
+            product = doc.get("product") or {}
+            img_file = (product.get("image_file") or "").strip()
+            if img_file:
+                cand = (proj_dir / img_file).resolve()
+                if cand.exists():
+                    prod_path = str(cand)
+        except Exception:
+            prod_path = None
+
+        self.on_progress(f"[Image][DBG] product_image_path={prod_path}")
+
+        # 4. 2-Step 이미지 생성 (제품 이미지를 image2로 강제 주입)
         try:
             build_shopping_images_2step(
-                video_json_path=video_json_path,
-                ui_width=width_val,  # settings에서 가져온 가로값
-                ui_height=height_val,  # settings에서 가져온 세로값
-                steps=steps_val,  # settings에서 가져온 스텝 수
-                on_progress=_cb
+                video_json_path=vpath,
+                source_json_path=vpath,
+                product_image_path=prod_path,
+                ui_width=width_val,
+                ui_height=height_val,
+                steps=steps_val,
+                skip_if_exists=skip_if_exists,
+                on_progress=_cb,
             )
         except Exception as e:
             self.on_progress(f"❌ 이미지 생성 오류: {e}")
             raise e
+
 
 # -----------------------------------------------------------------------------
 # 6. 영상 생성/병합기

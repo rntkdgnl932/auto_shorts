@@ -5,6 +5,9 @@ import os
 from copy import deepcopy
 import re
 import json
+from pathlib import Path
+from app.utils import load_json, save_json
+from app.settings import I2V_CHUNK_BASE_FRAMES, I2V_OVERLAP_FRAMES, I2V_PAD_TAIL_FRAMES
 
 TraceFn = Callable[[str, str], None]
 
@@ -357,7 +360,7 @@ def _build_korean_prompts(scene: dict, styles: Dict[str, str]) -> tuple[str, str
 
 
 # real_use
-def apply_gpt_to_story_v11(
+def apply_ai_to_story_v11(
         story: dict,
         *,
         ask: Callable[..., str],
@@ -369,19 +372,17 @@ def apply_gpt_to_story_v11(
         **kwargs,
 ) -> dict:
     """
-    [수정됨 v10] 변수명 충돌 해결 버전.
-    - 네거티브 필터링 루프 변수 'tag' -> 't_str'로 변경하여 shadowing 경고 제거.
-    - 한글 네거티브 박멸 로직 유지.
-    - 영어 강제 로직 유지.
+    프로젝트 분석 → video.json 생성용 메인 함수 (v11, 캐릭터 5슬롯/프롬프트 문장형 개선 버전)
     """
-    if temperature is not None: _t(trace, "warn", f"ignored kw: temperature={temperature}")
-    if kwargs: _t(trace, "warn", f"ignored extra kwargs: {list(kwargs.keys())}")
-
-
+    if temperature is not None:
+        _t(trace, "warn", f"ignored kw: temperature={temperature}")
+    if kwargs:
+        _t(trace, "warn", f"ignored extra kwargs: {list(kwargs.keys())}")
 
     # --- 내부 유틸 ---
     def _clean_and_split_tags(text_input: str) -> List[str]:
-        if not isinstance(text_input, str): return []
+        if not isinstance(text_input, str):
+            return []
         text_cleaned = text_input.replace("\u200b", " ")
         tags_raw = re.split(r'[,/\n\s]+', text_cleaned)
         return [t.strip() for t in tags_raw if t.strip()]
@@ -394,13 +395,13 @@ def apply_gpt_to_story_v11(
             if isinstance(group, list):
                 tags_to_process = [str(item) for item in group if isinstance(item, str)]
             elif isinstance(group, str):
-                tags_to_process = _clean_and_split_tags(group)
+                tags_to_process = [group]
             for t_val in tags_to_process:
                 t_cleaned = t_val.strip()
-                if not t_cleaned: continue
-                t_lower = t_cleaned.lower()
-                if t_lower not in seen_tags:
-                    seen_tags.add(t_lower)
+                if not t_cleaned:
+                    continue
+                if t_cleaned not in seen_tags:
+                    seen_tags.add(t_cleaned)
                     ordered_tags.append(t_cleaned)
         final_str = ", ".join(ordered_tags)
         return re.sub(r'\s*,\s*', ', ', final_str).strip(', ')
@@ -413,28 +414,36 @@ def apply_gpt_to_story_v11(
             out_tags.append("young woman")
         elif "남성" in style_ko or "male" in style_lower:
             out_tags.append("young man")
-        if "young woman" in out_tags and os.environ.get("FORCE_HUGE_BREASTS") == "1":
+
+        # 강제 옵션
+        if "young woman" in out_tags and (force_huge_breasts or os.environ.get("FORCE_HUGE_BREASTS") == "1"):
             out_tags.extend(["huge breasts", "slim legs"])
+
         mapping = {
-            "긴": "long hair", "짧은": "short hair", "웨이브": "wavy hair", "생머리": "straight hair",
-            "갈색": "brown hair", "검정": "black hair", "금발": "blonde hair",
-            "후드": "hoodie", "청바지": "jeans", "원피스": "dress", "셔츠": "shirt", "정장": "suit",
-            "안경": "glasses", "모자": "hat", "미소": "smile", "무표정": "neutral expression"
+            "긴": "long hair", "웨이브": "wavy hair", "단발": "bob cut", "묶은": "ponytail",
+            "안경": "glasses", "선글라스": "sunglasses", "모자": "hat", "귀걸이": "earrings",
+            "정장": "suit", "드레스": "dress", "티셔츠": "t-shirt", "청바지": "jeans",
+            "치마": "skirt", "교복": "school uniform", "수영복": "swimsuit", "비키니": "bikini",
+            "운동복": "gym clothes", "한복": "hanbok", "기모노": "kimono",
+            "검은": "black", "흰": "white", "빨간": "red", "파란": "blue",
+            "노란": "yellow", "초록": "green", "보라": "purple", "분홍": "pink"
         }
         for k, v in mapping.items():
             if k in style_ko: out_tags.append(v)
-        return _clean_and_split_tags(_combine_unique_tags(out_tags))
+        return out_tags
 
-    # --- 데이터 준비 ---
+    # --- 입력 story 복사 및 전처리 ---
     story_data = json.loads(json.dumps(story, ensure_ascii=False))
-    title = story_data.get('title') or ''
-    lyrics_all = (story_data.get('lyrics') or '').strip()
-    scenes = story_data.get('scenes') or []
+    title = story_data.get("title") or ""
+    lyrics_all = (story_data.get("lyrics") or "").strip()
+    scenes = story_data.get("scenes") or []
 
-    characters_in_scenes = sorted(
-        set([(c.split(':', 1)[0] if isinstance(c, str) else (c.get('id', '') if isinstance(c, dict) else '')) for sc in
-             scenes if isinstance(sc, dict) for c in (sc.get('characters') or [])]))
+    characters_in_scenes = sorted(set([
+        (c.split(":", 1)[0] if isinstance(c, str) else (c.get("id", "") if isinstance(c, dict) else ""))
+        for sc in scenes if isinstance(sc, dict) for c in (sc.get("characters") or [])
+    ]))
 
+    # --- 씬별 payload 준비 ---
     payload_scenes: List[dict] = []
     position_map = {0: "왼쪽", 1: "오른쪽", 2: "가운데", 3: "왼쪽 뒤", 4: "오른쪽 뒤"}
     indexed_characters_map: Dict[str, List[str]] = {}
@@ -442,10 +451,13 @@ def apply_gpt_to_story_v11(
     for sc_item in scenes:
         if not isinstance(sc_item, dict): continue
         scene_id = sc_item.get("id")
+        if not scene_id: continue
+
         original_char_ids = [
-            (c.split(':', 1)[0] if isinstance(c, str) else (c.get('id') if isinstance(c, dict) else '')) for c in
-            (sc_item.get('characters') or [])]
+            (c.split(":", 1)[0] if isinstance(c, str) else (c.get("id") if isinstance(c, dict) else "")) for c in
+            (sc_item.get("characters") or [])]
         original_char_ids = [cid for cid in original_char_ids if cid]
+
         original_hint_from_scene = (sc_item.get("prompt") or "").strip()
         indexed_chars_for_ai: List[str] = []
         pos_prompt_for_layout = ""
@@ -453,14 +465,15 @@ def apply_gpt_to_story_v11(
         if len(original_char_ids) == 1:
             indexed_chars_for_ai = [f"{original_char_ids[0]}:0"]
         elif len(original_char_ids) > 1:
-            pos_descs_list = []
-            for i, char_id_loop in enumerate(original_char_ids):
+            pos_descs_list: List[str] = []
+            for i, char_id_loop in enumerate(original_char_ids[:5]):
                 indexed_chars_for_ai.append(f"{char_id_loop}:{i}")
                 pos_name_str = position_map.get(i, f"{i}번 위치")
                 pos_descs_list.append(f"{pos_name_str}에 {char_id_loop}")
-            pos_prompt_for_layout = f"장면 배치: {', '.join(pos_descs_list)}. 자연스러움."
+            pos_prompt_for_layout = f"장면 배치: {', '.join(pos_descs_list)}."
 
         indexed_characters_map[scene_id] = indexed_chars_for_ai
+
         direct_prompt_text = (sc_item.get("direct_prompt") or "").strip()
         if direct_prompt_text:
             context_source_for_ai = "direct_prompt_hint"
@@ -476,81 +489,114 @@ def apply_gpt_to_story_v11(
             "context_source": context_source_for_ai,
             "effect": sc_item.get("effect") or [],
             "screen_transition": bool(sc_item.get("screen_transition")),
-            "characters": indexed_chars_for_ai,
+            "characters": indexed_chars_for_ai,  # "id:index" 형태 전달
         })
 
     render_defaults = (story_data.get("defaults") or {}).get("image") or {}
-    render_width = int(render_defaults.get("width") or 832)
-    render_height = int(render_defaults.get("height") or 1472)
 
+    # Payload 구성
     payload = {
-        "title": title, "lyrics_all": lyrics_all, "characters": characters_in_scenes,
+        "title": title,
+        "lyrics_all": lyrics_all,
+        "characters": characters_in_scenes,
         "scenes": payload_scenes,
         "need_korean": True,
-        "render_hint": {"image_width": render_width, "image_height": render_height},
+        "render_hint": {
+            "image_width": int(render_defaults.get("width") or 832),
+            "image_height": int(render_defaults.get("height") or 1472),
+        },
         "rules": {
-            "character_styles": "한국어 설명 + 성별 명시.",
-            "prompts": "prompt(한글), prompt_img_base(영어), motion_hint(영어) 생성.",
-            "prompt_img_base": "ENGLISH ONLY.",
-            "motion_hint": "ENGLISH ONLY.",
-            "global": "전체 요약 및 영문 style_guide 포함."
-        }
+            "prompts": "prompt(한글), prompt_img_base(영어 문장), motion_hint(영어) 생성.",
+            "prompt_img_base": "ENGLISH SENTENCES ONLY.",
+            "global": "전체 요약 및 영문 style_guide 포함.",
+        },
     }
 
+    # --- [핵심 수정] 시스템 프롬프트: 태그 방식 -> 문장 방식 변경 & 인덱스 규칙 강화 ---
     system_prompt_base = (
         "You are a professional AI Video Director.\n"
         "Return ONLY one JSON object.\n"
-        "{\"character_styles\":{id:text,...},\"per_scene_lyrics\":[{\"id\":\"...\",\"lyric\":\"...\"}],"
+        "{\"character_styles\":{id:text,...},"
+        "\"per_scene_lyrics\":[{\"id\":\"...\",\"lyric\":\"...\"}],"
         "\"prompts\":[{\"id\":\"...\",\"prompt\":\"...\",\"prompt_img_base\":\"...\",\"motion_hint\":\"...\",\"effect\":[\"...\"]}],"
-        "\"global\":{\"global_summary\":\"...\",\"themes\":[\"...\"],\"palette\":\"...\",\"style_guide\":\"...\",\"negative_bank\":\"...\", "
-        "\"section_moods\": {\"intro\":\"...\",\"verse\":\"...\",\"chorus\":\"...\",\"bridge\":\"...\",\"outro\":\"...\"},\"effect\":[\"...\"],"
-        "\"image_width\":0,\"image_height\":0}}\n"
+        "\"global\":{...}}\n"
         "\n"
         "# STRICT RULES:\n"
         "1. **prompt (Scene Description)**: Korean. Used for user UI.\n"
-        "2. **prompt_img_base (Visual Tags)**: **STRICTLY ENGLISH ONLY**. Comma-separated tags for Stable Diffusion. NO Korean characters.\n"
-        "3. **motion_hint (Camera/Action)**: **STRICTLY ENGLISH ONLY**. Short camera or action tags. NO Korean characters.\n"
-        "4. **effect**: **STRICTLY ENGLISH ONLY**.\n"
-        "5. **character_styles**: Korean description.\n"
-        "6. **context_source**: If 'direct_prompt_hint', use 'hint' exclusively.\n"
+        "2. **prompt_img_base (Visual Description)**: **STRICTLY ENGLISH SENTENCES**.\n"
+        "   - **DO NOT** use comma-separated tags. Write a **descriptive, natural English sentence**.\n"
+        "   - **[Character Reference Rule]**: The 'characters' field provides 'id:index'.\n"
+        "     * ':0' -> MUST be referred to as 'from image 1'\n"
+        "     * ':1' -> MUST be referred to as 'from image 2'\n"
+        "     * ':2' -> 'from image 3', etc.\n"
+        "   - **[Content Generation]**:\n"
+        "     * Infer the character's gender from their ID (e.g. 'female' -> woman, 'male' -> man).\n"
+        "     * **Invent specific outfits and actions** based on the scene mood, lyrics, and hint.\n"
+        "     * Combine multiple characters into a coherent sentence.\n"
+        "   - **[Example Output]**:\n"
+        "     * BAD: 'woman, beach, summer, bikini, walking'\n"
+        "     * GOOD: 'A woman from image 1, wearing a colorful bikini, is walking along the sunny beach smiling.'\n"
+        "     * GOOD: 'A man from image 2 in a black suit is dancing with a woman from image 1 in a red dress under the streetlights.'\n"
+        "3. **motion_hint**: ENGLISH ONLY. Camera or action phrases.\n"
+        "4. **effect**: ENGLISH ONLY tags.\n"
+        "5. **character_styles**: Korean description including gender/age/style.\n"
     )
 
     system_prompt_final = system_prompt_base
     if force_huge_breasts:
         rule_replacement = (
-            "5. **character_styles**: Korean description.\n"
-            "   - [RULE] For 'female' ID, MUST include 'huge breasts, slim legs' in the description."
+            "5. **character_styles**: Korean description including gender/age/body/overall style.\n"
+            "   - [RULE] For 'female' characters, the Korean description MUST clearly imply "
+            "'huge breasts and slim legs'."
         )
-        system_prompt_final = system_prompt_final.replace("5. **character_styles**: Korean description.\n",
-                                                          rule_replacement)
+        system_prompt_final = system_prompt_final.replace(
+            "5. **character_styles**: Korean description including gender/age/style.\n",
+            rule_replacement,
+        )
 
+    # --- LLM 호출 ---
     user_prompt = json.dumps(payload, ensure_ascii=False)
-    _t(trace, "ai:ask", "Requesting analysis with strict English visual tags...")
-    raw_response = ask(system_prompt_final, user_prompt, prefer=prefer, allow_fallback=allow_fallback, trace=trace)
+    _t(trace, "ai:ask", "Requesting analysis with English sentences (image 1/2 references)...")
 
-    ai_data = {}
+    raw_response = ask(
+        system_prompt_final,
+        user_prompt,
+        prefer=prefer,
+        allow_fallback=allow_fallback,
+        trace=trace,
+    )
+
+    ai_data: Dict[str, Any] = {}
     try:
         text_response = str(raw_response).strip()
         json_start, json_end = text_response.find("{"), text_response.rfind("}")
         if 0 <= json_start < json_end:
             ai_data = json.loads(text_response[json_start: json_end + 1])
     except Exception:
-        pass
+        ai_data = {}
 
-    styles_from_ai = (ai_data.get("character_styles") or {})
-    character_styles_en_tags: Dict[str, List[str]] = {}
-    for char_id_str, style_ko_str in styles_from_ai.items():
-        character_styles_en_tags[char_id_str] = _convert_char_style_ko_to_en(str(style_ko_str))
-
+    # --- 후처리 ---
+    styles_from_ai = ai_data.get("character_styles") or {}
     character_styles_ko = {str(k): str(v) for k, v in styles_from_ai.items()}
-    _merge_global_context(story_data, ai_data.get("global") or {})
+
+    # 글로벌 컨텍스트 병합 (기존 함수가 없으므로 직접 병합 로직 구현 - 보통 utils나 내부에 있어야 하나 독립 실행 보장 위해 간단 처리)
+    global_ctx_ai = ai_data.get("global") or {}
+    if "global_context" not in story_data:
+        story_data["global_context"] = {}
+    if isinstance(global_ctx_ai, dict):
+        story_data["global_context"].update(global_ctx_ai)
 
     scene_lyrics_map = {d["id"]: (d.get("lyric") or "").strip() for d in (ai_data.get("per_scene_lyrics") or []) if
-                        isinstance(d, dict)}
-    prompts_from_ai = {d["id"]: d for d in (ai_data.get("prompts") or []) if isinstance(d, dict)}
+                        isinstance(d, dict) and d.get("id")}
+    prompts_from_ai = {d["id"]: d for d in (ai_data.get("prompts") or []) if isinstance(d, dict) and d.get("id")}
 
     quality_tags = "photorealistic, cinematic lighting, high detail, 8k, masterpiece"
-    default_negative_tags = "lowres, bad anatomy, bad proportions, extra limbs, extra fingers, missing fingers, jpeg artifacts, signature, logo, nsfw, text, letters, typography, watermark"
+
+    default_negative_tags = (
+        "lowres, bad anatomy, bad proportions, extra limbs, extra fingers, "
+        "missing fingers, jpeg artifacts, signature, logo, nsfw, text, letters, "
+        "typography, watermark"
+    )
 
     for scene_obj in scenes:
         if not isinstance(scene_obj, dict): continue
@@ -559,48 +605,40 @@ def apply_gpt_to_story_v11(
 
         ai_item = prompts_from_ai.get(sid, {})
         p_ko = (ai_item.get("prompt") or "").strip()
+
+        # [중요] AI가 생성한 문장 그대로 가져오기
         p_img_base = (ai_item.get("prompt_img_base") or "").strip()
         p_motion = (ai_item.get("motion_hint") or "").strip()
         p_effect = ai_item.get("effect") or story_data.get("global_context", {}).get("effect", [])
 
-        char_en_tags = []
-        indexed_chars = indexed_characters_map.get(sid, [])
-        for c_ref in indexed_chars:
-            cid = c_ref.split(':', 1)[0]
-            if cid in character_styles_en_tags:
-                char_en_tags.extend(character_styles_en_tags[cid])
+        final_img = p_img_base
+        if quality_tags not in final_img:
+            final_img = f"{final_img}, {quality_tags}"
 
-        final_img = _combine_unique_tags(p_img_base, char_en_tags, p_effect, quality_tags)
-        final_movie = _combine_unique_tags(final_img, p_motion)
+        final_movie = f"{final_img}, {p_motion}"
 
-        # --- [한글 네거티브 필터링 & 변수명 변경] ---
+        # 네거티브 처리
         global_neg = story_data.get("global_context", {}).get("negative_bank", "")
         raw_neg = _combine_unique_tags(global_neg, default_negative_tags)
-        clean_neg_list = []
-
-        # 여기서 'tag' 대신 't_str'을 사용하여 외부 이름 가리기 경고를 없앰
-        for t_str in raw_neg.split(','):
-            t_str = t_str.strip()
-            if not t_str: continue
-            if re.search(r'[가-힣]', t_str): continue  # 한글 있으면 버림
-            clean_neg_list.append(t_str)
-
+        clean_neg_list = [t.strip() for t in raw_neg.split(",") if t.strip() and not re.search(r"[가-힣]", t)]
         final_neg = ", ".join(clean_neg_list)
 
+        # Scene 업데이트
         scene_obj["prompt"] = p_ko or scene_obj.get("prompt", "")
         scene_obj["prompt_img"] = final_img
         scene_obj["prompt_movie"] = final_movie
-        scene_obj["prompt_negative"] = final_neg  # 영어만 남은 네거티브
+        scene_obj["prompt_negative"] = final_neg
         scene_obj["effect"] = _clean_and_split_tags(" ".join(p_effect) if isinstance(p_effect, list) else str(p_effect))
         scene_obj["lyric"] = scene_lyrics_map.get(sid, scene_obj.get("lyric", ""))
-        scene_obj["characters"] = indexed_chars
+        scene_obj["characters"] = indexed_characters_map.get(sid, scene_obj.get("characters", []))
 
     story_data["character_styles"] = character_styles_ko
     story_data["scenes"] = scenes
-    story_data.setdefault("audit", {})["generated_by"] = "gpt-5-v11-english-strict-no-korean-neg"
+    story_data.setdefault("audit", {})["generated_by"] = "gpt-5-v11-english-sentences-strict-slots"
 
-    _t(trace, "gpt", "apply_gpt_to_story_v11 완료 (English Forced, Korean Neg Filtered)")
+    _t(trace, "gpt", "apply_gpt_to_story_v11 완료 (Sentence Mode)")
     return story_data
+
 
 
 
@@ -1817,6 +1855,483 @@ def normalize_prompts(story: dict) -> dict:
             sc[k] = ", ".join([s.strip() for s in t.split(",") if s.strip()])
 
     return story
+
+
+def plan_segments_s_e(total_frames: int, base_chunk: int = 41) -> List[Tuple[int, int]]:
+    """
+    [Wan 전용] 단순 (start, end) 세그먼트 분할.
+    - 오버랩 없음.
+    - 각 세그먼트 길이는 최대 base_chunk 프레임.
+    - 마지막 세그먼트는 남은 프레임만 사용.
+
+    예)
+      total_frames=33 → [(0, 33)]
+      total_frames=41 → [(0, 41)]
+      total_frames=60 → [(0, 41), (41, 60)]
+      total_frames=65 → [(0, 41), (41, 65)]
+    """
+    out: List[Tuple[int, int]] = []
+
+    if total_frames <= 0:
+        return out
+    if base_chunk <= 0:
+        # base_chunk가 0이거나 음수면 전체를 한 번에
+        out.append((0, total_frames))
+        return out
+
+    start = 0
+    while start < total_frames:
+        end = start + base_chunk
+        if end > total_frames:
+            end = total_frames
+        out.append((start, end))
+        start = end
+
+    return out
+
+def plan_i2v_frame_segments(
+        total_frames: int,
+        *,
+        base_frames: int = I2V_CHUNK_BASE_FRAMES,
+        overlap_frames: int = I2V_OVERLAP_FRAMES,
+        pad_tail_frames: int = I2V_PAD_TAIL_FRAMES,
+) -> List[Dict[str, int]]:
+    """
+    I2V 롱/쇼핑 기준 세그먼트 분할.
+
+    - video.json에는 "유효 구간" 기준의 start_frame/end_frame 를 기록한다.
+      (end_frame은 exclusive: [start, end) )
+    - 실제 생성(Comfy)용으로는 overlap/pad를 고려한 gen_start_frame/gen_end_frame도 함께 제공한다.
+
+    규칙:
+      seg0:
+        effective: 0 ~ base
+        generate : 0 ~ base + pad
+      segN (N>=1):
+        effective: prev_end ~ prev_end + base (또는 남은 프레임)
+        generate : (start - overlap) ~ (end + pad)
+    """
+    out: List[Dict[str, int]] = []
+    if total_frames <= 0:
+        return out
+
+    base = max(1, int(base_frames))
+    ov = max(0, int(overlap_frames))
+    pad = max(0, int(pad_tail_frames))
+
+    start = 0
+    while start < total_frames:
+        end = min(total_frames, start + base)
+
+        if start == 0:
+            gen_s = 0
+        else:
+            gen_s = max(0, start - ov)
+
+        gen_e = min(total_frames, end + pad)
+
+        out.append({
+            "start_frame": int(start),
+            "end_frame": int(end),
+            "gen_start_frame": int(gen_s),
+            "gen_end_frame": int(gen_e),
+        })
+
+        start = end
+
+    return out
+
+
+# shorts 탭 video.json 빌드
+def fill_prompt_movie_with_ai(
+        project_dir: "Path",
+        ask: "Callable[[str, str], str]",
+        *,
+        log_fn: Optional[Callable[[str], None]] = None,
+) -> None:
+    """
+    [통일 패치]
+    - fill_prompt_movie_with_ai / fill_prompt_movie_with_ai_long 모두
+      동일한 I2V 세그먼트 분할 기준을 사용한다:
+        I2V_CHUNK_BASE_FRAMES, I2V_OVERLAP_FRAMES, I2V_PAD_TAIL_FRAMES
+    - shorts 탭 video.json도 shopping/i2v롱과 같은 내부 세그 구조(frame_segments)를 갖도록 만든다.
+    """
+    import json
+
+    def _log(msg: str) -> None:
+        if callable(log_fn):
+            try:
+                log_fn(msg)
+            except Exception:
+                pass
+
+    pdir = Path(project_dir).resolve()
+    vpath = pdir / "video.json"
+
+    vdoc: Dict[str, Any] = load_json(vpath, {}) or {}
+    if not isinstance(vdoc, dict):
+        _log("[fill_prompt_movie_with_ai] video.json 형식 오류")
+        return
+
+    # 원본 분위기 (project.json)
+    pj_path = pdir / "project.json"
+    original_vibe_prompt = ""
+    if pj_path.exists():
+        pj_doc = load_json(pj_path, {}) or {}
+        if isinstance(pj_doc, dict):
+            original_vibe_prompt = pj_doc.get("prompt_user") or pj_doc.get("prompt", "") or ""
+
+    # FPS 확정
+    defaults_map: Dict[str, Any] = vdoc.get("defaults") or {}
+    movie_def: Dict[str, Any] = defaults_map.get("movie") or {}
+    image_def: Dict[str, Any] = defaults_map.get("image") or {}
+
+    fps_candidates = [movie_def.get("target_fps"), vdoc.get("fps"), image_def.get("fps"), movie_def.get("fps"), 24]
+    fps = 24
+    for cand in fps_candidates:
+        if cand is None:
+            continue
+        try:
+            fps = int(cand)
+            break
+        except Exception:
+            continue
+
+    vdoc.setdefault("fps", fps)
+    vdoc.setdefault("defaults", {})
+    vdoc["defaults"].setdefault("movie", {})
+    vdoc["defaults"]["movie"]["target_fps"] = fps
+    vdoc["defaults"]["movie"]["input_fps"] = fps
+    vdoc["defaults"]["movie"]["fps"] = fps
+    vdoc["defaults"].setdefault("image", {})["fps"] = fps
+
+    # I2V 분할 기준(통일)
+    base_frames = int(I2V_CHUNK_BASE_FRAMES)
+    overlap_frames = int(I2V_OVERLAP_FRAMES)
+    pad_tail_frames = int(I2V_PAD_TAIL_FRAMES)
+
+    scenes = vdoc.get("scenes") or []
+    if not isinstance(scenes, list):
+        _log("[fill_prompt_movie_with_ai] scenes 없음")
+        save_json(vpath, vdoc)
+        return
+
+    changed = False
+
+    # 시스템 프롬프트(연속성 강제)
+    system_msg = (
+        "You are a Strict AI Cinematographer specializing in I2V continuity.\n"
+        "Your goal is to generate segment prompts for ONE continuous shot.\n\n"
+        "[ABSOLUTE PROHIBITIONS]\n"
+        "❌ NO turning around (back view).\n"
+        "❌ NO full rotation.\n"
+        "❌ NO hiding important subjects.\n\n"
+        "[MANDATORY RULES]\n"
+        "1) Segment N must start from the end state of Segment N-1.\n"
+        "2) Keep camera angle stable. Use micro-movements.\n"
+        "3) Output MUST be ENGLISH.\n"
+        "Return JSON only: {\"segment_prompts\": [\"...\", ...]}\n"
+    )
+
+    forced_negative = (
+        "nsfw, watermark, text, ugly, distorted face, "
+        "back view, turning around, extra fingers, mutated hands, "
+        "blurry, signature, logo, subtitle, words, caption"
+    )
+
+    for i, sc in enumerate(scenes):
+        if not isinstance(sc, dict):
+            continue
+
+        sid = str(sc.get("id") or f"scene_{i:05d}")
+
+        # negative 강화
+        current_neg = str(sc.get("prompt_negative") or "").strip()
+        if not current_neg:
+            sc["prompt_negative"] = forced_negative
+            changed = True
+        elif "back view" not in current_neg.lower():
+            sc["prompt_negative"] = current_neg + ", " + forced_negative
+            changed = True
+
+        # duration -> total_frames
+        try:
+            dur = float(sc.get("duration") or 0.0)
+        except Exception:
+            dur = 0.0
+        if dur <= 0:
+            try:
+                dur = float(sc.get("seconds") or 0.0)
+            except Exception:
+                dur = 0.0
+
+        total_frames = int(round(dur * fps)) if dur > 0 else 0
+        if total_frames <= 0:
+            continue
+
+        sc["total_frames"] = total_frames
+        sc["fps"] = fps
+        sc["overlap_frames"] = overlap_frames
+
+        # ★ 통일된 frame_segments 생성
+        segs = sc.get("frame_segments")
+        if not isinstance(segs, list) or not segs:
+            segs_out = plan_i2v_frame_segments(
+                total_frames,
+                base_frames=base_frames,
+                overlap_frames=overlap_frames,
+                pad_tail_frames=pad_tail_frames,
+            )
+            # prompt_movie 슬롯 추가
+            for seg in segs_out:
+                seg.setdefault("prompt_movie", "")
+            sc["frame_segments"] = segs_out
+            segs = segs_out
+            changed = True
+
+        # seg_count도 frame_segments 기반으로 통일
+        sc["seg_count"] = int(len(segs))
+
+        # 이미 다 채워졌으면 스킵
+        if all(str(seg.get("prompt_movie") or "").strip() for seg in segs):
+            _log(f"[{sid}] 세그먼트 프롬프트 이미 존재 (스킵)")
+            continue
+
+        # base_visual
+        base_visual = ""
+        for key in ("prompt_img_1", "prompt_img", "prompt"):
+            v = sc.get(key)
+            if isinstance(v, str) and v.strip():
+                base_visual = v.strip()
+                break
+
+        scene_lyric = str(sc.get("lyric") or "").strip()
+        if not base_visual and not scene_lyric:
+            _log(f"[{sid}] 참조 텍스트 부족 (스킵)")
+            continue
+
+        next_scene_lyric = "(Scene End)"
+        if i + 1 < len(scenes):
+            nsc = scenes[i + 1]
+            if isinstance(nsc, dict):
+                next_scene_lyric = str(nsc.get("lyric") or "").strip() or "(Next scene has no lyric)"
+
+        frame_ranges_info = [f"{s.get('start_frame')}-{s.get('end_frame')}f" for s in segs]
+
+        user_payload = {
+            "original_vibe": original_vibe_prompt,
+            "scene_lyric": scene_lyric,
+            "base_visual": base_visual,
+            "characters": sc.get("characters", []),
+            "time_structure": frame_ranges_info,
+            "next_scene_lyric": next_scene_lyric,
+            "instruction": "Generate chained prompts. Maintain continuity."
+        }
+        user_msg = json.dumps(user_payload, ensure_ascii=False)
+
+        _log(f"[{sid}] AI 프롬프트 생성 요청 (segments={len(segs)})")
+
+        try:
+            ai_raw = ask(system_msg, user_msg)
+
+            json_start = ai_raw.find("{")
+            json_end = ai_raw.rfind("}") + 1
+            if not (0 <= json_start < json_end):
+                raise RuntimeError(f"AI JSON 응답 형식 오류: {ai_raw[:80]}")
+
+            ai_json = json.loads(ai_raw[json_start:json_end])
+            new_prompts = ai_json.get("segment_prompts", [])
+
+            if not isinstance(new_prompts, list):
+                raise RuntimeError("AI segment_prompts가 list가 아님")
+
+            # 길이 불일치면 가능한 범위만 채우기
+            filled = 0
+            for k, seg in enumerate(segs):
+                if k >= len(new_prompts):
+                    break
+                if str(seg.get("prompt_movie") or "").strip():
+                    continue
+                p_text = str(new_prompts[k] or "").strip()
+                if p_text:
+                    seg["prompt_movie"] = p_text
+                    filled += 1
+
+            if filled:
+                sc["frame_segments"] = segs
+                changed = True
+                _log(f"[{sid}] 세그먼트 프롬프트 {filled}개 채움")
+
+        except Exception as e:
+            _log(f"[{sid}] AI 호출 실패: {e}")
+            continue
+
+    # 저장
+    save_json(vpath, vdoc)
+    if changed:
+        _log("[fill_prompt_movie_with_ai] 업데이트 완료 (video.json 저장)")
+    else:
+        _log("[fill_prompt_movie_with_ai] 변경 없음 (video.json 저장)")
+
+
+
+# shopping 탭 video.json 빌드
+# 기존 imports 유지...
+# fill_prompt_movie_with_ai_long 함수 전체 교체
+
+def fill_prompt_movie_with_ai_long(
+        story_data: dict,
+        ai_ask_func: Callable[[str, str], str],
+        trace: TraceFn | None = None
+) -> dict:
+    """
+    [Step 6] Long-Take Shopping 스타일:
+    각 씬을 지정된 FPS/Chunk 단위로 쪼개고,
+    AI에게 "시간 흐름에 따른 연속적 프롬프트(문장)" 생성을 요청하여 채워넣는다.
+    """
+    import math
+    import json
+    import re
+
+    # 1. UI 설정값 로드 (없으면 기본값)
+    ui_prefs = (story_data.get("defaults") or {}).get("ui_prefs") or {}
+    try:
+        fps = float(ui_prefs.get("movie_fps", 30))
+    except:
+        fps = 30.0
+
+    # Long-Take 설정 (기본값: 쇼핑 스타일 81프레임)
+    base_chunk = I2V_CHUNK_BASE_FRAMES  # e.g. 81 or 118
+    overlap = I2V_OVERLAP_FRAMES  # e.g. 10 or 20
+    pad_tail = I2V_PAD_TAIL_FRAMES  # e.g. 20
+
+    scenes = story_data.get("scenes", [])
+    if not scenes:
+        return story_data
+
+    _t(trace, "info", f"🚀 [AI Long-Take] 프롬프트 상세화 시작 (FPS: {fps}, chunk={base_chunk}, ov={overlap}, pad={pad_tail})")
+
+    for sc in scenes:
+        sid = sc.get("id")
+        # 1) 프레임 계산
+        try:
+            duration = float(sc.get("duration") or 2.0)
+            total_frames = int(duration * fps)
+        except:
+            total_frames = 60
+
+        # 2) 세그먼트 개수 계산 (단순 나눗셈이 아니라 Overlap 고려)
+        # 필요한 유효 길이 = total_frames
+        # 첫 청크 = base_chunk
+        # 이후 청크 추가분 = base_chunk - overlap
+        # 식: base_chunk + (n-1)*(base_chunk - overlap) >= total_frames + pad_tail
+        # (n-1) * step >= target - base
+        step = base_chunk - overlap
+        target = total_frames + pad_tail
+
+        if target <= base_chunk:
+            seg_count = 1
+        else:
+            needed = target - base_chunk
+            additional = math.ceil(needed / step)
+            seg_count = 1 + additional
+
+        _t(trace, "info", f"   - Scene {sid}: {duration:.2f}s * {fps}fps = {total_frames}f -> segments={seg_count}")
+
+        # 메타데이터 저장
+        sc["frame_segments"] = {
+            "fps": fps,
+            "total_frames": total_frames,
+            "segment_count": seg_count,
+            "base_chunk": base_chunk,
+            "overlap": overlap,
+            "segments": []  # 여기에 채움
+        }
+
+        # AI 요청 준비
+        base_prompt = sc.get("prompt_img") or sc.get("prompt") or "A cinematic shot"
+        # 문장형인지 확인 (대소문자 구별 없이)
+        is_sentence_mode = len(base_prompt.split()) > 6  # 대략 6단어 이상이면 문장으로 간주
+
+        # 3) AI에게 시퀀스 프롬프트 요청 (1개면 굳이 요청 안하고 복사할 수도 있지만, 일관성 위해 요청 권장)
+        #    단, 1개이고 내용이 짧으면 그냥 복사
+        if seg_count == 1 and not is_sentence_mode:
+            sc["frame_segments"]["segments"] = [base_prompt]
+            continue
+
+        # 시스템 프롬프트: 문장형 흐름을 요청
+        sys_msg = (
+            "You are an AI Video Sequencer.\n"
+            "Break down the provided 'base_prompt' into a sequence of prompts for a continuous video shot.\n"
+            f"Target segments: {seg_count}\n"
+            "\n"
+            "OUTPUT FORMAT (JSON ONLY):\n"
+            "{\n"
+            "  \"segment_prompts\": [\n"
+            "    \"String: Prompt for segment 1 (start)\",\n"
+            "    \"String: Prompt for segment 2 (middle action)...\",\n"
+            "    ...\n"
+            "  ]\n"
+            "}\n"
+            "\n"
+            "RULES:\n"
+            "1. The output list MUST have exactly the requested number of segments.\n"
+            "2. Ensure continuous action flow. Do not change the character's clothing or core appearance.\n"
+            "3. If 'base_prompt' is a sentence, maintain the sentence structure but advance the action slightly.\n"
+            "4. Use ENGLISH sentences only.\n"
+        )
+
+        user_msg = json.dumps({
+            "scene_id": sid,
+            "base_prompt": base_prompt,
+            "segment_count_needed": seg_count,
+            "duration_sec": duration
+        }, ensure_ascii=False)
+
+        try:
+            raw = ai_ask_func(sys_msg, user_msg)
+
+            # [강화된 파싱 로직] 마크다운 제거 및 JSON 추출
+            text_cleaned = raw.strip()
+            # ```json ... ``` 제거
+            if "```" in text_cleaned:
+                text_cleaned = re.sub(r"```json|```", "", text_cleaned).strip()
+
+            # 중괄호 찾기
+            idx_start = text_cleaned.find("{")
+            idx_end = text_cleaned.rfind("}")
+
+            if idx_start != -1 and idx_end != -1:
+                json_str = text_cleaned[idx_start: idx_end + 1]
+                parsed = json.loads(json_str)
+
+                prompts_list = parsed.get("segment_prompts", [])
+
+                # 개수 부족하면 마지막꺼 복사, 넘치면 자름
+                if len(prompts_list) < seg_count:
+                    last_p = prompts_list[-1] if prompts_list else base_prompt
+                    while len(prompts_list) < seg_count:
+                        prompts_list.append(last_p)
+                elif len(prompts_list) > seg_count:
+                    prompts_list = prompts_list[:seg_count]
+
+                # 결과 저장
+                sc["frame_segments"]["segments"] = [str(p).strip() for p in prompts_list]
+
+            else:
+                raise ValueError("JSON braces not found")
+
+        except Exception as e:
+            _t(trace, "info", f"❌ Scene {sid} AI prompt failed: {e}")
+            # 실패 시 폴백: 기본 프롬프트를 모든 세그먼트에 복사
+            fallback_list = [base_prompt] * seg_count
+            sc["frame_segments"]["segments"] = fallback_list
+
+    _t(trace, "info", "✅ [AI Long-Take] 프롬프트 상세화 완료")
+    return story_data
+
+
+
 
 
 

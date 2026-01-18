@@ -4,6 +4,8 @@ from __future__ import annotations
 
 from pathlib import Path as _Path
 import os
+from PIL import Image
+import uuid
 from app import settings
 # ── 유연 임포트 ─────────────────────────────────────────────────────────────
 from app.utils import ensure_dir, load_json, get_duration, _ffmpeg_escape_drawtext, SubtitleComposer, SubtitleStyle
@@ -112,37 +114,6 @@ def _slice_audio_segment(
 
 
 
-def plan_segments_s_e(total_frames: int, base_chunk: int = 41) -> List[Tuple[int, int]]:
-    """
-    [Wan 전용] 단순 (start, end) 세그먼트 분할.
-    - 오버랩 없음.
-    - 각 세그먼트 길이는 최대 base_chunk 프레임.
-    - 마지막 세그먼트는 남은 프레임만 사용.
-
-    예)
-      total_frames=33 → [(0, 33)]
-      total_frames=41 → [(0, 41)]
-      total_frames=60 → [(0, 41), (41, 60)]
-      total_frames=65 → [(0, 41), (41, 65)]
-    """
-    out: List[Tuple[int, int]] = []
-
-    if total_frames <= 0:
-        return out
-    if base_chunk <= 0:
-        # base_chunk가 0이거나 음수면 전체를 한 번에
-        out.append((0, total_frames))
-        return out
-
-    start = 0
-    while start < total_frames:
-        end = start + base_chunk
-        if end > total_frames:
-            end = total_frames
-        out.append((start, end))
-        start = end
-
-    return out
 
 
 
@@ -3200,13 +3171,13 @@ def build_missing_images_from_story(
     """
     story.json(또는 video.json)을 읽어 누락된 씬 이미지를 ComfyUI로 생성한다.
 
+    - 기본 워크플로우: QwenEdit2511-V1 (Step2용)
     - SaveImage 노드의 output_path를 동적으로 주입해 /view 404 문제를 줄인다.
     - result_data.outputs의 images 목록에서 type="output" 이미지를 우선 선택한다.
     - /view 호출 시 filename / subfolder / type 파라미터를 모두 로그로 남겨 디버깅에 활용한다.
+    - scene.characters 의 "female_01:0" 같은 값을 기반으로 캐릭터 이미지를
+      Load Image1~5 슬롯에 자동 매핑한다. (index+1 == 이미지 슬롯 번호)
     """
-    # --- [1. 모듈 임포트] ---
-
-
     # --- [2. 알림 콜백 함수 (중첩)] ---
     def _notify(stage: str, msg: str = "", **extra: Any) -> None:
         """진행률 콜백을 안전하게 호출하는 헬퍼"""
@@ -3247,13 +3218,14 @@ def build_missing_images_from_story(
     imgs_dir_name = str(paths_v.get("imgs_dir") or story_doc.get("paths", {}).get("imgs_dir") or "imgs")
     img_root = ensure_dir(root_dir / imgs_dir_name)
 
+    # --- [4. 워크플로우 로드 (Qwen Step2 기본)] ---
     try:
-
         base_jsons = _Path(JSONS_DIR)
     except (ImportError, AttributeError):
         base_jsons = _Path(r"C:\my_games\shorts_make\app\jsons")
 
-    wf_path_resolved = _Path(workflow_path) if workflow_path else (base_jsons / "nunchaku_qwen_image_swap.json")
+    # 기본값을 QwenEdit Step2 워크플로우로 변경
+    wf_path_resolved = _Path(workflow_path) if workflow_path else (base_jsons / "QwenEdit2511-V1.json")
     if not wf_path_resolved.exists():
         raise FileNotFoundError(f"필수 워크플로 없음: {wf_path_resolved}")
 
@@ -3263,7 +3235,7 @@ def build_missing_images_from_story(
     except (IOError, OSError, _json_loader.JSONDecodeError) as e_load_wf:
         raise RuntimeError(f"워크플로 로드 실패: {wf_path_resolved}") from e_load_wf
 
-    # --- [4. 워크플로/Comfy 헬퍼] ---
+    # --- [4-1. 워크플로/Comfy 헬퍼] ---
     def _find_nodes(gdict: Dict[str, Any], class_type_str: str) -> List[str]:
         hits: List[str] = []
         for nid, node_item in (gdict or {}).items():
@@ -3280,7 +3252,7 @@ def build_missing_images_from_story(
         except (KeyError, TypeError, AttributeError):
             _notify("warn", f"[IMG] 워크플로 주입 실패: Node {nid}, Key {key}")
 
-    # Latent / KSampler / Seed 관련
+    # Latent / KSampler / Seed 관련 (Qwen 워크플로에 없어도 안전하게 동작)
     latent_ids = _find_nodes(graph_origin, "EmptySD3LatentImage") + _find_nodes(graph_origin, "EmptyLatentImage")
     latent_ids = list(dict.fromkeys(latent_ids))
     ksampler_ids = _find_nodes(graph_origin, "KSampler")
@@ -3304,18 +3276,34 @@ def build_missing_images_from_story(
         except (KeyError, TypeError, ValueError, AttributeError):
             _notify("warn", f"[IMG] 시드 주입 실패: KSampler {k_id}")
 
-    # SaveImage 노드 사전 수집
+    # SaveImage 노드 수집
     save_image_ids = _find_nodes(graph_origin, "SaveImage")
     if not save_image_ids:
         _notify("warn", f"[IMG] 워크플로우({wf_path_resolved.name})에 'SaveImage' 노드가 없습니다. API 출력이 실패할 수 있습니다.")
 
-    # --- [ReActor 관련 헬퍼 - 기존 호환 유지용] ---
+    # --- [4-2. Qwen Step2용 LoadImage 슬롯 수집] ---
+    #  - "_meta.title" 에 "Load Image1", "Load Image2" ... 로 들어 있다고 가정
+    load_image_slots: Dict[int, str] = {}
+    for nid, node in (graph_origin or {}).items():
+        try:
+            if str(node.get("class_type")) != "LoadImage":
+                continue
+            title = str(node.get("_meta", {}).get("title") or node.get("label") or "")
+            m = re.search(r"Load\s*Image\s*(\d+)", title, re.IGNORECASE)
+            if not m:
+                continue
+            slot_idx = int(m.group(1))  # 1,2,3...
+            load_image_slots[slot_idx] = str(nid)
+        except Exception:
+            continue
+
+    # --- [캐릭터 이미지 경로 해석] ---
     def _resolve_face_image_by_name(name: str) -> _Path | None:
         try:
-
             base_dir_char = _Path(CHARACTER_DIR)
         except (ImportError, AttributeError):
             base_dir_char = _Path(r"C:\my_games\shorts_make\character")
+
         exts = (".png", ".jpg", ".jpeg", ".webp")
         for ext_item in exts:
             p_path = base_dir_char / f"{name}{ext_item}"
@@ -3323,21 +3311,7 @@ def build_missing_images_from_story(
                 return p_path
         return None
 
-    def _pick_scene_character_name(scene: Dict[str, Any]) -> str | None:
-        return None
-
-    def _inject_face_to_reactors(gdict: Dict[str, Any], file_name: str) -> List[str]:
-        return []
-
-    def _inject_face_image_loaders(_gdict: Dict[str, Any], _file_name: str) -> List[str]:
-        return []
-
-    def _parse_first_char_index(scene: Dict[str, Any]) -> int:
-        return 0
-
     # --- [ComfyUI 제출/대기 헬퍼] ---
-
-
     def _wait_img(url: str, gdict: Dict[str, Any], *, timeout: int, poll: float,
                   progress_cb: Callable[[Dict[str, Any]], None]) -> Dict[str, Any]:
         wait_i_counter = 0
@@ -3393,7 +3367,7 @@ def build_missing_images_from_story(
             # 워크플로 복제
             graph_clone = _json_loader.loads(_json_loader.dumps(graph_origin))
 
-            # Latent 크기 주입
+            # Latent 크기 주입 (Qwen 워크플로에 Latent가 없어도 안전)
             for nid_latent in latent_ids:
                 _set_input(graph_clone, nid_latent, "width", int(ui_width))
                 _set_input(graph_clone, nid_latent, "height", int(ui_height))
@@ -3407,135 +3381,110 @@ def build_missing_images_from_story(
             neg_text = str(sc.get("prompt_negative") or "") or default_neg
 
             def _apply_prompts(gdict: Dict[str, Any], pos: str, neg: str) -> None:
-                fields_list = ("text", "text_g", "text_l")
+                """
+                - CLIPTextEncode / DualClipTextEncode 의 text/text_g/text_l 갱신
+                - PrimitiveString(멀티라인) 프롬프트 노드(value) 갱신 (Qwen에서 사용)
+                - QwenImageIntegratedKSampler 의 negative_prompt 갱신
+                """
                 for nid_prompt, node_prompt in gdict.items():
                     try:
                         if not isinstance(node_prompt, dict):
                             continue
+                        ctype = str(node_prompt.get("class_type") or "")
                         node_inputs = node_prompt.get("inputs", {})
                         if not isinstance(node_inputs, dict):
                             node_inputs = node_prompt.setdefault("inputs", {})
-                        if not any(f_key in node_inputs for f_key in fields_list):
-                            continue
-                        hint_str = str(node_prompt.get("label") or "") + " " + str(
-                            node_prompt.get("_meta", {}).get("title") or ""
-                        )
-                        is_neg_prompt = (
-                            "neg" in hint_str.lower()
-                            or "negative" in hint_str.lower()
-                            or "Negative" in hint_str
-                        )
-                        val_to_set = neg if is_neg_prompt else pos
-                        for f_key in fields_list:
-                            if f_key in node_inputs:
-                                node_inputs[f_key] = val_to_set
+
+                        label = str(node_prompt.get("label") or "")
+                        title = str(node_prompt.get("_meta", {}).get("title") or "") + " " + label
+                        lower_title = title.lower()
+
+                        # 1) CLIP 기반 프롬프트 (예전 워크플로 호환)
+                        fields_list = ("text", "text_g", "text_l")
+                        if any(f_key in node_inputs for f_key in fields_list):
+                            is_neg_prompt = (
+                                "neg" in lower_title
+                                or "negative" in lower_title
+                            )
+                            val_to_set = neg if is_neg_prompt else pos
+                            for f_key in fields_list:
+                                if f_key in node_inputs:
+                                    node_inputs[f_key] = val_to_set
+
+                        # 2) PrimitiveString / PrimitiveStringMultiline 기반 (Qwen용)
+                        if "PrimitiveString" in ctype and "prompt" in lower_title:
+                            # 이 노드는 양수 프롬프트용으로만 사용 (neg는 Sampler에 직접 주입)
+                            node_inputs["value"] = pos
+
+                        # 3) Qwen Sampler의 negative_prompt 직접 주입
+                        if ctype == "QwenImageIntegratedKSampler":
+                            node_inputs["negative_prompt"] = neg or ""
                     except (AttributeError, KeyError, TypeError) as e_apply_prompt:
                         _notify("warn", f"[IMG] 프롬프트 적용 중 경고: {e_apply_prompt}")
                         continue
 
             _apply_prompts(graph_clone, pos_text_raw, neg_text)
 
-            # KSampler steps 주입
+            # KSampler steps 주입 (Qwen 워크플로에 없으면 무시)
             for nid_sampler in ksampler_ids:
                 _set_input(graph_clone, nid_sampler, "steps", int(steps))
 
-            # --- SaveImage output_path 주입 ---
+            # --- 캐릭터 → Load Image 슬롯 매핑 (Step2 방식) ---
+            try:
+                # scene.characters 정규화 ("female_01:0" → {"id":"female_01","index":0} ...)
+                sc_norm = normalize_scene_characters(sc)
+                sc.update(sc_norm)
+                chars_norm = sc_norm.get("characters") or []
+
+                slot_to_path: Dict[int, _Path] = {}
+                for c in chars_norm:
+                    cid = str(c.get("id") or "").strip()
+                    if not cid:
+                        continue
+                    idx_val = c.get("index")
+                    if not isinstance(idx_val, int) or idx_val < 0:
+                        continue
+                    slot_idx = idx_val + 1  # 0 → image1, 1 → image2 ...
+                    if slot_idx not in load_image_slots:
+                        continue
+                    if slot_idx in slot_to_path:
+                        continue
+                    p_face = _resolve_face_image_by_name(cid)
+                    if not p_face:
+                        continue
+                    slot_to_path[slot_idx] = p_face
+
+                if slot_to_path:
+                    comfy_dir = _Path(COMFY_INPUT_DIR)
+                    comfy_dir.mkdir(parents=True, exist_ok=True)
+                    for slot_idx, src_path in slot_to_path.items():
+                        node_id = load_image_slots.get(slot_idx)
+                        if not node_id:
+                            continue
+                        # 씬ID + 슬롯번호를 붙여서 파일명 충돌 최소화
+                        dest_name = f"{sid}_slot{slot_idx}_{src_path.name}"
+                        dest_path = comfy_dir / dest_name
+                        try:
+                            shutil.copy2(src_path, dest_path)
+                        except Exception as e_copy:
+                            _notify(
+                                "warn",
+                                f"[IMG] {sid} 캐릭터 이미지 복사 실패: slot={slot_idx}, src={src_path.name}, err={e_copy}",
+                            )
+                            continue
+                        _set_input(graph_clone, node_id, "image", dest_name)
+                        _notify("debug", f"[IMG] {sid} slot{slot_idx} → {dest_name} (node {node_id})")
+                else:
+                    # 캐릭터 매핑이 없어도 워크플로 기본값(9.jpg 등)으로 동작
+                    _notify("debug", f"[IMG] {sid} 캐릭터 이미지 매핑 없음 → 워크플로 기본 이미지 사용")
+            except Exception as e_char:
+                _notify("warn", f"[IMG] {sid} 캐릭터 슬롯 매핑 중 오류: {e_char}")
+
+            # --- SaveImage output_path 주입 (있는 경우에만) ---
             relative_output_path = f"t2i_output/{sid}"
             for save_node_id in save_image_ids:
                 _set_input(graph_clone, save_node_id, "output_path", relative_output_path)
                 _notify("debug", f"[IMG] SaveImage 노드({save_node_id})에 output_path='{relative_output_path}' 주입")
-
-            # --- ReActor 얼굴 스왑 설정 ---
-            WORKFLOW_REACTOR_MAP = {
-                "28": ("25", "male_01"),
-                "23": ("24", "female_01"),
-                "22": ("19", "other_char"),
-            }
-
-            scene_char_specs: Dict[str, int] = {}
-            try:
-                chars_list_data = sc.get("characters") or sc.get("character_objs") or []
-                for item_spec in chars_list_data:
-                    parsed_id = None
-                    parsed_idx = None
-                    if isinstance(item_spec, dict):
-                        parsed_id = str(item_spec.get("id") or item_spec.get("name") or "").strip()
-                        if "index" in item_spec:
-                            try:
-                                parsed_idx = int(item_spec.get("index"))
-                            except (TypeError, ValueError):
-                                parsed_idx = None
-                        elif "face_index" in item_spec:
-                            try:
-                                parsed_idx = int(item_spec.get("face_index"))
-                            except (TypeError, ValueError):
-                                parsed_idx = None
-                    elif isinstance(item_spec, str):
-                        raw_txt_val = item_spec.strip()
-                        if ":" in raw_txt_val:
-                            left_txt, right_txt = raw_txt_val.split(":", 1)
-                            parsed_id = left_txt.strip()
-                            try:
-                                parsed_idx = int(right_txt.strip())
-                            except ValueError:
-                                parsed_idx = None
-                        else:
-                            parsed_id = raw_txt_val
-                    if parsed_id:
-                        scene_char_specs[parsed_id] = 0 if parsed_idx is None else int(parsed_idx)
-            except (AttributeError, TypeError, ValueError, IndexError) as e_parse:
-                _notify("warn", f"[IMG] {sid} 캐릭터 파싱 실패: {e_parse}")
-
-            _notify("debug", f"[IMG] {sid} 씬 캐릭터 스펙: {scene_char_specs}")
-
-            enabled_reactors_count = 0
-            for reactor_id_str, (load_id_str, default_char_id_str) in WORKFLOW_REACTOR_MAP.items():
-                char_id_for_node: Optional[str] = None
-                face_index_for_node: int = 0
-                if default_char_id_str in scene_char_specs:
-                    char_id_for_node = default_char_id_str
-                    face_index_for_node = scene_char_specs[default_char_id_str]
-
-                if char_id_for_node:
-                    face_path_resolved = _resolve_face_image_by_name(char_id_for_node)
-                    face_name_in_input: Optional[str] = None
-
-                    if face_path_resolved and face_path_resolved.exists():
-                        try:
-                              # type: ignore
-                            comfy_in_dir = _Path(COMFY_INPUT_DIR)
-                            comfy_in_dir.mkdir(parents=True, exist_ok=True)
-                            face_name_in_input = face_path_resolved.name
-                            shutil.copy2(str(face_path_resolved), str(comfy_in_dir / face_name_in_input))
-                        except (ImportError, AttributeError) as e_import_settings:
-                            _notify("warn", f"[IMG] {sid} settings.COMFY_INPUT_DIR 임포트 실패: {e_import_settings}")
-                            face_name_in_input = None
-                        except (IOError, OSError, shutil.Error) as e_copy:
-                            _notify("warn", f"[IMG] {sid} 얼굴 복사 실패 ({face_name_in_input}): {e_copy}")
-                            face_name_in_input = None
-
-                    if face_name_in_input:
-                        _set_input(graph_clone, reactor_id_str, "enabled", True)
-                        _set_input(graph_clone, load_id_str, "image", face_name_in_input)
-                        _set_input(graph_clone, reactor_id_str, "input_faces_index", str(face_index_for_node))
-                        _set_input(graph_clone, reactor_id_str, "source_faces_index", "0")
-                        _notify(
-                            "info",
-                            f"[IMG] {sid} ReActor 활성화: Node {reactor_id_str} "
-                            f"(Char: {char_id_for_node}, FaceIdx: {face_index_for_node}, Img: {face_name_in_input})",
-                        )
-                        enabled_reactors_count += 1
-                    else:
-                        _set_input(graph_clone, reactor_id_str, "enabled", False)
-                        _notify(
-                            "warn",
-                            f"[IMG] {sid} ReActor 비활성화: Node {reactor_id_str} ({char_id_for_node} 이미지 파일 없음)",
-                        )
-                else:
-                    _set_input(graph_clone, reactor_id_str, "enabled", False)
-
-            if enabled_reactors_count == 0:
-                _notify("info", f"[IMG] {sid} 씬에 매칭되는 캐릭터 없음. 페이스 스왑 비활성화.")
 
             # --- ComfyUI 제출 ---
             req_count += 1
@@ -3649,608 +3598,682 @@ def build_missing_images_from_story(
     return created
 
 
+# ─────────────────────────────────────────────────────────────────────────────
+# 1. Step 1: Z-Image (베이스 생성)
+# ─────────────────────────────────────────────────────────────────────────────
 def build_step1_zimage_base(
         *,
-        video_json_path: str | _Path,
-        source_json_path: str | _Path,
-        workflow_path: str | _Path | None = None,
+        video_json_path: str | Path,
+        source_json_path: str | Path,
+        workflow_path: str | Path | None = None,
         ui_width: int = 720,
         ui_height: int = 1280,
         steps: int = 28,
         skip_if_exists: bool = True,
         timeout_sec: int = 1800,
         poll_sec: float = 1.0,
-        # 프롬프트 키 우선순위(탭마다 다르게 주입)
         pos_keys: List[str] | None = None,
         neg_keys: List[str] | None = None,
-        # faceswap: 기본 OFF, 필요 시 enable ids로 ON
         reactor_disable_all_by_default: bool = True,
         reactor_enable_node_ids: List[str] | None = None,
-        # 워크플로우의 positive/negative 주입을 "링크 기반"으로 하되,
-        # 필요하면 노드ID fallback도 지정 가능
         fallback_positive_clip_node_id: str | None = "6",
         fallback_negative_clip_node_id: str | None = "217",
-        # 출력 다운로드 파일 prefix
         out_prefix: str = "temp_",
         out_ext: str = ".png",
         on_progress: Optional[Dict[str, Any] | Callable[[Dict[str, Any]], None]] = None,
-) -> Dict[str, _Path]:
-    """
-    공통 Step1 (Z-Image 베이스 생성) 엔진
+) -> Dict[str, Path]:
+    # 1. 경로 및 설정 로드
+    p_video = Path(str(video_json_path)).resolve()
+    if not p_video.exists(): raise FileNotFoundError(f"video.json 없음: {p_video}")
 
-    - source_json_path(프롬프트 원본)에서 scene별 prompt를 읽어서
-      workflow_path(Z-Image 계열 워크플로우)에 주입하고,
-      imgs/{out_prefix}{scene_id}{out_ext} 로 저장한다.
-    - faceswap(ReActorFaceSwap)는 디폴트 OFF, reactor_enable_node_ids로 지정한 노드만 ON 가능.
-    - 반환: {scene_id: 생성된 이미지 경로}
-    """
-
-    def _notify(stage: str, msg: str = "", **extra: Any) -> None:
-        if not on_progress:
-            return
-        data: Dict[str, Any] = {"stage": stage, "msg": msg}
-        if extra:
-            data.update(extra)
-        try:
-            if callable(on_progress):
-                on_progress(data)
-            elif isinstance(on_progress, dict):
-                cb = on_progress.get("callback")
-                if callable(cb):
-                    cb(data)
-        except Exception:
-            pass
-
-    def _normalize_host(raw: str) -> str:
-        s = (raw or "").strip()
-        if not s:
-            s = "http://127.0.0.1:8188"
-        pr = _urlparse.urlparse(s)
-        if not pr.scheme:
-            s = "http://" + s.lstrip("/")
-        return s.rstrip("/")
-
-    def _submit_and_wait(base_url: str, graph: Dict[str, Any], *, timeout: int, poll: float) -> Dict[str, Any]:
-        r = requests.post(f"{base_url}/prompt", json={"prompt": graph}, timeout=60)
-        r.raise_for_status()
-        j = r.json() or {}
-        pid = j.get("prompt_id")
-        if not pid:
-            raise RuntimeError(f"ComfyUI prompt_id 없음: {j}")
-
-        t0 = _time.time()
-        while True:
-            if _time.time() - t0 > timeout:
-                raise TimeoutError(f"ComfyUI timeout({timeout}s): prompt_id={pid}")
-            rr = requests.get(f"{base_url}/history/{pid}", timeout=30)
-            rr.raise_for_status()
-            h = rr.json() or {}
-            if pid in h:
-                return h[pid]
-            _time.sleep(max(0.05, float(poll)))
-
-    def _download_first_image(base_url: str, outputs: Dict[str, Any], out_path: _Path) -> None:
-        for _, out_d in (outputs or {}).items():
-            if not isinstance(out_d, dict):
-                continue
-            imgs = out_d.get("images", []) or []
-            if not isinstance(imgs, list):
-                continue
-            for img in imgs:
-                if not isinstance(img, dict):
-                    continue
-                fname = img.get("filename")
-                if not fname:
-                    continue
-                params = {"filename": fname, "type": img.get("type", "output")}
-                sub = img.get("subfolder", None)
-                if sub is not None:
-                    params["subfolder"] = sub
-                resp = requests.get(f"{base_url}/view", params=params, timeout=60)
-                resp.raise_for_status()
-                ensure_dir(out_path.parent)
-                out_path.write_bytes(resp.content)
-                return
-        raise RuntimeError("outputs에 images가 없습니다(SaveImage/PreviewImage 출력 확인 필요)")
-
-    def _linked_node_id(v: Any) -> Optional[str]:
-        if isinstance(v, list) and len(v) >= 1:
-            return str(v[0])
-        return None
-
-    def _infer_ksamplers(graph: Dict[str, Any]) -> List[tuple[str, Dict[str, Any]]]:
-        out: List[tuple[str, Dict[str, Any]]] = []
-        for nid, node in (graph or {}).items():
-            if isinstance(node, dict) and str(node.get("class_type")) == "KSampler":
-                out.append((str(nid), node))
-        return out
-
-    def _set_cliptext(graph: Dict[str, Any], clip_nid: Optional[str], text: str) -> bool:
-        if not clip_nid:
-            return False
-        node = graph.get(str(clip_nid))
-        if not isinstance(node, dict):
-            return False
-        if str(node.get("class_type")) != "CLIPTextEncode":
-            return False
-        node.setdefault("inputs", {})["text"] = text
-        return True
-
-    # ------------------------
-    # paths / docs
-    # ------------------------
-    p_video = _P(video_json_path).resolve()
-    if not p_video.exists():
-        raise FileNotFoundError(f"video.json 없음: {p_video}")
-    proj_dir = p_video.parent
     video_doc = load_json(p_video, {}) or {}
-    scenes = (video_doc.get("scenes") or []) or []
+    scenes = video_doc.get("scenes", []) or []
 
-    p_src = _P(source_json_path).resolve()
+    p_src = Path(str(source_json_path)).resolve()
     if not p_src.exists():
-        raise FileNotFoundError(f"source json 없음: {p_src}")
-    src_doc = load_json(p_src, {}) or {}
-    src_scenes = (src_doc.get("scenes") or []) or []
+        src_doc = {}
+        src_scenes = []
+    else:
+        src_doc = load_json(p_src, {}) or {}
+        src_scenes = src_doc.get("scenes", []) or []
 
-    # id 매핑(t_001 / 001 / 1 모두)
-    src_map: Dict[str, Dict[str, Any]] = {}
+    # 소스 매핑
+    src_map = {}
     for s in src_scenes:
-        if not isinstance(s, dict):
-            continue
         rid = str(s.get("id", "")).strip()
-        if not rid:
-            continue
-        src_map[rid] = s
-        if rid.startswith("t_"):
-            src_map[rid.replace("t_", "")] = s
-            x = rid.replace("t_", "")
-            if x.isdigit():
-                src_map[str(int(x))] = s
-        if rid.isdigit():
-            src_map[str(int(rid))] = s
-            src_map[f"t_{int(rid):03d}"] = s
+        if rid:
+            src_map[rid] = s
+            if rid.startswith("t_"):
+                src_map[rid.replace("t_", "")] = s
+                x = rid.replace("t_", "")
+                if x.isdigit(): src_map[str(int(x))] = s
+            if rid.isdigit():
+                src_map[str(int(rid))] = s
+                src_map[f"t_{int(rid):03d}"] = s
 
+    # 이미지 저장 경로
     paths_v = video_doc.get("paths") or {}
-    root_dir = _P(paths_v.get("root") or proj_dir)
-    imgs_dir_name = str(paths_v.get("imgs_dir") or "imgs")
-    img_root = ensure_dir(root_dir / imgs_dir_name)
+    root_dir = Path(str(paths_v.get("root") or p_video.parent))
+    imgs_dir = ensure_dir(root_dir / str(paths_v.get("imgs_dir") or "imgs"))
 
-    # workflow
-    try:
-        base_jsons = _P(JSONS_DIR)
-    except Exception:
-        base_jsons = _P(r"C:\my_games\shorts_make\app\jsons")
+    # 워크플로우 로드
+    wf = Path(str(workflow_path)) if workflow_path else (Path(JSONS_DIR) / "Z-Image-lora.json")
+    if not wf.exists(): raise FileNotFoundError(f"Step1 WF 없음: {wf}")
 
-    wf = _P(workflow_path) if workflow_path else (base_jsons / "Z-Image-lora.json")
-    if not wf.exists():
-        raise FileNotFoundError(f"Step1 workflow 없음: {wf}")
+    # ★ 로그 출력
+    if on_progress:
+        msg = f"▶ [Step1] 워크플로우: {wf.name}"
+        if callable(on_progress):
+            on_progress({"stage": "debug", "msg": msg})
+        elif isinstance(on_progress, dict) and callable(on_progress.get("callback")):
+            on_progress["callback"]({"stage": "debug", "msg": msg})
 
-    graph_origin: Dict[str, Any] = _json.loads(wf.read_text(encoding="utf-8"))
+    graph_origin = json.loads(wf.read_text(encoding="utf-8"))
 
-    # comfy host
-    try:
-        from app import settings as _settings
-        comfy_host_raw = getattr(_settings, "COMFY_HOST", "")
-    except Exception:
-        comfy_host_raw = ""
-    base_url = _normalize_host(comfy_host_raw)
+    # ComfyUI URL 처리
+    base_url = str(COMFY_HOST).strip()
+    if not base_url.startswith("http"): base_url = f"http://{base_url}"
+    base_url = base_url.rstrip("/")
 
-    # keys default
-    if pos_keys is None:
-        pos_keys = ["prompt_img_1", "prompt_img", "prompt"]
-    if neg_keys is None:
-        neg_keys = ["prompt_negative", "prompt_img_neg", "prompt_neg"]
+    if pos_keys is None: pos_keys = ["prompt_img_1", "prompt_img", "prompt"]
+    if neg_keys is None: neg_keys = ["prompt_negative", "prompt_img_neg", "prompt_neg"]
 
-    # ------------------------
-    # run
-    # ------------------------
-    created: Dict[str, _Path] = {}
-    enable_set = set((reactor_enable_node_ids or []))
+    created = {}
+    enable_set = set(reactor_enable_node_ids or [])
 
-    _notify("step1", f"[Step1] start source={p_src.name} workflow={wf.name}")
-
+    # 씬 처리 루프
     for sc in scenes:
-        if not isinstance(sc, dict):
-            continue
         sid = str(sc.get("id", "")).strip()
-        if not sid:
-            continue
+        if not sid: continue
 
+        # 데이터 병합
         src_sc = src_map.get(sid)
         if not src_sc and sid.startswith("t_"):
             src_sc = src_map.get(sid.replace("t_", ""))
             if not src_sc and sid.replace("t_", "").isdigit():
                 src_sc = src_map.get(str(int(sid.replace("t_", ""))))
 
-        if not src_sc:
-            continue
+        final_sc = sc.copy()
+        if src_sc: final_sc.update(src_sc)
 
+        # 프롬프트 추출
         pos = ""
         for k in pos_keys:
-            v = src_sc.get(k)
+            v = final_sc.get(k)
             if isinstance(v, str) and v.strip():
                 pos = v.strip()
                 break
 
         neg = ""
         for k in neg_keys:
-            v = src_sc.get(k)
+            v = final_sc.get(k)
             if isinstance(v, str) and v.strip():
                 neg = v.strip()
                 break
 
-        if not pos:
-            continue
+        if not pos: continue
 
-        out_path = img_root / f"{out_prefix}{sid}{out_ext}"
+        out_path = imgs_dir / f"{out_prefix}{sid}{out_ext}"
         if skip_if_exists and out_path.exists() and out_path.stat().st_size > 0:
             created[sid] = out_path
             continue
 
-        _notify("step1_scene", f"[Step1] {sid} generating...")
+        if on_progress:
+            msg = f"[Step1] {sid} 생성 중... (Prompt: {pos[:30]}...)"
+            if callable(on_progress):
+                on_progress({"stage": "step1_scene", "msg": msg})
+            elif isinstance(on_progress, dict) and callable(on_progress.get("callback")):
+                on_progress["callback"]({"stage": "step1_scene", "msg": msg})
 
-        graph = _json.loads(_json.dumps(graph_origin))
+        # 그래프 복사 및 값 주입
+        graph = json.loads(json.dumps(graph_origin))
 
-        # 0) width/height/steps + Preview->Save
-        for nid, node in (graph or {}).items():
-            if not isinstance(node, dict):
-                continue
-            ctype = str(node.get("class_type") or "")
-            inputs = node.get("inputs", {}) or {}
+        for nid, node in graph.items():
+            inputs = node.get("inputs", {})
+            cls = str(node.get("class_type", ""))
 
-            if (
-                    "width" in inputs and "height" in inputs
-                    and isinstance(inputs.get("width"), int) and isinstance(inputs.get("height"), int)
-            ):
+            # 해상도
+            if "width" in inputs and "height" in inputs:
                 inputs["width"] = int(ui_width)
                 inputs["height"] = int(ui_height)
 
-            if ctype == "KSampler":
-                if "steps" in inputs:
-                    inputs["steps"] = int(steps)
+            # 스텝
+            if cls == "KSampler" and "steps" in inputs:
+                inputs["steps"] = int(steps)
 
-            if ctype == "PreviewImage":
+            # 파일명 Prefix
+            if cls == "PreviewImage":
                 node["class_type"] = "SaveImage"
-                node.setdefault("inputs", {})["filename_prefix"] = "Z_Base"
+                node.setdefault("inputs", {})["filename_prefix"] = f"Z_Base_{sid}"
 
-        # 1) positive/negative (KSampler link 기반)
+            # Seed 랜덤화
+            if cls == "KSampler" and "seed" in inputs:
+                inputs["seed"] = random.randint(1, 2 ** 31)
+
+            # ReActor 설정
+            if cls == "ReActorFaceSwap":
+                inputs["enabled"] = (str(nid) in enable_set)
+
+        # 프롬프트 주입 (Inline Logic)
+        # KSampler 찾아서 연결된 CLIPTextEncode 추적
         ok_pos = False
         ok_neg = False
-        for _, ksampler in _infer_ksamplers(graph):
-            inp = (ksampler.get("inputs") or {})
-            if not ok_pos:
-                ok_pos = _set_cliptext(graph, _linked_node_id(inp.get("positive")), pos)
-            if neg and (not ok_neg):
-                ok_neg = _set_cliptext(graph, _linked_node_id(inp.get("negative")), neg)
 
-        # fallback by node id
-        if (not ok_pos) and fallback_positive_clip_node_id:
-            _set_cliptext(graph, fallback_positive_clip_node_id, pos)
-        if neg and (not ok_neg) and fallback_negative_clip_node_id:
-            _set_cliptext(graph, fallback_negative_clip_node_id, neg)
+        ksamplers = [node for nid, node in graph.items() if node.get("class_type") == "KSampler"]
+        for ks in ksamplers:
+            inp = ks.get("inputs", {})
 
-        # 2) seed (KSampler.seed int만 갱신; 링크 seed는 워크플로우쪽이 필요하면 별도 확장)
-        for _, ksampler in _infer_ksamplers(graph):
-            inp = (ksampler.get("inputs") or {})
-            if "seed" in inp and isinstance(inp.get("seed"), int):
-                inp["seed"] = _random.randint(1, 2_147_483_646)
+            # Positive Link
+            pos_link = inp.get("positive")
+            if isinstance(pos_link, list) and len(pos_link) > 0:
+                pos_nid = str(pos_link[0])
+                if pos_nid in graph and graph[pos_nid].get("class_type") == "CLIPTextEncode":
+                    graph[pos_nid]["inputs"]["text"] = pos
+                    ok_pos = True
 
-        # 3) ReActorFaceSwap 디폴트 OFF + 선택 ON
-        for nid, node in (graph or {}).items():
-            if not isinstance(node, dict):
-                continue
-            if str(node.get("class_type") or "") == "ReActorFaceSwap":
-                inp = node.setdefault("inputs", {})
-                if reactor_disable_all_by_default:
-                    inp["enabled"] = False
-                if str(nid) in enable_set:
-                    inp["enabled"] = True
+            # Negative Link
+            neg_link = inp.get("negative")
+            if isinstance(neg_link, list) and len(neg_link) > 0:
+                neg_nid = str(neg_link[0])
+                if neg_nid in graph and graph[neg_nid].get("class_type") == "CLIPTextEncode":
+                    graph[neg_nid]["inputs"]["text"] = neg
+                    ok_neg = True
 
-        result = _submit_and_wait(base_url, graph, timeout=timeout_sec, poll=poll_sec)
-        outputs = result.get("outputs") or {}
-        _download_first_image(base_url, outputs, out_path)
-        created[sid] = out_path
+        # Fallback (못 찾았으면 지정된 ID 사용)
+        if not ok_pos and fallback_positive_clip_node_id in graph:
+            graph[fallback_positive_clip_node_id]["inputs"]["text"] = pos
+        if not ok_neg and fallback_negative_clip_node_id in graph:
+            graph[fallback_negative_clip_node_id]["inputs"]["text"] = neg
 
-    _notify("step1_done", f"[Step1] done created={len(created)}")
+        # 실행
+        try:
+            res = _submit_and_wait_comfy_func(base_url, graph, timeout=timeout_sec, poll=poll_sec)
+
+            # 이미지 다운로드 (Inline Logic)
+            outputs = res.get("outputs", {})
+            downloaded = False
+            for _, out_d in outputs.items():
+                if "images" in out_d:
+                    for img in out_d["images"]:
+                        fname = img.get("filename")
+                        if fname:
+                            p = {"filename": fname, "type": img.get("type", "output"),
+                                 "subfolder": img.get("subfolder", "")}
+                            r = requests.get(f"{base_url}/view", params=p, timeout=60)
+                            if r.status_code == 200:
+                                out_path.parent.mkdir(parents=True, exist_ok=True)
+                                with open(out_path, "wb") as f: f.write(r.content)
+                                downloaded = True
+                                break
+                if downloaded: break
+
+            if downloaded:
+                created[sid] = out_path
+            else:
+                if on_progress:
+                    # 간단 알림
+                    pass
+
+        except Exception as e:
+            if on_progress:
+                msg = f"[{sid}] 생성 실패: {e}"
+                if callable(on_progress):
+                    on_progress({"stage": "err", "msg": msg})
+                elif isinstance(on_progress, dict) and callable(on_progress.get("callback")):
+                    on_progress["callback"]({"stage": "err", "msg": msg})
+            continue
+
     return created
 
 
-
+# ─────────────────────────────────────────────────────────────────────────────
+# 2. Step 2: Qwen Composite (합성)
+# ─────────────────────────────────────────────────────────────────────────────
 def build_step2_qwen_composite(
         *,
-        video_json_path: str | _Path,
-        source_json_path: str | _Path,
-        workflow_path: str | _Path | None = None,
-        # 베이스 이미지 경로 규칙(쇼츠는 Step2만 쓰니, base_from_key를 쓸 수도 있음)
+        # 기본(레거시) 모드: video.json 전체를 순회하면서 합성
+        video_json_path: str | Path | None = None,
+        source_json_path: str | Path | None = None,
+        workflow_path: str | Path | None = None,
         base_prefix: str = "temp_",
         base_ext: str = ".png",
-        # 쇼츠에서 “메인이미지 만들기”로 Step2만 쓸 경우:
-        # source_json에서 베이스 이미지를 직접 지정하는 키를 쓰고 싶으면 base_from_key 사용
-        base_from_key: str | None = None,  # 예: "img_file" 또는 "base_img_file"
-        # product image는 쇼핑에서만 필요. 없으면 Step2를 "단순 편집"으로도 사용 가능하게 둠.
-        product_image_path: str | _Path | None = None,
-        # 워크플로우의 입력 주입 노드ID(기본은 네 QwenEdit2511-V1 구조)
+        base_from_key: str | None = None,
+        product_image_path: str | Path | None = None,
         node_id_base_image: str = "9",
         node_id_product_image: str = "32",
         node_id_prompt_value: str = "88",
-        node_id_sampler: str = "107",  # QwenImageIntegratedKSampler
+        node_id_sampler: str = "107",
         sampler_steps_key: str = "steps",
         sampler_seed_key: str = "seed",
-        # 프롬프트 키 우선순위
-        edit_keys: List[str] | None = None,
+        edit_keys: list | None = None,
         ui_width: int = 720,
         ui_height: int = 1280,
         steps: int = 28,
         skip_if_exists: bool = True,
         timeout_sec: int = 1800,
         poll_sec: float = 1.0,
-        on_progress: Optional[Dict[str, Any] | Callable[[Dict[str, Any]], None]] = None,
-) -> None:
+        on_progress: object = None,
+        # 신규 모드: shorts / shopping UI에서 단일 씬 기준으로 호출
+        project_dir_or_file: str | Path | None = None,
+        scene: Optional[Dict[str, Any]] = None,
+        slot_images: Optional[List[str]] = None,
+        options: Optional[Dict[str, Any]] = None,
+        target_scene_ids: Optional[List[str]] = None,
+) -> Optional[Path]:
+    """Qwen Composite(이미지 합성) 공통 실행 함수.
+
+    사용 패턴:
+      - video_json_path만 넘기면 video.json의 모든 씬을 순회하며 합성.
+      - project_dir_or_file + scene + slot_images를 넘기면 해당 씬 1개만 처리.
+        slot_images는 [image1, image2, image3, image4, image5] 형식.
     """
-    공통 Step2 (QwenEdit 합성/편집) 엔진
 
-    - source_json_path(프롬프트 원본)에서 scene별 edit prompt를 읽어서
-      workflow_path(QwenEdit 계열)에 주입하고,
-      imgs/{scene_id}.png 로 저장하며 video.json의 scene.img_file 갱신
-    - product_image_path가 None이면, product 입력 노드는 건드리지 않고 “편집만” 수행 가능
-    """
+    # 이 모듈에 이미 존재한다고 가정(너 코드에 있는 유틸)
+    # load_json, save_json, ensure_dir, JSONS_DIR, COMFY_HOST, COMFY_INPUT_DIR,
+    # CHARACTER_DIR, _submit_and_wait_comfy_func
+    # (여기서는 이름 그대로 사용)
 
+    # ------------------------------------------------------------------
+    # 0) 옵션 병합 (UI에서 넘어온 옵션 우선 적용)
+    # ------------------------------------------------------------------
+    if options and isinstance(options, dict):
+        ui_width = int(options.get("width", ui_width))
+        ui_height = int(options.get("height", ui_height))
+        steps = int(options.get("steps", steps))
 
-    def _notify(stage: str, msg: str = "", **extra: Any) -> None:
-        if not on_progress:
-            return
-        data: Dict[str, Any] = {"stage": stage, "msg": msg}
-        if extra:
-            data.update(extra)
+    # ------------------------------------------------------------------
+    # 1) video.json 경로 확정
+    # ------------------------------------------------------------------
+    p_video: Path | None = None
+
+    if project_dir_or_file is not None:
+        p = Path(str(project_dir_or_file)).resolve()
+        if p.is_dir():
+            p_video = p / "video.json"
+        else:
+            p_video = p
+    elif video_json_path is not None:
+        p_video = Path(str(video_json_path)).resolve()
+
+    if p_video is None or not p_video.exists():
+        raise FileNotFoundError(f"video.json 없음: {p_video}")
+
+    # ------------------------------------------------------------------
+    # 2) video.json / 소스 JSON 로드
+    # ------------------------------------------------------------------
+    video_doc = load_json(p_video, {}) or {}
+    scenes = video_doc.get("scenes", []) or []
+
+    # 처리 대상 scene id 집합 계산
+    target_ids: Optional[set[str]] = None
+    if scene and scene.get("id"):
+        target_ids = {str(scene.get("id")).strip()}
+    elif target_scene_ids:
+        target_ids = {str(sid).strip() for sid in target_scene_ids if str(sid).strip()}
+
+    # 소스 데이터(프롬프트 등) 로드
+    src_map: Dict[str, Dict[str, Any]] = {}
+    if source_json_path:
+        p_src = Path(str(source_json_path)).resolve()
+        if p_src.exists():
+            src_doc = load_json(p_src, {}) or {}
+            for s in src_doc.get("scenes", []) or []:
+                rid = str(s.get("id", "")).strip()
+                if rid:
+                    src_map[rid] = s
+
+    # ------------------------------------------------------------------
+    # 3) 워크플로우 / Comfy 설정
+    # ------------------------------------------------------------------
+    wf = Path(str(workflow_path)) if workflow_path else (Path(JSONS_DIR) / "QwenEdit2511-V1.json")
+    if not wf.exists():
+        raise FileNotFoundError(f"Step2 WF 없음: {wf}")
+
+    if on_progress:
+        msg = f"[Step2] 워크플로우: {wf.name}"
+        if callable(on_progress):
+            on_progress({"stage": "debug", "msg": msg})
+        elif isinstance(on_progress, dict) and callable(on_progress.get("callback")):
+            on_progress["callback"]({"stage": "debug", "msg": msg})
+
+    graph_origin = json.loads(wf.read_text(encoding="utf-8"))
+
+    base_url = str(COMFY_HOST).strip()
+    if not base_url.startswith("http"):
+        base_url = f"http://{base_url}"
+    base_url = base_url.rstrip("/")
+
+    comfy_input_dir = ensure_dir(Path(COMFY_INPUT_DIR))
+
+    # blank 이미지 준비 (비활성 슬롯용)
+    blank_path = comfy_input_dir / "blank.png"
+    if not blank_path.exists():
         try:
-            if callable(on_progress):
-                on_progress(data)
-            elif isinstance(on_progress, dict):
-                cb = on_progress.get("callback")
-                if callable(cb):
-                    cb(data)
+            Image.new("RGB", (512, 512), (0, 0, 0)).save(blank_path)
         except Exception:
             pass
 
-    def _normalize_host(raw: str) -> str:
-        s = (raw or "").strip()
-        if not s:
-            s = "http://127.0.0.1:8188"
-        pr = _urlparse.urlparse(s)
-        if not pr.scheme:
-            s = "http://" + s.lstrip("/")
-        return s.rstrip("/")
+    # 제품 이미지(레거시 모드 기본값)
+    prod_input_name_global: Optional[str] = None
+    if product_image_path:
+        p_prod = Path(str(product_image_path)).resolve()
+        if p_prod.exists():
+            prod_input_name_global = f"prod_{uuid.uuid4().hex[:6]}.png"
+            shutil.copy2(str(p_prod), str(comfy_input_dir / prod_input_name_global))
 
-    def _submit_and_wait(base_url: str, graph: Dict[str, Any], *, timeout: int, poll: float) -> Dict[str, Any]:
-        r = requests.post(f"{base_url}/prompt", json={"prompt": graph}, timeout=60)
-        r.raise_for_status()
-        j = r.json() or {}
-        pid = j.get("prompt_id")
-        if not pid:
-            raise RuntimeError(f"ComfyUI prompt_id 없음: {j}")
-
-        t0 = _time.time()
-        while True:
-            if _time.time() - t0 > timeout:
-                raise TimeoutError(f"ComfyUI timeout({timeout}s): prompt_id={pid}")
-            rr = requests.get(f"{base_url}/history/{pid}", timeout=30)
-            rr.raise_for_status()
-            h = rr.json() or {}
-            if pid in h:
-                return h[pid]
-            _time.sleep(max(0.05, float(poll)))
-
-    def _download_first_image(base_url: str, outputs: Dict[str, Any], out_path: _Path) -> None:
-        for _, out_d in (outputs or {}).items():
-            if not isinstance(out_d, dict):
-                continue
-            imgs = out_d.get("images", []) or []
-            if not isinstance(imgs, list):
-                continue
-            for img in imgs:
-                if not isinstance(img, dict):
-                    continue
-                fname = img.get("filename")
-                if not fname:
-                    continue
-                params = {"filename": fname, "type": img.get("type", "output")}
-                sub = img.get("subfolder", None)
-                if sub is not None:
-                    params["subfolder"] = sub
-                resp = requests.get(f"{base_url}/view", params=params, timeout=60)
-                resp.raise_for_status()
-                ensure_dir(out_path.parent)
-                out_path.write_bytes(resp.content)
-                return
-        raise RuntimeError("outputs에 images가 없습니다(SaveImage/PreviewImage 출력 확인 필요)")
-
-    p_video = _P(video_json_path).resolve()
-    if not p_video.exists():
-        raise FileNotFoundError(f"video.json 없음: {p_video}")
-    proj_dir = p_video.parent
-    video_doc = load_json(p_video, {}) or {}
-    scenes = (video_doc.get("scenes") or []) or []
-
-    p_src = _P(source_json_path).resolve()
-    if not p_src.exists():
-        raise FileNotFoundError(f"source json 없음: {p_src}")
-    src_doc = load_json(p_src, {}) or {}
-    src_scenes = (src_doc.get("scenes") or []) or []
-
-    src_map: Dict[str, Dict[str, Any]] = {}
-    for s in src_scenes:
-        if not isinstance(s, dict):
-            continue
-        rid = str(s.get("id", "")).strip()
-        if not rid:
-            continue
-        src_map[rid] = s
-        if rid.startswith("t_"):
-            src_map[rid.replace("t_", "")] = s
-            x = rid.replace("t_", "")
-            if x.isdigit():
-                src_map[str(int(x))] = s
-        if rid.isdigit():
-            src_map[str(int(rid))] = s
-            src_map[f"t_{int(rid):03d}"] = s
-
-    paths_v = video_doc.get("paths") or {}
-    root_dir = _P(paths_v.get("root") or proj_dir)
-    imgs_dir_name = str(paths_v.get("imgs_dir") or "imgs")
-    img_root = ensure_dir(root_dir / imgs_dir_name)
-
-    # workflow
-    try:
-        base_jsons = _P(JSONS_DIR)
-    except Exception:
-        base_jsons = _P(r"C:\my_games\shorts_make\app\jsons")
-
-    wf = _P(workflow_path) if workflow_path else (base_jsons / "QwenEdit2511-V1.json")
-    if not wf.exists():
-        raise FileNotFoundError(f"Step2 workflow 없음: {wf}")
-    graph_origin: Dict[str, Any] = _json.loads(wf.read_text(encoding="utf-8"))
-
-    # comfy input dir + host
-    try:
-        from app import settings as _settings
-        comfy_host_raw = getattr(_settings, "COMFY_HOST", "")
-        comfy_input_dir = _P(getattr(_settings, "COMFY_INPUT_DIR", str(proj_dir / "input")))
-    except Exception:
-        comfy_host_raw = ""
-        comfy_input_dir = _P(proj_dir / "input")
-
-    base_url = _normalize_host(comfy_host_raw)
-    comfy_input_dir.mkdir(parents=True, exist_ok=True)
-
-    # edit keys default
     if edit_keys is None:
         edit_keys = ["prompt_img_2", "prompt_edit", "prompt"]
 
-    # product image input 준비(있으면)
-    prod_input_name: Optional[str] = None
-    if product_image_path:
-        p_prod = _P(product_image_path).resolve()
-        if not p_prod.exists():
-            raise FileNotFoundError(f"product image 없음: {p_prod}")
-        prod_input_name = f"prod_{_uuid.uuid4().hex[:6]}.png"
-        shutil.copy2(str(p_prod), str(comfy_input_dir / prod_input_name))
+    # image1~5 에 해당하는 LoadImage 슬롯 탐색 (base/product 제외한 나머지)
+    char_loader_ids: List[int] = []
+    reactor_ids: List[int] = []
+    ipadapter_ids: List[int] = []
 
-    _notify("step2", f"[Step2] start source={p_src.name} workflow={wf.name}")
+    for nid, node in graph_origin.items():
+        cls = str(node.get("class_type", ""))
+
+        if "LoadImage" in cls:
+            if str(nid) not in [str(node_id_base_image), str(node_id_product_image)]:
+                char_loader_ids.append(int(nid))
+
+        # FaceSwap/ReActor 류
+        if "ReActor" in cls or "FaceSwap" in cls:
+            reactor_ids.append(int(nid))
+
+        # IPAdapter 류
+        if "IPAdapter" in cls:
+            ipadapter_ids.append(int(nid))
+
+    char_loader_ids.sort()
+    reactor_ids.sort()
+    ipadapter_ids.sort()
+
+    def _emit(msg: str) -> None:
+        if not on_progress:
+            return
+        try:
+            if callable(on_progress):
+                on_progress({"stage": "debug", "msg": msg})
+            elif isinstance(on_progress, dict) and callable(on_progress.get("callback")):
+                on_progress["callback"]({"stage": "debug", "msg": msg})
+        except Exception:
+            pass
+
+    def _disable_ref_nodes(graph: Dict[str, Any]) -> None:
+        """
+        쇼핑 Step2처럼 image1/2만 쓸 때:
+        - IPAdapter/ReActor/FaceSwap 계열을 비활성화 + weight 0
+        """
+        for nid in ipadapter_ids:
+            sid_str = str(nid)
+            node = graph.get(sid_str)
+            if not node:
+                continue
+            inputs = node.setdefault("inputs", {})
+            if "enabled" in inputs:
+                inputs["enabled"] = False
+            if "weight" in inputs:
+                try:
+                    inputs["weight"] = 0.0
+                except Exception:
+                    pass
+
+        for nid in reactor_ids:
+            sid_str = str(nid)
+            node = graph.get(sid_str)
+            if not node:
+                continue
+            inputs = node.setdefault("inputs", {})
+            if "enabled" in inputs:
+                inputs["enabled"] = False
+
+    # ------------------------------------------------------------------
+    # 4) scene 루프
+    # ------------------------------------------------------------------
+    proj_dir = p_video.parent
+    paths_v = video_doc.get("paths") or {}
+    root_dir = Path(str(paths_v.get("root") or proj_dir))
+    imgs_dir = ensure_dir(root_dir / str(paths_v.get("imgs_dir") or "imgs"))
+
+    created_single: Optional[Path] = None
 
     for sc in scenes:
-        if not isinstance(sc, dict):
-            continue
         sid = str(sc.get("id", "")).strip()
         if not sid:
             continue
-
-        src_sc = src_map.get(sid)
-        if not src_sc and sid.startswith("t_"):
-            src_sc = src_map.get(sid.replace("t_", ""))
-            if not src_sc and sid.replace("t_", "").isdigit():
-                src_sc = src_map.get(str(int(sid.replace("t_", ""))))
-
-        if not src_sc:
+        if target_ids is not None and sid not in target_ids:
             continue
 
-        # edit prompt
+        # 소스 병합
+        src_sc = src_map.get(sid, sc)
+
+        # 1) 프롬프트 결정
         p_edit = ""
         for k in edit_keys:
-            v = src_sc.get(k)
-            if isinstance(v, str) and v.strip():
-                p_edit = v.strip()
+            val = src_sc.get(k)
+            if isinstance(val, str) and val.strip():
+                p_edit = val.strip()
                 break
         if not p_edit:
-            continue
+            p_edit = src_sc.get("prompt_img") or src_sc.get("prompt") or ""
 
-        # base image 결정
-        base_file: Optional[_P] = None
-        if base_from_key:
-            v = src_sc.get(base_from_key)
-            if isinstance(v, str) and v.strip():
-                cand = (proj_dir / v).resolve() if not _P(v).is_absolute() else _P(v).resolve()
-                if cand.exists():
-                    base_file = cand
+        # 2) 슬롯 이미지 결정
+        current_slots: Optional[List[str]] = None
+        if target_ids is not None and slot_images is not None:
+            current_slots = list(slot_images)
 
-        if base_file is None:
-            base_file = img_root / f"{base_prefix}{sid}{base_ext}"
+        # 기본값: 모두 blank
+        base_input_name = "blank.png"
+        prod_input_name = prod_input_name_global
 
-        if not base_file.exists():
-            # Step2만 쓰는 경우엔 base_from_key 지정해줘야 함.
-            continue
+        # --- (A) slot_images 기반 모드 (shorts / shopping 통합 규칙) ---
+        if current_slots:
+            # slot 0 → base
+            if len(current_slots) > 0 and current_slots[0]:
+                p0 = Path(str(current_slots[0])).resolve()
+                if p0.exists():
+                    n0 = f"slot0_{sid}_{uuid.uuid4().hex[:6]}.png"
+                    shutil.copy2(str(p0), str(comfy_input_dir / n0))
+                    base_input_name = n0
 
-        final_file = img_root / f"{sid}.png"
+            # slot 1 → product
+            if len(current_slots) > 1 and current_slots[1]:
+                p1 = Path(str(current_slots[1])).resolve()
+                if p1.exists():
+                    n1 = f"slot1_{sid}_{uuid.uuid4().hex[:6]}.png"
+                    shutil.copy2(str(p1), str(comfy_input_dir / n1))
+                    prod_input_name = n1
+            elif prod_input_name is None:
+                prod_input_name = "blank.png"
+
+            # slot 2~ → 나머지 LoadImage 슬롯(char_loader_ids 순서)
+            extra_slots = current_slots[2:]
+
+        # --- (B) 레거시/자동 모드 ---
+        else:
+            extra_slots = []
+
+            # 베이스 이미지: base_from_key 우선, 없으면 temp_{sid}.png 사용
+            base_file: Optional[Path] = None
+            if base_from_key:
+                v = src_sc.get(base_from_key)
+                if v:
+                    cand = (proj_dir / str(v)).resolve()
+                    if cand.exists():
+                        base_file = cand
+
+            if base_file is None:
+                base_file = imgs_dir / f"{base_prefix}{sid}{base_ext}"
+
+            if base_file.exists():
+                base_input_name = f"base_{sid}_{uuid.uuid4().hex[:6]}.png"
+                shutil.copy2(str(base_file), str(comfy_input_dir / base_input_name))
+
+            # 제품 이미지는 전역 prod_input_name_global 그대로 사용
+            prod_input_name = prod_input_name_global or "blank.png"
+
+        # 결과 파일 경로
+        final_file = imgs_dir / f"{sid}.png"
         if skip_if_exists and final_file.exists() and final_file.stat().st_size > 0:
             sc["img_file"] = str(final_file)
+            if target_ids is not None:
+                created_single = final_file
             continue
 
-        _notify("step2_scene", f"[Step2] {sid} editing...")
+        if on_progress:
+            msg = f"[Step2] {sid} 합성 중... (Prompt: {p_edit[:60]}...)"
+            if callable(on_progress):
+                on_progress({"stage": "step2_scene", "msg": msg})
+            elif isinstance(on_progress, dict) and callable(on_progress.get("callback")):
+                on_progress["callback"]({"stage": "step2_scene", "msg": msg})
 
-        base_input_name = f"base_{sid}_{_uuid.uuid4().hex[:6]}.png"
-        shutil.copy2(str(base_file), str(comfy_input_dir / base_input_name))
+        # ------------------------------------------------------------------
+        # 3) 그래프 복사 및 노드 주입
+        # ------------------------------------------------------------------
+        graph = json.loads(json.dumps(graph_origin))
 
-        graph = _json.loads(_json.dumps(graph_origin))
-
-        # 주입: base image
+        # image1, image2 (Base / Product)
         if node_id_base_image in graph:
-            try:
-                graph[node_id_base_image].setdefault("inputs", {})["image"] = base_input_name
-            except Exception:
-                pass
+            graph[node_id_base_image]["inputs"]["image"] = base_input_name
 
-        # 주입: product image (있을 때만)
-        if prod_input_name and node_id_product_image in graph:
-            try:
-                graph[node_id_product_image].setdefault("inputs", {})["image"] = prod_input_name
-            except Exception:
-                pass
+        if node_id_product_image in graph:
+            val = prod_input_name if prod_input_name else "blank.png"
+            graph[node_id_product_image]["inputs"]["image"] = val
 
-        # 주입: prompt value
+        # slot 3~ (char_loader_ids)
+        if current_slots:
+            # (1) LoadImage3~5(및 그 외)를 slot_images[2:]로 채움 (없으면 blank)
+            any_extra_active = False
+
+            for idx, loader_id in enumerate(char_loader_ids):
+                img_val = "blank.png"
+                slot_idx = idx + 2  # slot_images 기준 index
+                if slot_idx < len(current_slots) and current_slots[slot_idx]:
+                    p_img = Path(str(current_slots[slot_idx])).resolve()
+                    if p_img.exists():
+                        name = f"slot{slot_idx}_{sid}_{uuid.uuid4().hex[:6]}.png"
+                        shutil.copy2(str(p_img), str(comfy_input_dir / name))
+                        img_val = name
+                        any_extra_active = True
+
+                lid_str = str(loader_id)
+                if lid_str in graph:
+                    graph[lid_str].setdefault("inputs", {})["image"] = img_val
+
+            # (2) ✅ 핵심 수정:
+            #     image3~5 슬롯이 "실제로" 하나도 없으면
+            #     Comfy에서 네가 수동으로 'image3~5 비활성화'한 것처럼
+            #     IPAdapter/ReActor/FaceSwap 계열을 모두 비활성화한다.
+            if not any_extra_active:
+                _emit(f"[Step2][DBG] {sid}: slot2~5 비어있음 → IPAdapter/ReActor/FaceSwap 비활성화")
+                _disable_ref_nodes(graph)
+            else:
+                _emit(f"[Step2][DBG] {sid}: slot2~5 활성 이미지 있음 → 참조 노드 유지(활성)")
+
+        else:
+            # 레거시 모드: characters 기반 자동 세팅
+            scene_chars = src_sc.get("characters", [])
+            active_slots = set()
+            slot_files: Dict[int, str] = {}
+
+            char_base_dir = Path(CHARACTER_DIR)
+
+            for idx, char_entry in enumerate(scene_chars):
+                cid = str(char_entry).split(":")[0].strip()
+                slot_idx = idx  # 단순 0,1,2... 매핑
+                if 0 <= slot_idx < len(char_loader_ids):
+                    for ext in [".png", ".jpg", ".webp"]:
+                        cpath = char_base_dir / f"{cid}{ext}"
+                        if cpath.exists():
+                            shutil.copy2(str(cpath), str(comfy_input_dir / cpath.name))
+                            active_slots.add(slot_idx)
+                            slot_files[slot_idx] = cpath.name
+                            break
+
+            if not active_slots:
+                # 캐릭터 없으면 관련 노드 비활성 + blank 이미지
+                for nid, node in graph.items():
+                    cls = node.get("class_type", "")
+                    if "IPAdapter" in cls or "ReActor" in cls or "FaceSwap" in cls:
+                        inputs = node.setdefault("inputs", {})
+                        inputs["enabled"] = False
+                        if "weight" in inputs:
+                            inputs["weight"] = 0.0
+                for lid in char_loader_ids:
+                    lid_str = str(lid)
+                    if lid_str in graph:
+                        graph[lid_str].setdefault("inputs", {})["image"] = "blank.png"
+            else:
+                for i, lid in enumerate(char_loader_ids):
+                    lid_str = str(lid)
+                    if lid_str not in graph:
+                        continue
+                    img_val = slot_files.get(i, "blank.png") if i in active_slots else "blank.png"
+                    graph[lid_str].setdefault("inputs", {})["image"] = img_val
+
+        # prompt/value, sampler/size 설정
         if node_id_prompt_value in graph:
-            try:
-                graph[node_id_prompt_value].setdefault("inputs", {})["value"] = p_edit
-            except Exception:
-                pass
+            graph[node_id_prompt_value]["inputs"]["value"] = p_edit
 
-        # steps/seed (QwenImageIntegratedKSampler 포함)
-        if node_id_sampler in graph:
-            try:
-                inp = graph[node_id_sampler].setdefault("inputs", {})
-                if sampler_steps_key in inp:
-                    inp[sampler_steps_key] = int(steps)
-                if sampler_seed_key in inp and isinstance(inp.get(sampler_seed_key), int):
-                    inp[sampler_seed_key] = _random.randint(1, 2_147_483_646)
-            except Exception:
-                pass
-
-        # 폭넓게 width/height 처리 + Preview->Save
-        for nid, node in (graph or {}).items():
-            if not isinstance(node, dict):
-                continue
-            ctype = str(node.get("class_type") or "")
-            inputs = node.get("inputs", {}) or {}
-
-            if (
-                    "width" in inputs and "height" in inputs
-                    and isinstance(inputs.get("width"), int) and isinstance(inputs.get("height"), int)
-            ):
+        for nid, node in graph.items():
+            inputs = node.get("inputs", {})
+            if "width" in inputs and "height" in inputs:
                 inputs["width"] = int(ui_width)
                 inputs["height"] = int(ui_height)
 
-            if ctype == "PreviewImage":
+            if str(nid) == node_id_sampler and sampler_steps_key in inputs:
+                inputs[sampler_steps_key] = int(steps)
+                inputs[sampler_seed_key] = random.randint(1, 2 ** 31)
+
+            if node.get("class_type") == "PreviewImage":
                 node["class_type"] = "SaveImage"
-                node.setdefault("inputs", {})["filename_prefix"] = "Step2_Out"
+                inputs["filename_prefix"] = f"Step2_{sid}"
 
-        result = _submit_and_wait(base_url, graph, timeout=timeout_sec, poll=poll_sec)
-        outputs = result.get("outputs") or {}
-        _download_first_image(base_url, outputs, final_file)
+        # ------------------------------------------------------------------
+        # 4) Comfy 실행 및 결과 다운로드
+        # ------------------------------------------------------------------
+        try:
+            res = _submit_and_wait_comfy_func(base_url, graph, timeout=timeout_sec, poll=poll_sec)
 
-        sc["img_file"] = str(final_file)
+            outputs = res.get("outputs", {})
+            downloaded = False
+            for _, out_d in outputs.items():
+                if "images" in out_d:
+                    for img in out_d["images"]:
+                        fname = img.get("filename")
+                        if not fname:
+                            continue
+                        params = {
+                            "filename": fname,
+                            "type": img.get("type", "output"),
+                            "subfolder": img.get("subfolder", ""),
+                        }
+                        r = requests.get(f"{base_url}/view", params=params, timeout=60)
+                        if r.status_code == 200:
+                            final_file.parent.mkdir(parents=True, exist_ok=True)
+                            with open(final_file, "wb") as f:
+                                f.write(r.content)
+                            downloaded = True
+                            break
+                if downloaded:
+                    break
 
-    # video.json 저장
+            if downloaded:
+                sc["img_file"] = str(final_file)
+                if target_ids is not None:
+                    created_single = final_file
+
+        except Exception as e:
+            if on_progress:
+                msg = f"[{sid}] 합성 실패: {e}"
+                if callable(on_progress):
+                    on_progress({"stage": "err", "msg": msg})
+                elif isinstance(on_progress, dict) and callable(on_progress.get("callback")):
+                    on_progress["callback"]({"stage": "err", "msg": msg})
+            continue
+
     save_json(p_video, video_doc)
-    _notify("step2_done", "[Step2] done")
-
+    return created_single
 
 
 
@@ -4582,428 +4605,6 @@ def build_video_json_with_gap_policy(
 
 
 
-# video_build.py
-
-
-
-# No.48 전용
-def fill_prompt_movie_with_ai(
-        project_dir: "Path",
-        ask: "Callable[[str, str], str]",
-        *,
-        log_fn: Optional[Callable[[str], None]] = None,
-) -> None:
-    """
-    [강력 개선됨] AI를 사용하여 씬별 세그먼트 프롬프트를 생성합니다.
-    - Face Lock: 인물이 절대 뒤를 돌지 않도록 강제 (정면 유지)
-    - Object Safety: 제품이 화면을 벗어나거나 가려지지 않도록 강제
-    - Consistency: 이전 행동을 이어받되, 급격한 각도 변화 금지
-    """
-    import json
-
-    def _log(msg: str) -> None:
-        if callable(log_fn):
-            try:
-                log_fn(msg)
-            except Exception:
-                pass
-
-    pdir = Path(project_dir).resolve()
-    vpath = pdir / "video.json"
-
-    # 파일 로드
-    vdoc: Dict[str, Any] = load_json(vpath, {}) or {}
-    if not isinstance(vdoc, dict):
-        _log("[fill_prompt_movie_with_ai] video.json 형식 오류")
-        return
-
-    # 1. 원본 분위기 (project.json) 로드
-    pj_path = pdir / "project.json"
-    original_vibe_prompt = ""
-    if pj_path.exists():
-        pj_doc = load_json(pj_path, {}) or {}
-        if isinstance(pj_doc, dict):
-            original_vibe_prompt = pj_doc.get("prompt_user") or pj_doc.get("prompt", "")
-
-    # 2. FPS 및 기본 설정 확정
-    defaults_map: Dict[str, Any] = vdoc.get("defaults") or {}
-    movie_def: Dict[str, Any] = defaults_map.get("movie") or {}
-    image_def: Dict[str, Any] = defaults_map.get("image") or {}
-
-    fps_candidates = [movie_def.get("target_fps"), vdoc.get("fps"), image_def.get("fps"), 30]
-    fps = 30
-    for cand in fps_candidates:
-        if cand is not None:
-            try:
-                fps = int(cand)
-                break
-            except (TypeError, ValueError):
-                continue
-
-    # FPS 동기화 및 저장
-    vdoc.setdefault("fps", fps)
-    vdoc.setdefault("defaults", {})
-    vdoc["defaults"].setdefault("movie", {})["target_fps"] = fps
-    vdoc["defaults"]["movie"]["input_fps"] = fps
-    vdoc["defaults"]["movie"]["fps"] = fps
-    vdoc["defaults"].setdefault("image", {})["fps"] = fps
-
-    try:
-        base_chunk_val = int(movie_def.get("base_chunk", 41))
-    except Exception:
-        base_chunk_val = 41
-
-    # 3. 씬 루프 처리
-    scenes = vdoc.get("scenes") or []
-    if not isinstance(scenes, list):
-        _log("[fill_prompt_movie_with_ai] scenes 없음")
-        save_json(vpath, vdoc)
-        return
-
-    changed = False
-
-    # [핵심 수정] 시스템 프롬프트: 인물/제품 고정 규칙(Strict Consistency Rules) 추가
-    system_msg = (
-        "You are a Strict AI Cinematographer specializing in Commercial Product Videos.\n"
-        "Your goal is to split a scene into segments that maintain PERFECT VISUAL CONSISTENCY.\n"
-        "Visual hallucinations happen when a character turns around or an object leaves the frame. You must prevent this.\n\n"
-        "[ABSOLUTE PROHIBITIONS - NEVER DO THESE]\n"
-        "❌ NO turning around (back view).\n"
-        "❌ NO spinning or full rotation.\n"
-        "❌ NO hiding the object with hands or body.\n"
-        "❌ NO throwing the object out of the frame.\n\n"
-        "[MANDATORY RULES]\n"
-        "1. **FACE LOCK**: The character must ALWAYS face the camera (Front or 3/4 view). Even when moving, they walk backwards or sideways to keep eye contact.\n"
-        "2. **OBJECT SAFETY**: The object must stay visible in the center area. Describe actions like 'holding up', 'showing', 'tilting', or 'bringing closer to lens'.\n"
-        "3. **CHAIN REACTION**: Start Segment N with the END state of Segment N-1, but keep the angle stable.\n"
-        "4. **OBJECT ABSTRACTION**: From Segment 2 onwards, refer to the product ONLY as 'the object' or 'it' (do not use specific class names like 'bottle').\n"
-        "5. **MICRO-MOVEMENTS**: Instead of big actions, focus on lighting changes, camera zooms, or subtle hand adjustments.\n"
-        "6. **LANGUAGE**: Output MUST be in ENGLISH.\n\n"
-        "output format: JSON {\"segment_prompts\": [\"prompt 1\", \"prompt 2\", ...]}"
-    )
-
-    # 네거티브 프롬프트 자동 강화 (코드에서 강제 주입)
-    forced_negative = (
-        "nsfw, watermark, text, ugly, distorted face, morphine face, "
-        "back view, turning around, disappearing object, object out of frame, "
-        "extra fingers, mutated hands, covering object, blurry, "
-        "signature, logo, subtitle, words, caption, username, artist name"
-    )
-
-    for i, sc in enumerate(scenes):
-        if not isinstance(sc, dict):
-            continue
-
-        scene_id = sc.get("id", "unknown")
-
-        # 네거티브 프롬프트가 비어있거나 약하면 강제 주입
-        current_neg = sc.get("prompt_negative", "")
-        if not current_neg:
-            sc["prompt_negative"] = forced_negative
-            changed = True
-        elif "back view" not in current_neg:  # 핵심 키워드 없으면 추가
-            sc["prompt_negative"] = current_neg + ", " + forced_negative
-            changed = True
-
-        # 총 프레임 및 세그먼트 계산
-        try:
-            dur = float(sc.get("duration") or 0.0)
-        except (TypeError, ValueError):
-            dur = 0.0
-
-        total_frames = int(round(dur * fps)) if dur > 0 else 0
-        if total_frames <= 0:
-            continue
-
-        # frame_segments 구조 생성 (없을 경우)
-        segs = sc.get("frame_segments")
-        if not isinstance(segs, list) or not segs:
-            # plan_segments_s_e 함수는 video_build.py 내부에 있다고 가정
-            pairs_tuples = plan_segments_s_e(total_frames, base_chunk=base_chunk_val)
-            segs_out: List[Dict[str, Any]] = []
-            for s_f, e_f in pairs_tuples:
-                segs_out.append({"start_frame": int(s_f), "end_frame": int(e_f), "prompt_movie": ""})
-            sc["frame_segments"] = segs_out
-            segs = segs_out
-            changed = True
-
-        # 이미 프롬프트가 다 차있으면 스킵
-        prompts_list = [seg.get("prompt_movie", "") for seg in segs]
-        if all(prompts_list):
-            _log(f"[{scene_id}] 세그먼트 프롬프트가 이미 존재함 (스킵)")
-            continue
-
-        # AI 호출용 기본 정보 수집
-        base_visual = ""
-        for key in ("prompt_img_1", "prompt_img", "prompt"):
-            val = sc.get(key)
-            if isinstance(val, str) and val.strip():
-                base_visual = val.strip()
-                break
-
-        scene_lyric = sc.get("lyric", "")
-
-        # 정보가 너무 없으면 스킵
-        if not base_visual and not scene_lyric:
-            _log(f"[{scene_id}] 참조 텍스트 부족 (스킵)")
-            continue
-
-        # 다음 씬 가사 (문맥용)
-        next_scene_lyric = "(Scene End)"
-        if i + 1 < len(scenes):
-            next_sc = scenes[i + 1]
-            if isinstance(next_sc, dict):
-                next_scene_lyric = next_sc.get("lyric", "") or "(Next scene has no lyric)"
-
-        _log(f"[{scene_id}] AI 행동 묘사 생성 요청 (세그먼트 {len(segs)}개)...")
-
-        frame_ranges_info = [f"{s.get('start_frame')}-{s.get('end_frame')}f" for s in segs]
-
-        # 사용자 프롬프트 구성
-        user_prompt_payload = {
-            "original_vibe": original_vibe_prompt,
-            "scene_lyric": scene_lyric,
-            "base_visual": base_visual,
-            "characters": sc.get("characters", []),
-            "time_structure": frame_ranges_info,
-            "next_scene_lyric": next_scene_lyric,
-            "instruction": "Generate chained prompts. Keep the character facing forward. Never hide the object."
-        }
-        user_msg = json.dumps(user_prompt_payload, ensure_ascii=False)
-
-        try:
-            # AI 호출
-            ai_raw_response = ask(system_msg, user_msg)
-
-            # JSON 파싱
-            json_start = ai_raw_response.find("{")
-            json_end = ai_raw_response.rfind("}") + 1
-            if not (0 <= json_start < json_end):
-                raise RuntimeError(f"AI JSON 응답 형식 오류: {ai_raw_response[:50]}...")
-
-            ai_json = json.loads(ai_raw_response[json_start:json_end])
-            new_prompts = ai_json.get("segment_prompts", [])
-
-            # 결과 검증
-            if not isinstance(new_prompts, list) or len(new_prompts) != len(segs):
-                _log(f"[{scene_id}] AI 반환 개수 불일치 (요청:{len(segs)} vs 응답:{len(new_prompts)})")
-
-            # 프롬프트 적용
-            filled_count = 0
-            for i_seg, seg in enumerate(segs):
-                if i_seg < len(new_prompts):
-                    p_text = str(new_prompts[i_seg]).strip()
-                    if p_text and not seg.get("prompt_movie", ""):
-                        seg["prompt_movie"] = p_text
-                        filled_count += 1
-
-            if filled_count > 0:
-                _log(f"[{scene_id}] {filled_count}개 세그먼트 프롬프트 적용 완료.")
-                sc["frame_segments"] = segs
-                changed = True
-
-        except Exception as e:
-            _log(f"[{scene_id}] AI 호출 실패: {e}")
-            continue
-
-    if changed:
-        save_json(vpath, vdoc)
-        _log("[fill_prompt_movie_with_ai] 업데이트 완료 (video.json 저장됨)")
-    else:
-        # FPS 동기화 등 메타데이터 변경이 있을 수 있으므로 저장
-        save_json(vpath, vdoc)
-        _log("[fill_prompt_movie_with_ai] 변경 사항 없음 (기본 저장)")
-
-# 75 워크플로우 전용
-def fill_prompt_movie_with_ai_long(
-        project_dir: str,
-        ai_ask_func: Callable[[str, str], str],
-        log_fn: Callable[[str], None] = print
-):
-    """
-    [New] video.json의 장면 정보를 읽어 FPS 기반 총 프레임을 계산하고,
-    1~3개 세그먼트로 균등 분할하여 각 프롬프트를 AI로 생성합니다.
-
-    [수정사항]
-    - 프롬프트 생성 시 'prompt_img_1'(비주얼)과 'subtitle'(스토리)을 참고합니다.
-    - 세그먼트 프롬프트는 한국어/영어 쌍으로 저장합니다:
-        prompt_1_kor, prompt_2_kor, prompt_3_kor (사람용)
-        prompt_1,     prompt_2,     prompt_3     (모델용: 위 한글의 충실 번역)
-    - 세그먼트 프롬프트에서는 제품을 반드시 "the object"로만 지칭하도록 강제합니다.
-    """
-
-
-    p_dir = Path(project_dir)
-    v_path = p_dir / "video.json"
-
-    if not v_path.exists():
-        log_fn("❌ video.json not found.")
-        return
-
-    try:
-        data = json.loads(v_path.read_text(encoding="utf-8"))
-    except Exception as e:
-        log_fn(f"❌ JSON Load Error: {e}")
-        return
-
-    # video.json의 defaults 값 참조
-    defaults = data.get("defaults", {})
-    movie_def = defaults.get("movie", {})
-    fps = int(movie_def.get("fps", 24))
-
-    scenes = data.get("scenes", [])
-
-    log_fn(f"🚀 [AI Long-Take] 프롬프트 상세화 시작 (FPS: {fps})")
-
-    for sc in scenes:
-        sid = sc.get("id")
-
-        # 실제 오디오 길이가 있으면 우선 사용, 없으면 설정된 seconds 사용
-        duration = float(sc.get("duration", 0) or 0.0)
-        if duration <= 0:
-            duration = float(sc.get("seconds", 4.0) or 4.0)
-
-        # 프롬프트 생성을 위한 소스 데이터 확보
-        # 1. 시각적 베이스 (이미지 프롬프트)
-        visual_desc = sc.get("prompt_img_1") or sc.get("prompt_img") or sc.get("prompt", "")
-        # 2. 스토리 맥락 (자막/내레이션)
-        story_context = sc.get("subtitle") or sc.get("lyric") or sc.get("narration") or ""
-
-        # 1. 총 프레임 및 세그먼트 수 계산 (81프레임 기준)
-        total_frames = int(duration * fps)
-
-        seg_count = 1
-        if total_frames > 162:  # 163 ~ : 3분할
-            seg_count = 3
-        elif total_frames > 81:  # 82 ~ 162 : 2분할
-            seg_count = 2
-        else:  # ~ 81 : 1분할
-            seg_count = 1
-
-        sc["total_frames"] = total_frames
-        sc["seg_count"] = seg_count
-
-        log_fn(f"   - Scene {sid}: {duration:.2f}s * {fps}fps = {total_frames} frames -> {seg_count} segments")
-
-        # 2. AI 프롬프트 생성 (조건 강화 + kor/en 쌍 생성)
-        sys_msg = (
-            "You are a bilingual I2V prompt director for long-take continuity.\n"
-            "You MUST produce segment prompts that feel like ONE continuous shot.\n"
-            "The start image already contains the real product appearance via compositing.\n"
-            "From segment prompts onward, you MUST refer to the product ONLY as: 'the object'.\n\n"
-            "STRICT CONTINUITY RULES (non-negotiable)\n"
-            "1) For EACH segment, write Korean first, then English.\n"
-            "2) English must be a faithful translation of the Korean. Do NOT add new actions.\n"
-            "3) Do NOT introduce new locations, new props, new characters, or new background elements.\n"
-            "4) Keep the SAME setting/background as the start image. Minimal background description.\n"
-            "5) Use ONLY the phrase 'the object' for the product in BOTH Korean and English.\n"
-            "   - Do NOT say extinguisher, phone, toilet, device, product name, etc.\n"
-            "   - In Korean, also avoid naming the product; describe it as '물체' 수준으로만 표현.\n"
-            "6) Each segment MUST begin from the exact end state of the previous segment.\n"
-            "7) Prefer subtle camera moves only: slow push-in, slight dolly, gentle rack focus. Avoid fast cuts.\n"
-            "8) Focus on clear, simple, physically plausible actions. No magic spawning unless already implied.\n\n"
-            f"Split the action into exactly {seg_count} sequential segments.\n"
-            "Return JSON ONLY with the required keys."
-        )
-
-        # 조건부 JSON 포맷 문자열 미리 생성 (kor/en 쌍)
-        p2_json = '"prompt_2_kor": "...", "prompt_2": "...",' if seg_count >= 2 else ""
-        p3_json = '"prompt_3_kor": "...", "prompt_3": "...",' if seg_count >= 3 else ""
-
-        user_msg = f"""
-[Start Image Description]
-{visual_desc}
-
-[Story Context]
-{story_context}
-
-[Segment Goal Template]
-- Segment 1: transition from the start image into the first clear action featuring the object.
-- Segment 2: continue seamlessly; reveal one key feature/visual emphasis of the object (e.g., glow, highlight, focus shift).
-- Segment 3: continue seamlessly; resolve with a clean hero moment of the object (stable pose, hold).
-
-[Hard Constraints]
-- Keep the same setting/background as the start image. Do not re-describe the background.
-- Product reference must be ONLY: "the object" (English) / "물체" (Korean).
-- Do NOT use any other product noun (no extinguisher/phone/toilet/device/product name).
-- No new scene cuts. No time jumps.
-
-[Output JSON Format]
-{{
-  "prompt_1_kor": "한국어로 1번 세그먼트 동작 (물체로만 지칭)",
-  "prompt_1": "English translation of prompt_1_kor (must include 'the object')",
-  {p2_json}
-  {p3_json}
-  "last_state_kor": "마지막 프레임 상태를 한국어 1문장으로 요약 (물체로만 지칭)",
-  "last_state": "English translation of last_state_kor (must include 'the object')"
-}}
-"""
-
-        try:
-            resp = ai_ask_func(sys_msg, user_msg)
-
-            # JSON 파싱 안전 처리
-            resp_clean = re.sub(r"```json|```", "", resp).strip()
-            # 첫 '{' 부터 마지막 '}' 까지만 추출
-            l = resp_clean.find("{")
-            r = resp_clean.rfind("}")
-            if l == -1 or r == -1 or r <= l:
-                raise ValueError("AI 응답에서 JSON 객체를 찾지 못했습니다.")
-            json_str = resp_clean[l:r + 1]
-            parsed = json.loads(json_str)
-
-            # kor/en 저장 (영문은 반드시 존재하도록 fallback 처리)
-            sc["prompt_1_kor"] = (parsed.get("prompt_1_kor") or "").strip()
-            sc["prompt_1"] = (parsed.get("prompt_1") or "").strip()
-            if not sc["prompt_1"]:
-                sc["prompt_1"] = (parsed.get("prompt_1_kor") or "").strip()
-
-            if seg_count >= 2:
-                sc["prompt_2_kor"] = (parsed.get("prompt_2_kor") or "").strip()
-                sc["prompt_2"] = (parsed.get("prompt_2") or "").strip()
-                if not sc["prompt_2"]:
-                    sc["prompt_2"] = (parsed.get("prompt_2_kor") or "").strip()
-
-            if seg_count >= 3:
-                sc["prompt_3_kor"] = (parsed.get("prompt_3_kor") or "").strip()
-                sc["prompt_3"] = (parsed.get("prompt_3") or "").strip()
-                if not sc["prompt_3"]:
-                    sc["prompt_3"] = (parsed.get("prompt_3_kor") or "").strip()
-
-            # last_state도 저장(추후 디버깅/연속성 튜닝에 유용)
-            sc["last_state_kor"] = (parsed.get("last_state_kor") or "").strip()
-            sc["last_state"] = (parsed.get("last_state") or "").strip()
-
-            # 최후 안전장치: 최소값 채우기
-            if not sc.get("prompt_1"):
-                sc["prompt_1"] = visual_desc or "The subject continues holding the object."
-            if seg_count >= 2 and not sc.get("prompt_2"):
-                sc["prompt_2"] = "The action continues seamlessly with the object."
-            if seg_count >= 3 and not sc.get("prompt_3"):
-                sc["prompt_3"] = "The action resolves in a clean hero moment with the object."
-
-        except Exception as e:
-            log_fn(f"⚠️ Scene {sid} AI Error: {e}")
-
-            # 에러 시 기본값
-            sc["prompt_1_kor"] = "시작 이미지 상태에서 자연스럽게 물체를 강조하는 동작으로 이어진다."
-            sc["prompt_1"] = "From the start image, continue with a natural action that emphasizes the object."
-
-            if seg_count >= 2:
-                sc["prompt_2_kor"] = "직전 동작을 이어받아 물체를 더 강하게 부각한다."
-                sc["prompt_2"] = "Continue seamlessly and emphasize the object more clearly."
-
-            if seg_count >= 3:
-                sc["prompt_3_kor"] = "자연스럽게 마무리 포즈로 이어지며 물체를 안정적으로 보여준다."
-                sc["prompt_3"] = "Resolve into a clean finishing pose while presenting the object steadily."
-
-            sc["last_state_kor"] = "마지막 프레임에서 인물은 물체를 안정적으로 보여주고 있다."
-            sc["last_state"] = "In the final frame, the subject presents the object steadily."
-
-    with open(v_path, "w", encoding="utf-8") as f:
-        json.dump(data, f, indent=2, ensure_ascii=False)
-
-    log_fn("✅ [AI Long-Take] 프롬프트 상세화 완료. (prompt_n_kor + prompt_n 저장)")
 
 
 def retry_cut_audio_for_scene(project_dir: str, scene_id: str, offset: float) -> str:

@@ -112,6 +112,10 @@ WAN_MAX_FRAMES_PER_SEGMENT: int = int(os.environ.get("WAN_MAX_FRAMES_PER_SEGMENT
 
 
 # 오디오/비디오 저장 관련
+BASIC_VOCAL_TAGS = [
+        "clean vocals", "natural articulation", "warm emotional tone",
+        "studio reverb light", "clear diction", "breath control", "balanced mixing",
+    ]
 # - AUDIO_SAVE_FORMAT 은 "wav"|"mp3"|"opus" 중 하나
 AUDIO_SAVE_FORMAT: str = os.environ.get("AUDIO_SAVE_FORMAT", "mp3").lower()
 
