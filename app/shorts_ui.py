@@ -2527,6 +2527,9 @@ class MainWindow(QtWidgets.QMainWindow):
         run_job_with_progress_async(self, "AI 분석", job, on_done=done)
 
     def on_click_build_story_from_seg_async_ex(self) -> None:
+
+
+
         """
         seg.json → story.json → video.json 생성 프로세스.
         ★ Shopping 스타일(81세그먼트, prompt_1, last_state)을 내부 함수(_apply_shopping_style_local)로 직접 구현.

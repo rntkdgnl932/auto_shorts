@@ -3577,5 +3577,27 @@ class SubtitleComposer:
 
 
 # ===============================================================================================
+# ========================한영 변환기======================================================
+def translate_kor_to_en_prompt(ai, kor_text: str) -> str:
+    kor_text = (kor_text or "").strip()
+    if not kor_text:
+        return ""
+    if ai is None:
+        return kor_text
+
+    sys_msg = (
+        "You are a professional translator for AI image generation prompts.\n"
+        "Translate Korean to natural, concise English.\n"
+        "Do NOT add new details. Keep meaning faithful.\n"
+        "Output English ONLY."
+    )
+    user_msg = f'Korean:\n"{kor_text}"\n\nEnglish:'
+    try:
+        out = ai.ask_smart(sys_msg, user_msg, prefer="openai")
+        return (out or "").strip().replace("```", "").strip()
+    except Exception:
+        return kor_text
+
+
 
 #
