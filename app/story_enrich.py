@@ -4,6 +4,7 @@ from typing import List, Dict, Callable, Any, Optional, Tuple, Set
 import os
 from copy import deepcopy
 import re
+import math
 import json
 from pathlib import Path
 from app.utils import load_json, save_json
@@ -2329,155 +2330,160 @@ def fill_prompt_movie_with_ai_shopping(
 
 # shorts 탭 json
 def fill_prompt_movie_with_ai_shorts(
-        story_data: dict,
-        ai_ask_func: Callable[[str, str], str],
-        trace: TraceFn | None = None
+    video_data: dict,
+    ask: Callable[[str, str], str],
+    trace: TraceFn | None = None,
 ) -> dict:
     """
-    [Step 6] Long-Take Shopping 스타일:
-    각 씬을 지정된 FPS/Chunk 단위로 쪼개고,
-    AI에게 "시간 흐름에 따른 연속적 프롬프트(문장)" 생성을 요청하여 채워넣는다.
+    Shorts 탭용 프롬프트/세그먼트 엔진.
 
-    [수정] 캐릭터/의상/배경 보존 강화:
-    - 모든 세그먼트 프롬프트에 '의상'과 '배경' 묘사를 강제로 포함시킴.
+    - 입력: video.json dict
+    - 출력: 같은 dict에 아래 필드를 주입/갱신
+        * 각 scene:
+            - total_frames
+            - seg_count
+            - movie_duration
+            - prompt_1 ~ prompt_N
+            - prompt_1_kor ~ prompt_N_kor
+            - last_state, last_state_kor
+    - 세그먼트 규칙:
+        * BASE_CHUNK = 81 프레임
+        * OVERLAP   = 10 프레임
+        * fps = defaults.movie.fps (없으면 30)
     """
-    import math
-    import json
-    import re
+    defaults = video_data.get("defaults") or {}
+    movie_opts = defaults.get("movie") or {}
 
-    # 1. UI 설정값 로드
-    ui_prefs = (story_data.get("defaults") or {}).get("ui_prefs") or {}
     try:
-        fps = float(ui_prefs.get("movie_fps", 30))
-    except:
+        fps = float(movie_opts.get("fps") or 30.0)
+    except Exception:
         fps = 30.0
 
-    # Long-Take 설정 (기본값)
-    base_chunk = I2V_CHUNK_BASE_FRAMES  # e.g. 81
-    overlap = I2V_OVERLAP_FRAMES  # e.g. 10
-    pad_tail = I2V_PAD_TAIL_FRAMES  # e.g. 20
+    # Shopping 스타일 세그먼트 상수
+    BASE_CHUNK = 81
+    OVERLAP = 10
 
-    scenes = story_data.get("scenes", [])
-    if not scenes:
-        return story_data
-
-    _t(trace, "info", f"🚀 [AI Long-Take] 프롬프트 상세화 시작 (FPS: {fps}, chunk={base_chunk})")
+    scenes = video_data.get("scenes") or []
+    _t(trace, "shorts", f"[Shopping Logic] 세그먼트 계산 및 AI 상세화 시작 (FPS: {fps})...")
 
     for sc in scenes:
         sid = sc.get("id")
+        if not sid:
+            continue
 
-        # 1) 프레임/세그먼트 계산
+        # 시간 계산
         try:
-            duration = float(sc.get("duration") or 2.0)
-            total_frames = int(duration * fps)
-        except:
-            total_frames = 60
+            start_t = float(sc.get("start", 0.0))
+        except Exception:
+            start_t = 0.0
+        try:
+            end_t = float(sc.get("end", 0.0))
+        except Exception:
+            end_t = 0.0
 
-        step = base_chunk - overlap
-        target = total_frames + pad_tail
+        if end_t > start_t:
+            duration = end_t - start_t
+        else:
+            try:
+                duration = float(sc.get("duration", 4.0))
+            except Exception:
+                duration = 4.0
 
-        if target <= base_chunk:
+        # 프레임/세그먼트 계산
+        total_frames = int(math.ceil(duration * fps))
+
+        if total_frames <= BASE_CHUNK:
             seg_count = 1
         else:
-            needed = target - base_chunk
+            step = BASE_CHUNK - OVERLAP
+            needed = total_frames - BASE_CHUNK
             additional = math.ceil(needed / step)
             seg_count = 1 + additional
 
-        _t(trace, "info", f"   - Scene {sid}: {duration:.2f}s ({total_frames}f) -> segments={seg_count}")
+        # 메타 저장
+        sc["total_frames"] = total_frames
+        sc["seg_count"] = seg_count
+        sc["movie_duration"] = duration
 
-        # 메타데이터 저장
-        sc["frame_segments"] = {
-            "fps": fps,
-            "total_frames": total_frames,
-            "segment_count": seg_count,
-            "base_chunk": base_chunk,
-            "overlap": overlap,
-            "segments": []
-        }
+        # AI 요청용 기본 프롬프트
+        base_p = sc.get("prompt_img") or sc.get("prompt") or ""
+        base_kor = sc.get("prompt") or ""
 
-        # 베이스 프롬프트 (상세 묘사가 있는 prompt_img 우선)
-        base_prompt = sc.get("prompt_img") or sc.get("prompt") or "A cinematic shot"
-
-        # 2) 단순 복사 vs AI 요청 판단
-        # 세그먼트가 1개이고 내용이 짧으면 그냥 복사 (API 절약)
-        is_long_text = len(base_prompt.split()) > 10
-        if seg_count == 1 and not is_long_text:
-            sc["frame_segments"]["segments"] = [base_prompt]
-            continue
-
-        # ------------------------------------------------------------
-        # [핵심 수정] 시스템 프롬프트 강화: 의상/배경 고정 명령
-        # ------------------------------------------------------------
         sys_msg = (
-            "You are an AI Video Sequencer specializing in consistent character animation.\n"
-            "Your task is to break down the 'base_prompt' into a sequence of prompts for a long-take video.\n"
-            f"Target segments: {seg_count}\n"
-            "\n"
-            "*** CRITICAL REQUIREMENT (Visual Consistency) ***\n"
-            "Every single segment prompt MUST explicitly include:\n"
-            "1. The BACKGROUND description (e.g., 'in a dark alley', 'sunny park').\n"
-            "2. The Character's APPEARANCE & CLOTHING (e.g., 'wearing a red dress', 'in a suit').\n"
-            "3. The specific ACTION for that segment.\n"
-            "\n"
-            "Do NOT assume the AI remembers the previous segment. You MUST repeat the clothing and background details in every line.\n"
-            "\n"
-            "OUTPUT FORMAT (JSON ONLY):\n"
-            "{\n"
-            "  \"segment_prompts\": [\n"
-            "    \"[Background] [Character + Clothing] [Action for start]\",\n"
-            "    \"[Background] [Character + Clothing] [Action for middle]\",\n"
-            "    ...\n"
-            "  ]\n"
-            "}\n"
-            "\n"
-            "RULES:\n"
-            "1. The output list MUST have exactly the requested number of segments.\n"
-            "2. NEVER change the clothing or background. Consistency is key.\n"
-            "3. Use ENGLISH sentences only.\n"
+            "You are a Video Director. Break down the scene into detailed prompts.\n"
+            "OUTPUT JSON ONLY: "
+            "{\"prompts_en\": [\"...\"], \"prompts_kor\": [\"...\"], "
+            "\"last_state_en\": \"...\", \"last_state_kor\": \"...\"}\n"
+            f"Rules: Create exactly {seg_count} segments. "
+            "'prompts_en' is detailed visual description for each chunk. "
+            "'last_state' is the final frame description."
         )
 
-        user_msg = json.dumps({
-            "scene_id": sid,
-            "base_prompt": base_prompt,
-            "segment_count_needed": seg_count,
-            "duration_sec": duration,
-            "instruction": "Ensure the character's clothing and background are described in EVERY segment."
-        }, ensure_ascii=False)
+        user_msg = json.dumps(
+            {
+                "scene": sid,
+                "original": base_p,
+                "original_kor": base_kor,
+                "count": seg_count,
+            },
+            ensure_ascii=False,
+        )
 
         try:
-            raw = ai_ask_func(sys_msg, user_msg)
-
-            # 파싱 로직
-            text_cleaned = raw.strip()
-            if "```" in text_cleaned:
-                text_cleaned = re.sub(r"```json|```", "", text_cleaned).strip()
-
-            idx_start = text_cleaned.find("{")
-            idx_end = text_cleaned.rfind("}")
-
-            if idx_start != -1 and idx_end != -1:
-                json_str = text_cleaned[idx_start: idx_end + 1]
-                parsed = json.loads(json_str)
-                prompts_list = parsed.get("segment_prompts", [])
-
-                # 개수 보정
-                if len(prompts_list) < seg_count:
-                    last_p = prompts_list[-1] if prompts_list else base_prompt
-                    while len(prompts_list) < seg_count:
-                        prompts_list.append(last_p)
-                elif len(prompts_list) > seg_count:
-                    prompts_list = prompts_list[:seg_count]
-
-                sc["frame_segments"]["segments"] = [str(p).strip() for p in prompts_list]
-
-            else:
-                raise ValueError("JSON braces not found")
-
+            raw = ask(sys_msg, user_msg)
         except Exception as e:
-            _t(trace, "info", f"❌ Scene {sid} AI prompt failed: {e}")
-            # 실패 시 폴백
-            sc["frame_segments"]["segments"] = [base_prompt] * seg_count
+            _t(trace, "warn", f"Scene {sid} AI 호출 실패: {e}")
+            # 폴백: 최소한 prompt_1만 채워준다.
+            sc["prompt_1"] = base_p
+            sc["prompt_1_kor"] = base_kor
+            continue
 
-    _t(trace, "info", "✅ [AI Long-Take] 프롬프트 상세화 완료 (의상/배경 고정)")
-    return story_data
+        # 응답 파싱
+        try:
+            txt = (raw or "").strip()
+            txt = txt.replace("```json", "").replace("```", "")
+            s = txt.find("{")
+            e = txt.rfind("}")
+            if s == -1 or e == -1:
+                raise ValueError("JSON block not found in response")
+
+            parsed = json.loads(txt[s : e + 1])
+        except Exception as e:
+            _t(trace, "warn", f"Scene {sid} JSON 파싱 실패: {e}")
+            sc["prompt_1"] = base_p
+            sc["prompt_1_kor"] = base_kor
+            continue
+
+        p_en = parsed.get("prompts_en", [])
+        p_kor = parsed.get("prompts_kor", [])
+
+        if isinstance(p_en, str):
+            p_en = [p_en]
+        if isinstance(p_kor, str):
+            p_kor = [p_kor]
+
+        # 개수 보정
+        if not p_en:
+            p_en = [base_p] * seg_count
+        if not p_kor:
+            p_kor = [base_kor] * seg_count
+
+        while len(p_en) < seg_count:
+            p_en.append(p_en[-1])
+        while len(p_kor) < seg_count:
+            p_kor.append(p_kor[-1])
+
+        # ★ Shopping 스타일 필드명(prompt_1, prompt_2...)으로 저장
+        for i in range(seg_count):
+            sc[f"prompt_{i + 1}"] = p_en[i]
+            sc[f"prompt_{i + 1}_kor"] = p_kor[i]
+
+        sc["last_state"] = parsed.get("last_state_en", "")
+        sc["last_state_kor"] = parsed.get("last_state_kor", "")
+
+        _t(trace, "shorts", f"Scene {sid}: seg_count={seg_count}, total_frames={total_frames}")
+
+    _t(trace, "shorts", "✅ [Shopping Logic] 적용 완료.")
+    return video_data
+
 

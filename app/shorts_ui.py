@@ -52,7 +52,7 @@ import app.settings as _settings
 from app.settings import BASIC_VOCAL_TAGS, FFPROBE_EXE, BASE_DIR, CHARACTER_DIR, COMFY_HOST, JSONS_DIR, COMFY_INPUT_DIR, FFMPEG_EXE, _DEFAULT_ACE_WAIT_TIMEOUT_SEC, _DEFAULT_ACE_POLL_INTERVAL_SEC
 from app.lyrics_gen import create_project_files, normalize_sections, generate_title_lyrics_tags
 from json import loads, dumps
-from app.story_enrich import apply_ai_to_story_v11, fill_prompt_movie_with_ai
+from app.story_enrich import apply_ai_to_story_v11
 import subprocess
 import requests
 import functools
@@ -2314,6 +2314,221 @@ class MainWindow(QtWidgets.QMainWindow):
     def on_click_build_story_from_seg_async(self) -> None:
         """
         seg.json → story.json → video.json 생성 프로세스.
+        ★ Shopping 스타일(81세그먼트, prompt_1, last_state)을
+          story_enrich.fill_prompt_movie_with_ai_shorts 로 처리.
+        """
+        # 1. 작업 중복 방지
+        if getattr(self, "_seg_story_busy", False):
+            QtWidgets.QMessageBox.information(self, "알림", "작업이 이미 진행 중입니다.")
+            return
+        self._seg_story_busy = True
+
+        btn = getattr(self, "btn_test1_story", None) or getattr(getattr(self, "ui", None), "btn_test1_story", None)
+        if btn:
+            btn.setEnabled(False)
+
+        # 2. 프로젝트 경로 확인
+        proj_dir_str = ""
+        try:
+            if hasattr(self, "current_project_dir") and self.current_project_dir:
+                proj_dir_str = str(self.current_project_dir)
+            elif hasattr(self, "project_dir") and self.project_dir:
+                proj_dir_str = str(self.project_dir)
+        except Exception:
+            pass
+
+        if not proj_dir_str:
+            QtWidgets.QMessageBox.warning(self, "오류", "프로젝트 폴더가 없습니다.")
+            self._seg_story_busy = False
+            if btn:
+                btn.setEnabled(True)
+            return
+
+        proj_dir_path = Path(proj_dir_str).resolve()
+        seg_json_path = proj_dir_path / "seg.json"
+
+        if not seg_json_path.exists():
+            QtWidgets.QMessageBox.warning(self, "오류", "seg.json 파일이 없습니다.")
+            self._seg_story_busy = False
+            if btn:
+                btn.setEnabled(True)
+            return
+
+        # 3. UI 설정값 읽기
+        def _read_ui_settings():
+            fps, w, h, steps = 30, 720, 1280, 20
+            try:
+                if hasattr(self, "cmb_movie_fps"):
+                    fps = int(self.cmb_movie_fps.currentData())
+                if hasattr(self, "cmb_render_w") and hasattr(self, "cmb_render_h"):
+                    w = int(self.cmb_render_w.currentData())
+                    h = int(self.cmb_render_h.currentData())
+                if hasattr(self, "spn_render_steps"):
+                    steps = int(self.spn_render_steps.value())
+            except Exception:
+                pass
+            return fps, w, h, steps
+
+        # ─────────────────────────────────────────────────────────────
+        # Job 실행
+        # ─────────────────────────────────────────────────────────────
+        def job(on_progress_callback: Callable[[dict], None]) -> Dict[str, Any]:
+            def _log(msg: str):
+                try:
+                    on_progress_callback({"msg": msg})
+                except Exception:
+                    pass
+
+            _log(f"[1/5] 분석 시작: {proj_dir_path.name}")
+
+            # [1] Story Skeleton
+            seg_data = load_json(seg_json_path, [])
+            meta = load_json(proj_dir_path / "project.json", {})
+            imgs_dir = proj_dir_path / "imgs"
+            imgs_dir.mkdir(exist_ok=True)
+
+            scenes = []
+            # Intro
+            scenes.append({
+                "id": "t_000",
+                "section": "intro",
+                "start": 0.0,
+                "end": float(seg_data[0].get("start", 0)),
+                "img_file": str(imgs_dir / "t_000.png"),
+                "prompt": "Intro",
+                "lyric": ""
+            })
+            # Verses
+            for i, row in enumerate(seg_data):
+                sid = f"t_{i + 1:03d}"
+                start = float(row.get("start", 0))
+                end = float(row.get("end", start))
+                scenes.append({
+                    "id": sid,
+                    "section": "verse",
+                    "start": start,
+                    "end": end,
+                    "img_file": str(imgs_dir / f"{sid}.png"),
+                    "prompt": "Scene...",
+                    "lyric": str(row.get("text", "")).strip(),
+                    "characters": meta.get("characters", ["female_01"])
+                })
+            # Outro
+            last = float(seg_data[-1].get("end", 0))
+            scenes.append({
+                "id": f"t_{len(seg_data) + 1:03d}",
+                "section": "outro",
+                "start": last,
+                "end": last + 5.0,
+                "img_file": str(imgs_dir / "outro.png"),
+                "prompt": "Outro",
+                "lyric": ""
+            })
+
+            story_path = proj_dir_path / "story.json"
+            save_json(story_path, {"title": meta.get("title"), "scenes": scenes})
+            _log("[1/5] story.json 생성 완료")
+
+            # [2] Video JSON
+            _log("[2/5] video.json 구조 생성...")
+            video_path_str = build_video_json_with_gap_policy(str(proj_dir_path))
+            video_path = Path(video_path_str)
+
+            # [3] AI (A안)
+            _log("[3/5] AI 기본 묘사 생성...")
+            ai = AI()
+
+            def _ai_ask(sys, usr, **k):
+                if "prefer" in k:
+                    del k["prefer"]
+                # 기본은 gemini 강제 사용
+                return ai.ask_smart(sys, usr, prefer="gemini", **k)
+
+            v_data = load_json(video_path)
+            # UI 설정 주입
+            fps, w, h, steps = _read_ui_settings()
+            v_data.setdefault("defaults", {})
+            v_data["defaults"].update({
+                "movie": {"fps": fps, "target_fps": fps},
+                "image": {"width": w, "height": h, "fps": fps},
+                "generator": {"steps": steps},
+            })
+
+            v_data = apply_ai_to_story_v11(v_data, ask=_ai_ask)
+            save_json(video_path, v_data)
+
+            # [4] 가사 복원 (story.json → video.json 직접 매핑)
+            _log("[4/5] 가사 복원...")
+            try:
+                story_doc = load_json(story_path, {}) or {}
+                story_scenes = {
+                    str(s.get("id", "")).strip(): s
+                    for s in story_doc.get("scenes", []) or []
+                    if str(s.get("id", "")).strip()
+                }
+
+                v_data_lyrics = load_json(video_path, {}) or {}
+                restored = 0
+                for sc in v_data_lyrics.get("scenes", []) or []:
+                    sid = str(sc.get("id", "")).strip()
+                    if not sid:
+                        continue
+                    base_sc = story_scenes.get(sid)
+                    if not base_sc:
+                        continue
+                    if "lyric" in base_sc:
+                        sc["lyric"] = base_sc.get("lyric", "")
+                        restored += 1
+
+                save_json(video_path, v_data_lyrics)
+                _log(f"[4/5] 가사 복원 완료: {restored}개 씬에 lyric 주입.")
+            except Exception as e:
+                _log(f"[4/5] 가사 복원 실패: {e}")
+
+            # [5] Shorts/Shopping 스타일 세그먼트 + 프롬프트 상세화 (공통 엔진)
+            _log(f"[5/5] Shorts Style 세그먼트 적용 (FPS:{fps})...")
+            v_data = load_json(video_path, {}) or {}
+
+            def _trace(tag: str, msg: str) -> None:
+                _log(f"[{tag}] {msg}")
+
+            v_data = fill_prompt_movie_with_ai_shorts(
+                v_data,
+                ask=_ai_ask,
+                trace=_trace,
+            )
+            save_json(video_path, v_data)
+
+            _log("완료.")
+            return {"fps": fps}
+
+        def done(ok, res, err):
+            self._seg_story_busy = False
+            if btn:
+                btn.setEnabled(True)
+            if ok:
+                fps = res.get("fps")
+                msg = f"완료 (Shorts Style, FPS:{fps})"
+                try:
+                    self.statusBar().showMessage(msg, 5000)
+                except Exception:
+                    pass
+                print(f"[UI] {msg}")
+                try:
+                    QtWidgets.QMessageBox.information(self, "완료", "분석이 완료되었습니다.")
+                except Exception:
+                    pass
+            else:
+                try:
+                    QtWidgets.QMessageBox.critical(self, "실패", str(err))
+                except Exception:
+                    pass
+
+        run_job_with_progress_async(self, "AI 분석", job, on_done=done)
+
+    def on_click_build_story_from_seg_async_ex(self) -> None:
+        """
+        seg.json → story.json → video.json 생성 프로세스.
         ★ Shopping 스타일(81세그먼트, prompt_1, last_state)을 내부 함수(_apply_shopping_style_local)로 직접 구현.
         """
         # 1. 작업 중복 방지
@@ -2603,780 +2818,6 @@ class MainWindow(QtWidgets.QMainWindow):
                     pass
 
         run_job_with_progress_async(self, "AI 분석", job, on_done=done)
-
-    def on_click_build_story_from_seg_async_ex(self) -> None:
-        """
-        seg.json → story.json 스켈레톤 → video.json(갭 포함) 생성 → video.json만 AI 강화 → 프롬프트 주입 → 가사 재주입
-        - [수정 A안] AI 프롬프트 강화 시 'characters' 순서에 따라 'image 1', 'image 2' 지칭 규칙 강제 주입
-        - [수정 설정] 분석 단계에서 UI의 해상도(W/H), FPS, Steps를 video.json에 저장 (Step 2 이미지 생성용)
-        - [수정 세그먼트] Shopping 탭의 'fill_prompt_movie_with_ai_shorts'을 사용하여 81 세그먼트 고정밀 생성
-        """
-
-        # 재진입 방지
-        if getattr(self, "_seg_story_busy", False):
-            QtWidgets.QMessageBox.information(self, "알림", "프로젝트 분석 작업이 이미 진행 중입니다.")
-            return
-        self._seg_story_busy = True
-
-        # 버튼 비활성화
-        btn_build_story = getattr(self, "btn_test1_story", None) or getattr(getattr(self, "ui", None),
-                                                                            "btn_test1_story", None)
-        if btn_build_story is not None:
-            try:
-                btn_build_story.setEnabled(False)
-            except RuntimeError:  # 위젯이 삭제된 경우 등
-                pass
-
-        # 프로젝트 경로 확인
-        proj_dir_str = ""
-        try:
-            proj_dir_callable = getattr(self, "_current_project_dir", None)
-            if callable(proj_dir_callable):
-                proj_dir_val = proj_dir_callable()
-                proj_dir_str = str(proj_dir_val) if isinstance(proj_dir_val, Path) else proj_dir_val or ""
-            else:
-                proj_dir_attr = proj_dir_callable or getattr(self, "project_dir", None)
-                proj_dir_str = str(proj_dir_attr) if isinstance(proj_dir_attr, Path) else proj_dir_attr or ""
-
-            if not proj_dir_str:
-                raise ValueError("프로젝트 경로를 가져올 수 없습니다.")
-
-        except AttributeError:
-            proj_dir_str = ""
-        except (ValueError, TypeError, OSError) as e_proj_dir:
-            print(f"[WARN] 프로젝트 경로 확인 중 오류: {type(e_proj_dir).__name__}: {e_proj_dir}")
-            proj_dir_str = ""
-        except Exception as e_unknown:
-            print(f"[ERROR] 프로젝트 경로 확인 중 예상치 못한 오류: {type(e_unknown).__name__}: {e_unknown}")
-            proj_dir_str = ""
-
-        if not proj_dir_str:
-            QtWidgets.QMessageBox.warning(self, "오류", "프로젝트 폴더를 선택하거나 생성해 주세요.")
-            self._seg_story_busy = False
-            if btn_build_story is not None:
-                try:
-                    btn_build_story.setEnabled(True)
-                except RuntimeError:
-                    pass
-            return
-
-        # 경로 객체 생성 및 seg.json 확인
-        try:
-            proj_dir_path = Path(proj_dir_str).resolve()
-            seg_json_path = proj_dir_path / "seg.json"
-            if not seg_json_path.is_file():
-                raise FileNotFoundError(f"seg.json 파일을 찾을 수 없습니다:\n{seg_json_path}")
-        except FileNotFoundError as e_fnf:
-            QtWidgets.QMessageBox.warning(self, "오류", str(e_fnf))
-            self._seg_story_busy = False
-            if btn_build_story is not None:
-                try:
-                    btn_build_story.setEnabled(True)
-                except RuntimeError:
-                    pass
-            return
-        except OSError as e_os:
-            QtWidgets.QMessageBox.critical(self, "오류", f"경로 접근 오류: {e_os}")
-            self._seg_story_busy = False
-            if btn_build_story is not None:
-                try:
-                    btn_build_story.setEnabled(True)
-                except RuntimeError:
-                    pass
-            return
-
-        # seg 원문 가사 재주입 함수 (내부 함수로 정의)
-        def _reinject_lyrics_from_seg(target_json_path: Path, source_story_path: Path,
-                                      log_fn: Callable[[str], None]) -> None:
-            """
-            [수정됨]
-            - 원본 seg.json 대신, 1단계에서 생성된 story.json (source_story_path)을 읽는다.
-            - 'start' 시간 대신 'id'를 키로 매칭하여 가사를 재주입한다.
-            """
-            try:
-                target_doc = load_json(target_json_path, None)
-                if not isinstance(target_doc, dict):
-                    log_fn("[WARN] 가사 재주입 실패: 대상 JSON(video.json) 형식이 dict가 아닙니다.")
-                    return
-
-                source_doc = load_json(source_story_path, None)
-                if not isinstance(source_doc, dict):
-                    log_fn(f"[WARN] 가사 재주입 실패: 원본 JSON(story.json) 형식이 dict가 아닙니다. 경로: {source_story_path}")
-                    return
-
-                scenes_raw = target_doc.get("scenes")
-                if not isinstance(scenes_raw, list):
-                    log_fn("[WARN] 가사 재주입 실패: 대상 JSON(video.json)에 'scenes' 리스트가 없습니다.")
-                    return
-                scenes: List[Dict[str, Any]] = scenes_raw
-
-                # 'start' 시간 대신 'id'를 키로 하는 가사 맵 생성 (story.json 기준)
-                source_scenes = source_doc.get("scenes", [])
-                if not isinstance(source_scenes, list):
-                    log_fn(f"[WARN] 원본 JSON(story.json)에 'scenes' 리스트가 없습니다.")
-                    return
-
-                lyric_map: Dict[str, str] = {}
-                for src_scene in source_scenes:
-                    if isinstance(src_scene, dict):
-                        scene_id_key = str(src_scene.get("id", "")).strip()
-                        # [주의] story.json의 lyric을 사용 (사용자 의도)
-                        text_val = str(src_scene.get("lyric", "")).strip()
-                        if scene_id_key and text_val:
-                            lyric_map[scene_id_key] = text_val
-
-                reinjected_count = 0
-                cleared_gap_count = 0
-
-                for sc_item in scenes:
-                    if not isinstance(sc_item, dict):
-                        continue
-                    sc_id_str = str(sc_item.get("id") or "")
-                    sc_origin_str = str(sc_item.get("origin") or "")
-                    is_gap_scene = sc_id_str.startswith("gap_") or sc_origin_str == "gap-fill"
-
-                    if is_gap_scene:
-                        if sc_item.get("lyric"):
-                            sc_item["lyric"] = ""
-                            cleared_gap_count += 1
-                        continue
-
-                    # 'start' 시간(sc_key) 대신 'id'(sc_id_str)로 맵에서 검색
-                    if sc_id_str in lyric_map:
-                        original_text = lyric_map[sc_id_str]
-                        if original_text and sc_item.get("lyric", "") != original_text:
-                            sc_item["lyric"] = original_text
-                            reinjected_count += 1
-
-                if reinjected_count > 0 or cleared_gap_count > 0:
-                    target_doc["scenes"] = scenes
-                    try:
-                        save_json(target_json_path, target_doc)
-                        log_fn(
-                            f"[INFO] 가사 재주입 완료 (ID 매칭): 정상 씬 복원 {reinjected_count}개, 갭 씬 정리 {cleared_gap_count}개")
-                    except (OSError, TypeError) as e_save_reinject:
-                        log_fn(f"[ERROR] 가사 재주입 저장 오류: {type(e_save_reinject).__name__}: {e_save_reinject}")
-                else:
-                    log_fn("[INFO] 가사 재주입 (ID 매칭): 변경 없음")
-
-            except (FileNotFoundError, json.JSONDecodeError, OSError, TypeError, ValueError) as e_reinject:
-                log_fn(f"[ERROR] 가사 재주입 오류: {type(e_reinject).__name__}: {e_reinject}")
-            except Exception as e_unknown_reinject:
-                log_fn(f"[ERROR] 가사 재주입 중 예상치 못한 오류: {type(e_unknown_reinject).__name__}: {e_unknown_reinject}")
-
-        # video_json_path 변수를 job 함수 상단에서 미리 정의
-        video_json_path = proj_dir_path / "video.json"
-
-        # --- FPS 읽기 도우미 함수 ---
-        def _read_ui_fps() -> int:
-            try:
-                cmb = getattr(self, "cmb_movie_fps", None)
-                return int(cmb.currentData()) if cmb and hasattr(cmb, "currentData") else 30
-            except Exception:
-                return 30
-
-        # --- [추가] 해상도/Steps 읽기 도우미 ---
-        def _read_ui_size() -> tuple[int, int]:
-            try:
-                w = int(self.cmb_render_w.currentData())
-                h = int(self.cmb_render_h.currentData())
-                return w, h
-            except Exception:
-                return 720, 1280
-
-        def _read_ui_steps() -> int:
-            try:
-                return int(self.spn_render_steps.value())
-            except Exception:
-                return 20
-
-        # --- AI 호출 래퍼 ---
-        def _ask_en(system_msg: str, user_msg: str) -> str:
-            try:
-                # self._ai 인스턴스가 AI 클래스라고 가정
-                return str(self._ai.ask_smart(system_msg, user_msg, prefer="gemini", allow_fallback=True) or "")
-            except Exception:
-                return ""
-
-        # ----- job 함수 정의 -----
-        def job(on_progress_callback: Callable[[dict], None]) -> Dict[str, str]:
-
-            # _log_progress 정의
-            def _log_progress(message: str) -> None:
-                """진행률 콜백을 호출하는 내부 헬퍼 함수."""
-                try:
-                    on_progress_callback({"msg": message})
-                except Exception as e_log:
-                    print(f"[ERROR] Progress callback failed: {e_log}")
-
-            # --- 체크박스 상태 읽기 ---
-            try:
-                checkbox = getattr(self, "chk_huge_breasts", None)
-                if checkbox and callable(getattr(checkbox, "isChecked", None)):
-                    force_huge = bool(checkbox.isChecked())
-                else:
-                    force_huge = False
-            except Exception:
-                force_huge = False
-
-            os.environ["FORCE_HUGE_BREASTS"] = "1" if force_huge else "0"
-            _log_progress(f"[INFO] 'huge breasts' 강제 주입: {force_huge}")
-
-            def _detect_prefer_from_ui() -> str:
-                default_prefer = "gemini"
-                widget_name_list = [
-                    "ai_mode", "mode", "cmb_ai", "combo_ai", "cmb_model", "combo_model",
-                    "model", "provider", "combo_provider", "btn_ai_toggle"
-                ]
-                for widget_name in widget_name_list:
-                    try:
-                        widget_obj = getattr(self, widget_name, None) or \
-                                     getattr(getattr(self, "ui", None), widget_name, None)
-
-                        current_text_value = ""
-
-                        if widget_name == "btn_ai_toggle" and hasattr(widget_obj, "isChecked") and callable(
-                                widget_obj.isChecked):
-                            current_text_value = "gemini" if widget_obj.isChecked() else "openai"
-
-                        elif hasattr(widget_obj, "currentText") and callable(widget_obj.currentText):
-                            current_text_value = str(widget_obj.currentText())
-                        elif isinstance(widget_obj, str):
-                            current_text_value = widget_obj
-
-                        if current_text_value:
-                            text_lower = current_text_value.lower()
-                            if "gemini" in text_lower: return "gemini"
-                            if "openai" in text_lower or "gpt" in text_lower: return "openai"
-                    except AttributeError:
-                        pass
-                    except Exception as e_detect:
-                        _log_progress(f"[WARN] AI 선호도 감지 중 오류 ({widget_name}): {e_detect}")
-
-                try:
-                    ai_instance = AI()
-                    ai_default_prefer = getattr(ai_instance, "default_prefer", None)
-                    if isinstance(ai_default_prefer, str) and ai_default_prefer:
-                        return ai_default_prefer.lower()
-                except Exception as e_ai_init:
-                    _log_progress(f"[WARN] AI 기본 선호도 가져오기 실패: {e_ai_init}")
-
-                return default_prefer
-
-            # 1) story.json 스켈레톤 생성 함수 (기존 로직 유지)
-            def _build_story_skeleton_internal(seg_doc_list: List[Dict[str, Any]], project_dir: Path) -> Path:
-                _log_progress("[1/6] story.json 스켈레톤 생성 시작...")
-                if not isinstance(seg_doc_list, list) or not seg_doc_list:
-                    raise ValueError("seg.json 내용이 비어있거나 리스트 형식이 아닙니다.")
-
-                meta_path = project_dir / "project.json"
-                meta_info: Dict[str, Any] = {}
-                try:
-                    meta_info_raw = load_json(meta_path, None)
-                    if isinstance(meta_info_raw, dict):
-                        meta_info = meta_info_raw
-                    else:
-                        _log_progress("[WARN] project.json 형식이 잘못되었습니다 (빈 메타 사용)")
-                except FileNotFoundError:
-                    _log_progress("[WARN] project.json 파일을 찾을 수 없습니다 (빈 메타 사용)")
-                except (json.JSONDecodeError, OSError) as e_load_meta:
-                    _log_progress(f"[WARN] project.json 로드 실패 ({type(e_load_meta).__name__}, 빈 메타 사용)")
-
-                imgs_dir = project_dir / "imgs"
-                try:
-                    imgs_dir.mkdir(parents=True, exist_ok=True)
-                except OSError as e_mkdir:
-                    _log_progress(f"[WARN] 이미지 폴더 생성 실패: {e_mkdir}")
-
-                scenes_list: List[Dict[str, Any]] = []
-                cursor_time = 0.0
-                first_start_time = 0.0
-
-                if seg_doc_list and isinstance(seg_doc_list[0], dict):
-                    try:
-                        first_start_time = float(seg_doc_list[0].get("start", 0.0))
-                    except (ValueError, TypeError):
-                        _log_progress("[WARN] 첫 세그먼트 시작 시간 변환 실패, 0.0 사용")
-                        first_start_time = 0.0
-                else:
-                    _log_progress("[WARN] seg.json 첫 항목이 dict가 아니거나 비어있음")
-
-                if first_start_time >= 1.0:
-                    intro_end_time = round(first_start_time, 3)
-                    intro_scene_id = "t_000"
-                    scenes_list.append({
-                        "id": intro_scene_id, "section": "intro", "label": "Intro",
-                        "start": 0.0, "end": intro_end_time, "duration": intro_end_time,
-                        "scene": "intro", "characters": [],
-                        "effect": ["soft light", "film grain", "gentle camera pan"],
-                        "screen_transition": True,
-                        "img_file": str(imgs_dir / f"{intro_scene_id}.png"),
-                        "prompt": "인트로: 부드러운 전환과 분위기 암시",
-                        "prompt_img": "", "prompt_movie": "", "prompt_negative": "",
-                        "lyric": "",
-                    })
-                    cursor_time = first_start_time
-
-                for i_seg, row_data in enumerate(seg_doc_list, start=1):
-                    if not isinstance(row_data, dict):
-                        _log_progress(f"[WARN] seg.json {i_seg}번째 항목이 dict가 아님. 건너뜀")
-                        continue
-
-                    try:
-                        start_time_val = float(row_data.get("start", 0.0))
-                    except (ValueError, TypeError):
-                        start_time_val = 0.0
-                    try:
-                        end_time_val = float(row_data.get("end", start_time_val))
-                    except (ValueError, TypeError):
-                        end_time_val = start_time_val
-
-                    if end_time_val < start_time_val: end_time_val = start_time_val
-                    if start_time_val < cursor_time: start_time_val = cursor_time
-
-                    scene_id_str = f"t_{i_seg:03d}"
-                    duration_val = round(max(0.0, end_time_val - start_time_val), 3)
-                    lyric_text_val = str(row_data.get("text", "")).strip()
-
-                    default_character = ["female_01"]
-                    project_characters = meta_info.get("characters")
-                    characters_to_use = project_characters if isinstance(project_characters,
-                                                                         list) and project_characters else default_character
-
-                    scenes_list.append({
-                        "id": scene_id_str, "section": "verse", "label": "Verse",
-                        "start": round(start_time_val, 3), "end": round(end_time_val, 3), "duration": duration_val,
-                        "scene": "verse",
-                        "characters": characters_to_use,
-                        "effect": ["bokeh", "slow push-in"],
-                        "screen_transition": False,
-                        "img_file": str(imgs_dir / f"{scene_id_str}.png"),
-                        "prompt": "장면 묘사 필요",
-                        "prompt_img": "", "prompt_movie": "", "prompt_negative": "",
-                        "lyric": lyric_text_val,
-                    })
-                    cursor_time = end_time_val
-
-                last_end_time = cursor_time
-                outro_start_time = last_end_time
-                outro_duration = 5.0
-                outro_end_time = outro_start_time + outro_duration
-                outro_scene_index = len(seg_doc_list) + (1 if first_start_time >= 1.0 else 0) + 1
-                outro_id_str = f"t_{outro_scene_index:03d}"
-
-                scenes_list.append({
-                    "id": outro_id_str, "section": "outro", "label": "Outro",
-                    "start": round(outro_start_time, 3), "end": round(outro_end_time, 3),
-                    "duration": round(outro_duration, 3),
-                    "scene": "outro", "characters": [],
-                    "effect": ["fade-out", "soft glow"],
-                    "screen_transition": True,
-                    "img_file": str(imgs_dir / f"{outro_id_str}.png"),
-                    "prompt": "아웃트로: 여운과 마무리",
-                    "prompt_img": "", "prompt_movie": "", "prompt_negative": "",
-                    "lyric": "",
-                })
-
-                story_record: Dict[str, Any] = {
-                    "title": str(meta_info.get("title") or project_dir.name),
-                    "duration": round(outro_end_time, 3),
-                    "offset": 0.0,
-                    "lyrics": str(meta_info.get("lyrics") or ""),
-                    "characters": meta_info.get("characters") or ["female_01"],
-                    "character_styles": meta_info.get("character_styles") or {},
-                    "global_context": meta_info.get("global_context") or {
-                        "themes": [], "palette": "", "style_guide": "", "negative_bank": "",
-                        "section_moods": {"intro": "", "verse": "", "chorus": "", "bridge": "", "outro": ""},
-                        "effect": [],
-                    },
-                    "defaults": meta_info.get("defaults") or {
-                        "image": {"width": 720, "height": 1080, "negative": "@global"}
-                    },
-                    "scenes": scenes_list,
-                    "audit": {"built_from": "seg.json", "ai_used": False},
-                }
-
-                story_file_path = project_dir / "story.json"
-                try:
-                    save_json(story_file_path, story_record)
-                    _log_progress(f"[1/6] story.json 스켈레톤 생성 완료: {story_file_path.name}")
-                except (OSError, TypeError) as e_save_story:
-                    _log_progress(f"[ERROR] story.json 저장 실패: {e_save_story}")
-                return story_file_path
-
-            # --- job 함수 메인 로직 시작 ---
-            on_progress_callback({"stage": "start", "msg": f"프로젝트 분석 시작 (A안 적용): {proj_dir_path.name}"})
-
-            seg_content_raw: Optional[list] = None
-            try:
-                seg_content_raw = load_json(seg_json_path, None)
-                if not isinstance(seg_content_raw, list):
-                    raise ValueError(f"seg.json 파일 내용이 리스트 형식이 아닙니다: {seg_json_path}")
-            except FileNotFoundError:
-                raise FileNotFoundError(f"seg.json 파일을 찾을 수 없습니다: {seg_json_path}")
-            except (json.JSONDecodeError, ValueError) as e_load_seg:
-                raise ValueError(f"seg.json 로드 또는 파싱 실패: {e_load_seg}")
-            except OSError as e_os_seg:
-                raise OSError(f"seg.json 접근 오류: {e_os_seg}")
-
-            seg_content: List[Dict[str, Any]] = seg_content_raw if seg_content_raw is not None else []
-
-            try:
-                story_path = _build_story_skeleton_internal(seg_content, proj_dir_path)
-            except Exception as e_build_skel:
-                raise RuntimeError(f"story.json 스켈레톤 생성 실패: {e_build_skel}") from e_build_skel
-
-            _log_progress("[2/6] video.json(갭 포함) 생성...")
-            video_path_str: Optional[str] = None
-            try:
-                video_path_result = build_video_json_with_gap_policy(str(proj_dir_path), small_gap_sec=2.0)
-                if isinstance(video_path_result, str) and Path(video_path_result).is_file():
-                    video_path_str = video_path_result
-                    on_progress_callback(
-                        {"stage": "video_json_built", "msg": f"video.json 생성 완료: {Path(video_path_str).name}"})
-                else:
-                    _log_progress("[WARN] video.json 생성 함수가 유효한 경로를 반환하지 않았습니다.")
-            except FileNotFoundError:
-                _log_progress("[WARN] video.json 생성 건너뜀 (story.json 없음)")
-            except (TypeError, ValueError) as e_v:
-                _log_progress(f"[WARN] video.json 생성 중 오류 발생: {type(e_v).__name__}: {e_v}")
-            except Exception as e_v_unknown:
-                _log_progress(f"[ERROR] video.json 생성 중 예상치 못한 오류: {type(e_v_unknown).__name__}: {e_v_unknown}")
-
-            ai_client_instance: Optional[AI] = None
-            try:
-                ai_client_instance = AI()
-            except Exception as e_ai_init_job:
-                _log_progress(f"[WARN] AI 클라이언트 초기화 실패 ({type(e_ai_init_job).__name__}), AI 강화 생략.")
-
-            prefer_detected_provider = _detect_prefer_from_ui()
-
-            # _ask_wrapper_internal 내부 함수 (AI 호출 담당 + A안 로직 추가)
-            def _ask_wrapper_internal(
-                    system: str,
-                    user: str,
-                    *,
-                    prefer: Optional[str] = None,
-                    allow_fallback: Optional[bool] = None,
-                    trace: Optional[Callable[[str, str], None]] = None,
-            ) -> str:
-                if ai_client_instance is None:
-                    raise RuntimeError("AI 클라이언트가 초기화되지 않아 호출할 수 없습니다.")
-
-                prefer_final = prefer or prefer_detected_provider or getattr(ai_client_instance, "default_prefer",
-                                                                             "openai")
-                allow_fallback_final = False if allow_fallback is None else bool(allow_fallback)
-
-                ask_smart = getattr(ai_client_instance, "ask_smart", None)
-                if not callable(ask_smart):
-                    raise AttributeError("ask_smart method not found")
-
-                sig = inspect.signature(ask_smart)
-                call_kwargs: Dict[str, Any] = {}
-                if "prefer" in sig.parameters:
-                    call_kwargs["prefer"] = prefer_final
-                if "allow_fallback" in sig.parameters:
-                    call_kwargs["allow_fallback"] = allow_fallback_final
-                if "trace" in sig.parameters and trace is not None:
-                    call_kwargs["trace"] = trace
-
-                # --- [A안] 캐릭터 슬롯 기반 영어 프롬프트 규칙 주입 ---
-                system_prompt_final = str(system)
-                try:
-                    pj_meta = load_json(proj_dir_path / "project.json", {})
-                    char_list = pj_meta.get("characters", [])
-                    char_styles = pj_meta.get("character_styles", {})
-
-                    slot_instructions = []
-                    if len(char_list) > 0:
-                        c1 = char_list[0]
-                        s1 = char_styles.get(c1, "Unknown")
-                        slot_instructions.append(f"   - **Image 1 Source**: '{c1}' ({s1})")
-                        slot_instructions.append(
-                            f"     -> RULE: MUST refer to this character as **'the [man/woman] from image 1'**.")
-
-                    if len(char_list) > 1:
-                        c2 = char_list[1]
-                        s2 = char_styles.get(c2, "Unknown")
-                        slot_instructions.append(f"   - **Image 2 Source**: '{c2}' ({s2})")
-                        slot_instructions.append(
-                            f"     -> RULE: MUST refer to this character as **'the [man/woman] from image 2'**.")
-
-                    if slot_instructions:
-                        mapping_text = "\n".join(slot_instructions)
-                        system_prompt_final += f"\n\n[IMPORTANT: IMAGE SLOT MAPPING]\nThis workflow uses specific image slots. You MUST follow these rules when writing 'prompt_img' (English):\n{mapping_text}\n- If describing visual appearance or action, always link it to 'image 1' or 'image 2'.\n- 'prompt_img' MUST be in English."
-                except Exception as e_map:
-                    _log_progress(f"[WARN] A안 프롬프트 매핑 중 오류: {e_map}")
-
-                # (기존) force_huge 로직
-                if force_huge:
-                    rule_2_marker = "2) Always include character traits for each referenced character."
-                    if rule_2_marker in system_prompt_final:
-                        rule_2_replacement = (
-                            "2) Always include character traits for each referenced character.\n"
-                            "       - For any character id that starts with \"female\", you MUST include \"adult woman\" AND \"huge breasts\"."
-                        )
-                        system_prompt_final = system_prompt_final.replace(rule_2_marker, rule_2_replacement)
-                    elif "# 엄격한 작성 규칙:" in system_prompt_final:
-                        rule_marker = "- character_styles: 한국어 설명."
-                        rule_replacement = (
-                            "- character_styles: 한국어 설명.\n"
-                            "- [중요 규칙] 'female' ID를 가진 character_styles 설명에 'huge breasts, slim legs'를 반드시 한국어로 포함."
-                        )
-                        system_prompt_final = system_prompt_final.replace(rule_marker, rule_replacement)
-                    else:
-                        system_prompt_final += "\n\nRULE: For 'female' characters, you MUST include 'huge breasts'."
-
-                if trace:
-                    try:
-                        trace("ai.ask", f"prefer={prefer_final} allow_fallback={allow_fallback_final} "
-                                        f"len={len(str(system_prompt_final))}/{len(str(user))}")
-                    except Exception:
-                        pass
-
-                result_text = ask_smart(system_prompt_final, str(user),
-                                        **call_kwargs)
-                return str(result_text or "")
-
-            if video_path_str and Path(video_path_str).is_file():
-                _log_progress("[3/6] video.json AI 강화 시작 (A안 프롬프트 적용)...")
-                try:
-                    video_doc_raw = load_json(Path(video_path_str), None)
-                    if isinstance(video_doc_raw, dict):
-
-                        # apply_gpt_to_story_v11 호출 (force_huge_breasts는 이제 wrapper 안에서 처리하거나 여기서 전달)
-                        # 여기서는 wrapper가 system prompt를 수정하므로 기본 호출
-                        video_ai_enhanced = apply_ai_to_story_v11(
-                            video_doc_raw,
-                            ask=_ask_wrapper_internal,
-                            prefer=prefer_detected_provider,
-                            allow_fallback=None,
-                            trace=None,
-                            force_huge_breasts=force_huge
-                        )
-
-                        video_ai_enhanced.setdefault("audit", {})
-                        video_ai_enhanced["audit"]["ai_used"] = True
-                        video_ai_enhanced["audit"]["provider"] = prefer_detected_provider
-                        save_json(Path(video_path_str), video_ai_enhanced)
-                        on_progress_callback({"stage": "ai_done_video",
-                                              "msg": f"video.json AI 강화 완료 (provider: {prefer_detected_provider})"})
-                    else:
-                        _log_progress("[WARN] video.json 형식이 dict가 아니라서 AI 강화 생략")
-                except (RuntimeError, TypeError, ValueError) as e_ai_vid:
-                    _log_progress(f"[WARN] video.json AI 강화 중 오류(진행 계속): {type(e_ai_vid).__name__}: {e_ai_vid}")
-                    on_progress_callback({"stage": "ai_error_video", "msg": f"video.json AI 강화 실패: {e_ai_vid}"})
-                except Exception as e_ai_unknown:
-                    _log_progress(
-                        f"[ERROR] video.json AI 강화 중 예상치 못한 오류: {type(e_ai_unknown).__name__}: {e_ai_unknown}")
-                    on_progress_callback({"stage": "ai_error_video", "msg": f"video.json AI 강화 실패: {e_ai_unknown}"})
-            elif video_path_str:
-                _log_progress("[WARN] video.json 경로가 유효한 파일이 아니라 AI 강화 생략")
-            else:
-                _log_progress("[WARN] video.json 경로가 없어 AI 강화 생략")
-
-            if video_path_str and Path(video_path_str).is_file():
-                _log_progress("[4/6] video.json 프롬프트 주입/정규화...")
-                try:
-                    save_story_overwrite_with_prompts(Path(video_path_str))
-
-                    try:
-                        doc_norm = load_json(Path(video_path_str), None)
-                        if isinstance(doc_norm, dict):
-                            scenes_norm_raw = doc_norm.get("scenes")
-                            if isinstance(scenes_norm_raw, list):
-                                scenes_norm: List[Dict[str, Any]] = scenes_norm_raw
-                                neg_changed_count = 0
-                                for sc_norm in scenes_norm:
-                                    if not isinstance(sc_norm, dict): continue
-
-                                    neg_raw = str(sc_norm.get("prompt_negative", "")).strip()
-                                    if neg_raw:
-                                        neg_clean = neg_raw.replace("，", ",")
-                                        neg_clean = re.sub(r"\s*,\s*", ",", neg_clean).strip(',')
-                                        parts_list = [p.strip() for p in neg_clean.split(",") if p.strip()]
-                                        seen_set: set[str] = set()
-                                        uniq_list: list[str] = []
-                                        for ptxt in parts_list:
-                                            ptxt_lower = ptxt.lower()
-                                            if ptxt_lower not in seen_set:
-                                                seen_set.add(ptxt_lower)
-                                                uniq_list.append(ptxt)
-                                        final_neg = ", ".join(uniq_list)
-                                        if sc_norm.get("prompt_negative") != final_neg:
-                                            sc_norm["prompt_negative"] = final_neg
-                                            neg_changed_count += 1
-
-                                if neg_changed_count > 0:
-                                    save_json(Path(video_path_str), doc_norm)
-                                    _log_progress(f"[INFO] 네거티브 프롬프트 정리 완료 ({neg_changed_count}개 씬 수정됨)")
-
-                            else:
-                                _log_progress("[WARN] 네거티브 정리 실패: 'scenes'가 리스트가 아님")
-                        else:
-                            _log_progress("[WARN] 네거티브 정리 실패: video.json 형식이 dict가 아님")
-                    except (OSError, ValueError, TypeError, json.JSONDecodeError) as e_norm:
-                        _log_progress(f"[WARN] 네거티브 정리 중 경고: {type(e_norm).__name__}: {e_norm}")
-                    except Exception as e_norm_unknown:
-                        _log_progress(
-                            f"[ERROR] 네거티브 정리 중 예상치 못한 오류: {type(e_norm_unknown).__name__}: {e_norm_unknown}")
-
-                    on_progress_callback({"stage": "prompt_inject_done_video", "msg": "video.json 프롬프트 주입 완료"})
-                except (RuntimeError, ValueError, TypeError) as e_prompt_vid:
-                    _log_progress(f"[WARN] video.json 프롬프트 주입 오류: {type(e_prompt_vid).__name__}: {e_prompt_vid}")
-                    on_progress_callback(
-                        {"stage": "prompt_inject_error_video", "msg": f"video.json 프롬프트 주입 실패: {e_prompt_vid}"})
-                except Exception as e_prompt_unknown:
-                    _log_progress(
-                        f"[ERROR] video.json 프롬프트 주입 중 예상치 못한 오류: {type(e_prompt_unknown).__name__}: {e_prompt_unknown}")
-                    on_progress_callback(
-                        {"stage": "prompt_inject_error_video", "msg": f"video.json 프롬프트 주입 실패: {e_prompt_unknown}"})
-            elif video_path_str:
-                _log_progress("[WARN] video.json 경로가 유효한 파일이 아니라 프롬프트 주입 생략")
-            else:
-                _log_progress("[WARN] video.json 경로가 없어 프롬프트 주입 생략")
-
-            if video_path_str and Path(video_path_str).is_file():
-                _log_progress("[5/6] video.json 가사 재주입 (ID 매칭)...")
-                try:
-                    # [수정] seg_json_path 대신 story_path (뼈대)를 원본으로 사용
-                    _reinject_lyrics_from_seg(Path(video_path_str), story_path, _log_progress)
-                    on_progress_callback(
-                        {"stage": "lyric_reinject_done_video", "msg": "video.json 가사 재주입 시도 완료 (ID 매칭)"})
-                except (FileNotFoundError, OSError, TypeError, ValueError) as e_reinject_call:
-                    _log_progress(
-                        f"[ERROR] video.json 가사 재주입 오류: {type(e_reinject_call).__name__}: {e_reinject_call}")
-                    on_progress_callback(
-                        {"stage": "lyric_reinject_error_video", "msg": f"video.json 가사 재주입 오류: {e_reinject_call}"})
-                except Exception as e_reinject_unknown:
-                    _log_progress(
-                        f"[ERROR] video.json 가사 재주입 중 예상치D 못한 오류: {type(e_reinject_unknown).__name__}: {e_reinject_unknown}")
-                    on_progress_callback(
-                        {"stage": "lyric_reinject_error_video",
-                         "msg": f"video.json 가사 재주입 오류: {e_reinject_unknown}"})
-            elif video_path_str:
-                _log_progress("[WARN] video.json 경로가 유효한 파일이 아니라 가사 재주입 생략")
-            else:
-                _log_progress("[WARN] video.json 경로가 없어 가사 재주입 생략")
-
-            _log_progress("[6/6] FPS/해상도 설정 적용 및 81세그먼트(Shopping Style) 적용 시작...")
-            try:
-                # --- [핵심 수정] UI 설정값(해상도, FPS, Steps)을 video.json에 강제 저장 ---
-                ui_w, ui_h = _read_ui_size()
-                ui_fps = _read_ui_fps()
-                ui_steps = _read_ui_steps()
-
-                vdoc_fps = load_json(video_json_path, {}) or {}
-                if not isinstance(vdoc_fps, dict): vdoc_fps = {}
-
-                vdoc_fps.setdefault("defaults", {})
-                vdoc_fps["defaults"] = {
-                    "movie": {"fps": ui_fps, "target_fps": ui_fps, "input_fps": ui_fps},
-                    "image": {"width": ui_w, "height": ui_h, "fps": ui_fps},
-                    "generator": {"steps": ui_steps}
-                }
-                vdoc_fps["fps"] = int(ui_fps)
-
-                save_json(video_json_path, vdoc_fps)
-                _log_progress(f"[6/6] UI 설정 강제 주입 완료 (W:{ui_w} H:{ui_h} FPS:{ui_fps} Steps:{ui_steps})")
-
-                # --- [핵심 수정] fill_prompt_movie_with_ai 대신 _long 버전 호출 (81 세그먼트) ---
-
-                # 여기서 AI 래퍼(ask_wrapper)를 전달할 때 이미 A안 프롬프트 로직이 내장되어 있으므로
-                # fill_prompt_movie_with_ai_shorts 내부에서도 AI 호출 시 해당 규칙이 적용될 가능성이 높음.
-                fill_prompt_movie_with_ai_shorts(
-                    proj_dir_path,  # Path 객체
-                    _ask_wrapper_internal,  # A안 프롬프트 로직이 포함된 wrapper
-                    log_fn=_log_progress
-                )
-                _log_progress("[6/6] Shopping 스타일 고정밀(81) 세그먼트 생성 완료.")
-                # --- ▲▲▲ [핵심 수정] 끝 ▲▲▲ ---
-
-            except ImportError as e_import_fill:
-                _log_progress(f"[ERROR] 6/6 단계: fill_prompt_movie_with_ai_shorts 임포트 실패: {e_import_fill}")
-            except Exception as e_fill:
-                _log_progress(f"[ERROR] 6/6 단계(세그먼트 프롬프트) 실행 실패: {e_fill}")
-
-            if video_path_str and Path(video_path_str).is_file():
-                try:
-                    vid_doc_final = load_json(Path(video_path_str), None)
-                    if isinstance(vid_doc_final, dict):
-                        aud_final = vid_doc_final.setdefault("audit", {})
-                        aud_final["provider"] = prefer_detected_provider
-                        save_json(Path(video_path_str), vid_doc_final)
-                    else:
-                        _log_progress("[WARN] provider 고정 실패: video.json 형식이 dict가 아님")
-                except (OSError, TypeError, ValueError, json.JSONDecodeError) as e_final_save:
-                    _log_progress(f"[WARN] 최종 provider 저장 실패: {type(e_final_save).__name__}: {e_final_save}")
-                except Exception as e_final_unknown:
-                    _log_progress(
-                        f"[ERROR] 최종 provider 저장 중 예상치 못한 오류: {type(e_final_unknown).__name__}: {e_final_unknown}")
-
-            final_fps_val = _read_ui_fps()
-            return {"story_path": str(story_path), "video_path": video_path_str or "", "fps": final_fps_val}
-
-        # ----- done 콜백 함수 정의 -----
-        def done(ok: bool, payload: Optional[dict], err: Optional[Exception]) -> None:
-            """작업 완료 후 UI 업데이트 및 상태 정리."""
-            try:
-                self._seg_story_busy = False
-                if btn_build_story is not None:
-                    try:
-                        btn_build_story.setEnabled(True)
-                    except RuntimeError:
-                        pass
-
-                if ok and payload:
-                    story_path_out = payload.get("story_path") or ""
-                    video_path_out = payload.get("video_path") or ""
-
-                    fps_val_done = payload.get("fps")
-                    msg_parts = ["프로젝트 분석 완료(A안+81Segment)"]
-                    if story_path_out: msg_parts.append(f"story: {Path(story_path_out).name}")
-                    if video_path_out: msg_parts.append(f"video: {Path(video_path_out).name}")
-                    if fps_val_done: msg_parts.append(f"FPS: {fps_val_done}")
-                    final_msg = " | ".join(msg_parts)
-
-                    print(f"[UI] {final_msg}")
-                    try:
-                        status_bar_obj = getattr(self, "status", None) or getattr(self, "statusBar", None)
-                        status_bar = status_bar_obj() if callable(status_bar_obj) else status_bar_obj
-                        if status_bar and hasattr(status_bar, "showMessage"):
-                            status_bar.showMessage(final_msg, 5000)
-                    except AttributeError:
-                        pass
-                    except Exception as e_status:
-                        print(f"[WARN] 상태바 업데이트 실패: {e_status}")
-
-                elif err is not None:
-                    err_msg_detail = traceback.format_exception(type(err), err, err.__traceback__)
-                    err_msg_short = f"프로젝트 분석 실패: {type(err).__name__}: {err}"
-
-                    print(f"[UI][ERROR] {err_msg_short}\n{''.join(err_msg_detail)}")
-                    QtWidgets.QMessageBox.critical(self, "오류", err_msg_short)
-                    try:
-                        status_bar_obj = getattr(self, "status", None) or getattr(self, "statusBar", None)
-                        status_bar = status_bar_obj() if callable(status_bar_obj) else status_bar_obj
-                        if status_bar and hasattr(status_bar, "showMessage"):
-                            status_bar.showMessage(err_msg_short, 5000)
-                    except AttributeError:
-                        pass
-                    except Exception as e_status_err:
-                        print(f"[WARN] 상태바 에러 메시지 업데이트 실패: {e_status_err}")
-                else:
-                    print("[UI][ERROR] 프로젝트 분석 실패 (알 수 없는 오류)")
-                    QtWidgets.QMessageBox.critical(self, "오류", "알 수 없는 오류로 프로젝트 분석에 실패했습니다.")
-
-            except Exception as e_done:
-                print(f"[ERROR] done 콜백 실행 중 오류: {type(e_done).__name__}: {e_done}")
-
-        # 비동기 작업 실행
-        run_job_with_progress_async(
-            owner=self,
-            title="프로젝트 정밀 분석 (A안 + 81 Segment)",
-            job=job,
-            on_done=done
-        )
 
 
 
