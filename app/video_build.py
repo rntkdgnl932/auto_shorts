@@ -3866,20 +3866,28 @@ def build_step2_qwen_composite(
       - video_json_path만 넘기면 video.json의 모든 씬을 순회하며 합성.
       - project_dir_or_file + scene + slot_images를 넘기면 해당 씬 1개만 처리.
         slot_images는 [image1, image2, image3, image4, image5] 형식.
+
+    정책:
+      - 최종 해상도는 video.json의 defaults.image.width/height 를 최우선으로 사용
+      - 워크플로우에서 리사이즈 처리한다면, Python에서 결과 PNG 리사이즈는 하지 않는다.
     """
 
-    # 이 모듈에 이미 존재한다고 가정(너 코드에 있는 유틸)
-    # load_json, save_json, ensure_dir, JSONS_DIR, COMFY_HOST, COMFY_INPUT_DIR,
-    # CHARACTER_DIR, _submit_and_wait_comfy_func
-    # (여기서는 이름 그대로 사용)
-
     # ------------------------------------------------------------------
-    # 0) 옵션 병합 (UI에서 넘어온 옵션 우선 적용)
+    # 0) 옵션 병합 (UI에서 넘어온 옵션 우선 적용) - 단, video.json defaults가 있으면 덮어씀
     # ------------------------------------------------------------------
     if options and isinstance(options, dict):
-        ui_width = int(options.get("width", ui_width))
-        ui_height = int(options.get("height", ui_height))
-        steps = int(options.get("steps", steps))
+        try:
+            ui_width = int(options.get("width", ui_width))
+        except Exception:
+            pass
+        try:
+            ui_height = int(options.get("height", ui_height))
+        except Exception:
+            pass
+        try:
+            steps = int(options.get("steps", steps))
+        except Exception:
+            pass
 
     # ------------------------------------------------------------------
     # 1) video.json 경로 확정
@@ -3903,6 +3911,25 @@ def build_step2_qwen_composite(
     # ------------------------------------------------------------------
     video_doc = load_json(p_video, {}) or {}
     scenes = video_doc.get("scenes", []) or []
+
+    # ✅ video.json.defaults.image 기준으로 해상도 가져오기 (최우선)
+    defaults_img = (video_doc.get("defaults") or {}).get("image") or {}
+    try:
+        w_val = defaults_img.get("width")
+        h_val = defaults_img.get("height")
+        if w_val is not None:
+            w_int = int(w_val)
+            if w_int > 0:
+                ui_width = w_int
+        if h_val is not None:
+            h_int = int(h_val)
+            if h_int > 0:
+                ui_height = h_int
+    except Exception:
+        pass
+
+    ui_width = int(ui_width)
+    ui_height = int(ui_height)
 
     # 처리 대상 scene id 집합 계산
     target_ids: Optional[set[str]] = None
@@ -3930,11 +3957,14 @@ def build_step2_qwen_composite(
         raise FileNotFoundError(f"Step2 WF 없음: {wf}")
 
     if on_progress:
-        msg = f"[Step2] 워크플로우: {wf.name}"
-        if callable(on_progress):
-            on_progress({"stage": "debug", "msg": msg})
-        elif isinstance(on_progress, dict) and callable(on_progress.get("callback")):
-            on_progress["callback"]({"stage": "debug", "msg": msg})
+        msg = f"[Step2] 워크플로우: {wf.name} / size={ui_width}x{ui_height} steps={steps}"
+        try:
+            if callable(on_progress):
+                on_progress({"stage": "debug", "msg": msg})
+            elif isinstance(on_progress, dict) and callable(on_progress.get("callback")):
+                on_progress["callback"]({"stage": "debug", "msg": msg})
+        except Exception:
+            pass
 
     graph_origin = json.loads(wf.read_text(encoding="utf-8"))
 
@@ -3976,11 +4006,9 @@ def build_step2_qwen_composite(
             if str(nid) not in [str(node_id_base_image), str(node_id_product_image)]:
                 char_loader_ids.append(int(nid))
 
-        # FaceSwap/ReActor 류
         if "ReActor" in cls or "FaceSwap" in cls:
             reactor_ids.append(int(nid))
 
-        # IPAdapter 류
         if "IPAdapter" in cls:
             ipadapter_ids.append(int(nid))
 
@@ -4001,7 +4029,7 @@ def build_step2_qwen_composite(
 
     def _disable_ref_nodes(graph: Dict[str, Any]) -> None:
         """
-        쇼핑 Step2처럼 image1/2만 쓸 때:
+        image3~5(참조 슬롯)가 비어있을 때:
         - IPAdapter/ReActor/FaceSwap 계열을 비활성화 + weight 0
         """
         for nid in ipadapter_ids:
@@ -4026,6 +4054,28 @@ def build_step2_qwen_composite(
             inputs = node.setdefault("inputs", {})
             if "enabled" in inputs:
                 inputs["enabled"] = False
+
+    def _apply_size_to_inputs(inputs: Dict[str, Any], w: int, h: int) -> None:
+        """
+        워크플로우마다 키가 다른 경우가 있어서 폭넓게 커버한다.
+        - (width,height) 쌍
+        - (image_width,image_height) 쌍
+        - (target_width,target_height) 쌍
+        - (resize_width,resize_height) 쌍
+        """
+        pairs = [
+            ("width", "height"),
+            ("image_width", "image_height"),
+            ("target_width", "target_height"),
+            ("resize_width", "resize_height"),
+        ]
+        for kw, kh in pairs:
+            if kw in inputs and kh in inputs:
+                try:
+                    inputs[kw] = int(w)
+                    inputs[kh] = int(h)
+                except Exception:
+                    pass
 
     # ------------------------------------------------------------------
     # 4) scene 루프
@@ -4122,27 +4172,29 @@ def build_step2_qwen_composite(
 
         if on_progress:
             msg = f"[Step2] {sid} 합성 중... (Prompt: {p_edit[:60]}...)"
-            if callable(on_progress):
-                on_progress({"stage": "step2_scene", "msg": msg})
-            elif isinstance(on_progress, dict) and callable(on_progress.get("callback")):
-                on_progress["callback"]({"stage": "step2_scene", "msg": msg})
+            try:
+                if callable(on_progress):
+                    on_progress({"stage": "step2_scene", "msg": msg})
+                elif isinstance(on_progress, dict) and callable(on_progress.get("callback")):
+                    on_progress["callback"]({"stage": "step2_scene", "msg": msg})
+            except Exception:
+                pass
 
         # ------------------------------------------------------------------
-        # 3) 그래프 복사 및 노드 주입
+        # 5) 그래프 복사 및 노드 주입
         # ------------------------------------------------------------------
         graph = json.loads(json.dumps(graph_origin))
 
         # image1, image2 (Base / Product)
         if node_id_base_image in graph:
-            graph[node_id_base_image]["inputs"]["image"] = base_input_name
+            graph[node_id_base_image].setdefault("inputs", {})["image"] = base_input_name
 
         if node_id_product_image in graph:
             val = prod_input_name if prod_input_name else "blank.png"
-            graph[node_id_product_image]["inputs"]["image"] = val
+            graph[node_id_product_image].setdefault("inputs", {})["image"] = val
 
         # slot 3~ (char_loader_ids)
         if current_slots:
-            # (1) LoadImage3~5(및 그 외)를 slot_images[2:]로 채움 (없으면 blank)
             any_extra_active = False
 
             for idx, loader_id in enumerate(char_loader_ids):
@@ -4160,10 +4212,6 @@ def build_step2_qwen_composite(
                 if lid_str in graph:
                     graph[lid_str].setdefault("inputs", {})["image"] = img_val
 
-            # (2) ✅ 핵심 수정:
-            #     image3~5 슬롯이 "실제로" 하나도 없으면
-            #     Comfy에서 네가 수동으로 'image3~5 비활성화'한 것처럼
-            #     IPAdapter/ReActor/FaceSwap 계열을 모두 비활성화한다.
             if not any_extra_active:
                 _emit(f"[Step2][DBG] {sid}: slot2~5 비어있음 → IPAdapter/ReActor/FaceSwap 비활성화")
                 _disable_ref_nodes(graph)
@@ -4191,7 +4239,6 @@ def build_step2_qwen_composite(
                             break
 
             if not active_slots:
-                # 캐릭터 없으면 관련 노드 비활성 + blank 이미지
                 for nid, node in graph.items():
                     cls = node.get("class_type", "")
                     if "IPAdapter" in cls or "ReActor" in cls or "FaceSwap" in cls:
@@ -4211,32 +4258,40 @@ def build_step2_qwen_composite(
                     img_val = slot_files.get(i, "blank.png") if i in active_slots else "blank.png"
                     graph[lid_str].setdefault("inputs", {})["image"] = img_val
 
-        # prompt/value, sampler/size 설정
+        # prompt/value
         if node_id_prompt_value in graph:
-            graph[node_id_prompt_value]["inputs"]["value"] = p_edit
+            graph[node_id_prompt_value].setdefault("inputs", {})["value"] = p_edit
 
+        # sampler/size 설정 + PreviewImage -> SaveImage
         for nid, node in graph.items():
             inputs = node.get("inputs", {})
-            if "width" in inputs and "height" in inputs:
-                inputs["width"] = int(ui_width)
-                inputs["height"] = int(ui_height)
+            if isinstance(inputs, dict):
+                # ✅ 워크플로우에서 리사이즈 처리할 수 있게 폭넓게 size 주입
+                _apply_size_to_inputs(inputs, ui_width, ui_height)
 
-            if str(nid) == node_id_sampler and sampler_steps_key in inputs:
-                inputs[sampler_steps_key] = int(steps)
-                inputs[sampler_seed_key] = random.randint(1, 2 ** 31)
+            if str(nid) == node_id_sampler and isinstance(inputs, dict) and sampler_steps_key in inputs:
+                try:
+                    inputs[sampler_steps_key] = int(steps)
+                except Exception:
+                    pass
+                try:
+                    inputs[sampler_seed_key] = random.randint(1, 2 ** 31)
+                except Exception:
+                    pass
 
             if node.get("class_type") == "PreviewImage":
                 node["class_type"] = "SaveImage"
-                inputs["filename_prefix"] = f"Step2_{sid}"
+                node.setdefault("inputs", {})["filename_prefix"] = f"Step2_{sid}"
 
         # ------------------------------------------------------------------
-        # 4) Comfy 실행 및 결과 다운로드
+        # 6) Comfy 실행 및 결과 다운로드
         # ------------------------------------------------------------------
         try:
             res = _submit_and_wait_comfy_func(base_url, graph, timeout=timeout_sec, poll=poll_sec)
 
             outputs = res.get("outputs", {})
             downloaded = False
+
             for _, out_d in outputs.items():
                 if "images" in out_d:
                     for img in out_d["images"]:
@@ -4258,22 +4313,31 @@ def build_step2_qwen_composite(
                 if downloaded:
                     break
 
-            if downloaded:
-                sc["img_file"] = str(final_file)
-                if target_ids is not None:
-                    created_single = final_file
+            if not downloaded:
+                raise RuntimeError("Comfy에서 이미지를 다운로드하지 못했습니다.")
+
+            # ✅ 워크플로우에서 리사이즈가 끝난 결과를 그대로 저장한다 (Python 리사이즈 금지)
+            sc["img_file"] = str(final_file)
+            if target_ids is not None:
+                created_single = final_file
 
         except Exception as e:
             if on_progress:
                 msg = f"[{sid}] 합성 실패: {e}"
-                if callable(on_progress):
-                    on_progress({"stage": "err", "msg": msg})
-                elif isinstance(on_progress, dict) and callable(on_progress.get("callback")):
-                    on_progress["callback"]({"stage": "err", "msg": msg})
+                try:
+                    if callable(on_progress):
+                        on_progress({"stage": "err", "msg": msg})
+                    elif isinstance(on_progress, dict) and callable(on_progress.get("callback")):
+                        on_progress["callback"]({"stage": "err", "msg": msg})
+                except Exception:
+                    pass
             continue
 
     save_json(p_video, video_doc)
     return created_single
+
+
+
 
 
 

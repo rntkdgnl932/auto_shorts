@@ -2174,12 +2174,8 @@ def fill_prompt_movie_with_ai(
         _log("[fill_prompt_movie_with_ai] 변경 없음 (video.json 저장)")
 
 
-
-# shopping 탭 video.json 빌드
-# 기존 imports 유지...
-# fill_prompt_movie_with_ai_long 함수 전체 교체
-
-def fill_prompt_movie_with_ai_long(
+# shopping 탭 json
+def fill_prompt_movie_with_ai_shopping(
         story_data: dict,
         ai_ask_func: Callable[[str, str], str],
         trace: TraceFn | None = None
@@ -2331,7 +2327,157 @@ def fill_prompt_movie_with_ai_long(
     return story_data
 
 
+# shorts 탭 json
+def fill_prompt_movie_with_ai_shorts(
+        story_data: dict,
+        ai_ask_func: Callable[[str, str], str],
+        trace: TraceFn | None = None
+) -> dict:
+    """
+    [Step 6] Long-Take Shopping 스타일:
+    각 씬을 지정된 FPS/Chunk 단위로 쪼개고,
+    AI에게 "시간 흐름에 따른 연속적 프롬프트(문장)" 생성을 요청하여 채워넣는다.
 
+    [수정] 캐릭터/의상/배경 보존 강화:
+    - 모든 세그먼트 프롬프트에 '의상'과 '배경' 묘사를 강제로 포함시킴.
+    """
+    import math
+    import json
+    import re
 
+    # 1. UI 설정값 로드
+    ui_prefs = (story_data.get("defaults") or {}).get("ui_prefs") or {}
+    try:
+        fps = float(ui_prefs.get("movie_fps", 30))
+    except:
+        fps = 30.0
 
+    # Long-Take 설정 (기본값)
+    base_chunk = I2V_CHUNK_BASE_FRAMES  # e.g. 81
+    overlap = I2V_OVERLAP_FRAMES  # e.g. 10
+    pad_tail = I2V_PAD_TAIL_FRAMES  # e.g. 20
+
+    scenes = story_data.get("scenes", [])
+    if not scenes:
+        return story_data
+
+    _t(trace, "info", f"🚀 [AI Long-Take] 프롬프트 상세화 시작 (FPS: {fps}, chunk={base_chunk})")
+
+    for sc in scenes:
+        sid = sc.get("id")
+
+        # 1) 프레임/세그먼트 계산
+        try:
+            duration = float(sc.get("duration") or 2.0)
+            total_frames = int(duration * fps)
+        except:
+            total_frames = 60
+
+        step = base_chunk - overlap
+        target = total_frames + pad_tail
+
+        if target <= base_chunk:
+            seg_count = 1
+        else:
+            needed = target - base_chunk
+            additional = math.ceil(needed / step)
+            seg_count = 1 + additional
+
+        _t(trace, "info", f"   - Scene {sid}: {duration:.2f}s ({total_frames}f) -> segments={seg_count}")
+
+        # 메타데이터 저장
+        sc["frame_segments"] = {
+            "fps": fps,
+            "total_frames": total_frames,
+            "segment_count": seg_count,
+            "base_chunk": base_chunk,
+            "overlap": overlap,
+            "segments": []
+        }
+
+        # 베이스 프롬프트 (상세 묘사가 있는 prompt_img 우선)
+        base_prompt = sc.get("prompt_img") or sc.get("prompt") or "A cinematic shot"
+
+        # 2) 단순 복사 vs AI 요청 판단
+        # 세그먼트가 1개이고 내용이 짧으면 그냥 복사 (API 절약)
+        is_long_text = len(base_prompt.split()) > 10
+        if seg_count == 1 and not is_long_text:
+            sc["frame_segments"]["segments"] = [base_prompt]
+            continue
+
+        # ------------------------------------------------------------
+        # [핵심 수정] 시스템 프롬프트 강화: 의상/배경 고정 명령
+        # ------------------------------------------------------------
+        sys_msg = (
+            "You are an AI Video Sequencer specializing in consistent character animation.\n"
+            "Your task is to break down the 'base_prompt' into a sequence of prompts for a long-take video.\n"
+            f"Target segments: {seg_count}\n"
+            "\n"
+            "*** CRITICAL REQUIREMENT (Visual Consistency) ***\n"
+            "Every single segment prompt MUST explicitly include:\n"
+            "1. The BACKGROUND description (e.g., 'in a dark alley', 'sunny park').\n"
+            "2. The Character's APPEARANCE & CLOTHING (e.g., 'wearing a red dress', 'in a suit').\n"
+            "3. The specific ACTION for that segment.\n"
+            "\n"
+            "Do NOT assume the AI remembers the previous segment. You MUST repeat the clothing and background details in every line.\n"
+            "\n"
+            "OUTPUT FORMAT (JSON ONLY):\n"
+            "{\n"
+            "  \"segment_prompts\": [\n"
+            "    \"[Background] [Character + Clothing] [Action for start]\",\n"
+            "    \"[Background] [Character + Clothing] [Action for middle]\",\n"
+            "    ...\n"
+            "  ]\n"
+            "}\n"
+            "\n"
+            "RULES:\n"
+            "1. The output list MUST have exactly the requested number of segments.\n"
+            "2. NEVER change the clothing or background. Consistency is key.\n"
+            "3. Use ENGLISH sentences only.\n"
+        )
+
+        user_msg = json.dumps({
+            "scene_id": sid,
+            "base_prompt": base_prompt,
+            "segment_count_needed": seg_count,
+            "duration_sec": duration,
+            "instruction": "Ensure the character's clothing and background are described in EVERY segment."
+        }, ensure_ascii=False)
+
+        try:
+            raw = ai_ask_func(sys_msg, user_msg)
+
+            # 파싱 로직
+            text_cleaned = raw.strip()
+            if "```" in text_cleaned:
+                text_cleaned = re.sub(r"```json|```", "", text_cleaned).strip()
+
+            idx_start = text_cleaned.find("{")
+            idx_end = text_cleaned.rfind("}")
+
+            if idx_start != -1 and idx_end != -1:
+                json_str = text_cleaned[idx_start: idx_end + 1]
+                parsed = json.loads(json_str)
+                prompts_list = parsed.get("segment_prompts", [])
+
+                # 개수 보정
+                if len(prompts_list) < seg_count:
+                    last_p = prompts_list[-1] if prompts_list else base_prompt
+                    while len(prompts_list) < seg_count:
+                        prompts_list.append(last_p)
+                elif len(prompts_list) > seg_count:
+                    prompts_list = prompts_list[:seg_count]
+
+                sc["frame_segments"]["segments"] = [str(p).strip() for p in prompts_list]
+
+            else:
+                raise ValueError("JSON braces not found")
+
+        except Exception as e:
+            _t(trace, "info", f"❌ Scene {sid} AI prompt failed: {e}")
+            # 실패 시 폴백
+            sc["frame_segments"]["segments"] = [base_prompt] * seg_count
+
+    _t(trace, "info", "✅ [AI Long-Take] 프롬프트 상세화 완료 (의상/배경 고정)")
+    return story_data
 

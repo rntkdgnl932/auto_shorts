@@ -29,7 +29,7 @@ from app.utils import (
 from app import settings
 from app.video_build import build_shots_with_i2v, concatenate_scene_clips, concatenate_scene_clips_final_av
 from app.video_build import build_step1_zimage_base, build_step2_qwen_composite
-from app.story_enrich import fill_prompt_movie_with_ai_long
+from app.story_enrich import fill_prompt_movie_with_ai_shopping
 def _now_str() -> str:
     return datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
 
@@ -376,9 +376,6 @@ def build_shopping_images_2step(
         * slot1 (image1) = temp_{sid}.png (배경/인물)
         * slot2 (image2) = product_image_path (제품)
     """
-    from pathlib import Path
-    from app.utils import load_json
-    from app.video_build import build_step1_zimage_base, build_step2_qwen_composite
 
     def _emit(msg: str) -> None:
         if not on_progress:
@@ -1514,7 +1511,7 @@ def convert_shopping_to_video_json_with_ai(
             def ask_wrapper(sys_msg, user_msg):
                 return ai_client.ask_smart(sys_msg, user_msg, prefer="openai")
 
-            fill_prompt_movie_with_ai_long(
+            fill_prompt_movie_with_ai_shopping(
                 str(dst_json_path.parent),
                 ask_wrapper,
                 log_fn=_log

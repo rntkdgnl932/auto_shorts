@@ -26,7 +26,7 @@ import math
 import sys
 import faulthandler
 import datetime
-from app.story_enrich import fill_prompt_movie_with_ai_long
+from app.story_enrich import fill_prompt_movie_with_ai_shorts
 from app.utils import normalize_tags_to_english, save_story_overwrite_with_prompts, _normalize_maked_title_root, sanitize_title
 from app.utils import AI
 from app.utils import load_json as _lj, save_json as _sj
@@ -1414,27 +1414,29 @@ class MainWindow(QtWidgets.QMainWindow):
     # real_use
     def on_click_generate_missing_images_with_log(self) -> None:
         """
-        [수정] 누락 이미지 생성 (shorts 탭 전용)
-        - 캐릭터가 없는 씬  : Step1(Z-Image)로 단일 이미지 생성
-        - 캐릭터가 있는 씬  : Step2(Qwen Composite)로 캐릭터 이미지를 슬롯에 주입하여 생성
+        [최종 통합본] 누락 이미지 생성 (Shorts 탭)
 
-        슬롯 규칙 (slot_images)
-        - image1(slot 0) : 첫 번째 캐릭터 또는 기타 주 이미지
-        - image2(slot 1) : 두 번째 캐릭터 또는 보조 이미지
-        - image3~5       : 추가 캐릭터/보조 이미지 (없으면 None 유지)
-        - 캐릭터가 전혀 없으면 Step2는 호출하지 않고 Step1 결과만 사용
+        요구사항 반영:
+        1) 캐릭터 없는 씬(t_000 포함)은 Step1(Z-Image)로 생성해야 한다.
+        2) imgs/{sid}.png가 정상 파일이면 무조건 skip 해야 한다.
+        3) Step1은 "캐릭터 없는 씬" 중 "이미지 파일이 없거나 깨진 것"만 생성해야 한다.
+           (Step1이 캐릭터 있는 씬까지 생성해버리는 문제 방지)
         """
-        import json
         from pathlib import Path
+        import json
         from app.utils import load_json, save_json, run_job_with_progress_async
         from app.video_build import build_step1_zimage_base, build_step2_qwen_composite
         from app.settings import CHARACTER_DIR
 
+        # --- 정책 값 ---
+        MIN_OK_BYTES = 1024  # 1KB 초과만 "정상 이미지"로 간주
+
+        # 1. 버튼 비활성화
         btn = getattr(self, "btn_missing_img", None) or getattr(getattr(self, "ui", None), "btn_missing_img", None)
         if isinstance(btn, QtWidgets.QAbstractButton):
             btn.setEnabled(False)
 
-        # video.json 경로 탐색
+        # 2. video.json 경로 탐색 (원본 로직 유지)
         video_path = None
         tb = getattr(self, "txt_story_path", None)
         if tb and hasattr(tb, "text"):
@@ -1449,24 +1451,23 @@ class MainWindow(QtWidgets.QMainWindow):
                         video_path = v
 
         if video_path is None:
-            proj_dir = ""
-            getter = getattr(self, "_current_project_dir", None)
-            if callable(getter):
-                try:
-                    proj_dir = getter() or ""
-                except Exception:
-                    proj_dir = ""
-            if not proj_dir:
-                proj_dir = getattr(self, "project_dir", "") or ""
+            proj_dir = None
+            candidates = ["_current_project_dir", "project_dir", "current_project_dir"]
+            for attr_name in candidates:
+                val = getattr(self, attr_name, None)
+                if val:
+                    if callable(val):
+                        try:
+                            val = val()
+                        except Exception:
+                            continue
+                    if val and isinstance(val, (str, Path)):
+                        proj_dir = val
+                        break
             if proj_dir:
                 v = (Path(proj_dir).resolve() / "video.json")
                 if v.exists():
                     video_path = v
-
-        if video_path is None:
-            v = (Path.cwd() / "video.json").resolve()
-            if v.exists():
-                video_path = v
 
         if video_path is None or not video_path.exists():
             QtWidgets.QMessageBox.critical(self, "오류", "video.json을 찾을 수 없습니다.")
@@ -1474,11 +1475,12 @@ class MainWindow(QtWidgets.QMainWindow):
                 btn.setEnabled(True)
             return
 
-        proj_dir_path = video_path.parent
+        project_root = video_path.parent
+        imgs_dir = project_root / "imgs"
+        imgs_dir.mkdir(parents=True, exist_ok=True)
 
-        # UI 옵션 읽기
-        ui_w = 720
-        ui_h = 1080
+        # 3. UI 옵션 읽기 (원본 유지)
+        ui_w, ui_h = 720, 1080
         if hasattr(self, "cmb_img_w"):
             try:
                 ui_w = int(self.cmb_img_w.currentData())
@@ -1489,14 +1491,16 @@ class MainWindow(QtWidgets.QMainWindow):
                 ui_h = int(self.cmb_img_h.currentData())
             except Exception:
                 pass
-
-        ui_steps = 28
+        ui_steps = 20
         if hasattr(self, "spn_t2i_steps"):
             try:
                 ui_steps = int(self.spn_t2i_steps.value())
             except Exception:
                 pass
 
+        # ---------------------------------------------------------
+        # 작업 로직 시작 (비동기)
+        # ---------------------------------------------------------
         def job(progress_cb):
             def _log(msg: str):
                 try:
@@ -1504,121 +1508,223 @@ class MainWindow(QtWidgets.QMainWindow):
                 except Exception:
                     pass
 
+            _log(f"📂 프로젝트: {project_root.name}")
+
             doc = load_json(video_path, {}) or {}
             scenes = doc.get("scenes", []) or []
 
-            # 캐릭터 유무를 먼저 스캔해서, 캐릭터 없는 씬 id 목록을 만든다.
-            charless_ids = set()
-            for sc in scenes:
-                sid = sc.get("id")
-                if not sid:
-                    continue
-                chars = sc.get("characters", []) or []
-                if not chars:
-                    charless_ids.add(str(sid))
+            # [분류 단계]
+            char_scene_ids = []
+            no_char_scene_ids = []
 
-            # 1단계: 캐릭터가 없는 씬들에 대해 Z-Image(베이스) 생성
-            generated_count = 0
-            if charless_ids:
-                _log(f"[Step1] 캐릭터 없는 씬 {len(charless_ids)}개 Z-Image 생성 중...")
+            # 0) imgs/{sid}.png 존재하지만 깨진 파일(작은 파일)은 삭제해서
+            #    Step1/Step2의 skip_if_exists에 막히지 않게 한다.
+            def _is_ok_image(p: Path) -> bool:
                 try:
-                    created_map = build_step1_zimage_base(
-                        video_json_path=video_path,
-                        source_json_path=None,
-                        ui_width=ui_w,
-                        ui_height=ui_h,
-                        steps=ui_steps,
-                        skip_if_exists=True,
-                        on_progress=progress_cb,
-                    ) or {}
-                except Exception as e:
-                    _log(f"[Step1] 실행 실패(계속 진행): {e}")
-                    created_map = {}
+                    return p.exists() and p.stat().st_size > MIN_OK_BYTES
+                except Exception:
+                    return False
 
-                # Step1 결과를 최종 img_file 로 반영
-                for sc in scenes:
-                    sid = str(sc.get("id", "")).strip()
-                    if not sid or sid not in charless_ids:
-                        continue
-                    base_path = created_map.get(sid)
-                    if base_path:
-                        sc["img_file"] = str(base_path)
-                        generated_count += 1
-
-            # 2단계: 캐릭터가 있는 씬들에 대해 Qwen Composite 실행
-            from pathlib import Path as _P
-            from app.settings import CHARACTER_DIR as _CHAR_DIR
-
-            char_base_dir = _P(_CHAR_DIR)
+            def _purge_if_broken(p: Path) -> bool:
+                """깨진(너무 작은) 파일이면 삭제하고 True 반환"""
+                try:
+                    if p.exists() and p.stat().st_size <= MIN_OK_BYTES:
+                        p.unlink()
+                        return True
+                except Exception:
+                    pass
+                return False
 
             for sc in scenes:
                 sid = str(sc.get("id", "")).strip()
                 if not sid:
                     continue
 
-                # 이미 img_file 이 있고 파일이 존재하면 스킵
-                img_file = sc.get("img_file")
-                if img_file and _P(img_file).exists():
+                img_path = imgs_dir / f"{sid}.png"
+
+                # 정상 파일이면 스킵
+                if _is_ok_image(img_path):
                     continue
+
+                # 깨진 파일이면 삭제 후 재생성 대상으로
+                _purge_if_broken(img_path)
 
                 chars = sc.get("characters", []) or []
+                if chars:
+                    char_scene_ids.append(sid)
+                else:
+                    no_char_scene_ids.append(sid)
 
-                # 캐릭터가 없으면 앞에서 Step1로 처리했으므로 여기서는 스킵
-                if not chars:
-                    continue
+            if not char_scene_ids and not no_char_scene_ids:
+                return "새로 생성할 이미지가 없습니다."
 
-                _log(f"[Step2] {sid} 캐릭터 {len(chars)}명 합성 중...")
+            _log(
+                f"📋 총 생성 대상: {len(char_scene_ids) + len(no_char_scene_ids)}개 "
+                f"(캐릭터씬: {len(char_scene_ids)}, 배경씬: {len(no_char_scene_ids)})"
+            )
 
-                # 캐릭터 이미지 경로 수집
-                char_imgs: list[str] = []
-                for c in chars:
-                    cname = str(c).split(":")[0].strip()
-                    found = None
-                    for ext in (".png", ".jpg", ".webp"):
-                        cand = char_base_dir / f"{cname}{ext}"
-                        if cand.exists():
-                            found = cand
-                            break
-                    if found is not None:
-                        char_imgs.append(str(found))
+            # ---------------------------------------------------------------
+            # [Phase 1] 캐릭터 있는 씬 -> Step 2 (Qwen 2511)
+            # ---------------------------------------------------------------
+            search_dirs = [
+                Path(r"C:\my_games\shorts_make\character"),  # 1순위
+                project_root / "characters",  # 2순위
+                Path(CHARACTER_DIR),  # 3순위
+            ]
 
-                if not char_imgs:
-                    _log(f"  -> 캐릭터 이미지 파일을 찾지 못해 건너뜀")
-                    continue
+            if char_scene_ids:
+                _log("🚀 [Phase 1] 캐릭터 합성(Step 2) 시작...")
 
-                # slot_images 구성: 최대 5개까지만 사용, 나머지는 None
-                slots: list[str | None] = [None] * 5
-                for idx, path in enumerate(char_imgs):
-                    if idx >= 5:
-                        break
-                    slots[idx] = path
+                for sid in char_scene_ids:
+                    sc = next((s for s in scenes if str(s.get("id")) == sid), None)
+                    if not sc:
+                        continue
 
-                try:
-                    res_path = build_step2_qwen_composite(
-                        project_dir_or_file=video_path,
-                        scene=sc,
-                        slot_images=slots,
-                        options={"width": ui_w, "height": ui_h, "steps": ui_steps},
-                        skip_if_exists=True,
-                        on_progress=progress_cb,
-                    )
-                    if res_path:
-                        generated_count += 1
-                except Exception as e:
-                    _log(f"  [ERR] Step2 실패: {e}")
+                    # 최종 이미지가 이미 정상으로 생겼으면 스킵(안전)
+                    out_img = imgs_dir / f"{sid}.png"
+                    if _is_ok_image(out_img):
+                        _log(f"  ⏭️ Scene {sid}: imgs/{sid}.png 이미 존재(정상) -> skip")
+                        continue
 
-            save_json(video_path, doc)
-            return f"총 {generated_count}장 생성 완료"
+                    # 혹시 깨진 파일이면 삭제(안전)
+                    _purge_if_broken(out_img)
 
+                    chars = sc.get("characters", []) or []
+                    _log(f"  ▶ Scene {sid}: 캐릭터 {len(chars)}명 로드 시도")
+
+                    valid_char_paths = []
+                    for c in chars:
+                        cname = ""
+                        if isinstance(c, dict):
+                            cname = str(c.get("id", "")).strip()
+                        else:
+                            cname = str(c).split(":")[0].strip()
+
+                        if not cname:
+                            continue
+
+                        found_path = None
+                        for base_dir in search_dirs:
+                            if found_path:
+                                break
+                            if not base_dir.exists():
+                                continue
+                            for ext in (".png", ".jpg", ".webp"):
+                                cand = base_dir / f"{cname}{ext}"
+                                if cand.exists():
+                                    found_path = str(cand)
+                                    break
+
+                        if found_path:
+                            valid_char_paths.append(found_path)
+                            _log(f"    ✅ [Load] {cname} -> {found_path}")
+                        else:
+                            _log(f"    ⚠️ [Fail] 캐릭터 파일 없음: {cname}")
+
+                    if not valid_char_paths:
+                        _log("    -> 유효 캐릭터 파일이 없어 스킵.")
+                        continue
+
+                    try:
+                        build_step2_qwen_composite(
+                            video_json_path=video_path,
+                            source_json_path=video_path,
+                            ui_width=ui_w,
+                            ui_height=ui_h,
+                            steps=ui_steps,
+                            edit_keys=["prompt_img_2", "prompt_img", "prompt_edit", "prompt"],
+                            skip_if_exists=True,
+                            on_progress=progress_cb,
+                            slot_images=valid_char_paths,
+                            target_scene_ids=[sid],
+                        )
+                    except Exception as e:
+                        _log(f"    ❌ Step 2 에러 ({sid}): {e}")
+
+            # ---------------------------------------------------------------
+            # [Phase 2] 캐릭터 없는 씬(t_000 포함) -> Step 1 (Z-Image)
+            #
+            # 핵심 수정:
+            # - Step1을 video.json "전체 스캔"으로 돌리면 캐릭터 씬도 같이 생성됨(현재 문제). :contentReference[oaicite:2]{index=2}
+            # - 그래서 "대상 no-char 씬만" 임시 source_json을 만들어 1개씩 호출한다.
+            # - out_prefix=""로 최종 파일이 imgs/{sid}.png로 떨어지게 강제한다.
+            # ---------------------------------------------------------------
+            if no_char_scene_ids:
+                _log("🚀 [Phase 2] 배경 이미지(Step 1) 시작...")
+
+                for sid in no_char_scene_ids:
+                    out_img = imgs_dir / f"{sid}.png"
+
+                    # 이미 정상 파일이면 스킵
+                    if _is_ok_image(out_img):
+                        _log(f"  ⏭️ Scene {sid}: imgs/{sid}.png 이미 존재(정상) -> skip")
+                        continue
+
+                    # 깨진 파일이면 삭제 후 생성
+                    if _purge_if_broken(out_img):
+                        _log(f"  🧹 Scene {sid}: 깨진 파일 삭제 후 재생성")
+
+                    sc = next((s for s in scenes if str(s.get("id")) == sid), None)
+                    if not sc:
+                        continue
+
+                    # 캐릭터가 진짜 비어있는지 방어 체크(요구사항 3)
+                    if sc.get("characters"):
+                        _log(f"  ⏭️ Scene {sid}: characters가 비어있지 않음(방어) -> Step1 skip")
+                        continue
+
+                    # 임시 source_json 생성 (이 씬만 포함)
+                    tmp_src = project_root / f"_tmp_step1_src_{sid}.json"
+                    try:
+                        tmp_doc = dict(doc)
+                        tmp_doc["scenes"] = [sc]
+                        tmp_src.write_text(json.dumps(tmp_doc, ensure_ascii=False, indent=2), encoding="utf-8")
+                    except Exception as e:
+                        _log(f"  ❌ Scene {sid}: 임시 source_json 생성 실패: {e}")
+                        continue
+
+                    try:
+                        build_step1_zimage_base(
+                            video_json_path=video_path,  # 결과/기준은 실제 video.json
+                            source_json_path=tmp_src,  # 입력(프롬프트/씬목록)은 1개만
+                            ui_width=ui_w,
+                            ui_height=ui_h,
+                            steps=ui_steps,
+                            out_prefix="",  # ✅ 최종 저장을 imgs/{sid}.png 로
+                            out_ext=".png",
+                            skip_if_exists=True,
+                            on_progress=progress_cb,
+                        )
+                        _log(f"  ✅ Step1 완료: {sid}")
+                    except Exception as e:
+                        _log(f"  ❌ Step1 에러 ({sid}): {e}")
+                    finally:
+                        try:
+                            if tmp_src.exists():
+                                tmp_src.unlink()
+                        except Exception:
+                            pass
+
+                _log("   -> Phase 2 완료")
+
+            return "모든 이미지 생성 작업 완료."
+
+        # 4. 종료 처리
         def done(ok, payload, err):
             if isinstance(btn, QtWidgets.QAbstractButton):
                 btn.setEnabled(True)
             if not ok:
-                QtWidgets.QMessageBox.critical(self, "실패", str(err))
+                if hasattr(self, "append_log"):
+                    self.append_log(f"❌ 오류: {err}")
+                else:
+                    QtWidgets.QMessageBox.critical(self, "실패", str(err))
             else:
-                QtWidgets.QMessageBox.information(self, "완료", str(payload))
+                if hasattr(self, "append_log"):
+                    self.append_log(f"✅ {payload}")
+                else:
+                    QtWidgets.QMessageBox.information(self, "완료", str(payload))
 
-        run_job_with_progress_async(self, "누락 이미지 생성", job, on_done=done)
+        run_job_with_progress_async(self, "누락 이미지 생성(Auto)", job, on_done=done)
 
     # real_use
     def on_click_segments_missing_images_with_log(self):
@@ -2461,7 +2567,7 @@ class MainWindow(QtWidgets.QMainWindow):
         seg.json → story.json 스켈레톤 → video.json(갭 포함) 생성 → video.json만 AI 강화 → 프롬프트 주입 → 가사 재주입
         - [수정 A안] AI 프롬프트 강화 시 'characters' 순서에 따라 'image 1', 'image 2' 지칭 규칙 강제 주입
         - [수정 설정] 분석 단계에서 UI의 해상도(W/H), FPS, Steps를 video.json에 저장 (Step 2 이미지 생성용)
-        - [수정 세그먼트] Shopping 탭의 'fill_prompt_movie_with_ai_long'을 사용하여 81 세그먼트 고정밀 생성
+        - [수정 세그먼트] Shopping 탭의 'fill_prompt_movie_with_ai_shorts'을 사용하여 81 세그먼트 고정밀 생성
         """
 
         # 재진입 방지
@@ -3135,8 +3241,8 @@ class MainWindow(QtWidgets.QMainWindow):
                 # --- [핵심 수정] fill_prompt_movie_with_ai 대신 _long 버전 호출 (81 세그먼트) ---
 
                 # 여기서 AI 래퍼(ask_wrapper)를 전달할 때 이미 A안 프롬프트 로직이 내장되어 있으므로
-                # fill_prompt_movie_with_ai_long 내부에서도 AI 호출 시 해당 규칙이 적용될 가능성이 높음.
-                fill_prompt_movie_with_ai_long(
+                # fill_prompt_movie_with_ai_shorts 내부에서도 AI 호출 시 해당 규칙이 적용될 가능성이 높음.
+                fill_prompt_movie_with_ai_shorts(
                     proj_dir_path,  # Path 객체
                     _ask_wrapper_internal,  # A안 프롬프트 로직이 포함된 wrapper
                     log_fn=_log_progress
@@ -3145,7 +3251,7 @@ class MainWindow(QtWidgets.QMainWindow):
                 # --- ▲▲▲ [핵심 수정] 끝 ▲▲▲ ---
 
             except ImportError as e_import_fill:
-                _log_progress(f"[ERROR] 6/6 단계: fill_prompt_movie_with_ai_long 임포트 실패: {e_import_fill}")
+                _log_progress(f"[ERROR] 6/6 단계: fill_prompt_movie_with_ai_shorts 임포트 실패: {e_import_fill}")
             except Exception as e_fill:
                 _log_progress(f"[ERROR] 6/6 단계(세그먼트 프롬프트) 실행 실패: {e_fill}")
 
