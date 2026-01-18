@@ -2422,19 +2422,23 @@ class MainWindow(QtWidgets.QMainWindow):
                     res = ai_ask_func(sys_msg, user_msg)
                     # 파싱
                     txt = res.strip().replace("```json", "").replace("```", "")
-                    s = txt.find("{");
+                    s = txt.find("{")
                     e = txt.rfind("}")
                     if s != -1 and e != -1:
                         parsed = json.loads(txt[s:e + 1])
                         p_en = parsed.get("prompts_en", [])
                         p_kor = parsed.get("prompts_kor", [])
 
-                        if isinstance(p_en, str): p_en = [p_en]
-                        if isinstance(p_kor, str): p_kor = [p_kor]
+                        if isinstance(p_en, str):
+                            p_en = [p_en]
+                        if isinstance(p_kor, str):
+                            p_kor = [p_kor]
 
                         # 개수 보정
-                        while len(p_en) < seg_count: p_en.append(p_en[-1] if p_en else base_p)
-                        while len(p_kor) < seg_count: p_kor.append(p_kor[-1] if p_kor else base_kor)
+                        while len(p_en) < seg_count:
+                            p_en.append(p_en[-1] if p_en else base_p)
+                        while len(p_kor) < seg_count:
+                            p_kor.append(p_kor[-1] if p_kor else base_kor)
 
                         # ★ Shopping 스타일 필드명(prompt_1, prompt_2...)으로 저장
                         for i in range(seg_count):
@@ -2473,29 +2477,47 @@ class MainWindow(QtWidgets.QMainWindow):
 
             scenes = []
             # Intro
-            scenes.append({"id": "t_000", "section": "intro", "start": 0.0, "end": float(seg_data[0].get("start", 0)),
-                           "img_file": str(imgs_dir / "t_000.png"), "prompt": "Intro", "lyric": ""})
+            scenes.append({
+                "id": "t_000",
+                "section": "intro",
+                "start": 0.0,
+                "end": float(seg_data[0].get("start", 0)),
+                "img_file": str(imgs_dir / "t_000.png"),
+                "prompt": "Intro",
+                "lyric": ""
+            })
             # Verses
             for i, row in enumerate(seg_data):
                 sid = f"t_{i + 1:03d}"
-                start = float(row.get("start", 0));
+                start = float(row.get("start", 0))
                 end = float(row.get("end", start))
                 scenes.append({
-                    "id": sid, "section": "verse", "start": start, "end": end,
-                    "img_file": str(imgs_dir / f"{sid}.png"), "prompt": "Scene...",
-                    "lyric": str(row.get("text", "")).strip(), "characters": meta.get("characters", ["female_01"])
+                    "id": sid,
+                    "section": "verse",
+                    "start": start,
+                    "end": end,
+                    "img_file": str(imgs_dir / f"{sid}.png"),
+                    "prompt": "Scene...",
+                    "lyric": str(row.get("text", "")).strip(),
+                    "characters": meta.get("characters", ["female_01"])
                 })
             # Outro
             last = float(seg_data[-1].get("end", 0))
-            scenes.append({"id": f"t_{len(seg_data) + 1:03d}", "section": "outro", "start": last, "end": last + 5.0,
-                           "img_file": str(imgs_dir / "outro.png"), "prompt": "Outro", "lyric": ""})
+            scenes.append({
+                "id": f"t_{len(seg_data) + 1:03d}",
+                "section": "outro",
+                "start": last,
+                "end": last + 5.0,
+                "img_file": str(imgs_dir / "outro.png"),
+                "prompt": "Outro",
+                "lyric": ""
+            })
 
             story_path = proj_dir_path / "story.json"
             save_json(story_path, {"title": meta.get("title"), "scenes": scenes})
 
             # [2] Video JSON
             _log("[2/5] video.json 구조 생성...")
-            # [수정] 인자 2개 -> 1개로 변경
             video_path_str = build_video_json_with_gap_policy(str(proj_dir_path))
             video_path = Path(video_path_str)
 
@@ -2504,7 +2526,8 @@ class MainWindow(QtWidgets.QMainWindow):
             ai = AI()
 
             def _ai_ask(sys, usr, **k):
-                if 'prefer' in k: del k['prefer']
+                if "prefer" in k:
+                    del k["prefer"]
                 return ai.ask_smart(sys, usr, prefer="gemini", **k)
 
             v_data = load_json(video_path)
@@ -2514,32 +2537,53 @@ class MainWindow(QtWidgets.QMainWindow):
             v_data["defaults"].update({
                 "movie": {"fps": fps, "target_fps": fps},
                 "image": {"width": w, "height": h, "fps": fps},
-                "generator": {"steps": steps}
+                "generator": {"steps": steps},
             })
 
-            # [수정] apply_gpt_to_story_v11 -> apply_ai_to_story_v11
             v_data = apply_ai_to_story_v11(v_data, ask=_ai_ask)
             save_json(video_path, v_data)
 
-            # [4] 가사 복원
+            # [4] 가사 복원 (story.json → video.json 직접 매핑)
             _log("[4/5] 가사 복원...")
-            save_story_overwrite_with_prompts(video_path)
+            try:
+                story_doc = load_json(story_path, {}) or {}
+                story_scenes = {
+                    str(s.get("id", "")).strip(): s
+                    for s in story_doc.get("scenes", []) or []
+                    if str(s.get("id", "")).strip()
+                }
+
+                v_data_lyrics = load_json(video_path, {}) or {}
+                restored = 0
+                for sc in v_data_lyrics.get("scenes", []) or []:
+                    sid = str(sc.get("id", "")).strip()
+                    if not sid:
+                        continue
+                    base_sc = story_scenes.get(sid)
+                    if not base_sc:
+                        continue
+                    if "lyric" in base_sc:
+                        sc["lyric"] = base_sc.get("lyric", "")
+                        restored += 1
+
+                save_json(video_path, v_data_lyrics)
+                _log(f"[4/5] 가사 복원 완료: {restored}개 씬에 lyric 주입.")
+            except Exception as e:
+                _log(f"[4/5] 가사 복원 실패: {e}")
 
             # [5] Shopping Style 적용 (Local Function)
             _log(f"[5/5] Shopping Style 세그먼트 적용 (FPS:{fps})...")
             v_data = load_json(video_path)
-
-            # 기존 공용함수 대신, 위에서 정의한 로컬 함수 사용
             _apply_shopping_style_local(v_data, _ai_ask, _log)
-
             save_json(video_path, v_data)
-            _log("완료.")
 
+            _log("완료.")
             return {"fps": fps}
 
         def done(ok, res, err):
             self._seg_story_busy = False
-            if btn: btn.setEnabled(True)
+            if btn:
+                btn.setEnabled(True)
             if ok:
                 fps = res.get("fps")
                 msg = f"완료 (Shopping Style, FPS:{fps})"
@@ -2559,8 +2603,6 @@ class MainWindow(QtWidgets.QMainWindow):
                     pass
 
         run_job_with_progress_async(self, "AI 분석", job, on_done=done)
-
-
 
     def on_click_build_story_from_seg_async_ex(self) -> None:
         """
