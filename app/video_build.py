@@ -3870,6 +3870,8 @@ def build_step2_qwen_composite(
     정책:
       - 최종 해상도는 video.json의 defaults.image.width/height 를 최우선으로 사용
       - 워크플로우에서 리사이즈 처리한다면, Python에서 결과 PNG 리사이즈는 하지 않는다.
+      - sampler의 image 슬롯 개수는 scene["characters"] 개수(또는 slot_images 길이)에 맞춰 image1~imageN만 사용하고,
+        image(N+1)~image5는 제거한다.
     """
 
     # ------------------------------------------------------------------
@@ -4029,12 +4031,8 @@ def build_step2_qwen_composite(
 
     def _disable_ref_nodes(graph: Dict[str, Any]) -> None:
         """
-        image3~5(참조 슬롯)가 비어있을 때:
-        - IPAdapter/ReActor/FaceSwap 계열을 비활성화 + weight 0
-        - Qwen 통합 샘플러의 image3~image5 입력 자체를 제거해서
-          UI에서 2~5번 LoadImage 노드를 끈 것과 최대한 비슷하게 만든다.
+        참조용 노드(IPAdapter / ReActor / FaceSwap)를 비활성화한다.
         """
-        # IPAdapter / ReActor / FaceSwap 계열 비활성화
         for nid in ipadapter_ids:
             sid_str = str(nid)
             node = graph.get(sid_str)
@@ -4058,17 +4056,33 @@ def build_step2_qwen_composite(
             if "enabled" in inputs:
                 inputs["enabled"] = False
 
-        # Qwen 통합 KSampler에서 참조용 image3~5 입력을 완전히 제거
+    def _trim_sampler_images(graph: Dict[str, Any], active_slots: int) -> None:
+        """
+        sampler의 image 슬롯을 캐릭터 수에 맞게 정리한다.
+
+        - 항상 image1은 사용(기본 베이스 이미지).
+        - active_slots가 1이면 image1만 남기고 image2~5를 제거.
+        - active_slots가 N이면 image1~imageN까지만 남기고 image(N+1)~5 제거.
+        """
         try:
-            sampler_node = graph.get(str(node_id_sampler))
-            if sampler_node:
-                s_inputs = sampler_node.setdefault("inputs", {})
-                for key in ("image3", "image4", "image5"):
-                    if key in s_inputs:
-                        s_inputs.pop(key, None)
+            n_active = int(active_slots)
         except Exception:
-            # 샘플러 구조가 다르더라도 크리티컬 에러는 막는다.
-            pass
+            n_active = 1
+        if n_active < 1:
+            n_active = 1
+        if n_active > 5:
+            n_active = 5
+
+        sampler_node = graph.get(str(node_id_sampler))
+        if not sampler_node:
+            return
+
+        inputs = sampler_node.setdefault("inputs", {})
+        # image2~5 정리
+        for idx in range(n_active + 1, 6):
+            key = f"image{idx}"
+            if key in inputs:
+                inputs.pop(key, None)
 
     def _apply_size_to_inputs(inputs: Dict[str, Any], w: int, h: int) -> None:
         """
@@ -4122,10 +4136,18 @@ def build_step2_qwen_composite(
         if not p_edit:
             p_edit = src_sc.get("prompt_img") or src_sc.get("prompt") or ""
 
-        # 2) 슬롯 이미지 결정
+        # 2) 슬롯 이미지 / 캐릭터 수 결정
         current_slots: Optional[List[str]] = None
         if target_ids is not None and slot_images is not None:
             current_slots = list(slot_images)
+
+        scene_chars = src_sc.get("characters", []) or []
+        # characters 개수와 slot_images 개수 중 큰 쪽을 기준으로 sampler image 개수 결정
+        char_count = max(len(scene_chars), len(current_slots) if current_slots else 0)
+        if char_count < 1:
+            char_count = 1
+        if char_count > 5:
+            char_count = 5
 
         # 기본값: 모두 blank
         base_input_name = "blank.png"
@@ -4133,7 +4155,7 @@ def build_step2_qwen_composite(
 
         # --- (A) slot_images 기반 모드 (shorts / shopping 통합 규칙) ---
         if current_slots:
-            # slot 0 → base
+            # slot 0 → base (캐릭터 1번)
             if len(current_slots) > 0 and current_slots[0]:
                 p0 = Path(str(current_slots[0])).resolve()
                 if p0.exists():
@@ -4141,7 +4163,7 @@ def build_step2_qwen_composite(
                     shutil.copy2(str(p0), str(comfy_input_dir / n0))
                     base_input_name = n0
 
-            # slot 1 → product
+            # slot 1 → product (있으면), 없으면 blank
             if len(current_slots) > 1 and current_slots[1]:
                 p1 = Path(str(current_slots[1])).resolve()
                 if p1.exists():
@@ -4151,7 +4173,6 @@ def build_step2_qwen_composite(
             elif prod_input_name is None:
                 prod_input_name = "blank.png"
 
-            # slot 2~ → 나머지 LoadImage 슬롯(char_loader_ids 순서)
             extra_slots = current_slots[2:]
 
         # --- (B) 레거시/자동 모드 ---
@@ -4228,20 +4249,20 @@ def build_step2_qwen_composite(
                     graph[lid_str].setdefault("inputs", {})["image"] = img_val
 
             if not any_extra_active:
-                _emit(f"[Step2][DBG] {sid}: slot2~5 비어있음 → IPAdapter/ReActor/FaceSwap 비활성화 + sampler image3~5 제거")
+                _emit(f"[Step2][DBG] {sid}: 추가 참조 이미지 없음 → IPAdapter/ReActor/FaceSwap 비활성화")
                 _disable_ref_nodes(graph)
             else:
-                _emit(f"[Step2][DBG] {sid}: slot2~5 활성 이미지 있음 → 참조 노드 유지(활성)")
+                _emit(f"[Step2][DBG] {sid}: 추가 참조 이미지 있음 → 참조 노드 유지(활성)")
 
         else:
             # 레거시 모드: characters 기반 자동 세팅
-            scene_chars = src_sc.get("characters", [])
+            scene_chars_legacy = scene_chars
             active_slots = set()
             slot_files: Dict[int, str] = {}
 
             char_base_dir = Path(CHARACTER_DIR)
 
-            for idx, char_entry in enumerate(scene_chars):
+            for idx, char_entry in enumerate(scene_chars_legacy):
                 cid = str(char_entry).split(":")[0].strip()
                 slot_idx = idx  # 단순 0,1,2... 매핑
                 if 0 <= slot_idx < len(char_loader_ids):
@@ -4265,8 +4286,6 @@ def build_step2_qwen_composite(
                     lid_str = str(lid)
                     if lid_str in graph:
                         graph[lid_str].setdefault("inputs", {})["image"] = "blank.png"
-                # 레거시에서도 참조 슬롯 비어 있으면 sampler image3~5 제거
-                _disable_ref_nodes(graph)
             else:
                 for i, lid in enumerate(char_loader_ids):
                     lid_str = str(lid)
@@ -4274,6 +4293,14 @@ def build_step2_qwen_composite(
                         continue
                     img_val = slot_files.get(i, "blank.png") if i in active_slots else "blank.png"
                     graph[lid_str].setdefault("inputs", {})["image"] = img_val
+
+        # sampler image 슬롯 정리 (캐릭터 수 기준)
+        if char_count >= 1:
+            if char_count == 1:
+                _emit(f"[Step2][DBG] {sid}: 캐릭터 1개 → sampler image2~5 제거")
+            elif char_count < 5:
+                _emit(f"[Step2][DBG] {sid}: 캐릭터 {char_count}개 → sampler image{char_count + 1}~5 제거")
+            _trim_sampler_images(graph, char_count)
 
         # prompt/value
         if node_id_prompt_value in graph:
@@ -4351,6 +4378,7 @@ def build_step2_qwen_composite(
 
     save_json(p_video, video_doc)
     return created_single
+
 
 
 
