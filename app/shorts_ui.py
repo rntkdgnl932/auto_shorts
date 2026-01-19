@@ -3243,6 +3243,7 @@ class MainWindow(QtWidgets.QMainWindow):
         self.cb_basic_vocal_list = basic_cbs
         blay = QtWidgets.QVBoxLayout(self.grp_basic_vocal)
         blay.addWidget(basic_cont)
+        self._make_group_collapsible(self.grp_basic_vocal, is_expanded=False)
 
         # 수동 태그(Style/Scene/Instrument/Tempo)
         style_list = ["electronic","rock","pop","funk","soul","cyberpunk","acid jazz","edm","soft electric drums","melodic"]
@@ -3253,6 +3254,7 @@ class MainWindow(QtWidgets.QMainWindow):
 
         self.grp_manual_tags = QtWidgets.QGroupBox("수동 태그(체크)")
         cat_wrap = QtWidgets.QGridLayout(self.grp_manual_tags)
+        self._make_group_collapsible(self.grp_manual_tags, is_expanded=False)
 
         def _make_cat_box(title: str, names: List[str]):
             box = QtWidgets.QGroupBox(title)
@@ -3424,7 +3426,6 @@ class MainWindow(QtWidgets.QMainWindow):
         layout_render.addWidget(QtWidgets.QLabel("가사크기:"))
         layout_render.addWidget(self.spn_lyric_font_size)  # (공통)
         layout_render.addStretch(1)
-
         main_layout.addWidget(grp_render)  # [신규] 렌더 설정 그룹 추가
         # --- [신규] 재배치 끝 ---
         #
@@ -3455,6 +3456,22 @@ class MainWindow(QtWidgets.QMainWindow):
         # ★ 변환 버튼 액션 연결(오른쪽 칸에 주입)
         self._wire_convert_toggle_action()
 
+    # 그룹박스 접기
+    def _make_group_collapsible(self, groupbox: QtWidgets.QGroupBox, is_expanded: bool = True):
+        """그룹박스 제목 옆 체크박스로 내용을 접거나 펼침"""
+        groupbox.setCheckable(True)
+        groupbox.setChecked(is_expanded)
+
+        def _on_toggle(checked: bool):
+            lay = groupbox.layout()
+            if not lay: return
+            for i in range(lay.count()):
+                item = lay.itemAt(i)
+                if item.widget():
+                    item.widget().setVisible(checked)
+
+        groupbox.toggled.connect(_on_toggle)
+        _on_toggle(is_expanded)  # 초기 상태 적용
     # ai 토글
     def on_ai_toggle(self, checked: bool) -> None:
         if checked:
