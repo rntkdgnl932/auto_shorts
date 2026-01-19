@@ -2305,235 +2305,226 @@ class MainWindow(QtWidgets.QMainWindow):
 
     # real_use
     def on_click_build_story_from_seg_async(self) -> None:
-            """
-            seg.json → story.json → video.json 생성 프로세스.
-            [수정] 첫 소절이 0초에 시작하면 Intro(t_000) 씬을 생성하지 않도록 변경
-            """
-            # 1. 작업 중복 방지
-            if getattr(self, "_seg_story_busy", False):
-                QtWidgets.QMessageBox.information(self, "알림", "작업이 이미 진행 중입니다.")
-                return
-            self._seg_story_busy = True
+        """
+        seg.json → story.json → video.json 생성 프로세스.
+        ★ Shopping 스타일(81세그먼트, prompt_1, last_state)을
+          story_enrich.fill_prompt_movie_with_ai_shorts 로 처리.
+        """
+        # 1. 작업 중복 방지
+        if getattr(self, "_seg_story_busy", False):
+            QtWidgets.QMessageBox.information(self, "알림", "작업이 이미 진행 중입니다.")
+            return
+        self._seg_story_busy = True
 
-            btn = getattr(self, "btn_test1_story", None) or getattr(getattr(self, "ui", None), "btn_test1_story", None)
+        btn = getattr(self, "btn_test1_story", None) or getattr(getattr(self, "ui", None), "btn_test1_story", None)
+        if btn:
+            btn.setEnabled(False)
+
+        # 2. 프로젝트 경로 확인
+        proj_dir_str = ""
+        try:
+            if hasattr(self, "current_project_dir") and self.current_project_dir:
+                proj_dir_str = str(self.current_project_dir)
+            elif hasattr(self, "project_dir") and self.project_dir:
+                proj_dir_str = str(self.project_dir)
+        except Exception:
+            pass
+
+        if not proj_dir_str:
+            QtWidgets.QMessageBox.warning(self, "오류", "프로젝트 폴더가 없습니다.")
+            self._seg_story_busy = False
             if btn:
-                btn.setEnabled(False)
+                btn.setEnabled(True)
+            return
 
-            # 2. 프로젝트 경로 확인
-            proj_dir_str = ""
+        proj_dir_path = Path(proj_dir_str).resolve()
+        seg_json_path = proj_dir_path / "seg.json"
+
+        if not seg_json_path.exists():
+            QtWidgets.QMessageBox.warning(self, "오류", "seg.json 파일이 없습니다.")
+            self._seg_story_busy = False
+            if btn:
+                btn.setEnabled(True)
+            return
+
+        # 3. UI 설정값 읽기
+        def _read_ui_settings():
+            fps, w, h, steps = 30, 720, 1280, 20
             try:
-                if hasattr(self, "current_project_dir") and self.current_project_dir:
-                    proj_dir_str = str(self.current_project_dir)
-                elif hasattr(self, "project_dir") and self.project_dir:
-                    proj_dir_str = str(self.project_dir)
+                if hasattr(self, "cmb_movie_fps"):
+                    fps = int(self.cmb_movie_fps.currentData())
+                if hasattr(self, "cmb_render_w") and hasattr(self, "cmb_render_h"):
+                    w = int(self.cmb_render_w.currentData())
+                    h = int(self.cmb_render_h.currentData())
+                if hasattr(self, "spn_render_steps"):
+                    steps = int(self.spn_render_steps.value())
             except Exception:
                 pass
+            return fps, w, h, steps
 
-            if not proj_dir_str:
-                QtWidgets.QMessageBox.warning(self, "오류", "프로젝트 폴더가 없습니다.")
-                self._seg_story_busy = False
-                if btn: btn.setEnabled(True)
-                return
-
-            proj_dir_path = Path(proj_dir_str).resolve()
-            seg_json_path = proj_dir_path / "seg.json"
-
-            if not seg_json_path.exists():
-                QtWidgets.QMessageBox.warning(self, "오류", "seg.json 파일이 없습니다.")
-                self._seg_story_busy = False
-                if btn: btn.setEnabled(True)
-                return
-
-            # 3. UI 설정값 읽기
-            def _read_ui_settings():
-                fps, w, h, steps = 30, 720, 1280, 20
+        # ─────────────────────────────────────────────────────────────
+        # Job 실행
+        # ─────────────────────────────────────────────────────────────
+        def job(on_progress_callback: Callable[[dict], None]) -> Dict[str, Any]:
+            def _log(msg: str):
                 try:
-                    if hasattr(self, "cmb_movie_fps"):
-                        fps = int(self.cmb_movie_fps.currentData())
-                    if hasattr(self, "cmb_render_w") and hasattr(self, "cmb_render_h"):
-                        w = int(self.cmb_render_w.currentData())
-                        h = int(self.cmb_render_h.currentData())
-                    if hasattr(self, "spn_render_steps"):
-                        steps = int(self.spn_render_steps.value())
+                    on_progress_callback({"msg": msg})
                 except Exception:
                     pass
-                return fps, w, h, steps
 
-            # ─────────────────────────────────────────────────────────────
-            # Job 실행
-            # ─────────────────────────────────────────────────────────────
-            def job(on_progress_callback: Callable[[dict], None]) -> Dict[str, Any]:
-                def _log(msg: str):
-                    try:
-                        on_progress_callback({"msg": msg})
-                    except Exception:
-                        pass
+            _log(f"[1/5] 분석 시작: {proj_dir_path.name}")
 
-                _log(f"[1/5] 분석 시작: {proj_dir_path.name}")
+            # [1] Story Skeleton
+            seg_data = load_json(seg_json_path, [])
+            meta = load_json(proj_dir_path / "project.json", {})
+            imgs_dir = proj_dir_path / "imgs"
+            imgs_dir.mkdir(exist_ok=True)
 
-                # [1] Story Skeleton
-                seg_data = load_json(seg_json_path, [])
-                meta = load_json(proj_dir_path / "project.json", {})
-                imgs_dir = proj_dir_path / "imgs"
-                imgs_dir.mkdir(exist_ok=True)
+            scenes = []
+            # Intro
+            first_start = 0.0
+            if seg_data:
+                first_start = float(seg_data[0].get("start", 0.0))
 
-                scenes = []
-
-                # -----------------------------------------------------------------
-                # ★ [수정] Intro(t_000) 생성 조건 추가
-                # 첫 가사가 0.5초보다 늦게 시작할 때만 Intro 씬을 만듭니다.
-                # -----------------------------------------------------------------
-                first_start = 0.0
-                if seg_data:
-                    first_start = float(seg_data[0].get("start", 0.0))
-
-                if first_start > 0.5:
-                    scenes.append({
-                        "id": "t_000",
-                        "section": "intro",
-                        "start": 0.0,
-                        "end": first_start,
-                        "img_file": str(imgs_dir / "t_000.png"),
-                        "prompt": "Intro scene, cinematic lighting",
-                        "lyric": ""
-                    })
-                else:
-                    _log(f"ℹ️ 첫 소절 시작({first_start:.2f}s)이 빨라 Intro(t_000)를 생략합니다.")
-
-                # Verses
-                for i, row in enumerate(seg_data):
-                    sid = f"t_{i + 1:03d}"
-                    start = float(row.get("start", 0))
-                    end = float(row.get("end", start))
-                    scenes.append({
-                        "id": sid,
-                        "section": "verse",
-                        "start": start,
-                        "end": end,
-                        "img_file": str(imgs_dir / f"{sid}.png"),
-                        "prompt": "Scene details...",
-                        "lyric": str(row.get("text", "")).strip(),
-                        "characters": meta.get("characters", ["female_01"])
-                    })
-
-                # Outro (마지막 가사 끝난 후 5초)
-                last_end = 0.0
-                if seg_data:
-                    last_end = float(seg_data[-1].get("end", 0))
-
-                # 혹시 scenes가 하나도 없으면(가사 파일 비어있음 등) 안전장치
-                if not scenes:
-                    last_end = 0.0
-
+            if first_start > 0.5:
                 scenes.append({
-                    "id": f"t_{len(seg_data) + 1:03d}",  # ID가 겹치지 않게 seg_data 길이 기준
-                    "section": "outro",
-                    "start": last_end,
-                    "end": last_end + 5.0,
-                    "img_file": str(imgs_dir / "outro.png"),
-                    "prompt": "Outro, fading out",
+                    "id": "t_000",
+                    "section": "intro",
+                    "start": 0.0,
+                    "end": first_start,
+                    "img_file": str(imgs_dir / "t_000.png"),
+                    "prompt": "Intro scene, cinematic lighting",
                     "lyric": ""
                 })
-
-                story_path = proj_dir_path / "story.json"
-                save_json(story_path, {"title": meta.get("title"), "scenes": scenes})
-                _log("[1/5] story.json 생성 완료")
-
-                # [2] Video JSON
-                _log("[2/5] video.json 구조 생성...")
-                video_path_str = build_video_json_with_gap_policy(str(proj_dir_path))
-                video_path = Path(video_path_str)
-
-                # [3] AI (A안)
-                _log("[3/5] AI 기본 묘사 생성...")
-                ai = AI()
-
-                def _ai_ask(sys, usr, **k):
-                    if "prefer" in k:
-                        del k["prefer"]
-                    return ai.ask_smart(sys, usr, prefer="gemini", **k)
-
-                v_data = load_json(video_path)
-                # UI 설정 주입
-                fps, w, h, steps = _read_ui_settings()
-                v_data.setdefault("defaults", {})
-                v_data["defaults"].update({
-                    "movie": {"fps": fps, "target_fps": fps},
-                    "image": {"width": w, "height": h, "fps": fps},
-                    "generator": {"steps": steps},
+            else:
+                _log(f"ℹ️ 첫 소절 시작({first_start:.2f}s)이 빨라 Intro(t_000)를 생략합니다.")
+            # Verses
+            for i, row in enumerate(seg_data):
+                sid = f"t_{i + 1:03d}"
+                start = float(row.get("start", 0))
+                end = float(row.get("end", start))
+                scenes.append({
+                    "id": sid,
+                    "section": "verse",
+                    "start": start,
+                    "end": end,
+                    "img_file": str(imgs_dir / f"{sid}.png"),
+                    "prompt": "Scene...",
+                    "lyric": str(row.get("text", "")).strip(),
+                    "characters": meta.get("characters", ["female_01"])
                 })
+            # Outro
+            last = float(seg_data[-1].get("end", 0))
+            scenes.append({
+                "id": f"t_{len(seg_data) + 1:03d}",
+                "section": "outro",
+                "start": last,
+                "end": last + 5.0,
+                "img_file": str(imgs_dir / "outro.png"),
+                "prompt": "Outro",
+                "lyric": ""
+            })
 
-                v_data = apply_ai_to_story_v11(v_data, ask=_ai_ask)
-                save_json(video_path, v_data)
+            story_path = proj_dir_path / "story.json"
+            save_json(story_path, {"title": meta.get("title"), "scenes": scenes})
+            _log("[1/5] story.json 생성 완료")
 
-                # [4] 가사 복원 (story.json → video.json 직접 매핑)
-                _log("[4/5] 가사 복원...")
+            # [2] Video JSON
+            _log("[2/5] video.json 구조 생성...")
+            video_path_str = build_video_json_with_gap_policy(str(proj_dir_path))
+            video_path = Path(video_path_str)
+
+            # [3] AI (A안)
+            _log("[3/5] AI 기본 묘사 생성...")
+            ai = AI()
+
+            def _ai_ask(sys, usr, **k):
+                if "prefer" in k:
+                    del k["prefer"]
+                # 기본은 gemini 강제 사용
+                return ai.ask_smart(sys, usr, prefer="gemini", **k)
+
+            v_data = load_json(video_path)
+            # UI 설정 주입
+            fps, w, h, steps = _read_ui_settings()
+            v_data.setdefault("defaults", {})
+            v_data["defaults"].update({
+                "movie": {"fps": fps, "target_fps": fps},
+                "image": {"width": w, "height": h, "fps": fps},
+                "generator": {"steps": steps},
+            })
+
+            v_data = apply_ai_to_story_v11(v_data, ask=_ai_ask)
+            save_json(video_path, v_data)
+
+            # [4] 가사 복원 (story.json → video.json 직접 매핑)
+            _log("[4/5] 가사 복원...")
+            try:
+                story_doc = load_json(story_path, {}) or {}
+                story_scenes = {
+                    str(s.get("id", "")).strip(): s
+                    for s in story_doc.get("scenes", []) or []
+                    if str(s.get("id", "")).strip()
+                }
+
+                v_data_lyrics = load_json(video_path, {}) or {}
+                restored = 0
+                for sc in v_data_lyrics.get("scenes", []) or []:
+                    sid = str(sc.get("id", "")).strip()
+                    if not sid:
+                        continue
+                    base_sc = story_scenes.get(sid)
+                    if not base_sc:
+                        continue
+                    if "lyric" in base_sc:
+                        sc["lyric"] = base_sc.get("lyric", "")
+                        restored += 1
+
+                save_json(video_path, v_data_lyrics)
+                _log(f"[4/5] 가사 복원 완료: {restored}개 씬에 lyric 주입.")
+            except Exception as e:
+                _log(f"[4/5] 가사 복원 실패: {e}")
+
+            # [5] Shorts/Shopping 스타일 세그먼트 + 프롬프트 상세화 (공통 엔진)
+            _log(f"[5/5] Shorts Style 세그먼트 적용 (FPS:{fps})...")
+            v_data = load_json(video_path, {}) or {}
+
+            def _trace(tag: str, msg: str) -> None:
+                _log(f"[{tag}] {msg}")
+
+            v_data = fill_prompt_movie_with_ai_shorts(
+                v_data,
+                ask=_ai_ask,
+                trace=_trace,
+            )
+            save_json(video_path, v_data)
+
+            _log("완료.")
+            return {"fps": fps}
+
+        def done(ok, res, err):
+            self._seg_story_busy = False
+            if btn:
+                btn.setEnabled(True)
+            if ok:
+                fps = res.get("fps")
+                msg = f"완료 (Shorts Style, FPS:{fps})"
                 try:
-                    story_doc = load_json(story_path, {}) or {}
-                    story_scenes = {
-                        str(s.get("id", "")).strip(): s
-                        for s in story_doc.get("scenes", []) or []
-                        if str(s.get("id", "")).strip()
-                    }
+                    self.statusBar().showMessage(msg, 5000)
+                except Exception:
+                    pass
+                print(f"[UI] {msg}")
+                try:
+                    QtWidgets.QMessageBox.information(self, "완료", "분석이 완료되었습니다.")
+                except Exception:
+                    pass
+            else:
+                try:
+                    QtWidgets.QMessageBox.critical(self, "실패", str(err))
+                except Exception:
+                    pass
 
-                    v_data_lyrics = load_json(video_path, {}) or {}
-                    restored = 0
-                    for sc in v_data_lyrics.get("scenes", []) or []:
-                        sid = str(sc.get("id", "")).strip()
-                        if not sid:
-                            continue
-                        base_sc = story_scenes.get(sid)
-                        if not base_sc:
-                            continue
-                        if "lyric" in base_sc:
-                            sc["lyric"] = base_sc.get("lyric", "")
-                            restored += 1
-
-                    save_json(video_path, v_data_lyrics)
-                    _log(f"[4/5] 가사 복원 완료: {restored}개 씬에 lyric 주입.")
-                except Exception as e:
-                    _log(f"[4/5] 가사 복원 실패: {e}")
-
-                # [5] Shorts/Shopping 스타일 세그먼트 + 프롬프트 상세화 (공통 엔진)
-                _log(f"[5/5] Shorts Style 세그먼트 적용 (FPS:{fps})...")
-                v_data = load_json(video_path, {}) or {}
-
-                def _trace(tag: str, msg: str) -> None:
-                    _log(f"[{tag}] {msg}")
-
-                v_data = fill_prompt_movie_with_ai_shorts(
-                    v_data,
-                    ask=_ai_ask,
-                    trace=_trace,
-                )
-                save_json(video_path, v_data)
-
-                _log("완료.")
-                return {"fps": fps}
-
-            def done(ok, res, err):
-                self._seg_story_busy = False
-                if btn:
-                    btn.setEnabled(True)
-                if ok:
-                    fps = res.get("fps")
-                    msg = f"완료 (Shorts Style, FPS:{fps})"
-                    try:
-                        self.statusBar().showMessage(msg, 5000)
-                    except Exception:
-                        pass
-                    print(f"[UI] {msg}")
-                    try:
-                        QtWidgets.QMessageBox.information(self, "완료", "분석이 완료되었습니다.")
-                    except Exception:
-                        pass
-                else:
-                    try:
-                        QtWidgets.QMessageBox.critical(self, "실패", str(err))
-                    except Exception:
-                        pass
-
-            run_job_with_progress_async(self, "AI 분석", job, on_done=done)
+        run_job_with_progress_async(self, "AI 분석", job, on_done=done)
 
     def on_click_build_story_from_seg_async_ex(self) -> None:
 
