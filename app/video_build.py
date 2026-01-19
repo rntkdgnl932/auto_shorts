@@ -4029,7 +4029,7 @@ def build_step2_qwen_composite(
 
     def _disable_ref_nodes(graph: Dict[str, Any]) -> None:
         """
-        image3~5(참조 슬롯)가 비어있을 때:
+        참조 슬롯(image3~ 등)이 비어있을 때:
         - IPAdapter/ReActor/FaceSwap 계열을 비활성화 + weight 0
         """
         for nid in ipadapter_ids:
@@ -4107,7 +4107,7 @@ def build_step2_qwen_composite(
         if not p_edit:
             p_edit = src_sc.get("prompt_img") or src_sc.get("prompt") or ""
 
-        # 2) 슬롯 이미지 결정
+        # 2) 슬롯 이미지 결정 (UI에서 직접 넘겨준 경우)
         current_slots: Optional[List[str]] = None
         if target_ids is not None and slot_images is not None:
             current_slots = list(slot_images)
@@ -4116,27 +4116,26 @@ def build_step2_qwen_composite(
         base_input_name = "blank.png"
         prod_input_name = prod_input_name_global
 
-        # --- (A) slot_images 기반 모드 (shorts / shopping 통합 규칙) ---
+        # --- (A) slot_images 기반 모드 (shorts / shopping 통합 규칙 - base/product 우선 세팅) ---
         if current_slots:
             # slot 0 → base
             if len(current_slots) > 0 and current_slots[0]:
                 p0 = Path(str(current_slots[0])).resolve()
                 if p0.exists():
-                    n0 = f"slot0_{sid}_{uuid.uuid4().hex[:6]}.png"
+                    n0 = f"slot0_{sid}_{uuid.uuid4().hex[:6]}{p0.suffix.lower()}"
                     shutil.copy2(str(p0), str(comfy_input_dir / n0))
                     base_input_name = n0
 
-            # slot 1 → product
+            # slot 1 → product (※ characters 기반 브랜치에서 다시 덮어쓸 수 있음)
             if len(current_slots) > 1 and current_slots[1]:
                 p1 = Path(str(current_slots[1])).resolve()
                 if p1.exists():
-                    n1 = f"slot1_{sid}_{uuid.uuid4().hex[:6]}.png"
+                    n1 = f"slot1_{sid}_{uuid.uuid4().hex[:6]}{p1.suffix.lower()}"
                     shutil.copy2(str(p1), str(comfy_input_dir / n1))
                     prod_input_name = n1
             elif prod_input_name is None:
                 prod_input_name = "blank.png"
 
-            # slot 2~ → 나머지 LoadImage 슬롯(char_loader_ids 순서)
             extra_slots = current_slots[2:]
 
         # --- (B) 레거시/자동 모드 ---
@@ -4156,7 +4155,7 @@ def build_step2_qwen_composite(
                 base_file = imgs_dir / f"{base_prefix}{sid}{base_ext}"
 
             if base_file.exists():
-                base_input_name = f"base_{sid}_{uuid.uuid4().hex[:6]}.png"
+                base_input_name = f"base_{sid}_{uuid.uuid4().hex[:6]}{base_file.suffix.lower()}"
                 shutil.copy2(str(base_file), str(comfy_input_dir / base_input_name))
 
             # 제품 이미지는 전역 prod_input_name_global 그대로 사용
@@ -4193,8 +4192,137 @@ def build_step2_qwen_composite(
             val = prod_input_name if prod_input_name else "blank.png"
             graph[node_id_product_image].setdefault("inputs", {})["image"] = val
 
-        # slot 3~ (char_loader_ids)
-        if current_slots:
+        # slot 3~ (char_loader_ids) + characters 기반 이미지 매핑
+        scene_chars = src_sc.get("characters", []) or []
+
+        # 기본: 모든 char_loader 입력은 우선 blank 로 초기화
+        for lid in char_loader_ids:
+            lid_str = str(lid)
+            if lid_str in graph:
+                graph[lid_str].setdefault("inputs", {})["image"] = "blank.png"
+
+        # --------------------------------------------------------------
+        # 4-1) characters 와 slot_images 가 모두 있는 경우
+        #      → slot_images 를 "캐릭터 이미지"로 보고 characters 개수만큼만 사용
+        # --------------------------------------------------------------
+        if scene_chars and current_slots:
+            resolved_char_files: List[str] = []
+
+            # (A) slot_images 기반으로 캐릭터 수만큼만 복사
+            for idx, _ in enumerate(scene_chars):
+                if idx >= len(current_slots):
+                    break
+                src_path = Path(str(current_slots[idx])).resolve()
+                if not src_path.exists():
+                    continue
+                name = f"char{idx}_{sid}_{uuid.uuid4().hex[:6]}{src_path.suffix.lower()}"
+                shutil.copy2(str(src_path), str(comfy_input_dir / name))
+                resolved_char_files.append(name)
+
+            # (B) 부족한 캐릭터 이미지는 CHARACTER_DIR 기준으로 보충
+            if len(resolved_char_files) < len(scene_chars):
+                char_base_dir = Path(CHARACTER_DIR)
+                for idx in range(len(resolved_char_files), len(scene_chars)):
+                    entry = scene_chars[idx]
+                    if isinstance(entry, dict):
+                        cid = str(entry.get("id", "")).split(":")[0].strip()
+                    else:
+                        cid = str(entry).split(":")[0].strip()
+                    if not cid:
+                        continue
+                    for ext in (".png", ".jpg", ".webp"):
+                        cpath = char_base_dir / f"{cid}{ext}"
+                        if cpath.exists():
+                            name = f"char{idx}_{sid}_{uuid.uuid4().hex[:6]}{ext}"
+                            shutil.copy2(str(cpath), str(comfy_input_dir / name))
+                            resolved_char_files.append(name)
+                            break
+
+            if resolved_char_files:
+                # 첫 번째 캐릭터 이미지는 base 이미지로 사용
+                base_input_name = resolved_char_files[0]
+
+                # product 이미지는 slot_images 가 아니라 product_image_path 에서만 받도록 복원
+                prod_input_name = prod_input_name_global or "blank.png"
+
+                if len(resolved_char_files) > 1 and char_loader_ids:
+                    any_extra_active = False
+                    for idx, loader_id in enumerate(char_loader_ids):
+                        extra_idx = idx + 1  # 두 번째 캐릭터부터 char_loader 에 매핑
+                        if extra_idx >= len(resolved_char_files):
+                            break
+                        img_val = resolved_char_files[extra_idx]
+                        lid_str = str(loader_id)
+                        if lid_str in graph:
+                            graph[lid_str].setdefault("inputs", {})["image"] = img_val
+                            any_extra_active = True
+
+                    if not any_extra_active:
+                        _emit(f"[Step2][DBG] {sid}: characters는 있으나 추가 참조 슬롯 없음 → IPAdapter/ReActor/FaceSwap 비활성화")
+                        _disable_ref_nodes(graph)
+                    else:
+                        _emit(f"[Step2][DBG] {sid}: characters 기반 추가 참조 슬롯 활성 → 참조 노드 유지")
+                else:
+                    # 캐릭터가 1명뿐이면 참조 노드는 의미가 없으므로 비활성화
+                    _emit(f"[Step2][DBG] {sid}: characters=1 → IPAdapter/ReActor/FaceSwap 비활성화")
+                    _disable_ref_nodes(graph)
+            else:
+                _emit(f"[Step2][DBG] {sid}: characters는 있지만 이미지 로드 실패 → 참조 노드 비활성화")
+                _disable_ref_nodes(graph)
+
+        # --------------------------------------------------------------
+        # 4-2) characters 만 있고 slot_images 는 없는 경우 (레거시 모드)
+        #      → CHARACTER_DIR 기반 자동 세팅
+        # --------------------------------------------------------------
+        elif scene_chars:
+            active_slots = set()
+            slot_files: Dict[int, str] = {}
+
+            char_base_dir = Path(CHARACTER_DIR)
+
+            for idx, char_entry in enumerate(scene_chars):
+                if idx >= len(char_loader_ids):
+                    break
+                if isinstance(char_entry, dict):
+                    cid = str(char_entry.get("id", "")).split(":")[0].strip()
+                else:
+                    cid = str(char_entry).split(":")[0].strip()
+                if not cid:
+                    continue
+                for ext in [".png", ".jpg", ".webp"]:
+                    cpath = char_base_dir / f"{cid}{ext}"
+                    if cpath.exists():
+                        name = f"char{idx}_{sid}_{uuid.uuid4().hex[:6]}{ext}"
+                        shutil.copy2(str(cpath), str(comfy_input_dir / name))
+                        active_slots.add(idx)
+                        slot_files[idx] = name
+                        break
+
+            if not active_slots:
+                for nid, node in graph.items():
+                    cls = node.get("class_type", "")
+                    if "IPAdapter" in cls or "ReActor" in cls or "FaceSwap" in cls:
+                        inputs = node.setdefault("inputs", {})
+                        inputs["enabled"] = False
+                        if "weight" in inputs:
+                            inputs["weight"] = 0.0
+                for lid in char_loader_ids:
+                    lid_str = str(lid)
+                    if lid_str in graph:
+                        graph[lid_str].setdefault("inputs", {})["image"] = "blank.png"
+            else:
+                for i, lid in enumerate(char_loader_ids):
+                    lid_str = str(lid)
+                    if lid_str not in graph:
+                        continue
+                    img_val = slot_files.get(i, "blank.png") if i in active_slots else "blank.png"
+                    graph[lid_str].setdefault("inputs", {})["image"] = img_val
+
+        # --------------------------------------------------------------
+        # 4-3) characters 는 없고 slot_images 만 있는 경우
+        #      → 예전 규칙(0: base, 1: product, 2~: 참조 이미지) 유지
+        # --------------------------------------------------------------
+        elif current_slots:
             any_extra_active = False
 
             for idx, loader_id in enumerate(char_loader_ids):
@@ -4218,45 +4346,13 @@ def build_step2_qwen_composite(
             else:
                 _emit(f"[Step2][DBG] {sid}: slot2~5 활성 이미지 있음 → 참조 노드 유지(활성)")
 
+        # --------------------------------------------------------------
+        # 4-4) characters 도 없고 slot_images 도 없는 경우
+        #      → 모든 참조 노드를 끄고 blank만 사용
+        # --------------------------------------------------------------
         else:
-            # 레거시 모드: characters 기반 자동 세팅
-            scene_chars = src_sc.get("characters", [])
-            active_slots = set()
-            slot_files: Dict[int, str] = {}
-
-            char_base_dir = Path(CHARACTER_DIR)
-
-            for idx, char_entry in enumerate(scene_chars):
-                cid = str(char_entry).split(":")[0].strip()
-                slot_idx = idx  # 단순 0,1,2... 매핑
-                if 0 <= slot_idx < len(char_loader_ids):
-                    for ext in [".png", ".jpg", ".webp"]:
-                        cpath = char_base_dir / f"{cid}{ext}"
-                        if cpath.exists():
-                            shutil.copy2(str(cpath), str(comfy_input_dir / cpath.name))
-                            active_slots.add(slot_idx)
-                            slot_files[slot_idx] = cpath.name
-                            break
-
-            if not active_slots:
-                for nid, node in graph.items():
-                    cls = node.get("class_type", "")
-                    if "IPAdapter" in cls or "ReActor" in cls or "FaceSwap" in cls:
-                        inputs = node.setdefault("inputs", {})
-                        inputs["enabled"] = False
-                        if "weight" in inputs:
-                            inputs["weight"] = 0.0
-                for lid in char_loader_ids:
-                    lid_str = str(lid)
-                    if lid_str in graph:
-                        graph[lid_str].setdefault("inputs", {})["image"] = "blank.png"
-            else:
-                for i, lid in enumerate(char_loader_ids):
-                    lid_str = str(lid)
-                    if lid_str not in graph:
-                        continue
-                    img_val = slot_files.get(i, "blank.png") if i in active_slots else "blank.png"
-                    graph[lid_str].setdefault("inputs", {})["image"] = img_val
+            _emit(f"[Step2][DBG] {sid}: characters/slot_images 모두 없음 → 참조 노드 비활성화")
+            _disable_ref_nodes(graph)
 
         # prompt/value
         if node_id_prompt_value in graph:
@@ -4335,6 +4431,7 @@ def build_step2_qwen_composite(
 
     save_json(p_video, video_doc)
     return created_single
+
 
 
 
