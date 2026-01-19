@@ -105,9 +105,68 @@ class AllMain(QtWidgets.QMainWindow):
 
 def main():
     app = QtWidgets.QApplication(sys.argv)
+
+    # ✅ 다크 테마 적용 (여기!)
+    app.setStyleSheet("""
+    QWidget {
+        background-color: #121212;
+        color: #E0E0E0;
+        font-size: 13px;
+    }
+
+    QTabWidget::pane {
+        border: 1px solid #2c2c2c;
+    }
+
+    QTabBar::tab {
+        background: #1e1e1e;
+        color: #bdbdbd;
+        padding: 8px 16px;
+        border: 1px solid #2c2c2c;
+        border-bottom: none;
+        min-width: 90px;
+    }
+
+    QTabBar::tab:selected {
+        background: #2b2b2b;
+        color: #ffffff;
+    }
+
+    QTabBar::tab:hover {
+        background: #333333;
+    }
+
+    QPushButton {
+        background-color: #2d2d2d;
+        border: 1px solid #3c3c3c;
+        padding: 6px 12px;
+        border-radius: 4px;
+    }
+
+    QPushButton:hover {
+        background-color: #3a3a3a;
+    }
+
+    QPushButton:pressed {
+        background-color: #1f1f1f;
+    }
+
+    QLineEdit, QTextEdit, QPlainTextEdit {
+        background-color: #1c1c1c;
+        border: 1px solid #3c3c3c;
+        padding: 4px;
+        selection-background-color: #007acc;
+    }
+
+    QLabel {
+        background: transparent;
+    }
+    """)
+
     win = AllMain()
     win.show()
     sys.exit(app.exec_())
+
 
 
 if __name__ == "__main__":

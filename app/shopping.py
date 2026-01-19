@@ -27,7 +27,7 @@ from app.issue_list_builder import (
 
 from app.shopping_video_build import build_shopping_images_2step
 from app.shopping_video_build import convert_shopping_to_video_json_with_ai
-
+from app.video_build import build_shots_with_i2v_long
 from app.shopping_video_build import (
     ShoppingVideoJsonBuilder,
     ShoppingImageGenerator,
@@ -1869,7 +1869,6 @@ class VideoBuildDialog(QtWidgets.QDialog):
         def job(progress):
             progress(f"[Movie] I2V 영상 생성 시작 (Long Take, {fps} fps)...")
             # [변경] Long 버전 빌드 함수 호출
-            from app.video_build import build_shots_with_i2v_long
 
             build_shots_with_i2v_long(
                 project_dir=self.product_dir,

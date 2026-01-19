@@ -34,7 +34,7 @@ from app.utils import run_job_with_progress_async as run_async_imp
 from app.utils import run_job_with_progress_async
 from app.utils import load_json, save_json, sanitize_title as sanitize_title_fn
 from app.video_build import build_and_merge_full_video, add_subtitles_with_ffmpeg, xfade_concat, concatenate_scene_clips
-from app.video_build import build_shots_with_i2v as build_func_imp
+from app.video_build import build_shots_with_i2v as build_func_imp, build_shots_with_i2v_long
 from app.video_build import retry_cut_audio_for_scene, build_missing_images_from_story, build_video_json_with_gap_policy
 
 from PyQt5.QtCore import Qt
@@ -1728,261 +1728,254 @@ class MainWindow(QtWidgets.QMainWindow):
 
     # real_use
     def on_click_segments_missing_images_with_log(self):
-        """
-        [2단계] 세그먼트 이미지 생성 (Qwen I2I) - 주입 검증 강화 및 에러 방지 패치
-        """
-        btn = getattr(self, "btn_segments_img", None)
-        if btn: btn.setEnabled(False)
+            """
+            [2단계] 세그먼트 이미지 생성 (Qwen I2I) - 세그먼트 루프 및 프롬프트 매핑 수정판
+            """
+            btn = getattr(self, "btn_segments_img", None)
+            if btn: btn.setEnabled(False)
 
-        try:
-            proj_dir = self._current_project_dir()
-            if not proj_dir or not proj_dir.exists():
-                raise FileNotFoundError("프로젝트 디렉터리를 찾을 수 없습니다.")
-
-            video_json_path = proj_dir / "video.json"
-            if not video_json_path.exists():
-                raise FileNotFoundError(f"video.json을 찾을 수 없습니다.\n{video_json_path}")
-
-            qwen_wf_path = Path(JSONS_DIR) / "qwen2509_i2i.json"
-            if not qwen_wf_path.exists():
-                raise FileNotFoundError(f"Qwen I2I 워크플로우를 찾을 수 없습니다.\n{qwen_wf_path}")
-
-            qwen_workflow_template = load_json(qwen_wf_path)
-            if not qwen_workflow_template:
-                raise ValueError("qwen2509_i2i.json 파일을 읽을 수 없습니다.")
-
-            comfy_input_path = Path(COMFY_INPUT_DIR)
-            character_base_dir = Path(CHARACTER_DIR)
-
-            # [Patch] UI에서 Steps 값 읽기 (Node 1 주입용)
             try:
-                ui_steps = int(self.spn_t2i_steps.value())
-            except Exception:
-                ui_steps = 28
+                proj_dir = self._current_project_dir()
+                if not proj_dir or not proj_dir.exists():
+                    raise FileNotFoundError("프로젝트 디렉터리를 찾을 수 없습니다.")
 
-        except Exception as e_prep:
-            QtWidgets.QMessageBox.critical(self, "준비 오류", str(e_prep))
-            if btn: btn.setEnabled(True)
-            return
+                video_json_path = proj_dir / "video.json"
+                if not video_json_path.exists():
+                    raise FileNotFoundError(f"video.json을 찾을 수 없습니다.\n{video_json_path}")
 
-        def job(progress_callback):
-            _log = lambda msg: progress_callback({"msg": msg})
-            _log(f"qwen2509_i2i.json 워크플로우(ReActor 포함)를 사용하여 키프레임 생성을 시작합니다.")
+                # 워크플로우 로드
+                qwen_wf_path = Path(JSONS_DIR) / "qwen2509_i2i.json"
+                if not qwen_wf_path.exists():
+                    raise FileNotFoundError(f"Qwen I2I 워크플로우(qwen2509_i2i.json)가 없습니다.")
 
-            # --- 헬퍼 함수 ---
-            def _parse_character_spec(raw_obj: Any) -> Dict[str, Any]:
-                if isinstance(raw_obj, str):
-                    parts = raw_obj.split(":", 1)
-                    cid = parts[0].strip()
-                    idxx = int(parts[1]) if len(parts) > 1 and parts[1].isdigit() else 0
-                    return {"id": cid, "index": idxx}
-                if isinstance(raw_obj, dict):
-                    cid = str(raw_obj.get("id", "")).strip()
-                    idxx = raw_obj.get("index")
-                    try:
-                        idx_int = int(idxx) if idxx is not None else 0
-                    except:
-                        idx_int = 0
-                    return {"id": cid, "index": idx_int}
-                return {"id": "", "index": 0}
+                qwen_workflow_template = load_json(qwen_wf_path)
 
-            def _resolve_character_image_path(char_id: str) -> Optional[Path]:
-                if not char_id: return None
-                for ext in (".png", ".jpg", ".jpeg", ".webp"):
-                    p = character_base_dir / f"{char_id}{ext}"
-                    if p.exists(): return p
-                return None
+                comfy_input_path = Path(COMFY_INPUT_DIR)
+                character_base_dir = Path(CHARACTER_DIR)
 
-            def _copy_to_input(src_path: Path) -> str:
                 try:
-                    dst = comfy_input_path / src_path.name
-                    shutil.copy2(str(src_path), str(dst))
-                    return src_path.name
-                except Exception as e:
-                    _log(f"[WARN] 파일 복사 실패 ({src_path.name}): {e}")
-                    return ""
+                    ui_steps = int(self.spn_t2i_steps.value())
+                except:
+                    ui_steps = 28
 
-            vdoc = load_json(video_json_path)
-            scenes = vdoc.get("scenes", [])
-            total_segments = sum(len(s.get("frame_segments", [])) for s in scenes)
-            _log(f"총 {len(scenes)}개 씬, {total_segments}개 세그먼트(키프레임) 처리 예정.")
+            except Exception as e_prep:
+                QtWidgets.QMessageBox.critical(self, "준비 오류", str(e_prep))
+                if btn: btn.setEnabled(True)
+                return
 
-            processed_count = 0
+            def job(progress_callback):
+                _log = lambda msg: progress_callback({"msg": msg})
+                _log(f"qwen2509_i2i.json 로드됨. 세그먼트 이미지 생성을 시작합니다.")
 
-            # ReActor ID 매핑
-            QWEN_REACTOR_MAP = {
-                "19": ("17", "female_01"),  # Slot 1
-                "22": ("21", "male_01"),  # Slot 2
-                "23": ("18", "other_char"),  # Slot 3
-            }
+                # --- 헬퍼 함수들 ---
+                def _parse_character_spec(raw_obj: Any) -> Dict[str, Any]:
+                    if isinstance(raw_obj, str):
+                        parts = raw_obj.split(":", 1)
+                        return {"id": parts[0].strip(),
+                                "index": int(parts[1]) if len(parts) > 1 and parts[1].isdigit() else 0}
+                    if isinstance(raw_obj, dict):
+                        return {"id": str(raw_obj.get("id", "")).strip(), "index": int(raw_obj.get("index", 0))}
+                    return {"id": "", "index": 0}
 
-            SAVE_NODE_ID = "24"
+                def _resolve_character_image_path(char_id: str) -> Optional[Path]:
+                    if not char_id: return None
+                    for ext in (".png", ".jpg", ".jpeg", ".webp"):
+                        p = character_base_dir / f"{char_id}{ext}"
+                        if p.exists(): return p
+                    return None
 
-            for scene_index, scene in enumerate(scenes):
-                scene_id = scene.get("id")
-                img_file_str = scene.get("img_file")
-                frame_segments = scene.get("frame_segments", [])
+                def _copy_to_input(src_path: Path) -> str:
+                    try:
+                        dst = comfy_input_path / src_path.name
+                        shutil.copy2(str(src_path), str(dst))
+                        return src_path.name
+                    except:
+                        return ""
 
-                if not scene_id or not img_file_str or not frame_segments:
-                    continue
+                # video.json 로드
+                vdoc = load_json(video_json_path)
+                scenes = vdoc.get("scenes", [])
 
-                base_image_path = Path(img_file_str)
-                if not base_image_path.exists():
-                    _log(f"[{scene_id}] 스킵: 기준 이미지 없음.")
-                    continue
+                # 전체 작업량 계산
+                total_tasks = 0
+                for s in scenes:
+                    # seg_count 필드를 우선 신뢰
+                    cnt = int(s.get("seg_count", 0))
+                    # 만약 seg_count가 0인데 frame_segments가 있다면 구버전 호환
+                    if cnt == 0 and "frame_segments" in s:
+                        cnt = len(s["frame_segments"])
+                    total_tasks += cnt
 
-                # 메인 이미지 복사
-                main_img_name = _copy_to_input(base_image_path)
+                _log(f"총 {len(scenes)}개 씬, {total_tasks}개 세그먼트 처리 예정.")
 
-                # [Patch] 메인 이미지가 복사되지 않았다면 건너뜀 (안전장치)
-                if not main_img_name:
-                    _log(f"[{scene_id}] 메인 이미지 복사 실패. 스킵.")
-                    continue
+                processed_count = 0
 
-                keyframe_dir = base_image_path.parent / scene_id
-                keyframe_dir.mkdir(parents=True, exist_ok=True)
+                # ReActor 매핑 (슬롯)
+                QWEN_REACTOR_MAP = {
+                    "19": ("17", "female_01"),
+                    "22": ("21", "male_01"),
+                    "23": ("18", "other_char"),
+                }
+                SAVE_NODE_ID = "24"  # 이미지 저장 노드
+                PROMPT_NODE_ID = "7"  # 프롬프트 입력 노드 (ClipTextEncode)
 
-                # 원본 보존 (kf_0)
-                kf_0_path = keyframe_dir / "kf_0.png"
-                if not kf_0_path.exists():
-                    shutil.copy2(str(base_image_path), str(kf_0_path))
+                for scene_index, scene in enumerate(scenes):
+                    scene_id = scene.get("id")
+                    img_file_str = scene.get("img_file")
 
-                # --- ReActor 설정 준비 ---
-                scene_char_specs: Dict[str, int] = {}
-                for char_raw in scene.get("characters", []):
-                    spec = _parse_character_spec(char_raw)
-                    if spec["id"]: scene_char_specs[spec["id"]] = spec["index"]
+                    # seg_count 확인
+                    seg_count = int(scene.get("seg_count", 0))
 
-                face_files_to_inject: Dict[str, str] = {}
-                reactors_to_enable: Dict[str, str] = {}
+                    # 구버전 호환: seg_count가 0이면 frame_segments 리스트 길이 사용
+                    if seg_count == 0 and "frame_segments" in scene:
+                        seg_count = len(scene["frame_segments"])
 
-                for reactor_id, (load_id, default_char) in QWEN_REACTOR_MAP.items():
-                    if default_char in scene_char_specs:
-                        idx = scene_char_specs[default_char]
-                        fpath = _resolve_character_image_path(default_char)
-                        if fpath:
-                            fname = _copy_to_input(fpath)
-                            if fname:
-                                face_files_to_inject[load_id] = fname
-                                reactors_to_enable[reactor_id] = str(idx)
-
-                # --- 세그먼트 루프 ---
-                for seg_index, segment in enumerate(frame_segments):
-                    seg_prompt = segment.get("prompt_movie", "").strip()
-                    if not seg_prompt: continue
-
-                    keyframe_name = f"kf_{seg_index + 1}.png"
-                    keyframe_path = keyframe_dir / keyframe_name
-
-                    if keyframe_path.exists():
-                        processed_count += 1
+                    if seg_count == 0:
                         continue
 
-                    _log(f"[{scene_id}] 세그먼트 {seg_index + 1} 생성 중...")
+                    if not img_file_str:
+                        _log(f"[{scene_id}] 경고: img_file 없음. 스킵.")
+                        continue
 
-                    try:
-                        wf = json.loads(json.dumps(qwen_workflow_template))
+                    base_image_path = Path(img_file_str)
+                    if not base_image_path.exists():
+                        _log(f"[{scene_id}] 원본 이미지 파일 없음 ({img_file_str})")
+                        continue
 
-                        # [Patch] Node 1 (ImageScaleToTotalPixels) resolution_steps 주입
-                        # 에러 로그: "Required input is missing: resolution_steps" 해결
-                        if "1" in wf:
-                            wf["1"]["inputs"]["resolution_steps"] = ui_steps
+                    # 원본 이미지 Input 폴더로 복사
+                    main_img_name = _copy_to_input(base_image_path)
 
-                        # 1. 메인 이미지 주입 (Node 20)
-                        if "20" in wf:
-                            wf["20"]["inputs"]["image"] = main_img_name
-                            _log(f"   -> [Input] Image: {main_img_name}")
-                        else:
-                            _log("   -> [ERR] Node 20 (LoadImage) not found!")
+                    # 저장 폴더 생성 (project/scenes/t_xxx)
+                    keyframe_dir = base_image_path.parent / scene_id
+                    keyframe_dir.mkdir(parents=True, exist_ok=True)
 
-                        # 2. 프롬프트 주입 (Node 7)
-                        if "7" in wf:
-                            wf["7"]["inputs"]["prompt"] = seg_prompt
-                            _log(f"   -> [Input] Prompt: {seg_prompt[:50]}...")
+                    # kf_0.png (원본 복사)
+                    kf_0_path = keyframe_dir / "kf_0.png"
+                    if not kf_0_path.exists():
+                        shutil.copy2(str(base_image_path), str(kf_0_path))
 
-                        # 3. 시드
-                        if "4" in wf:
-                            wf["4"]["inputs"]["seed"] = (scene_index * 1000) + seg_index + 12345
+                    # 캐릭터 정보 파싱 (ReActor용)
+                    scene_char_specs = {}
+                    for char_raw in scene.get("characters", []):
+                        spec = _parse_character_spec(char_raw)
+                        if spec["id"]: scene_char_specs[spec["id"]] = spec["index"]
 
-                        # 4. ReActor 설정 및 [Patch] LoadImage 에러 방지
-                        for r_id, (l_id, def_char) in QWEN_REACTOR_MAP.items():
-                            if r_id in wf:
-                                should_enable = False
+                    # ReActor 얼굴 이미지 준비
+                    face_files_to_inject = {}
+                    reactors_to_enable = {}
+                    for reactor_id, (load_id, default_char) in QWEN_REACTOR_MAP.items():
+                        if default_char in scene_char_specs:
+                            idx = scene_char_specs[default_char]
+                            fpath = _resolve_character_image_path(default_char)
+                            if fpath:
+                                fname = _copy_to_input(fpath)
+                                if fname:
+                                    face_files_to_inject[load_id] = fname
+                                    reactors_to_enable[reactor_id] = str(idx)
 
-                                if r_id in reactors_to_enable:
-                                    # 활성화 대상이면 파일이 있는지 확인
-                                    if l_id in wf and l_id in face_files_to_inject:
+                    # ★ [수정] 1부터 seg_count까지 정확히 순회
+                    for i in range(1, seg_count + 1):
+                        # 파일명: kf_1.png, kf_2.png ...
+                        target_filename = f"kf_{i}.png"
+                        target_path = keyframe_dir / target_filename
+
+                        if target_path.exists():
+                            # 이미 있으면 스킵
+                            processed_count += 1
+                            continue
+
+                        # 프롬프트 추출: prompt_1, prompt_2 ...
+                        # 1. prompt_i 키 확인
+                        prompt_key = f"prompt_{i}"
+                        seg_prompt = scene.get(prompt_key, "")
+
+                        # 2. 없으면 prompt_movie(씬 전체 프롬프트) 사용
+                        if not seg_prompt:
+                            _log(f"[{scene_id}] #{i} '{prompt_key}' 없음 -> prompt_movie 사용")
+                            seg_prompt = scene.get("prompt_movie", "") or scene.get("prompt", "")
+
+                        _log(f"[{scene_id}] 생성중: {target_filename} (프롬프트: {seg_prompt[:30]}...)")
+
+                        # 워크플로우 복사 & 수정
+                        try:
+                            wf = json.loads(json.dumps(qwen_workflow_template))
+
+                            # 1. 설정값 주입
+                            if "1" in wf: wf["1"]["inputs"]["resolution_steps"] = ui_steps
+                            if "20" in wf: wf["20"]["inputs"]["image"] = main_img_name
+                            if "4" in wf: wf["4"]["inputs"]["seed"] = (scene_index * 1000) + i + random.randint(0, 9999)
+
+                            # 2. 프롬프트 주입 (Node 7번 체크)
+                            if PROMPT_NODE_ID in wf:
+                                wf[PROMPT_NODE_ID]["inputs"]["text"] = seg_prompt  # 보통 text 아니면 prompt
+                                if "prompt" in wf[PROMPT_NODE_ID]["inputs"]:  # 노드 타입에 따라 키가 다를 수 있음
+                                    wf[PROMPT_NODE_ID]["inputs"]["prompt"] = seg_prompt
+                            else:
+                                _log(f"[오류] 워크플로우에 프롬프트 노드({PROMPT_NODE_ID})가 없습니다.")
+
+                            # 3. ReActor 설정
+                            for r_id, (l_id, def_char) in QWEN_REACTOR_MAP.items():
+                                if r_id in wf:
+                                    enabled = False
+                                    if r_id in reactors_to_enable and l_id in wf:
                                         wf[l_id]["inputs"]["image"] = face_files_to_inject[l_id]
                                         wf[r_id]["inputs"]["enabled"] = True
                                         wf[r_id]["inputs"]["input_faces_index"] = reactors_to_enable[r_id]
                                         wf[r_id]["inputs"]["source_faces_index"] = 0
-                                        _log(f"   -> [ReActor] {def_char} ON (Node {r_id})")
-                                        should_enable = True
-                                    else:
-                                        _log(f"   -> [WARN] {def_char} 활성화 대상이나 이미지 없음.")
+                                        enabled = True
 
-                                # 활성화되지 않는 경우 (비활성 OR 이미지 없음)
-                                if not should_enable:
-                                    wf[r_id]["inputs"]["enabled"] = False
-                                    # [Patch] Node 17 등 LoadImage가 깨진 경로(female_01 (1).png)를 갖고 있으면
-                                    # ComfyUI가 에러를 뱉으므로, 유효한 파일(메인 이미지)로 덮어씌움
-                                    if l_id in wf:
-                                        wf[l_id]["inputs"]["image"] = main_img_name
+                                    if not enabled:
+                                        wf[r_id]["inputs"]["enabled"] = False
+                                        if l_id in wf: wf[l_id]["inputs"]["image"] = main_img_name
 
-                        # 5. 저장 파일명 설정
-                        if SAVE_NODE_ID in wf:
-                            wf[SAVE_NODE_ID]["inputs"]["filename_prefix"] = f"qwen_kf/{scene_id}/{seg_index + 1}"
+                            # 4. 저장 설정
+                            if SAVE_NODE_ID in wf:
+                                # prefix 설정: qwen_kf/t_005/1
+                                wf[SAVE_NODE_ID]["inputs"]["filename_prefix"] = f"qwen_kf/{scene_id}/{i}"
 
-                        # 실행
-                        result = _submit_and_wait_comfy(COMFY_HOST, wf, timeout=_DEFAULT_ACE_WAIT_TIMEOUT_SEC, poll=_DEFAULT_ACE_POLL_INTERVAL_SEC)
+                            # 실행
+                            result = _submit_and_wait_comfy(COMFY_HOST, wf, timeout=600)
 
-                        # 결과 파싱
-                        outputs_dict = result.get("outputs", {})
-                        target_out = outputs_dict.get(SAVE_NODE_ID, {})
-                        images = target_out.get("images", [])
+                            # 결과 저장
+                            outputs = result.get("outputs", {}).get(SAVE_NODE_ID, {}).get("images", [])
+                            if not outputs:
+                                # 혹시 다른 노드에 출력이 있는지 확인
+                                for nid, val in result.get("outputs", {}).items():
+                                    if "images" in val:
+                                        outputs = val["images"]
+                                        break
 
-                        # Fallback
-                        if not images:
-                            for nid, out_val in outputs_dict.items():
-                                if "images" in out_val:
-                                    images = out_val["images"]
-                                    break
+                            if outputs:
+                                img_data = outputs[0]
+                                fname = img_data.get("filename")
+                                fsub = img_data.get("subfolder")
+                                ftype = img_data.get("type")
 
-                        if not images:
-                            raise RuntimeError("이미지 생성 실패 (출력 없음)")
+                                # 이미지 다운로드
+                                resp = requests.get(f"{COMFY_HOST}/view",
+                                                    params={"filename": fname, "subfolder": fsub, "type": ftype})
+                                if resp.status_code == 200:
+                                    with open(target_path, "wb") as f:
+                                        f.write(resp.content)
+                                    processed_count += 1
+                                else:
+                                    _log(f"[{scene_id}] 이미지 다운로드 실패: {resp.status_code}")
+                            else:
+                                _log(f"[{scene_id}] #{i} ComfyUI 출력 없음.")
 
-                        img_info = images[0]
-                        filename = img_info.get("filename")
-                        subfolder = img_info.get("subfolder")
-                        file_type = img_info.get("type", "output")
+                        except Exception as e_gen:
+                            _log(f"[{scene_id}] #{i} 생성 에러: {e_gen}")
 
-                        _log(f"   -> [Download] {filename}")
+                return f"완료. 총 {processed_count}개 세그먼트 이미지 생성됨."
 
-                        resp = requests.get(
-                            f"{COMFY_HOST}/view",
-                            params={"filename": filename, "subfolder": subfolder, "type": file_type},
-                            timeout=60
-                        )
-                        resp.raise_for_status()
+            def done(ok, res, err):
+                if btn: btn.setEnabled(True)
+                if ok:
+                    QtWidgets.QMessageBox.information(self, "완료", res)
+                else:
+                    QtWidgets.QMessageBox.critical(self, "실패", str(err))
 
-                        with open(keyframe_path, "wb") as f:
-                            f.write(resp.content)
-
-                        processed_count += 1
-
-                    except Exception as e_seg:
-                        _log(f"[{scene_id}] 세그먼트 {seg_index + 1} 실패: {e_seg}")
-
-            return f"완료. 생성된 키프레임: {processed_count}개"
-
-        def done(ok, payload, err):
-            if btn: btn.setEnabled(True)
-            if not ok:
-                QtWidgets.QMessageBox.critical(self, "실패", str(err))
-            else:
-                QtWidgets.QMessageBox.information(self, "완료", str(payload))
-
-        run_job_with_progress_async(self, "세그먼트 이미지 생성 (Qwen)", job, on_done=done)
+            run_job_with_progress_async(self, "세그먼트 생성(Qwen)", job, on_done=done)
 
     # real_use
     def on_click_generate_music(self) -> None:
@@ -5096,6 +5089,80 @@ class MainWindow(QtWidgets.QMainWindow):
     # ────────────── 영상 빌드(선택) ──────────────
     # real_use
     def on_video(self, *, on_done_override: Optional[Callable] = None) -> None:
+            """
+            [수정됨] Long Take 영상 생성 (75번 워크플로우 사용)
+            - build_shots_with_i2v_long 함수를 호출합니다.
+            """
+            # 1. UI 설정 저장 (기존 로직 유지)
+            try:
+                self._save_ui_prefs_to_project()
+            except Exception as e:
+                print(f"[UI] 설정 저장 실패: {e}")
+
+            # 2. 버튼 비활성화 (중복 클릭 방지)
+            btn_video_widget = getattr(self, "btn_video", None)
+            if btn_video_widget:
+                btn_video_widget.setEnabled(False)
+
+            # 3. 프로젝트 경로 확인
+            proj_dir_str = self._current_project_dir()
+            if not proj_dir_str:
+                QtWidgets.QMessageBox.warning(self, "오류", "프로젝트 폴더가 선택되지 않았습니다.")
+                if btn_video_widget: btn_video_widget.setEnabled(True)
+                return
+
+            target_video_json = Path(proj_dir_str) / "video.json"
+            if not target_video_json.exists():
+                QtWidgets.QMessageBox.warning(self, "알림", "video.json이 없습니다.\n'프로젝트 분석'을 먼저 진행해주세요.")
+                if btn_video_widget: btn_video_widget.setEnabled(True)
+                return
+
+            # 4. UI 설정값 읽기 (FPS 등)
+            # (기존 _get_ui_int_value 헬퍼가 있다면 사용, 없으면 직접 읽기)
+            try:
+                ui_fps = int(self.cmb_movie_fps.currentData())
+            except:
+                ui_fps = 30
+
+            # 5. 작업 정의 (Job)
+            def job(progress):
+                progress({"msg": f"[Movie] Long Take 영상 생성 시작 (FPS: {ui_fps})..."})
+
+                # ★ 핵심: build_shots_with_i2v_long 호출
+                # total_frames=0 으로 넘기면 내부에서 video.json의 duration/fps 기반으로 자동 계산
+                build_shots_with_i2v_long(
+                    project_dir=str(proj_dir_str),
+                    total_frames=0,
+                    ui_fps=ui_fps,
+                    on_progress=lambda d: progress(d if isinstance(d, dict) else {"msg": str(d)})
+                )
+                return "OK"
+
+            # 6. 완료 처리 (Done)
+            def done(ok, res, err):
+                if btn_video_widget:
+                    btn_video_widget.setEnabled(True)
+
+                if on_done_override:
+                    on_done_override(ok, res, err)
+                    return
+
+                if ok:
+                    msg = "✅ [Long Take] 영상 생성 및 업스케일 완료"
+                    if hasattr(self, "_append_log"):
+                        self._append_log(msg)
+                    QtWidgets.QMessageBox.information(self, "완료", msg)
+                else:
+                    msg = f"❌ 영상 생성 실패: {err}"
+                    if hasattr(self, "_append_log"):
+                        self._append_log(msg)
+                    QtWidgets.QMessageBox.critical(self, "오류", str(err))
+
+            # 7. 비동기 실행
+            run_job_with_progress_async(self, "Long-Take 영상 생성", job, on_done=done)
+
+    # real_use
+    def on_video_ex(self, *, on_done_override: Optional[Callable] = None) -> None:
         try:
             self._save_ui_prefs_to_project()
         except Exception as e_save_prefs:
