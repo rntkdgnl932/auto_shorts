@@ -1402,14 +1402,56 @@ class ScenePromptEditDialog(QtWidgets.QDialog):
                     duration_f = scene.get("duration", 0.0)
                     if duration_f == 0.0 and end_f > start_f: duration_f = end_f - start_f
                     chars_list_label = scene.get("characters", [])
+                    # chars_str = ", ".join(chars_list_label) if chars_list_label else "없음"
+                    # label_text = (
+                    #     f"<b>{scene_id}</b> [{lyric or '가사 없음'}] | "
+                    #     f"<b>캐릭터:</b> [{chars_str}] | "
+                    #     f"<b>시간:</b> [{start_f:.2f} ~ {end_f:.2f}, ({duration_f:.2f}s)]"
+                    # )
+                    # label = QtWidgets.QLabel(label_text)
+                    # label.setWordWrap(False)
                     chars_str = ", ".join(chars_list_label) if chars_list_label else "없음"
-                    label_text = (
-                        f"<b>{scene_id}</b> [{lyric or '가사 없음'}] | "
-                        f"<b>캐릭터:</b> [{chars_str}] | "
-                        f"<b>시간:</b> [{start_f:.2f} ~ {end_f:.2f}, ({duration_f:.2f}s)]"
-                    )
-                    label = QtWidgets.QLabel(label_text)
-                    label.setWordWrap(False)
+
+                    # 기존의 단순 QLabel(label) 대신, 가로로 배치된 컨테이너 위젯(label_widget)을 만듭니다.
+                    label_widget = QtWidgets.QWidget()
+                    lw_layout = QtWidgets.QHBoxLayout(label_widget)
+                    lw_layout.setContentsMargins(0, 0, 0, 0)
+                    lw_layout.setSpacing(5)
+
+                    # 1. ID
+                    lw_layout.addWidget(QtWidgets.QLabel(f"<b>{scene_id}</b>"))
+
+                    # 2. 가사 입력창
+                    txt_lyric = QtWidgets.QLineEdit(scene.get("lyric", ""))
+                    txt_lyric.setPlaceholderText("가사 없음")
+                    # 스타일: 배경을 살짝 밝게 해서 입력창임을 강조
+                    txt_lyric.setStyleSheet("background-color: #fff; color: #000; border: 1px solid #ccc;")
+                    txt_lyric.setMinimumWidth(400)
+                    lw_layout.addWidget(txt_lyric, 1)  # 1 = 늘어나게 설정
+
+                    # 3. 수정 버튼
+                    btn_lyric_save = QtWidgets.QPushButton("가사수정")
+                    btn_lyric_save.setCursor(Qt.PointingHandCursor)
+                    btn_lyric_save.setFixedWidth(100)
+                    btn_lyric_save.setStyleSheet("background-color: #e1f5fe; color: #0277bd; font-weight: bold;")
+
+                    # 클릭 시 동작
+                    def _update_lyric_click(checked, s=scene, t=txt_lyric):
+                        new_text = t.text().strip()
+                        s["lyric"] = new_text
+                        print(f"[{s.get('id')}] 가사 메모리 업데이트: {new_text}")
+                        # ★ 버튼 누를 때 즉시 파일 저장을 원하면 아래 주석을 푸세요
+                        # save_json(self.json_path, self.full_video_data)
+
+                    btn_lyric_save.clicked.connect(_update_lyric_click)
+                    lw_layout.addWidget(btn_lyric_save)
+
+                    # 4. 기타 정보 (캐릭터, 시간)
+                    info_text = f"| 캐릭터: [{chars_str}] | 시간: {start_f:.2f}~{end_f:.2f}"
+                    lw_layout.addWidget(QtWidgets.QLabel(info_text))
+
+                    # 5. 변수명 매핑 (아래 코드에서 label 변수를 쓰므로, 위젯을 label에 할당)
+                    label = label_widget
 
                     row_container = QtWidgets.QWidget()
                     row_layout = QtWidgets.QHBoxLayout(row_container)
@@ -1526,7 +1568,7 @@ class ScenePromptEditDialog(QtWidgets.QDialog):
                             s["audio_offset"] = float(val)
                         spn_audio_offset.valueChanged.connect(on_offset_changed)
                         btn_trim_music = QtWidgets.QPushButton("음악 자르기")
-                        btn_trim_music.setFixedWidth(80)
+                        btn_trim_music.setFixedWidth(120)
                         btn_trim_music.setToolTip("설정된 오프셋을 적용하여 이 씬의 오디오 파일(wav)을 다시 생성합니다.")
                         def on_click_trim_music(s_id=scene_id, s_data=scene, off_widget=spn_audio_offset):
                             try:
