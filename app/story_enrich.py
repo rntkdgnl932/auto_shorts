@@ -527,6 +527,7 @@ def apply_ai_to_story_v11(
         "2. **prompt_img_base (Visual Description)**: **STRICTLY ENGLISH SENTENCES**.\n"
         "   - **DO NOT** use comma-separated tags. Write a **descriptive, natural English sentence**.\n"
         "   - **[Character Reference Rule]**: The 'characters' field provides 'id:index'.\n"
+        "     * **[EMPTY CHARACTERS]**: If the 'characters' list is empty, **DO NOT** mention any person or character. Describe ONLY the background/scenery.\n"
         "     * ':0' -> MUST be referred to as 'from image 1'\n"
         "     * ':1' -> MUST be referred to as 'from image 2'\n"
         "     * ':2' -> 'from image 3', etc.\n"
@@ -534,10 +535,12 @@ def apply_ai_to_story_v11(
         "     * Infer the character's gender from their ID (e.g. 'female' -> woman, 'male' -> man).\n"
         "     * **Invent specific outfits and actions** based on the scene mood, lyrics, and hint.\n"
         "     * Combine multiple characters into a coherent sentence.\n"
+        "     * If NO characters are listed, describe the atmosphere, lighting, and environment only.\n"
         "   - **[Example Output]**:\n"
         "     * BAD: 'woman, beach, summer, bikini, walking'\n"
         "     * GOOD: 'A woman from image 1, wearing a colorful bikini, is walking along the sunny beach smiling.'\n"
         "     * GOOD: 'A man from image 2 in a black suit is dancing with a woman from image 1 in a red dress under the streetlights.'\n"
+        "     * GOOD (No Character): 'A quiet, sunlit park bench surrounded by falling autumn leaves, bathed in warm golden light.'\n"
         "3. **motion_hint**: ENGLISH ONLY. Camera or action phrases.\n"
         "4. **effect**: ENGLISH ONLY tags.\n"
         "5. **character_styles**: Korean description including gender/age/style.\n"
@@ -2345,12 +2348,12 @@ def fill_prompt_movie_with_ai_shorts(
             - movie_duration
             - prompt_1 ~ prompt_N
             - prompt_1_kor ~ prompt_N_kor
-            - last_state, last_state_kor
     - 세그먼트 규칙:
         * BASE_CHUNK = 81 프레임
         * OVERLAP   = 10 프레임
         * fps = defaults.movie.fps (없으면 30)
     """
+
     defaults = video_data.get("defaults") or {}
     movie_opts = defaults.get("movie") or {}
 
@@ -2359,86 +2362,143 @@ def fill_prompt_movie_with_ai_shorts(
     except Exception:
         fps = 30.0
 
-    # Shopping 스타일 세그먼트 상수
     BASE_CHUNK = 81
     OVERLAP = 10
 
     scenes = video_data.get("scenes") or []
-    _t(trace, "shorts", f"[Shopping Logic] 세그먼트 계산 및 AI 상세화 시작 (FPS: {fps})...")
+
+    _t(trace, "shorts", f"[Shorts] 세그먼트 프롬프트 생성 시작 (FPS:{fps})")
 
     for sc in scenes:
         sid = sc.get("id")
         if not sid:
             continue
 
-        # 시간 계산
+        # ─────────────────────────────────────
+        # 1. 시간 / 세그먼트 계산 (기존 규칙 유지)
+        # ─────────────────────────────────────
         try:
             start_t = float(sc.get("start", 0.0))
-        except Exception:
-            start_t = 0.0
-        try:
             end_t = float(sc.get("end", 0.0))
+            duration = max(0.1, end_t - start_t)
         except Exception:
-            end_t = 0.0
+            duration = 4.0
 
-        if end_t > start_t:
-            duration = end_t - start_t
-        else:
-            try:
-                duration = float(sc.get("duration", 4.0))
-            except Exception:
-                duration = 4.0
-
-        # 프레임/세그먼트 계산
         total_frames = int(math.ceil(duration * fps))
 
         if total_frames <= BASE_CHUNK:
             seg_count = 1
         else:
             step = BASE_CHUNK - OVERLAP
-            needed = total_frames - BASE_CHUNK
-            additional = math.ceil(needed / step)
-            seg_count = 1 + additional
+            seg_count = 1 + math.ceil((total_frames - BASE_CHUNK) / step)
 
-        # 메타 저장
         sc["total_frames"] = total_frames
         sc["seg_count"] = seg_count
         sc["movie_duration"] = duration
 
-        # AI 요청용 기본 프롬프트
-        base_p = sc.get("prompt_img") or sc.get("prompt") or ""
-        base_kor = sc.get("prompt") or ""
+        # ─────────────────────────────────────
+        # 2. 베이스 컨텍스트 수집 (값만 사용)
+        # ─────────────────────────────────────
+        base_prompt_img = (sc.get("prompt_img") or "").strip()
+        base_prompt_kor = (sc.get("prompt") or "").strip()
+        lyric = (sc.get("lyric") or "").strip()
+        characters = sc.get("characters") or []
 
-        sys_msg = (
-            "You are a Video Director. Break down the scene into detailed prompts.\n"
-            "OUTPUT JSON ONLY: "
-            "{\"prompts_en\": [\"...\"], \"prompts_kor\": [\"...\"], "
-            "\"last_state_en\": \"...\", \"last_state_kor\": \"...\"}\n"
-            f"Rules: Create exactly {seg_count} segments. "
-            "'prompts_en' is detailed visual description for each chunk. "
-            "'last_state' is the final frame description."
-        )
+        # gap_n 씬은 베이스 이미지를 항상 문장형으로 재정의
+        is_gap = str(sid).startswith("gap_")
+        if is_gap:
+            if lyric:
+                base_prompt_img = (
+                    "A cinematic transition background that reflects the feeling of the current lyric."
+                )
+            else:
+                base_prompt_img = (
+                    "A cinematic atmospheric transition shot with soft focus and depth."
+                )
+            sc["prompt_img"] = base_prompt_img  # video.json 에도 문장형으로 저장
+
+        # lyric가 있으면 반드시 캐릭터가 존재한다고 간주
+        has_character = bool(characters) or bool(lyric)
+
+        # ─────────────────────────────────────
+        # 3. AI 시스템 프롬프트
+        # ─────────────────────────────────────
+        if has_character:
+            sys_msg = (
+                "You are a video director creating animated segments from a fixed base image.\n"
+                "RULES:\n"
+                "- The character already exists in the base image.\n"
+                "- Do NOT describe appearance, clothes, background, lighting, or style.\n"
+                "- ONLY describe character actions, facial expressions, body movement,\n"
+                "  camera movement, and cinematic effects.\n"
+                "- Refer to the character naturally (e.g. 'the woman', 'the man', 'the character').\n"
+                "- Each prompt must be a complete sentence.\n"
+                "OUTPUT JSON ONLY:\n"
+                "{"
+                "\"prompts_en\":[\"...\"],"
+                "\"prompts_kor\":[\"...\"],"
+                "\"last_state_en\":\"...\","
+                "\"last_state_kor\":\"...\""
+                "}\n"
+                f"Create exactly {seg_count} prompts."
+            )
+        else:
+            sys_msg = (
+                "You are a video director creating animated segments from a fixed base image.\n"
+                "RULES:\n"
+                "- There is NO character or person in the scene.\n"
+                "- Do NOT invent people or human actions.\n"
+                "- ONLY describe environmental motion, atmosphere, light changes,\n"
+                "  camera movement, and cinematic effects.\n"
+                "- Each prompt must be a complete sentence.\n"
+                "OUTPUT JSON ONLY:\n"
+                "{"
+                "\"prompts_en\":[\"...\"],"
+                "\"prompts_kor\":[\"...\"],"
+                "\"last_state_en\":\"...\","
+                "\"last_state_kor\":\"...\""
+                "}\n"
+                f"Create exactly {seg_count} prompts."
+            )
 
         user_msg = json.dumps(
             {
-                "scene": sid,
-                "original": base_p,
-                "original_kor": base_kor,
-                "count": seg_count,
+                "scene_id": sid,
+                "base_image_prompt_en": base_prompt_img,
+                "base_prompt_kor": base_prompt_kor,
+                "lyric_context": lyric,
+                "segment_count": seg_count,
             },
             ensure_ascii=False,
         )
 
+        # ─────────────────────────────────────
+        # 4. AI 호출
+        # ─────────────────────────────────────
         try:
             raw = ask(sys_msg, user_msg)
-        except Exception as e:
-            _t(trace, "warn", f"Scene {sid} AI 호출 실패: {e}")
-            # 폴백: 최소한 prompt_1만 채워준다.
-            sc["prompt_1"] = base_p
-            sc["prompt_1_kor"] = base_kor
+        except Exception:
+            _t(trace, "warn", f"{sid}: AI 호출 실패 → fallback 사용")
+            for i in range(seg_count):
+                if has_character:
+                    sc[f"prompt_{i+1}"] = (
+                        "The character makes a subtle movement as the camera gently shifts."
+                    )
+                    sc[f"prompt_{i+1}_kor"] = (
+                        "인물이 미묘한 움직임을 보이며 카메라가 부드럽게 이동한다."
+                    )
+                else:
+                    sc[f"prompt_{i+1}"] = (
+                        "The camera slowly moves, adding subtle cinematic motion."
+                    )
+                    sc[f"prompt_{i+1}_kor"] = (
+                        "카메라가 천천히 움직이며 미묘한 시네마틱 효과가 더해진다."
+                    )
             continue
 
-        # 응답 파싱
+        # ─────────────────────────────────────
+        # 5. 응답 파싱
+        # ─────────────────────────────────────
         try:
             txt = (raw or "").strip()
             txt = txt.replace("```json", "").replace("```", "")
@@ -2446,12 +2506,24 @@ def fill_prompt_movie_with_ai_shorts(
             e = txt.rfind("}")
             if s == -1 or e == -1:
                 raise ValueError("JSON block not found in response")
-
             parsed = json.loads(txt[s : e + 1])
-        except Exception as e:
-            _t(trace, "warn", f"Scene {sid} JSON 파싱 실패: {e}")
-            sc["prompt_1"] = base_p
-            sc["prompt_1_kor"] = base_kor
+        except Exception:
+            _t(trace, "warn", f"{sid}: JSON 파싱 실패 → fallback 사용")
+            for i in range(seg_count):
+                if has_character:
+                    sc[f"prompt_{i+1}"] = (
+                        "The character makes a subtle movement as the camera gently shifts."
+                    )
+                    sc[f"prompt_{i+1}_kor"] = (
+                        "인물이 미묘한 움직임을 보이며 카메라가 부드럽게 이동한다."
+                    )
+                else:
+                    sc[f"prompt_{i+1}"] = (
+                        "The camera slowly moves, adding subtle cinematic motion."
+                    )
+                    sc[f"prompt_{i+1}_kor"] = (
+                        "카메라가 천천히 움직이며 미묘한 시네마틱 효과가 더해진다."
+                    )
             continue
 
         p_en = parsed.get("prompts_en", [])
@@ -2462,11 +2534,23 @@ def fill_prompt_movie_with_ai_shorts(
         if isinstance(p_kor, str):
             p_kor = [p_kor]
 
-        # 개수 보정
         if not p_en:
-            p_en = [base_p] * seg_count
+            p_en = [
+                (
+                    "The camera slowly moves, adding subtle cinematic motion."
+                    if not has_character
+                    else "The character makes a subtle movement as the camera gently shifts."
+                )
+            ] * seg_count
+
         if not p_kor:
-            p_kor = [base_kor] * seg_count
+            p_kor = [
+                (
+                    "카메라가 천천히 움직이며 미묘한 시네마틱 효과가 더해진다."
+                    if not has_character
+                    else "인물이 미묘한 움직임을 보이며 카메라가 부드럽게 이동한다."
+                )
+            ] * seg_count
 
         while len(p_en) < seg_count:
             p_en.append(p_en[-1])
@@ -2475,15 +2559,17 @@ def fill_prompt_movie_with_ai_shorts(
 
         # ★ Shopping 스타일 필드명(prompt_1, prompt_2...)으로 저장
         for i in range(seg_count):
-            sc[f"prompt_{i + 1}"] = p_en[i]
-            sc[f"prompt_{i + 1}_kor"] = p_kor[i]
-
-        sc["last_state"] = parsed.get("last_state_en", "")
-        sc["last_state_kor"] = parsed.get("last_state_kor", "")
+            sc[f"prompt_{i + 1}"] = p_en[i].strip()
+            sc[f"prompt_{i + 1}_kor"] = p_kor[i].strip()
 
         _t(trace, "shorts", f"Scene {sid}: seg_count={seg_count}, total_frames={total_frames}")
 
-    _t(trace, "shorts", "✅ [Shopping Logic] 적용 완료.")
+    _t(trace, "shorts", "✅ 세그먼트 프롬프트 생성 완료.")
     return video_data
+
+
+
+
+
 
 
