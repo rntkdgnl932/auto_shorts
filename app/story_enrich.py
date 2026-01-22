@@ -32,11 +32,10 @@ def fill_prompt_movie_with_ai_shopping(
         trace: TraceFn | None = None
 ) -> dict:
     """
-    [Step 6] Long-Take Shopping 스타일 (마케팅 구조 + 단일 문장 + 바톤터치):
-    1. FPS를 video.json의 defaults.movie.fps (16)에서 우선적으로 읽음.
-    2. Duration 기반 프레임 계산 -> 세그먼트 개수 산출.
-    3. AI에게 [문제제기(Urgent) -> 해결(Clean) -> 임팩트(Satisfied)] 흐름의 '단일 문장' 요청.
-    4. 결과 저장 시 prompt_1, prompt_1_kor 형태로 평탄화(Flat)하여 저장.
+    [Step 6] Long-Take Shopping 스타일 (완전 동기화 버전):
+    1. 무조건 한글 'prompt'를 원본으로 사용 (기존 prompt_img 무시).
+    2. 인물 키워드가 없으면 캐릭터 정보(앵커)를 물리적으로 차단.
+    3. [NEW] 생성된 클린 프롬프트(seg1)로 기존 'prompt_img'를 강제 덮어쓰기 -> 불일치 해결.
     """
     import math
     import json
@@ -65,12 +64,14 @@ def fill_prompt_movie_with_ai_shopping(
         except:
             pass
 
-    # 캐릭터 정보 수집 (video.json의 meta 혹은 global_context 활용)
-    character_info = story_data.get("meta", {}).get("character_prompt", "")
-    if not character_info:
-        character_info = story_data.get("global_context", {}).get("character_desc", "A professional model")
+    # 원본 캐릭터 정보
+    origin_char_info = story_data.get("meta", {}).get("character_prompt", "")
+    if not origin_char_info:
+        origin_char_info = story_data.get("global_context", {}).get("character_desc", "A professional model")
 
-    # 세그먼트 계산 상수
+    # 인물 감지 키워드
+    PERSON_KEYWORDS = ["앵커", "아나운서", "사람", "여자", "남자", "여성", "남성", "모델", "인물", "얼굴", "표정", "제스처", "바라보", "설명", "말하"]
+
     base_chunk = I2V_CHUNK_BASE_FRAMES
     overlap = I2V_OVERLAP_FRAMES
     pad_tail = I2V_PAD_TAIL_FRAMES
@@ -79,7 +80,7 @@ def fill_prompt_movie_with_ai_shopping(
     if not scenes:
         return story_data
 
-    _t(trace, "info", f"🚀 [AI Long-Take] 쇼핑 마케팅 프롬프트(단일문장) 생성 시작 (FPS: {fps})")
+    _t(trace, "info", f"🚀 [AI Long-Take] 쇼핑 프롬프트 동기화 시작 (FPS: {fps})")
 
     for sc in scenes:
         sid = sc.get("id")
@@ -103,51 +104,54 @@ def fill_prompt_movie_with_ai_shopping(
             additional = math.ceil(needed / step)
             seg_count = 1 + additional
 
-        # 메타데이터 저장
         sc["total_frames"] = total_frames
         sc["seg_count"] = seg_count
         sc["movie_duration"] = duration
 
-        _t(trace, "info", f"   - [{sid}] {duration:.2f}s -> {seg_count} Segments")
+        # 3) 한글 prompt 원본 사용 (prompt_img 무시)
+        korean_prompt = str(sc.get("prompt", "")).strip()
+        if not korean_prompt:
+            korean_prompt = "Product shot"
 
-        # 3) AI 요청 준비
-        base_prompt = sc.get("prompt_img") or sc.get("prompt") or "A cinematic shot"
+        # 4) 인물 키워드 검사 -> Mode 결정
+        has_person = any(kw in korean_prompt for kw in PERSON_KEYWORDS)
+
+        if has_person:
+            current_char_info = origin_char_info
+            subject_mode = "PERSON"
+        else:
+            current_char_info = ""  # 캐릭터 정보 삭제 (앵커 차단)
+            subject_mode = "OBJECT"
+
+        _t(trace, "info", f"   - [{sid}] '{korean_prompt[:10]}...' -> Mode: {subject_mode}")
+
         lyric_context = sc.get("lyric", "")
 
-        # 시스템 프롬프트: 마케팅 구조 + 바톤 터치 + 단일 문장 강조
+        # 시스템 프롬프트
         sys_msg = (
-            "You are an Elite AI Video Director for Commercial Shorts.\n"
-            "Your task is to transform a static scene into a **Dynamic Sales Narrative** (Problem -> Solution -> Impact).\n"
+            "You are an Elite AI Video Director. Transform the Korean 'base_prompt' into a vivid English video description.\n"
             f"Target segments: {seg_count}\n"
             "\n"
-            "STRICT RULES:\n"
-            "1. **Marketing Narrative Logic**:\n"
-            "   - Analyze the 'Lyric/Context'. Is it describing a problem? A solution? A benefit?\n"
-            "   - **Problem Phase**: Visuals should look urgent, chaotic, or stressed. Camera is shaky or zoomed in.\n"
-            "   - **Solution/Product Phase**: Visuals should look clean, bright, and glossy. Smooth camera movement.\n"
-            "   - **Impact Phase**: Show satisfaction, relief, or a wow factor. Dynamic angles.\n"
-            "2. **Single Sentence Format**: Each prompt MUST be a SINGLE, vivid English sentence. NO labels like 'Background:', 'Character:'.\n"
-            "   - BAD: 'Background: Office. Character: Man. Action: Typing.'\n"
-            "   - GOOD: 'A stressed man in a messy office frantically types on his laptop as the camera zooms in on his sweating face.'\n"
-            "3. **Character Consistency**: Seamlessly integrate 'Character Info' (face, outfit) into the sentence naturally.\n"
-            "4. **Baton Touch Flow (Continuity)**:\n"
-            "   - Seg 1: Starts the action based on the marketing phase.\n"
-            "   - Seg 2: Continues EXACTLY from Seg 1's end state (e.g., if he stood up in Seg 1, he is standing in Seg 2).\n"
-            "   - Seg 3: Completes the narrative arc (e.g., from worry to smile).\n"
-            "5. **Dynamic Camera**: Specify camera movement in every sentence (e.g., 'Fast zoom in', 'Slow pan', 'Dutch angle').\n"
+            "RULES:\n"
+            "1. **Source of Truth**: Use the Korean 'base_prompt' as the ONLY guide.\n"
+            "2. **Subject Consistency**:\n"
+            f"   - Detected Mode: **{subject_mode}**\n"
+            "   - If OBJECT mode: DO NOT mention people/anchors. Show ONLY the object/place.\n"
+            "   - If PERSON mode: Integrate 'Character Info'.\n"
+            "3. **Format**: Single descriptive English sentence per segment.\n"
             "\n"
             "OUTPUT JSON ONLY:\n"
             "{\n"
-            "  \"prompts_en\": [\"Single English sentence for seg1...\", \"Single English sentence for seg2...\", ...],\n"
-            "  \"prompts_kor\": [\"세그먼트 1을 위한 한 문장의 한국어 묘사...\", \"세그먼트 2를 위한 한 문장의 한국어 묘사...\", ...]\n"
+            "  \"prompts_en\": [\"Seg1 English...\", \"Seg2 English...\"],\n"
+            "  \"prompts_kor\": [\"Seg1 한글...\", \"Seg2 한글...\"]\n"
             "}"
         )
 
         user_msg = json.dumps({
             "scene_id": sid,
-            "base_prompt": base_prompt,
+            "base_prompt": korean_prompt,
             "lyric_context": lyric_context,
-            "character_info": character_info,
+            "character_info": current_char_info,
             "segment_count_needed": seg_count,
             "duration_sec": duration
         }, ensure_ascii=False)
@@ -173,27 +177,35 @@ def fill_prompt_movie_with_ai_shopping(
                 if isinstance(p_en, str): p_en = [p_en]
                 if isinstance(p_kor, str): p_kor = [p_kor]
 
-                # 개수 맞추기
+                # 부족하면 채우기
                 while len(p_en) < seg_count:
-                    p_en.append(p_en[-1] if p_en else base_prompt)
+                    p_en.append(p_en[-1] if p_en else "Cinematic shot")
                 while len(p_kor) < seg_count:
-                    p_kor.append(p_kor[-1] if p_kor else "")
+                    p_kor.append(p_kor[-1] if p_kor else "영화 같은 샷")
 
-                # 4) 결과 저장 (Flat Key)
+                # 저장
                 for i in range(seg_count):
                     sc[f"prompt_{i + 1}"] = str(p_en[i]).strip()
                     sc[f"prompt_{i + 1}_kor"] = str(p_kor[i]).strip()
+
+                # [★핵심 수정] prompt_img도 첫 번째 세그먼트로 강제 동기화 (앵커 제거)
+                if p_en:
+                    sc["prompt_img"] = str(p_en[0]).strip()
 
             else:
                 raise ValueError("JSON braces not found")
 
         except Exception as e:
-            _t(trace, "warn", f"❌ [{sid}] AI Prompt Error: {e} -> Fallback")
+            _t(trace, "warn", f"❌ [{sid}] AI Prompt Error: {e}")
+            # Fallback
+            fallback_txt = "Cinematic shot of " + korean_prompt
             for i in range(seg_count):
-                sc[f"prompt_{i + 1}"] = base_prompt
-                sc[f"prompt_{i + 1}_kor"] = sc.get("prompt", "")
+                sc[f"prompt_{i + 1}"] = fallback_txt
+                sc[f"prompt_{i + 1}_kor"] = korean_prompt
+            # Fallback 시에도 prompt_img 동기화
+            sc["prompt_img"] = fallback_txt
 
-    _t(trace, "info", "✅ [AI Long-Take] 쇼핑 마케팅 프롬프트 상세화 완료")
+    _t(trace, "info", "✅ [AI Long-Take] 상세화 및 prompt_img 동기화 완료")
     return story_data
 
 
