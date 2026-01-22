@@ -1344,15 +1344,20 @@ def convert_shopping_to_video_json_with_ai(
         width: int = 1080,
         height: int = 1920,
         steps: int = 20,
+        # [추가] UI에서 전달받을 인자들
+        font_path: str = "",
+        title_fontsize: int = 60,
+        sub_fontsize: int = 40,
         on_progress: Optional[Callable[[Dict[str, Any]], None]] = None
 ) -> str:
     """
     [쇼핑->쇼츠 변환 최종판]
     - video_shopping.json -> video.json 구조 변환
-    - [수정] lyric 필드는 'narration' 값을 우선 사용 (subtitle 제외)
-    - [수정] AI 상세화 호출 시 video_data 딕셔너리 직접 전달
+    - [수정] lyric 필드는 'narration' 값을 우선 사용
+    - [수정] UI 설정(글꼴, 크기)을 인자로 받아 video.json에 저장
     """
     import json
+    import datetime
     from pathlib import Path
     from app.story_enrich import fill_prompt_movie_with_ai_shopping
 
@@ -1380,6 +1385,9 @@ def convert_shopping_to_video_json_with_ai(
     prod = src_data.get("product", {})
     project_name = prod.get("product_name") or src_data.get("project_name", "Shopping Project")
 
+    # 캐릭터 정보 추출
+    meta_info = src_data.get("meta", {})
+
     src_scenes = src_data.get("scenes", [])
     if not src_scenes:
         src_scenes = src_data.get("groups", [])
@@ -1389,7 +1397,6 @@ def convert_shopping_to_video_json_with_ai(
     full_lyrics_parts: List[str] = []
 
     for idx, sc in enumerate(src_scenes):
-        # ID 처리
         original_id = str(sc.get("id", "")).strip()
         if original_id:
             scene_id = original_id
@@ -1398,7 +1405,6 @@ def convert_shopping_to_video_json_with_ai(
 
         target_img_name = f"{scene_id}.png"
 
-        # 오디오 경로 처리
         voice_file = sc.get("voice_file") or sc.get("audio_path") or ""
         voice_path_obj = None
         if voice_file:
@@ -1409,7 +1415,6 @@ def convert_shopping_to_video_json_with_ai(
             if not voice_path_obj.exists():
                 voice_path_obj = None
 
-        # Duration (video_shopping.json 값 신뢰)
         try:
             dur = float(sc.get("duration") or sc.get("seconds") or 4.0)
         except Exception:
@@ -1417,8 +1422,6 @@ def convert_shopping_to_video_json_with_ai(
         if dur <= 0:
             dur = 4.0
 
-        # [핵심 수정] lyric은 narration(대사) 우선! (subtitle 제외)
-        # video_shopping.json에 narration이 있으면 그걸 씁니다.
         narration = str(sc.get("narration") or sc.get("narration_text") or sc.get("lyric") or "").strip()
 
         start_t = current_time
@@ -1436,7 +1439,7 @@ def convert_shopping_to_video_json_with_ai(
             "duration": round(dur, 3),
             "img_file": str(imgs_dir / target_img_name),
             "voice_file": str(voice_path_obj) if voice_path_obj else "",
-            "lyric": narration,  # 여기를 narration으로 확정
+            "lyric": narration,
             "prompt": sc.get("prompt", ""),
             "prompt_movie": sc.get("prompt_movie", ""),
             "prompt_img": sc.get("prompt_img", ""),
@@ -1449,16 +1452,40 @@ def convert_shopping_to_video_json_with_ai(
     total_duration = current_time
     full_lyrics = "\n".join(full_lyrics_parts)
 
+    # [중요] 4번 기능: UI에서 받은 값 저장
+    final_ui_prefs = {
+        "font_path": str(font_path).strip(),
+        "title_fontsize": int(title_fontsize) if title_fontsize > 0 else 60,
+        "sub_fontsize": int(sub_fontsize) if sub_fontsize > 0 else 40
+    }
+
+    # 기존 파일이 있다면 UI 설정 병합
+    if dst_json_path.exists():
+        try:
+            with open(dst_json_path, "r", encoding="utf-8") as old_f:
+                old_data = json.load(old_f)
+                old_ui = old_data.get("defaults", {}).get("ui_prefs", {})
+                if old_ui:
+                    # 빈 값이면 기존 값 유지, 값이 있으면 덮어쓰기
+                    if not final_ui_prefs["font_path"] and old_ui.get("font_path"):
+                        final_ui_prefs["font_path"] = old_ui["font_path"]
+                    # 폰트 크기는 UI 값 우선 (이미 위에서 int 변환됨)
+                _log("기존 UI 설정을 병합했습니다.")
+        except Exception:
+            pass
+
     video_data = {
         "title": project_name,
         "duration": round(total_duration, 3),
         "fps": fps,
         "lyrics": full_lyrics,
+        "meta": meta_info,
         "scenes": new_scenes,
         "defaults": {
             "movie": {"fps": fps, "target_fps": fps, "input_fps": fps},
             "image": {"width": width, "height": height, "fps": fps},
-            "generator": {"steps": steps}
+            "generator": {"steps": steps},
+            "ui_prefs": final_ui_prefs  # 저장
         },
         "audit": {
             "source": "shopping_converter_v2",
@@ -1472,7 +1499,7 @@ def convert_shopping_to_video_json_with_ai(
 
     _log(f"video.json 기본 생성 완료 (총 {total_duration:.2f}초)")
 
-    # AI 상세화 (Shopping Prompt)
+    # AI 상세화
     if ai_client:
         _log("AI 상세화 (Long-Take Prompt) 진행...")
         try:
@@ -1482,7 +1509,6 @@ def convert_shopping_to_video_json_with_ai(
             def _trace_wrapper(tag, msg):
                 _log(f"[{tag}] {msg}")
 
-            # [수정] 딕셔너리 전달 & trace 사용
             video_data = fill_prompt_movie_with_ai_shopping(
                 video_data,
                 ask_wrapper,

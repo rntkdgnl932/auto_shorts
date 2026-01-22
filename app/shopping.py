@@ -1721,6 +1721,7 @@ class VideoBuildDialog(QtWidgets.QDialog):
     def on_click_make_video_json(self):
         """
         [시나리오 탭] video.json(쇼츠 호환) 생성 및 AI 상세화 버튼
+        [수정] UI 설정값(글꼴, 크기 등)을 읽어서 변환 함수에 전달하도록 수정함.
         """
         if not self.product_dir or not Path(self.product_dir).exists():
             QtWidgets.QMessageBox.warning(self, "오류", "프로젝트 경로가 유효하지 않습니다.")
@@ -1731,14 +1732,12 @@ class VideoBuildDialog(QtWidgets.QDialog):
             QtWidgets.QMessageBox.warning(self, "알림", "video_shopping.json이 없습니다.\n먼저 '쇼핑데이터생성' 3단계까지 진행해주세요.")
             return
 
-        # UI 설정값 가져오기
+        # UI 설정값 가져오기 (이전 코드에서 읽어만 놓고 안 썼던 부분 수정)
         w, h, fps, steps, font, t_size, n_size = self._get_current_settings()
 
         self._append_log(f"⚙ 설정: {w}x{h}, {fps}fps, {steps}steps, 폰트={font}(T:{t_size}, N:{n_size})")
 
         self.btn_make_video_json.setEnabled(False)
-
-
 
         def job(progress_callback):
             # AI 객체 확보
@@ -1746,13 +1745,17 @@ class VideoBuildDialog(QtWidgets.QDialog):
             if not ai_client:
                 ai_client = AI()
 
+            # [핵심 수정] UI에서 읽은 font, t_size, n_size를 전달
             result = convert_shopping_to_video_json_with_ai(
                 project_dir=self.product_dir,
                 ai_client=ai_client,
                 fps=fps,
                 width=w,
                 height=h,
-                steps=steps,  # [New] steps 전달
+                steps=steps,
+                font_path=font,         # [전달]
+                title_fontsize=t_size,  # [전달]
+                sub_fontsize=n_size,    # [전달]
                 on_progress=progress_callback
             )
             return result

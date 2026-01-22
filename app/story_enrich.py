@@ -32,16 +32,16 @@ def fill_prompt_movie_with_ai_shopping(
         trace: TraceFn | None = None
 ) -> dict:
     """
-    [Step 6] Long-Take Shopping 스타일 (최종 수정판 - 간소화):
+    [Step 6] Long-Take Shopping 스타일 (마케팅 구조 + 단일 문장 + 바톤터치):
     1. FPS를 video.json의 defaults.movie.fps (16)에서 우선적으로 읽음.
-    2. Duration 기반 프레임 계산 -> 세그먼트 개수(seg_count) 산출.
-    3. AI에게 영어/한글 프롬프트를 각각 요청 (last_state 제거).
+    2. Duration 기반 프레임 계산 -> 세그먼트 개수 산출.
+    3. AI에게 [문제제기(Urgent) -> 해결(Clean) -> 임팩트(Satisfied)] 흐름의 '단일 문장' 요청.
     4. 결과 저장 시 prompt_1, prompt_1_kor 형태로 평탄화(Flat)하여 저장.
     """
     import math
     import json
     import re
-    # 상수 임포트 (파일 상단에 없으면 기본값 사용)
+    # 상수 임포트
     try:
         from app.settings import I2V_CHUNK_BASE_FRAMES, I2V_OVERLAP_FRAMES, I2V_PAD_TAIL_FRAMES
     except ImportError:
@@ -49,13 +49,10 @@ def fill_prompt_movie_with_ai_shopping(
         I2V_OVERLAP_FRAMES = 10
         I2V_PAD_TAIL_FRAMES = 20
 
-    # 1. FPS 로드 (defaults.movie.fps 우선)
+    # 1. FPS 로드
     defaults = story_data.get("defaults", {})
     movie_opts = defaults.get("movie", {})
 
-    # 1순위: video.json에 기록된 defaults.movie.fps (예: 16)
-    # 2순위: defaults.ui_prefs.movie_fps
-    # 3순위: 16.0
     fps = 16.0
     if "fps" in movie_opts:
         try:
@@ -68,6 +65,11 @@ def fill_prompt_movie_with_ai_shopping(
         except:
             pass
 
+    # 캐릭터 정보 수집 (video.json의 meta 혹은 global_context 활용)
+    character_info = story_data.get("meta", {}).get("character_prompt", "")
+    if not character_info:
+        character_info = story_data.get("global_context", {}).get("character_desc", "A professional model")
+
     # 세그먼트 계산 상수
     base_chunk = I2V_CHUNK_BASE_FRAMES
     overlap = I2V_OVERLAP_FRAMES
@@ -77,7 +79,7 @@ def fill_prompt_movie_with_ai_shopping(
     if not scenes:
         return story_data
 
-    _t(trace, "info", f"🚀 [AI Long-Take] 프롬프트 상세화 시작 (FPS: {fps}, chunk={base_chunk})")
+    _t(trace, "info", f"🚀 [AI Long-Take] 쇼핑 마케팅 프롬프트(단일문장) 생성 시작 (FPS: {fps})")
 
     for sc in scenes:
         sid = sc.get("id")
@@ -90,7 +92,7 @@ def fill_prompt_movie_with_ai_shopping(
             total_frames = 60
             duration = 4.0
 
-        # 2) 세그먼트 개수(seg_count) 계산
+        # 2) 세그먼트 개수 계산
         step = base_chunk - overlap
         target = total_frames + pad_tail
 
@@ -101,46 +103,60 @@ def fill_prompt_movie_with_ai_shopping(
             additional = math.ceil(needed / step)
             seg_count = 1 + additional
 
-        # 메타데이터 저장 (Flat 구조)
+        # 메타데이터 저장
         sc["total_frames"] = total_frames
         sc["seg_count"] = seg_count
         sc["movie_duration"] = duration
 
-        _t(trace, "info", f"   - [{sid}] {duration:.2f}s ({total_frames}f) -> {seg_count} Segments")
+        _t(trace, "info", f"   - [{sid}] {duration:.2f}s -> {seg_count} Segments")
 
         # 3) AI 요청 준비
         base_prompt = sc.get("prompt_img") or sc.get("prompt") or "A cinematic shot"
+        lyric_context = sc.get("lyric", "")
 
-        # 시스템 프롬프트: last_state 제거됨
+        # 시스템 프롬프트: 마케팅 구조 + 바톤 터치 + 단일 문장 강조
         sys_msg = (
-            "You are an AI Video Sequencer.\n"
-            "Break down the 'base_prompt' into a sequence of video prompts.\n"
+            "You are an Elite AI Video Director for Commercial Shorts.\n"
+            "Your task is to transform a static scene into a **Dynamic Sales Narrative** (Problem -> Solution -> Impact).\n"
             f"Target segments: {seg_count}\n"
             "\n"
-            "RULES:\n"
-            "1. Output exactly {seg_count} prompts in English and Korean.\n"
-            "2. Ensure continuous action flow. Do NOT change character clothing/appearance.\n"
-            "3. 'prompts_en': Detailed visual description for video generation (English).\n"
-            "4. 'prompts_kor': Korean translation/description of the action.\n"
+            "STRICT RULES:\n"
+            "1. **Marketing Narrative Logic**:\n"
+            "   - Analyze the 'Lyric/Context'. Is it describing a problem? A solution? A benefit?\n"
+            "   - **Problem Phase**: Visuals should look urgent, chaotic, or stressed. Camera is shaky or zoomed in.\n"
+            "   - **Solution/Product Phase**: Visuals should look clean, bright, and glossy. Smooth camera movement.\n"
+            "   - **Impact Phase**: Show satisfaction, relief, or a wow factor. Dynamic angles.\n"
+            "2. **Single Sentence Format**: Each prompt MUST be a SINGLE, vivid English sentence. NO labels like 'Background:', 'Character:'.\n"
+            "   - BAD: 'Background: Office. Character: Man. Action: Typing.'\n"
+            "   - GOOD: 'A stressed man in a messy office frantically types on his laptop as the camera zooms in on his sweating face.'\n"
+            "3. **Character Consistency**: Seamlessly integrate 'Character Info' (face, outfit) into the sentence naturally.\n"
+            "4. **Baton Touch Flow (Continuity)**:\n"
+            "   - Seg 1: Starts the action based on the marketing phase.\n"
+            "   - Seg 2: Continues EXACTLY from Seg 1's end state (e.g., if he stood up in Seg 1, he is standing in Seg 2).\n"
+            "   - Seg 3: Completes the narrative arc (e.g., from worry to smile).\n"
+            "5. **Dynamic Camera**: Specify camera movement in every sentence (e.g., 'Fast zoom in', 'Slow pan', 'Dutch angle').\n"
             "\n"
             "OUTPUT JSON ONLY:\n"
             "{\n"
-            "  \"prompts_en\": [\"seg1 en\", \"seg2 en\", ...],\n"
-            "  \"prompts_kor\": [\"seg1 kor\", \"seg2 kor\", ...]\n"
+            "  \"prompts_en\": [\"Single English sentence for seg1...\", \"Single English sentence for seg2...\", ...],\n"
+            "  \"prompts_kor\": [\"세그먼트 1을 위한 한 문장의 한국어 묘사...\", \"세그먼트 2를 위한 한 문장의 한국어 묘사...\", ...]\n"
             "}"
         )
 
         user_msg = json.dumps({
             "scene_id": sid,
             "base_prompt": base_prompt,
-            "segment_count_needed": seg_count
+            "lyric_context": lyric_context,
+            "character_info": character_info,
+            "segment_count_needed": seg_count,
+            "duration_sec": duration
         }, ensure_ascii=False)
 
         try:
             # AI 호출
             raw = ai_ask_func(sys_msg, user_msg)
 
-            # 파싱 (마크다운 제거 등)
+            # 파싱
             text_cleaned = raw.strip()
             if "```" in text_cleaned:
                 text_cleaned = re.sub(r"```json|```", "", text_cleaned).strip()
@@ -154,17 +170,16 @@ def fill_prompt_movie_with_ai_shopping(
                 p_en = parsed.get("prompts_en", [])
                 p_kor = parsed.get("prompts_kor", [])
 
-                # 리스트 타입 보정
                 if isinstance(p_en, str): p_en = [p_en]
                 if isinstance(p_kor, str): p_kor = [p_kor]
 
-                # 개수 맞추기 (부족하면 마지막 항목 복사)
+                # 개수 맞추기
                 while len(p_en) < seg_count:
                     p_en.append(p_en[-1] if p_en else base_prompt)
                 while len(p_kor) < seg_count:
                     p_kor.append(p_kor[-1] if p_kor else "")
 
-                # 4) 결과 저장 (Flat Key: prompt_1, prompt_1_kor ...)
+                # 4) 결과 저장 (Flat Key)
                 for i in range(seg_count):
                     sc[f"prompt_{i + 1}"] = str(p_en[i]).strip()
                     sc[f"prompt_{i + 1}_kor"] = str(p_kor[i]).strip()
@@ -174,12 +189,11 @@ def fill_prompt_movie_with_ai_shopping(
 
         except Exception as e:
             _t(trace, "warn", f"❌ [{sid}] AI Prompt Error: {e} -> Fallback")
-            # Fallback: 기본 프롬프트 복제
             for i in range(seg_count):
                 sc[f"prompt_{i + 1}"] = base_prompt
                 sc[f"prompt_{i + 1}_kor"] = sc.get("prompt", "")
 
-    _t(trace, "info", "✅ [AI Long-Take] 프롬프트 상세화 완료")
+    _t(trace, "info", "✅ [AI Long-Take] 쇼핑 마케팅 프롬프트 상세화 완료")
     return story_data
 
 
