@@ -87,7 +87,7 @@ JSONS_DIR.mkdir(parents=True, exist_ok=True)
 ACE_STEP_PROMPT_JSON: Path = JSONS_DIR / "ace_step_1_t2mm.json"  # 음악 생성 프롬프트 JSON
 # I2V_WORKFLOW:         Path = JSONS_DIR / "guff_movie.json"         # i2v 워크플로 JSON
 I2V_WORKFLOW:         Path = JSONS_DIR / "No.48.WAN2.2-LightX2V-I2V.json"
-
+WF_LIPSYNC = JSONS_DIR / "wanvideo_I2V_InfiniteTalk_song.json"
 
 # 음악생성 대기시간 등
 _DEFAULT_ACE_WAIT_TIMEOUT_SEC = 900.0   # 15분

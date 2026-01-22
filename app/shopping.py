@@ -11,6 +11,7 @@ from pathlib import Path
 from PyQt5 import QtWidgets, QtCore, QtGui
 from typing import List
 from app import settings
+from app.utils import AI
 
 from app.utils import (
     run_job_with_progress_async,
@@ -30,9 +31,8 @@ from app.shopping_video_build import convert_shopping_to_video_json_with_ai
 from app.video_build import build_shots_with_i2v_long
 from app.shopping_video_build import (
     ShoppingVideoJsonBuilder,
-    ShoppingImageGenerator,
+    # ShoppingImageGenerator,
     ShoppingMovieGenerator,
-    ShoppingShortsPipeline,
     BuildOptions,
     generate_tts_zonos as _tts_generate_zonos,
     _get_zonos_config as _zonos_get_config,
@@ -67,7 +67,7 @@ class SceneEditDialog(QtWidgets.QDialog):
 
         # 번역용 AI (prompt_img_*_kor -> EN)
         try:
-            from app.utils import AI
+
             self._ai = AI()
         except Exception:
             self._ai = None
@@ -905,19 +905,15 @@ class FinalEditDialog(QtWidgets.QDialog):
 
     def _lazy_ai(self):
         if self._ai is None:
-            from app.utils import AI
             self._ai = AI()
         return self._ai
 
     def _read_json(self):
-        import json
-        from pathlib import Path
+
         p = Path(self.video_json_path)
         return json.loads(p.read_text(encoding="utf-8"))
 
     def _write_json(self, data):
-        import json
-        from pathlib import Path
         p = Path(self.video_json_path)
         p.write_text(json.dumps(data, indent=2, ensure_ascii=False), encoding="utf-8")
 
@@ -1748,7 +1744,6 @@ class VideoBuildDialog(QtWidgets.QDialog):
             # AI 객체 확보
             ai_client = getattr(self, "ai", None)
             if not ai_client:
-                from app.utils import AI
                 ai_client = AI()
 
             result = convert_shopping_to_video_json_with_ai(
@@ -1770,7 +1765,7 @@ class VideoBuildDialog(QtWidgets.QDialog):
             else:
                 QtWidgets.QMessageBox.critical(self, "실패", f"작업 실패:\n{err}")
 
-        from app.utils import run_job_with_progress_async
+
         run_job_with_progress_async(
             owner=self,
             title="video.json 생성 및 AI 상세화",
@@ -1782,8 +1777,6 @@ class VideoBuildDialog(QtWidgets.QDialog):
         """
         5단계: 최종안 수정 (video.json의 prompt_1_kor/prompt_2_kor... 편집 + 한글→영어 반영)
         """
-        from pathlib import Path
-        from PyQt5 import QtWidgets
 
         if not Path(self.target_video_json).exists():
             QtWidgets.QMessageBox.warning(self, "알림", "video.json이 없습니다.\n'4. 비디오 JSON 생성'을 먼저 진행해주세요.")
@@ -1811,8 +1804,6 @@ class VideoBuildDialog(QtWidgets.QDialog):
             progress(f"[Image] (SHOP) 2-Step 이미지 생성 시작 ({w}x{h}, steps={steps})")
             progress(f"[Image][DBG] video_shopping_json={self.video_json_path}")
 
-            from app.utils import load_json
-            from pathlib import Path
 
             # ✅ 제품 이미지 경로 계산: product_dir / product.image_file
             prod_path = None
@@ -1828,7 +1819,6 @@ class VideoBuildDialog(QtWidgets.QDialog):
 
             progress(f"[Image][DBG] product_image_path={prod_path}")
 
-            from app.shopping_video_build import build_shopping_images_2step
 
             build_shopping_images_2step(
                 video_json_path=self.video_json_path,  # ✅ video_shopping.json 사용

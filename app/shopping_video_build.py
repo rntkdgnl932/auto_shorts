@@ -27,49 +27,12 @@ from app.utils import (
 
 )
 from app import settings
-from app.video_build import build_shots_with_i2v, concatenate_scene_clips, concatenate_scene_clips_final_av
+from app.video_build import build_shots_with_i2v, concatenate_scene_clips_final_av
 from app.video_build import build_step1_zimage_base, build_step2_qwen_composite
 from app.story_enrich import fill_prompt_movie_with_ai_shopping
 def _now_str() -> str:
     return datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
 
-
-# -----------------------------------------------------------------------------
-# [New] ComfyUI 제출 및 대기 함수 (독립형)
-# -----------------------------------------------------------------------------
-# def _submit_and_wait_local(
-#         base_url: str,
-#         graph: dict,
-#         timeout: int = 900,
-#         poll: float = 2.0,
-#         on_progress: Optional[Callable[[Dict[str, Any]], None]] = None
-# ) -> dict:
-#     """ComfyUI 워크플로우 제출 및 대기"""
-#     client_id = str(uuid.uuid4())
-#     payload = {"prompt": graph, "client_id": client_id}
-#
-#     try:
-#         resp = requests.post(f"{base_url}/prompt", json=payload, timeout=30)
-#         resp.raise_for_status()
-#         prompt_id = resp.json().get("prompt_id")
-#     except Exception as e:
-#         raise RuntimeError(f"ComfyUI 제출 실패: {e}")
-#
-#     start_t = time.time()
-#     while True:
-#         elapsed = time.time() - start_t
-#         if elapsed > timeout:
-#             raise TimeoutError(f"ComfyUI 시간 초과 ({elapsed:.1f}s)")
-#
-#         try:
-#             h_resp = requests.get(f"{base_url}/history/{prompt_id}", timeout=10)
-#             if h_resp.status_code == 200:
-#                 h_data = h_resp.json()
-#                 if prompt_id in h_data:
-#                     return h_data[prompt_id]
-#         except Exception:
-#             pass
-#         time.sleep(poll)
 
 
 # -----------------------------------------------------------------------------
@@ -913,57 +876,57 @@ class ShoppingVideoJsonBuilder:
 # -----------------------------------------------------------------------------
 # 5. 이미지 생성기
 # -----------------------------------------------------------------------------
-class ShoppingImageGenerator:
-    def __init__(self, on_progress: Optional[Callable[[str], None]] = None):
-        self.on_progress = on_progress or (lambda msg: None)
-
-    def generate_images(self, video_json_path: str | Path, skip_if_exists: bool = True) -> None:
-
-
-        def _cb(d):
-            self.on_progress(d.get("msg", ""))
-
-        vpath = Path(video_json_path).resolve()
-        proj_dir = vpath.parent
-
-        # 1. 해상도 가져오기 (기본값 안전장치 포함)
-        img_size = settings.DEFAULT_IMG_SIZE
-        width_val = img_size[0]
-        height_val = img_size[1]
-
-        # 2. 스텝 수 가져오기
-        steps_val = settings.DEFAULT_T2I_STEPS
-
-        # 3. 제품 이미지 경로 계산 (shopping.py on_gen_images_clicked와 동일 로직)
-        prod_path: str | None = None
-        try:
-            doc = load_json(vpath, {}) or {}
-            product = doc.get("product") or {}
-            img_file = (product.get("image_file") or "").strip()
-            if img_file:
-                cand = (proj_dir / img_file).resolve()
-                if cand.exists():
-                    prod_path = str(cand)
-        except Exception:
-            prod_path = None
-
-        self.on_progress(f"[Image][DBG] product_image_path={prod_path}")
-
-        # 4. 2-Step 이미지 생성 (제품 이미지를 image2로 강제 주입)
-        try:
-            build_shopping_images_2step(
-                video_json_path=vpath,
-                source_json_path=vpath,
-                product_image_path=prod_path,
-                ui_width=width_val,
-                ui_height=height_val,
-                steps=steps_val,
-                skip_if_exists=skip_if_exists,
-                on_progress=_cb,
-            )
-        except Exception as e:
-            self.on_progress(f"❌ 이미지 생성 오류: {e}")
-            raise e
+# class ShoppingImageGenerator:
+#     def __init__(self, on_progress: Optional[Callable[[str], None]] = None):
+#         self.on_progress = on_progress or (lambda msg: None)
+#
+#     def generate_images(self, video_json_path: str | Path, skip_if_exists: bool = True) -> None:
+#
+#
+#         def _cb(d):
+#             self.on_progress(d.get("msg", ""))
+#
+#         vpath = Path(video_json_path).resolve()
+#         proj_dir = vpath.parent
+#
+#         # 1. 해상도 가져오기 (기본값 안전장치 포함)
+#         img_size = settings.DEFAULT_IMG_SIZE
+#         width_val = img_size[0]
+#         height_val = img_size[1]
+#
+#         # 2. 스텝 수 가져오기
+#         steps_val = settings.DEFAULT_T2I_STEPS
+#
+#         # 3. 제품 이미지 경로 계산 (shopping.py on_gen_images_clicked와 동일 로직)
+#         prod_path: str | None = None
+#         try:
+#             doc = load_json(vpath, {}) or {}
+#             product = doc.get("product") or {}
+#             img_file = (product.get("image_file") or "").strip()
+#             if img_file:
+#                 cand = (proj_dir / img_file).resolve()
+#                 if cand.exists():
+#                     prod_path = str(cand)
+#         except Exception:
+#             prod_path = None
+#
+#         self.on_progress(f"[Image][DBG] product_image_path={prod_path}")
+#
+#         # 4. 2-Step 이미지 생성 (제품 이미지를 image2로 강제 주입)
+#         try:
+#             build_shopping_images_2step(
+#                 video_json_path=vpath,
+#                 source_json_path=vpath,
+#                 product_image_path=prod_path,
+#                 ui_width=width_val,
+#                 ui_height=height_val,
+#                 steps=steps_val,
+#                 skip_if_exists=skip_if_exists,
+#                 on_progress=_cb,
+#             )
+#         except Exception as e:
+#             self.on_progress(f"❌ 이미지 생성 오류: {e}")
+#             raise e
 
 
 # -----------------------------------------------------------------------------
@@ -1334,44 +1297,44 @@ class ShoppingMovieGenerator:
 # -----------------------------------------------------------------------------
 # 7. 파이프라인
 # -----------------------------------------------------------------------------
-class ShoppingShortsPipeline:
-    def __init__(self, on_progress: Optional[Callable[[str], None]] = None):
-        self.on_progress = on_progress or (lambda msg: None)
-
-    def run_all(
-            self,
-            product_dir: str | Path,
-            product_data: Dict[str, Any],
-            options: Optional[BuildOptions] = None,
-            build_json: bool = True,
-            build_images: bool = True,
-            build_movies: bool = True,
-            merge: bool = True,
-            skip_if_exists: bool = True,
-    ) -> Path:
-        options = options or BuildOptions()
-        vpath = Path(product_dir) / "video_shopping.json"
-
-        builder = ShoppingVideoJsonBuilder(self.on_progress)
-
-        if build_json:
-            if not vpath.exists():
-                vpath = builder.create_draft(product_dir, product_data, options)
-            builder.enrich_video_json(vpath, product_data)
-
-        if build_images:
-            img_gen = ShoppingImageGenerator(self.on_progress)
-            img_gen.generate_images(vpath, skip_if_exists)
-
-        if build_movies:
-            mov_gen = ShoppingMovieGenerator(self.on_progress)
-            mov_gen.generate_movies(vpath, skip_if_exists, fps=options.fps)
-
-        if merge:
-            mov_gen = ShoppingMovieGenerator(self.on_progress)
-            mov_gen.merge_movies(vpath)
-
-        return vpath
+# class ShoppingShortsPipeline:
+#     def __init__(self, on_progress: Optional[Callable[[str], None]] = None):
+#         self.on_progress = on_progress or (lambda msg: None)
+#
+#     def run_all(
+#             self,
+#             product_dir: str | Path,
+#             product_data: Dict[str, Any],
+#             options: Optional[BuildOptions] = None,
+#             build_json: bool = True,
+#             build_images: bool = True,
+#             build_movies: bool = True,
+#             merge: bool = True,
+#             skip_if_exists: bool = True,
+#     ) -> Path:
+#         options = options or BuildOptions()
+#         vpath = Path(product_dir) / "video_shopping.json"
+#
+#         builder = ShoppingVideoJsonBuilder(self.on_progress)
+#
+#         if build_json:
+#             if not vpath.exists():
+#                 vpath = builder.create_draft(product_dir, product_data, options)
+#             builder.enrich_video_json(vpath, product_data)
+#
+#         if build_images:
+#             img_gen = ShoppingImageGenerator(self.on_progress)
+#             img_gen.generate_images(vpath, skip_if_exists)
+#
+#         if build_movies:
+#             mov_gen = ShoppingMovieGenerator(self.on_progress)
+#             mov_gen.generate_movies(vpath, skip_if_exists, fps=options.fps)
+#
+#         if merge:
+#             mov_gen = ShoppingMovieGenerator(self.on_progress)
+#             mov_gen.merge_movies(vpath)
+#
+#         return vpath
 
 # video_shopping_build.json 에서 음성길이가 각 0.5초 추가된 것을 그대로 가져옴 (sc["seconds"] = round(final_dur + 0.5, 2)) 이 부분임.
 def convert_shopping_to_video_json_with_ai(
@@ -1385,12 +1348,13 @@ def convert_shopping_to_video_json_with_ai(
 ) -> str:
     """
     [쇼핑->쇼츠 변환 최종판]
-    - 원본(video_shopping.json)의 ID(t_001) 계승
-    - UI 설정값(fps, width, height, steps) 저장 (해상도 문제 해결)
-    - [중요 변경] 여기서는 오디오 길이를 "재측정"하지 않는다.
-      -> video_shopping.json에 이미 기록된 duration/seconds를 그대로 사용한다.
-    - fill_prompt_movie_with_ai_long 호출 (가변 프레임 상세화 / prompt_1~ 생성)
+    - video_shopping.json -> video.json 구조 변환
+    - [수정] lyric 필드는 'narration' 값을 우선 사용 (subtitle 제외)
+    - [수정] AI 상세화 호출 시 video_data 딕셔너리 직접 전달
     """
+    import json
+    from pathlib import Path
+    from app.story_enrich import fill_prompt_movie_with_ai_shopping
 
     def _log(msg: str):
         if on_progress:
@@ -1425,6 +1389,7 @@ def convert_shopping_to_video_json_with_ai(
     full_lyrics_parts: List[str] = []
 
     for idx, sc in enumerate(src_scenes):
+        # ID 처리
         original_id = str(sc.get("id", "")).strip()
         if original_id:
             scene_id = original_id
@@ -1433,7 +1398,7 @@ def convert_shopping_to_video_json_with_ai(
 
         target_img_name = f"{scene_id}.png"
 
-        # 1) 오디오 경로는 유지(저장만). 길이(dur)는 재측정하지 않음.
+        # 오디오 경로 처리
         voice_file = sc.get("voice_file") or sc.get("audio_path") or ""
         voice_path_obj = None
         if voice_file:
@@ -1444,9 +1409,7 @@ def convert_shopping_to_video_json_with_ai(
             if not voice_path_obj.exists():
                 voice_path_obj = None
 
-        # 2) duration 결정: video_shopping.json 값을 그대로 신뢰
-        #    - enrich에서 실제 측정값을 duration에 넣었다면 duration 우선
-        #    - 없으면 seconds 사용
+        # Duration (video_shopping.json 값 신뢰)
         try:
             dur = float(sc.get("duration") or sc.get("seconds") or 4.0)
         except Exception:
@@ -1454,12 +1417,16 @@ def convert_shopping_to_video_json_with_ai(
         if dur <= 0:
             dur = 4.0
 
+        # [핵심 수정] lyric은 narration(대사) 우선! (subtitle 제외)
+        # video_shopping.json에 narration이 있으면 그걸 씁니다.
+        narration = str(sc.get("narration") or sc.get("narration_text") or sc.get("lyric") or "").strip()
+
         start_t = current_time
         end_t = current_time + dur
         current_time = end_t
 
-        narration = str(sc.get("lyric") or sc.get("subtitle") or sc.get("narration") or sc.get("narration_text") or "")
-        full_lyrics_parts.append(narration)
+        if narration:
+            full_lyrics_parts.append(narration)
 
         new_scene = {
             "id": scene_id,
@@ -1469,7 +1436,7 @@ def convert_shopping_to_video_json_with_ai(
             "duration": round(dur, 3),
             "img_file": str(imgs_dir / target_img_name),
             "voice_file": str(voice_path_obj) if voice_path_obj else "",
-            "lyric": narration,
+            "lyric": narration,  # 여기를 narration으로 확정
             "prompt": sc.get("prompt", ""),
             "prompt_movie": sc.get("prompt_movie", ""),
             "prompt_img": sc.get("prompt_img", ""),
@@ -1482,7 +1449,6 @@ def convert_shopping_to_video_json_with_ai(
     total_duration = current_time
     full_lyrics = "\n".join(full_lyrics_parts)
 
-    # Defaults에 UI 설정값 강제 적용
     video_data = {
         "title": project_name,
         "duration": round(total_duration, 3),
@@ -1500,25 +1466,38 @@ def convert_shopping_to_video_json_with_ai(
         }
     }
 
+    # 1차 저장
     with open(dst_json_path, "w", encoding="utf-8") as f:
         json.dump(video_data, f, indent=2, ensure_ascii=False)
 
-    _log(f"video.json 저장 완료 (ID: {new_scenes[0]['id'] if new_scenes else 'N/A'} 등, 총 길이: {total_duration:.2f}초)")
-    _log("AI 상세화 (Long Take) 진행.")
+    _log(f"video.json 기본 생성 완료 (총 {total_duration:.2f}초)")
 
+    # AI 상세화 (Shopping Prompt)
     if ai_client:
+        _log("AI 상세화 (Long-Take Prompt) 진행...")
         try:
             def ask_wrapper(sys_msg, user_msg):
                 return ai_client.ask_smart(sys_msg, user_msg, prefer="openai")
 
-            fill_prompt_movie_with_ai_shopping(
-                str(dst_json_path.parent),
+            def _trace_wrapper(tag, msg):
+                _log(f"[{tag}] {msg}")
+
+            # [수정] 딕셔너리 전달 & trace 사용
+            video_data = fill_prompt_movie_with_ai_shopping(
+                video_data,
                 ask_wrapper,
-                log_fn=_log
+                trace=_trace_wrapper
             )
-            _log("✅ AI 상세화(Segments/Prompts) 완료.")
+
+            # AI 결과 반영 후 재저장
+            with open(dst_json_path, "w", encoding="utf-8") as f:
+                json.dump(video_data, f, indent=2, ensure_ascii=False)
+
+            _log("✅ AI 상세화 완료.")
         except Exception as e:
             _log(f"❌ AI 상세화 실패: {e}")
+            import traceback
+            traceback.print_exc()
 
     return str(dst_json_path)
 

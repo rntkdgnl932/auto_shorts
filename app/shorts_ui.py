@@ -27,35 +27,29 @@ import sys
 import faulthandler
 import datetime
 from app.story_enrich import fill_prompt_movie_with_ai_shorts
-from app.utils import normalize_tags_to_english, save_story_overwrite_with_prompts, _normalize_maked_title_root, sanitize_title
+from app.utils import normalize_tags_to_english, _normalize_maked_title_root, sanitize_title
 from app.utils import AI
 from app.utils import load_json as _lj, save_json as _sj
 from app.utils import run_job_with_progress_async as run_async_imp
 from app.utils import run_job_with_progress_async
-from app.utils import load_json, save_json, sanitize_title as sanitize_title_fn
-from app.video_build import build_and_merge_full_video, add_subtitles_with_ffmpeg, xfade_concat, concatenate_scene_clips
+from app.utils import load_json, save_json
+from app.video_build import build_and_merge_full_video, add_subtitles_with_ffmpeg
 from app.video_build import build_shots_with_i2v as build_func_imp, build_shots_with_i2v_long
-from app.video_build import retry_cut_audio_for_scene, build_missing_images_from_story, build_video_json_with_gap_policy
 
 from PyQt5.QtCore import Qt
 from PyQt5.QtWidgets import QPlainTextEdit, QTextEdit, QFontComboBox
 
 from app.audio_sync import generate_music_with_acestep, sync_lyrics_with_whisper_pro # build_story_json
-from app.utils import _submit_and_wait as _submit_and_wait_comfy
 from app.shorts_json_edit import ScenePromptEditDialog
 import re
 _CANON_RE = re.compile(r"[^a-z0-9]+")
 
 
-import app.settings as _settings
 
 from app.settings import BASIC_VOCAL_TAGS, FFPROBE_EXE, BASE_DIR, CHARACTER_DIR, COMFY_HOST, JSONS_DIR, COMFY_INPUT_DIR, FFMPEG_EXE, _DEFAULT_ACE_WAIT_TIMEOUT_SEC, _DEFAULT_ACE_POLL_INTERVAL_SEC
 from app.lyrics_gen import create_project_files, normalize_sections, generate_title_lyrics_tags
 from json import loads, dumps
-from app.story_enrich import apply_ai_to_story_v11
-import subprocess
-import requests
-import functools
+from app.story_enrich import apply_ai_to_story_v11, build_video_json_with_gap_policy
 from PyQt5 import QtGui
 
 import random  # ★ 랜덤 시드
@@ -1729,12 +1723,18 @@ class MainWindow(QtWidgets.QMainWindow):
     # real_use
     def on_click_segments_missing_images_with_log(self) -> None:
         """
-        세그먼트 이미지 생성 (2511 워크플로우 기반)
-        - image1 = imgs/{sid}.png
-        - image2~5 = 비활성
-        - prompt_i 사용
-        - 결과: imgs/_segments/{sid}_segXX.png
+        [수정본] 세그먼트 이미지 생성 (로그 최적화 버전)
+        - 스킵 시: "⏭️ ... 이미 존재 (Skip)" 로그 출력
+        - 대기 시: 0초, 30초, 60초... 간격으로만 로그 출력 (매초 출력 X)
+        - 완료 시: "✅ ... 완료!" 로그 출력
         """
+        import shutil
+        import requests
+        import time
+        import json
+        from pathlib import Path
+        from app.utils import load_json, run_job_with_progress_async
+        from app.settings import COMFY_HOST, JSONS_DIR, COMFY_INPUT_DIR
 
         btn = getattr(self, "btn_segments_img", None)
         if btn:
@@ -1769,18 +1769,43 @@ class MainWindow(QtWidgets.QMainWindow):
             return
 
         def job(progress_cb):
+            def _log(msg):
+                try:
+                    progress_cb({"msg": msg})
+                except:
+                    pass
+
             vdoc = load_json(video_path)
             scenes = vdoc.get("scenes", [])
             created = 0
+            timeout_per_image = 600
 
-            for sc in scenes:
+            # 1. 출력 노드 찾기
+            save_node_id = None
+            is_preview = False
+            for nid, node in wf_template.items():
+                if node.get("class_type") == "SaveImage":
+                    save_node_id = nid
+                    break
+            if not save_node_id:
+                for nid, node in wf_template.items():
+                    if node.get("class_type") == "PreviewImage":
+                        save_node_id = nid
+                        is_preview = True
+                        break
+            if not save_node_id:
+                raise ValueError("워크플로우에서 'SaveImage' 또는 'PreviewImage' 노드를 찾을 수 없습니다.")
+
+            for s_idx, sc in enumerate(scenes):
                 sid = sc.get("id")
                 seg_count = int(sc.get("seg_count", 0))
+
                 if not sid or seg_count <= 0:
                     continue
 
                 base_img = Path(sc.get("img_file", ""))
                 if not base_img.exists():
+                    _log(f"⚠️ [{sid}] 베이스 이미지 없음 (Skip)")
                     continue
 
                 # image1 준비
@@ -1788,44 +1813,86 @@ class MainWindow(QtWidgets.QMainWindow):
                 shutil.copy2(base_img, comfy_input / base_name)
 
                 for i in range(1, seg_count + 1):
-                    prompt = sc.get(f"prompt_{i}", "")
-                    if not prompt:
+                    prompt_text = sc.get(f"prompt_{i}", "")
+                    if not prompt_text:
                         continue
 
                     out_path = segments_dir / f"{sid}_seg{i:02d}.png"
+
+                    # [변경 1] 이미 존재 시 스킵 로그 명시
                     if out_path.exists():
+                        _log(f"⏭️ [{sid}] Seg {i} 이미 존재 (Skip)")
                         continue
 
+                    # 워크플로우 구성
                     wf = json.loads(json.dumps(wf_template))
-
-                    # image1
-                    wf["9"]["inputs"]["image"] = base_name  # base image node
-                    # image2~5 강제 blank
+                    if "9" in wf: wf["9"]["inputs"]["image"] = base_name
                     for nid in ["32", "33", "34", "35"]:
-                        if nid in wf:
-                            wf[nid]["inputs"]["image"] = "blank.png"
+                        if nid in wf: wf[nid]["inputs"]["image"] = "blank.png"
+                    if "88" in wf: wf["88"]["inputs"]["value"] = prompt_text
+                    if "107" in wf: wf["107"]["inputs"]["steps"] = ui_steps
+                    if is_preview:
+                        wf[save_node_id]["class_type"] = "SaveImage"
+                    wf[save_node_id]["inputs"]["filename_prefix"] = f"_segments/{sid}_seg{i:02d}"
 
-                    # prompt
-                    wf["88"]["inputs"]["value"] = prompt
-                    wf["107"]["inputs"]["steps"] = ui_steps
-                    wf["SaveImage"]["inputs"]["filename_prefix"] = f"_segments/{sid}_seg{i:02d}"
+                    _log(f"🚀 [{sid}] Seg {i}/{seg_count} 요청 중...")
 
-                    result = _submit_and_wait_comfy(COMFY_HOST, wf, timeout=600)
+                    try:
+                        p_data = {"prompt": wf}
+                        resp = requests.post(f"{COMFY_HOST}/prompt", json=p_data)
+                        if resp.status_code != 200:
+                            _log(f"❌ [{sid}] Seg {i} 요청 실패: {resp.text}")
+                            continue
 
-                    for out in result.get("outputs", {}).values():
-                        for img in out.get("images", []):
-                            r = requests.get(
-                                f"{COMFY_HOST}/view",
-                                params=img,
-                                timeout=30,
-                            )
-                            if r.status_code == 200:
-                                with open(out_path, "wb") as f:
-                                    f.write(r.content)
-                                created += 1
+                        prompt_id = resp.json().get("prompt_id")
+                        start_time = time.time()
+                        next_report_time = 0  # 30초 단위 로그를 위한 카운터
+
+                        while True:
+                            elapsed = time.time() - start_time
+
+                            if elapsed > timeout_per_image:
+                                _log(f"⏰ [{sid}] Seg {i} 대기 시간 초과! ({timeout_per_image}s)")
                                 break
 
-            return f"세그먼트 이미지 {created}개 생성 완료"
+                                # [변경 2] 30초마다 로그 출력 (0초, 30초, 60초...)
+                            if elapsed >= next_report_time:
+                                _log(f"⏳ [{sid}] Seg {i} 생성 중... ({int(elapsed)}s / {timeout_per_image}s)")
+                                next_report_time += 30
+
+                            h_resp = requests.get(f"{COMFY_HOST}/history/{prompt_id}")
+                            if h_resp.status_code == 200:
+                                h_data = h_resp.json()
+                                if prompt_id in h_data:
+                                    outputs = h_data[prompt_id].get("outputs", {})
+                                    output_found = False
+
+                                    for node_out in outputs.values():
+                                        if "images" in node_out:
+                                            for img_info in node_out["images"]:
+                                                fname = img_info.get("filename")
+                                                if fname:
+                                                    r = requests.get(f"{COMFY_HOST}/view", params=img_info, timeout=30)
+                                                    if r.status_code == 200:
+                                                        with open(out_path, "wb") as f:
+                                                            f.write(r.content)
+                                                        created += 1
+                                                        output_found = True
+                                                        # [변경 3] 완료 로그 (유지)
+                                                        _log(f"✅ [{sid}] Seg {i} 완료! ({elapsed:.1f}s)")
+                                                        break
+                                        if output_found: break
+
+                                    if output_found:
+                                        break
+
+                            time.sleep(1.0)
+
+                    except Exception as e:
+                        _log(f"❌ [{sid}] Seg {i} 에러: {e}")
+                        continue
+
+            return f"작업 완료: 총 {created}개 세그먼트 이미지 생성됨."
 
         def done(ok, res, err):
             if btn:

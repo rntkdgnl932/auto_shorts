@@ -6,10 +6,11 @@ from pathlib import Path as _Path
 import os
 from PIL import Image
 import uuid
+import subprocess
 from app import settings
 # ── 유연 임포트 ─────────────────────────────────────────────────────────────
-from app.utils import ensure_dir, load_json, get_duration, _ffmpeg_escape_drawtext, SubtitleComposer, SubtitleStyle
-from app.settings import BASE_DIR, I2V_WORKFLOW, FFMPEG_EXE, USE_HWACCEL, FINAL_OUT, COMFY_HOST
+from app.utils import ensure_dir, get_duration, SubtitleComposer
+from app.settings import FFMPEG_EXE, COMFY_HOST
 # music_gen에 있는 견고한 함수들을 우선 재사용 (가능할 때)
 from app.utils import _submit_and_wait as _submit_and_wait_comfy_func
 try:
@@ -20,20 +21,16 @@ try:
 except Exception:  # 단독 실행/상대 경로일 수도 있으니 폴백 제공
     _http_get_audio = None
     _load_workflow_graph_audio = None
-import math
 import json as json_mod
 import time
 import random
-from typing import Dict, List, Tuple, Optional, Any, Callable, Union, SupportsFloat, SupportsIndex
-from textwrap import dedent
+from typing import Dict, List, Tuple, Optional, Any, Callable
 import re
 import json
 
 from app.utils import (
     load_json as _load_json_func,
     ensure_dir as _ensure_dir_func,
-    _ffmpeg_escape_filter_path,
-    split_subtitle_two_lines
 )
 
 from app.settings import JSONS_DIR
@@ -42,82 +39,33 @@ from pathlib import Path
 
 
 import json as _json_loader
-
-import json as _json
-import random as _random
-import time as _time
-import urllib.parse as _urlparse
-import uuid as _uuid
-from pathlib import Path as _P
 import requests
 import shutil
 
 import random as _img_seed_random
 from app import settings as settings_obj
 
-from app.settings import CHARACTER_DIR, COMFY_INPUT_DIR, I2V_CHUNK_BASE_FRAMES, I2V_OVERLAP_FRAMES, I2V_PAD_TAIL_FRAMES
+from app.settings import CHARACTER_DIR, COMFY_INPUT_DIR, I2V_CHUNK_BASE_FRAMES, I2V_OVERLAP_FRAMES, I2V_PAD_TAIL_FRAMES, WF_LIPSYNC
 
-from app.utils import load_json, save_json, resolve_windows_fontfile
+from app.utils import load_json, save_json
 
 
-WF_T2I    = JSONS_DIR / "nunchaku_t2i.json"
-WF_SWAP_1 = JSONS_DIR / "nunchaku-t2i_swap_1.json"
-WF_SWAP_2 = JSONS_DIR / "nunchaku-t2i_swap_2.json"
-WF_SWAP_3 = JSONS_DIR / "nunchaku-t2i_swap_3.json"  # 3명은 옵션
-WF_LIPSYNC = JSONS_DIR / "wanvideo_I2V_InfiniteTalk_song.json"
 
 CHUNK_BASE_FRAMES = I2V_CHUNK_BASE_FRAMES
 OVERLAP_FRAMES = I2V_OVERLAP_FRAMES
 PAD_TAIL_FRAMES = I2V_PAD_TAIL_FRAMES
 
 # ── 공용 HTTP 유틸 ──────────────────────────────────────────────────────────
-_KOR_KEEP = re.compile(r"[^가-힣ㄱ-ㅎㅏ-ㅣ .,!?~…·\-_/]+")
-
-
-def _slice_audio_segment(
-        src_audio: Path,
-        start_sec: float,
-        end_sec: float,
-        out_audio: Path,
-        ffmpeg_exe: str
-) -> bool:
-    """
-    [정확도 모드] ffmpeg Output Seeking 사용
-    - -i (입력)를 먼저 두고 -ss (시작 시간)를 나중에 둡니다.
-    - 속도는 아주 조금 느려지지만, 밀림 현상 없이 정확한 시간을 잘라냅니다.
-    """
-    duration = max(0.1, end_sec - start_sec)
-
-    cmd = [
-        ffmpeg_exe, "-y",
-        "-i", str(src_audio),  # [변경 1] 입력 파일을 먼저 부르고
-        "-ss", f"{start_sec:.6f}",  # [변경 2] 그 다음에 시간을 찾습니다 (정밀 탐색)
-        "-t", f"{duration:.6f}",
-        "-c:a", "pcm_s16le",  # WAV 표준 코덱
-        "-vn",
-        str(out_audio)
-    ]
-
-    try:
-        subprocess.run(
-            cmd,
-            check=True,
-            stdout=subprocess.PIPE,
-            stderr=subprocess.STDOUT,
-            encoding="utf-8",
-            errors="ignore"
-        )
-        return out_audio.exists() and out_audio.stat().st_size > 0
-    except Exception as e:
-        print(f"[AudioSlice] 실패: {e}")
-        return False
 
 
 
 
 
 
-import subprocess
+
+
+
+
 
 
 # real_use
@@ -2578,8 +2526,8 @@ def xfade_concat(
         )
         if proc_probe.returncode == 0:
             try:
-                parsed = _json.loads(proc_probe.stdout)
-            except _json.JSONDecodeError:
+                parsed = _json_loader.loads(proc_probe.stdout)
+            except _json_loader.JSONDecodeError:
                 probe_map["ffprobe_out"] = proc_probe.stdout
             else:
                 vstreams = [s for s in parsed.get("streams", []) if s.get("codec_type") == "video"]
@@ -4496,277 +4444,9 @@ def sort_faces_right_to_left(face_boxes: List[Tuple[float, float, float, float]]
 #================페이스 스왑 관련=============##================페이스 스왑 관련=============##================페이스 스왑 관련=============#
 
 
-def _cleanup_punctuation(text: str) -> str:
-    """불필요한 공백/중복 점('. .') 제거, 문장 끝 공백 정리."""
-    t = (text or "").strip()
-    # ". ." → "."
-    t = re.sub(r"\s*\.\s*\.", ".", t)
-    # "  " → " "
-    t = re.sub(r"\s{2,}", " ", t)
-    # " ." → "."
-    t = re.sub(r"\s+\.", ".", t)
-    return t.strip()
-
-def build_video_json_with_gap_policy(
-    project_dir: str,
-    *,
-    small_gap_sec: float = 2.0,
-    filler_section: str = "bridge",
-    filler_label: str = "Gap",
-    filler_scene: str = "bridge",
-) -> str:
-    """
-    story.json을 읽어 공백 구간을 보정해 video.json을 생성한다.
-
-    규칙:
-    - gap < small_gap_sec: 이전 씬을 다음 씬 시작까지 '연장'(새 씬 추가 없음)
-    - gap ≥ small_gap_sec: 공백을 갭 씬으로 '삽입'
-    - 시작/끝 공백에도 동일 규칙 적용
-
-    요구사항:
-    - 갭 씬은 일반 씬과 동일 스키마를 갖되, 프롬프트는 비워서 AI가 전부 구성하도록 맡긴다.
-    - 갭 씬 ID는 3자리로 통일: gap_###, 그리고 바로 앞 t_### 번호를 따른다(예: t_007 뒤 gap_007).
-    """
-
-    proj_path = Path(project_dir)
-    story_path = proj_path / "story.json"
-    if not story_path.exists():
-        raise FileNotFoundError(f"story.json 파일을 찾을 수 없습니다: {story_path}")
-
-    story_doc = load_json(story_path, {}) or {}
-    if not isinstance(story_doc, dict):
-        raise TypeError("story.json 형식 오류(dict 아님)")
-
-    scenes_in = list(story_doc.get("scenes") or [])
-    if not scenes_in:
-        raise ValueError("story.json에 scenes가 없습니다.")
-
-    defaults = story_doc.get("defaults") or {}
-    default_img = defaults.get("image") or {}
-    default_negative = str(default_img.get("negative") or "")
-
-    imgs_dir = proj_path / "imgs"
-    try:
-        imgs_dir.mkdir(parents=True, exist_ok=True)
-    except OSError:
-        pass
-
-    # ✅ 타입체커가 허용하는 입력 타입으로 정확히 명시
-    def _as_float(v: str | bytes | bytearray | SupportsFloat | SupportsIndex | None) -> float:
-        if v is None:
-            return 0.0
-        try:
-            return float(v)
-        except (TypeError, ValueError):
-            return 0.0
-
-    # 시간 정렬 및 정규화
-    tmp_scenes: list[dict] = []
-    for it in scenes_in:
-        if not isinstance(it, dict):
-            continue
-        s = _as_float(it.get("start"))
-        e = _as_float(it.get("end"))
-        if e < s:
-            e = s
-        item = dict(it)
-        item["start"] = s
-        item["end"] = e
-        item["duration"] = round(max(0.0, e - s), 3)
-        tmp_scenes.append(item)
-    tmp_scenes.sort(key=lambda x: float(x.get("start", 0.0)))
-
-    total_duration = _as_float(story_doc.get("duration"))
-    if total_duration <= 0.0 and tmp_scenes:
-        total_duration = float(tmp_scenes[-1].get("end", 0.0))
-    offset_val = _as_float(story_doc.get("offset"))
-
-    out_scenes: list[dict] = []
-
-    # 직전 t_### 번호를 기억 → gap은 같은 번호 사용
-    last_t_num = 0
-    rx_tnum = re.compile(r"^t_(\d{3})$")
-
-    def _copy_scene_for_video(src: dict) -> dict:
-        nonlocal last_t_num
-        sc_id = str(src.get("id") or "")
-        m = rx_tnum.match(sc_id)
-        if m:
-            try:
-                last_t_num = int(m.group(1))
-            except ValueError:
-                last_t_num = last_t_num
-        return {
-            "id": src.get("id"),
-            "section": src.get("section"),
-            "label": src.get("label"),
-            "start": float(src.get("start", 0.0) or 0.0),
-            "end": float(src.get("end", 0.0) or 0.0),
-            "duration": round(max(0.0, float(src.get("end", 0.0) or 0.0) - float(src.get("start", 0.0) or 0.0)), 3),
-            "scene": src.get("scene"),
-            "characters": list(src.get("characters") or []),
-            "effect": list(src.get("effect") or []),
-            "screen_transition": bool(src.get("screen_transition", False)),
-            "img_file": str(src.get("img_file") or ""),
-            "prompt": str(src.get("prompt") or ""),
-            "prompt_img": str(src.get("prompt_img") or ""),
-            "prompt_movie": str(src.get("prompt_movie") or ""),
-            "prompt_negative": str(src.get("prompt_negative") or default_negative),
-            "lyric": str(src.get("lyric") or ""),
-        }
-
-    def _mk_gap(start: float, end: float) -> dict:
-        sc_id = f"gap_{last_t_num:03d}"  # 직전 t_### 번호를 따른다. 시작부면 000
-        return {
-            "id": sc_id,
-            "section": filler_section,
-            "label": filler_label,
-            "start": round(start, 3),
-            "end": round(end, 3),
-            "duration": round(max(0.0, end - start), 3),
-            "scene": filler_scene,
-            "characters": [],
-            "effect": ["dissolve"],
-            "screen_transition": True,
-            "img_file": str((imgs_dir / f"{sc_id}.png").resolve()),
-            "prompt": "",
-            "prompt_img": "",
-            "prompt_movie": "",
-            "prompt_negative": "",
-            "lyric": "",
-            "origin": "gap-fill",
-        }
-
-    # 시작부 공백
-    if tmp_scenes:
-        first_id = str(tmp_scenes[0].get("id") or "")
-        m0 = rx_tnum.match(first_id)
-        if m0:
-            try:
-                last_t_num = int(m0.group(1)) - 1  # 첫 씬 앞 갭은 gap_(첫t-1) → gap_000부터 가능
-            except ValueError:
-                last_t_num = 0
-        else:
-            last_t_num = 0
-
-        first_start = float(tmp_scenes[0].get("start", 0.0))
-        head_gap = round(max(0.0, first_start - offset_val), 3)
-        if head_gap > 0.0:
-            if head_gap < small_gap_sec:
-                sc0 = _copy_scene_for_video(tmp_scenes[0])
-                sc0["start"] = offset_val
-                sc0["duration"] = round(max(0.0, sc0["end"] - sc0["start"]), 3)
-                out_scenes.append(sc0)
-            else:
-                out_scenes.append(_mk_gap(offset_val, first_start))
-                out_scenes.append(_copy_scene_for_video(tmp_scenes[0]))
-        else:
-            out_scenes.append(_copy_scene_for_video(tmp_scenes[0]))
-
-    # 본문 공백
-    for i in range(len(tmp_scenes) - 1):
-        cur = tmp_scenes[i]
-        nxt = tmp_scenes[i + 1]
-        cur_end = float(cur.get("end", 0.0))
-        nxt_start = float(nxt.get("start", 0.0))
-        gap = round(max(0.0, nxt_start - cur_end), 3)
-
-        if gap <= 0.0:
-            out_scenes.append(_copy_scene_for_video(nxt))
-            continue
-
-        if gap < small_gap_sec:
-            last = out_scenes[-1]
-            last["end"] = nxt_start
-            last["duration"] = round(max(0.0, last["end"] - last["start"]), 3)
-            out_scenes.append(_copy_scene_for_video(nxt))
-        else:
-            out_scenes.append(_mk_gap(cur_end, nxt_start))
-            out_scenes.append(_copy_scene_for_video(nxt))
-
-    # 끝부분 공백
-    if tmp_scenes:
-        last_end = float(tmp_scenes[-1].get("end", 0.0))
-        if total_duration > 0.0:
-            tail_gap = round(max(0.0, total_duration - last_end), 3)
-            if tail_gap > 0.0:
-                if tail_gap < small_gap_sec:
-                    if out_scenes:
-                        out_scenes[-1]["end"] = total_duration
-                        out_scenes[-1]["duration"] = round(max(0.0, out_scenes[-1]["end"] - out_scenes[-1]["start"]), 3)
-                else:
-                    out_scenes.append(_mk_gap(last_end, total_duration))
-
-    video_obj = dict(story_doc)
-    video_obj["scenes"] = out_scenes
-    video_obj.setdefault("audit", {})
-    video_obj["audit"]["gap_policy"] = {
-        "applied": True,
-        "small_gap_sec": float(small_gap_sec),
-        "source": str(story_path),
-        "id_width": 3,
-        "note": "gaps inserted empty so AI can fully author them; gap id follows previous t id",
-    }
-
-    video_path = story_path.parent / "video.json"
-    save_json(video_path, video_obj)
-    return str(video_path)
 
 
 
 
-
-
-def retry_cut_audio_for_scene(project_dir: str, scene_id: str, offset: float) -> str:
-    """
-    [UI 요청] 특정 씬의 오디오를 오프셋(싱크 조절)을 적용하여 다시 자릅니다.
-    - offset > 0 : 오디오 시작 지점을 뒤로 밈 (늦게 시작)
-    - offset < 0 : 오디오 시작 지점을 앞으로 당김 (일찍 시작)
-    """
-    p_dir = Path(project_dir)
-
-    # 1. 원본 오디오(vocal) 찾기
-    src_audio = p_dir / "vocal.wav"
-    if not src_audio.exists():
-        src_audio = p_dir / "vocal.mp3"
-        if not src_audio.exists():
-            raise FileNotFoundError(f"프로젝트 폴더에 vocal.wav 또는 vocal.mp3가 없습니다: {p_dir}")
-
-    # 2. video.json에서 씬 정보 읽기
-    video_json_path = p_dir / "video.json"
-    video_data = load_json(video_json_path, {}) or {}
-    scenes = video_data.get("scenes", [])
-
-    target_scene = next((s for s in scenes if s.get("id") == scene_id), None)
-    if not target_scene:
-        raise ValueError(f"video.json에서 씬 ID '{scene_id}'를 찾을 수 없습니다.")
-
-    # 3. 시간 계산 (Start/End + Offset)
-    orig_start = float(target_scene.get("start", 0.0))
-    orig_end = float(target_scene.get("end", 0.0))
-
-    # ★ 싱크 적용 로직
-    new_start = max(0.0, orig_start + offset)  # 0초보다 작아질 수 없음
-    new_end = max(new_start + 0.1, orig_end + offset)  # 최소 길이 보장
-
-    # 4. 저장 경로 (clips/씬ID/song.wav)
-    scene_dir = p_dir / "clips" / scene_id
-    scene_dir.mkdir(parents=True, exist_ok=True)
-    out_audio = scene_dir / "song.wav"
-
-    # 5. 자르기 실행 (_slice_audio_segment 재사용)
-    # ffmpeg_exe는 전역 설정에서 가져옴
-    success = _slice_audio_segment(
-        src_audio=src_audio,
-        start_sec=new_start,
-        end_sec=new_end,
-        out_audio=out_audio,
-        ffmpeg_exe=FFMPEG_EXE
-    )
-
-    if not success:
-        raise RuntimeError(f"FFmpeg 오디오 자르기 실패 (Scene: {scene_id})")
-
-    return str(out_audio)
 
 

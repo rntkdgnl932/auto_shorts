@@ -7,7 +7,7 @@ import ctypes
 # -----------------------------
 # 공통: 에러 메시지 박스 헬퍼
 # -----------------------------
-def show_error_box(msg: str, title: str = "Error") -> None:
+def show_error_box(msg_err: str, title: str = "Error") -> None:
     """
     PyInstaller EXE / 콘솔 유무에 상관없이
     윈도우 메시지 박스로 에러 내용을 표시하는 헬퍼.
@@ -26,11 +26,11 @@ def show_error_box(msg: str, title: str = "Error") -> None:
         user32.MessageBoxW.restype = ctypes.c_int
 
         MB_OK = 0x00000000
-        user32.MessageBoxW(None, msg, title, MB_OK)
-    except Exception as e:
+        user32.MessageBoxW(None, msg_err, title, MB_OK)
+    except Exception as ee:
         # MessageBoxW 자체가 실패한 경우: 최소한 stderr로라도 남기기
-        print("MessageBoxW 호출 실패:", e, file=sys.stderr)
-        print(msg, file=sys.stderr)
+        print("MessageBoxW 호출 실패:", ee, file=sys.stderr)
+        print(msg_err, file=sys.stderr)
 
 
 # 1. 실행 위치 기준 잡기
