@@ -464,23 +464,17 @@ class MainWindow(QtWidgets.QMainWindow):
 
     def _on_auto_tags_toggled(self, _state: int) -> None:
         """
-        자동태그 체크박스 토글 시, 수동 태그 체크박스의 활성/비활성만 즉시 반영한다.
-        - 체크 상태나 저장 로직은 변경하지 않는다.
-        - _init_tag_sync에서 chk_auto_tags/cb_auto_tags를 동일 객체로 통일함.
-        """
-        auto_on = False
-        auto_chk = getattr(self, "chk_auto_tags", None)  # ← 통일된 핸들 사용
-        if auto_chk is not None and hasattr(auto_chk, "isChecked"):
-            try:
-                auto_on = bool(auto_chk.isChecked())
-            except Exception:
-                auto_on = False
+        자동/수동 태그 체크박스 토글 시 UI 반영.
 
+        현재 버전에서는 하위 태그 체크박스는 항상 사용 가능하게 두고,
+        체크 여부는 저장/생성 로직에서만 사용한다.
+        """
         tag_boxes = getattr(self, "_tag_boxes", None)
         if isinstance(tag_boxes, dict):
             for _label, tag_box in tag_boxes.items():
                 try:
-                    tag_box.setEnabled(not auto_on)
+                    # ★ 항상 활성화
+                    tag_box.setEnabled(True)
                 except Exception:
                     pass
 
@@ -574,7 +568,8 @@ class MainWindow(QtWidgets.QMainWindow):
                 try:
                     tag_box_local.blockSignals(True)
                     tag_box_local.setChecked(should_mark_local)
-                    tag_box_local.setEnabled(False if auto_enabled else True)
+                    # ★ 기본값 적용 시에도 항상 활성화
+                    tag_box_local.setEnabled(True)
                     tag_box_local.blockSignals(False)
                 except Exception:
                     pass
@@ -646,7 +641,8 @@ class MainWindow(QtWidgets.QMainWindow):
             try:
                 tag_box.blockSignals(True)
                 tag_box.setChecked(should_mark)
-                tag_box.setEnabled(False if auto_on_state else True)
+                # ★ 프로젝트 json 기반 동기화 시에도 항상 활성화
+                tag_box.setEnabled(True)
                 tag_box.blockSignals(False)
             except Exception:
                 pass
@@ -1388,18 +1384,12 @@ class MainWindow(QtWidgets.QMainWindow):
             except Exception:
                 pass
 
-            auto_on = False
-            auto_chk = getattr(self, "chk_auto_tags", None)
-            if auto_chk is not None and hasattr(auto_chk, "isChecked"):
-                try:
-                    auto_on = bool(auto_chk.isChecked())
-                except Exception:
-                    auto_on = False
+            # 가사 생성 이후에는 항상 수동 태그 편집 가능
             tag_boxes = getattr(self, "_tag_boxes", None)
             if isinstance(tag_boxes, dict):
                 for _label, box in tag_boxes.items():
                     try:
-                        box.setEnabled(not auto_on)
+                        box.setEnabled(True)
                     except Exception:
                         pass
 
@@ -2054,20 +2044,15 @@ class MainWindow(QtWidgets.QMainWindow):
                 except (AttributeError, RuntimeError):
                     pass
 
-                auto_on = False
-                auto_chk = getattr(self, "chk_auto_tags", None)
-                if auto_chk is not None and hasattr(auto_chk, "isChecked"):
-                    try:
-                        auto_on = bool(auto_chk.isChecked())
-                    except (AttributeError, RuntimeError, ValueError):
-                        auto_on = False
+                # 음악 생성 이후에도 항상 수동 태그 편집 가능
                 tag_boxes = getattr(self, "_tag_boxes", None)
                 if isinstance(tag_boxes, dict):
                     for _label, box in tag_boxes.items():
                         try:
-                            box.setEnabled(not auto_on)
+                            box.setEnabled(True)
                         except (AttributeError, RuntimeError):
                             pass
+
             self._music_inflight = False
 
         try:

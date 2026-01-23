@@ -106,8 +106,9 @@ class AllMain(QtWidgets.QMainWindow):
 def main():
     app = QtWidgets.QApplication(sys.argv)
 
-    # ✅ 다크 테마 적용 (여기!)
+    # ✅ 다크 테마 + 체크박스/트리 UI 개선
     app.setStyleSheet("""
+    /* 기본 위젯 공통 */
     QWidget {
         background-color: #121212;
         color: #E0E0E0;
@@ -161,11 +162,102 @@ def main():
     QLabel {
         background: transparent;
     }
+
+    /* ─────────────────────────
+       1) 체크박스(Shorts 탭) 가시성 강화
+       ───────────────────────── */
+    QCheckBox {
+        spacing: 6px;
+        color: #E0E0E0;
+    }
+
+    QCheckBox:checked {
+        font-weight: 600;
+        color: #ffffff;
+    }
+
+    QCheckBox::indicator {
+        width: 16px;
+        height: 16px;
+        border-radius: 3px;
+        border: 1px solid #888888;
+        background: #1f1f1f;
+    }
+
+    QCheckBox::indicator:unchecked {
+        background: #1f1f1f;
+        border: 1px solid #555555;
+    }
+
+    QCheckBox::indicator:checked {
+        background: #00c853;          /* 선명한 초록 체크박스 */
+        border: 1px solid #00e676;
+    }
+
+    QCheckBox::indicator:disabled {
+        background: #333333;
+        border: 1px solid #555555;
+    }
+
+    /* ─────────────────────────
+       2) 트리/리스트 (Shopping 탭 리스트)
+       ───────────────────────── */
+    QTreeWidget, QTreeView, QListWidget {
+        background-color: #101010;
+        alternate-background-color: #181818;
+        color: #E0E0E0;
+        border: 1px solid #333333;
+    }
+
+    QTreeWidget::item, QTreeView::item, QListWidget::item {
+        padding: 2px 6px;
+    }
+
+    /* 선택됐을 때(체크된 항목 포함) 색 강조 */
+    QTreeWidget::item:selected,
+    QTreeView::item:selected,
+    QListWidget::item:selected {
+        background-color: #2962ff;     /* 진한 파란색 선택 배경 */
+        color: #ffffff;
+    }
+
+    QTreeWidget::item:selected:inactive,
+    QTreeView::item:selected:inactive,
+    QListWidget::item:selected:inactive {
+        background-color: #29434e;
+    }
+
+    /* 헤더 (혹시 사용 중일 경우) */
+    QHeaderView::section {
+        background-color: #1f1f1f;
+        color: #E0E0E0;
+        padding: 4px;
+        border: 1px solid #303030;
+    }
+
+    /* ─────────────────────────
+       3) GroupBox 테두리/타이틀 가독성
+       ───────────────────────── */
+    QGroupBox {
+        border: 1px solid #333333;
+        margin-top: 12px;
+        padding-top: 16px;
+        border-radius: 4px;
+    }
+
+    QGroupBox::title {
+        subcontrol-origin: margin;
+        left: 10px;
+        padding: 0 4px;
+        color: #b0bec5;
+        background-color: #121212;
+    }
     """)
 
     win = AllMain()
     win.show()
     sys.exit(app.exec_())
+
 
 
 
