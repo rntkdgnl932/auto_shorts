@@ -359,7 +359,7 @@ class MainWindow(QtWidgets.QMainWindow):
         self._music_worker: Optional[MusicWorker] = None
 
         self.setWindowTitle("쇼츠 자동화 — 허브")
-        self.resize(1100, 800)
+        self.resize(1100, 900)
         self._signals_wired = False
         self._build_ui()
         self._wire()
@@ -2795,43 +2795,46 @@ class MainWindow(QtWidgets.QMainWindow):
         self.grp_len = QtWidgets.QGroupBox("곡 길이")
 
         self.rb_20s = QtWidgets.QRadioButton("30초(테스트)")  # ★ 추가
-        self.rb_1m = QtWidgets.QRadioButton("1분")
-        self.rb_2m = QtWidgets.QRadioButton("2분")
-        self.rb_3m = QtWidgets.QRadioButton("3분")
-        self.rb_2m.setChecked(True)
-        g = QtWidgets.QButtonGroup(self)
-        g.setExclusive(True)
-        for b in (self.rb_20s, self.rb_1m, self.rb_2m, self.rb_3m):
-            g.addButton(b)
-        l_lay = QtWidgets.QHBoxLayout(self.grp_len)
-        l_lay.addWidget(self.rb_20s)
-        l_lay.addWidget(self.rb_1m)
-        l_lay.addWidget(self.rb_2m)
-        l_lay.addWidget(self.rb_3m)
-        self._add_direct_len_controls_to_grp_len()
-        l_lay.addStretch(1)
+        self.rb_30s = QtWidgets.QRadioButton("40초")
+        self.rb_45s = QtWidgets.QRadioButton("45초(추천)")
+        self.rb_60s = QtWidgets.QRadioButton("60초(구간 반복)")
+        self.rb_20s.setChecked(True)
 
+        len_layout = QtWidgets.QHBoxLayout(self.grp_len)
+        len_layout.addWidget(self.rb_20s)
+        len_layout.addWidget(self.rb_30s)
+        len_layout.addWidget(self.rb_45s)
+        len_layout.addWidget(self.rb_60s)
+        len_layout.addStretch(1)
 
+        self.bg_len = QtWidgets.QButtonGroup(self)
+        for w in (self.rb_20s, self.rb_30s, self.rb_45s, self.rb_60s):
+            self.bg_len.addButton(w)
 
-        # 프롬프트
-        self.te_prompt = QtWidgets.QTextEdit()
-        self.te_prompt.setPlaceholderText("무드/키워드 입력")
-        prompt_grp = self._group("프롬프트", self.te_prompt)
-
-        # ▼▼ 추가: 형제 그룹 2개(긍정/부정)
-        self.te_prompt_pos = QtWidgets.QTextEdit()
-        # self.te_prompt_pos.setPlainText("ace-step tag 추천해줘 : \n")
-        prompt_grp_pos = self._group("긍정 프롬프트(+)", self.te_prompt_pos)
-
-        self.te_prompt_neg = QtWidgets.QTextEdit()
-        prompt_grp_neg = self._group("부정 프롬프트(-)", self.te_prompt_neg)
-
-        # 자동 태그 토글
+        # 자동 태그 체크박스 (사이드바로 이동할 예정)
         self.cb_auto_tags = QtWidgets.QCheckBox("태그 자동(가사 분위기 기반 추천)")
         self.cb_auto_tags.setChecked(True)
-        self.cb_auto_tags.toggled.connect(self._on_auto_toggle)
 
-        # ai select 토글
+        # 프롬프트 그룹
+        prompt_grp = QtWidgets.QGroupBox("프롬프트(공통)")
+        p_layout = QtWidgets.QVBoxLayout(prompt_grp)
+        self.te_prompt = QtWidgets.QPlainTextEdit()
+        self.te_prompt.setPlaceholderText("음악 전체 분위기/스타일 설명")
+        p_layout.addWidget(self.te_prompt)
+
+        prompt_grp_pos = QtWidgets.QGroupBox("추가 프롬프트(+)")
+        ppos_layout = QtWidgets.QVBoxLayout(prompt_grp_pos)
+        self.te_prompt_pos = QtWidgets.QPlainTextEdit()
+        self.te_prompt_pos.setPlaceholderText("추가로 강조할 요소들(+, 가산)")
+        ppos_layout.addWidget(self.te_prompt_pos)
+
+        prompt_grp_neg = QtWidgets.QGroupBox("제외 프롬프트(-)")
+        pneg_layout = QtWidgets.QVBoxLayout(prompt_grp_neg)
+        self.te_prompt_neg = QtWidgets.QPlainTextEdit()
+        self.te_prompt_neg.setPlaceholderText("제외/피하고 싶은 요소들(-, 감산)")
+        pneg_layout.addWidget(self.te_prompt_neg)
+
+        # AI 토글 버튼
         self.btn_ai_toggle = QtWidgets.QToolButton(self)
         self.btn_ai_toggle.setCheckable(True)
         self.btn_ai_toggle.toggled.connect(self.on_ai_toggle)
@@ -2841,10 +2844,8 @@ class MainWindow(QtWidgets.QMainWindow):
 
         # 표시/툴팁을 기본 상태에 맞춰 즉시 동기화
         try:
-            # on_ai_toggle(bool)이 버튼 텍스트/툴팁을 갱신한다면, 현재 상태로 한 번 호출
             self.on_ai_toggle(self.btn_ai_toggle.isChecked())
         except Exception:
-            # on_ai_toggle이 표시를 안 바꾼다면 안전하게 기본 표기를 직접 지정
             self.btn_ai_toggle.setText("모드: Gemini만")
             self.btn_ai_toggle.setToolTip("클릭: GPT 우선(부족 시 Gemini 폴백) / 다시 클릭: Gemini만 사용")
 
@@ -2863,17 +2864,19 @@ class MainWindow(QtWidgets.QMainWindow):
         vgrid.addWidget(self.rb_vocal_male,   0, 1)
         vgrid.addWidget(self.rb_vocal_mixed,  0, 2)
 
-        # Basic Vocal 묶음
+        # Basic Vocal 태그
         self.grp_basic_vocal = QtWidgets.QGroupBox("Basic Vocal")
-        basic_cont, basic_cbs = self._build_checks_grid(BASIC_VOCAL_TAGS, columns=4)
-        self.cb_basic_vocal_list = basic_cbs
+        bnames = [
+            "clean vocals", "natural articulation", "warm emotional tone",
+            "studio reverb light", "clear diction", "breath control", "balanced mixing",
+        ]
+        basic_cont, self.cb_basic_vocal = self._build_checks_grid(bnames, columns=3)
         blay = QtWidgets.QVBoxLayout(self.grp_basic_vocal)
         blay.addWidget(basic_cont)
         self._make_group_collapsible(self.grp_basic_vocal, is_expanded=False)
 
         # 수동 태그(Style/Scene/Instrument/Tempo)
         style_list = ["electronic","rock","pop","funk","soul","cyberpunk","acid jazz","edm","soft electric drums","melodic"]
-
         scene_list = ["background music for parties","radio broadcasts","workout playlists"]
         instr_list = ["saxophone","jazz","piano","violin","acoustic guitar","electric bass"]
         tempo_list = ["110 bpm","fast tempo","slow tempo","loops","fills"]
@@ -2901,16 +2904,12 @@ class MainWindow(QtWidgets.QMainWindow):
         # 상단 배치(제목/가사/태그)
         top = QtWidgets.QVBoxLayout()
         top.addWidget(self._group("제목", self.le_title))
-        top.addWidget(self._build_lyrics_group_three_columns(), 1)  # ← 가사 그룹 교체
+        top.addWidget(self._build_lyrics_group_three_columns(), 1)
 
-
-
-
-        # --- ▼▼▼ [신규] "huge" 체크박스 생성 (그룹박스 제거) ▼▼▼ ---
+        # huge 옵션 체크박스
         self.chk_huge_breasts = QtWidgets.QCheckBox("huge breasts")
-        self.chk_huge_breasts.setChecked(False)  # 기본값 False (체크 해제)
+        self.chk_huge_breasts.setChecked(False)
         self.chk_huge_breasts.setToolTip("체크 시 여성 캐릭터 프롬프트에 'huge breasts'를 강제로 추가합니다.")
-        # --- ▲▲▲ [신규] 생성 끝 ▲▲▲ ---
 
         opts = QtWidgets.QHBoxLayout()
         opts.addStretch(1)
@@ -2922,144 +2921,138 @@ class MainWindow(QtWidgets.QMainWindow):
         self.btn_save = QtWidgets.QPushButton("프로젝트 저장")
         self.btn_load_proj = QtWidgets.QPushButton("프로젝트 불러오기")
         self.btn_music = QtWidgets.QPushButton("음악생성(ACE-Step)")
-        # self.btn_show_progress = QtWidgets.QPushButton("테스트")  # (생성하지만 레이아웃에 추가 안 함)
         self.btn_video = QtWidgets.QPushButton("영상생성(i2v)")
         self.btn_analyze = QtWidgets.QPushButton("음악분석")
-
         self.btn_test1_story = QtWidgets.QPushButton("프로젝트분석")
-        self.btn_json_edit = QtWidgets.QPushButton("제이슨수정")  # <-- [신규] 버튼 생성
+        self.btn_json_edit = QtWidgets.QPushButton("제이슨수정")
         self.btn_merging_videos = QtWidgets.QPushButton("영상합치기")
         self.btn_lyrics_in = QtWidgets.QPushButton("가사넣기")
         self.btn_missing_img = QtWidgets.QPushButton("누락 이미지 생성")
 
-        # --- ▼▼▼ [이 코드 추가] ▼▼▼ ---
         self.btn_segments_img = QtWidgets.QPushButton("세그먼트 이미지 생성")
-        self.btn_segments_img.setToolTip("2단계: video.json의 frame_segments 프롬프트로 Qwen I2I를 실행해 키프레임 이미지들을 생성합니다.")
-        # --- ▲▲▲ [추가 끝] ▲▲▲ ---
+        self.btn_segments_img.setToolTip("2단계: video.json의 frame_segments 프롬프트로 Qwen I2I를 실행해 키프레임 이미지를 생성합니다.")
 
-        # --- ▼▼▼ 신규 매크로 버튼 생성 ▼▼▼ ---
         self.btn_macro_analyze = QtWidgets.QPushButton("분석")
         self.btn_macro_analyze.setToolTip("음악분석 -> 프로젝트분석을 순차적으로 실행합니다.")
         self.btn_macro_build_video = QtWidgets.QPushButton("영상만들기")
         self.btn_macro_build_video.setToolTip("영상생성(i2v) -> 영상합치기 -> 가사넣기를 순차적으로 실행합니다.")
-        # --- ▲▲▲ 신규 매크로 버튼 생성 ▲▲▲ ---
 
-        # --- [수정됨] 버튼 레이아웃 재배치 ---
-
-        # 첫째 줄: 가사생성, 초기화, 프로젝트저장, 프로젝트불러오기, 음악생성, 분석(매크로), 누락 이미지 생성, 영상만들기(매크로)
+        # 버튼 줄 1
         row = QtWidgets.QHBoxLayout()
-        # --- ▼▼▼ [이 부분을 수정합니다] ▼▼▼ ---
-
         row.addWidget(self.btn_gen)
-        self._add_clear_button_next_to_generate(row)  # "초기화" 버튼 추가
+        self._add_clear_button_next_to_generate(row)
         row.addWidget(self.btn_save)
         row.addWidget(self.btn_load_proj)
         row.addWidget(self.btn_music)
-        row.addSpacing(15)  # 구분선
-        row.addWidget(self.btn_macro_analyze)  # <-- "분석" 매크로 추가
-        row.addWidget(self.btn_missing_img)  # <-- "누락 이미지 생성" 이동
-
+        row.addSpacing(15)
+        row.addWidget(self.btn_macro_analyze)
+        row.addWidget(self.btn_missing_img)
         row.addWidget(self.btn_segments_img)
-        row.addWidget(self.btn_macro_build_video)  # <-- "영상만들기" 매크로 추가
-        row.addStretch(1)  # 버튼을 왼쪽으로 정렬
+        row.addWidget(self.btn_macro_build_video)
+        row.addStretch(1)
 
-        # 둘째 줄: 음악분석, 프로젝트분석, 영상생성, 영상합치기, 가사넣기
+        # 버튼 줄 2
         row_test = QtWidgets.QHBoxLayout()
         row_test.addWidget(self.btn_analyze)
         row_test.addWidget(self.btn_test1_story)
-        row_test.addWidget(self.btn_json_edit)  # <-- [신규] 버튼 레이아웃에 추가
+        row_test.addWidget(self.btn_json_edit)
         row_test.addWidget(self.btn_video)
         row_test.addWidget(self.btn_merging_videos)
         row_test.addWidget(self.btn_lyrics_in)
-        row_test.addStretch(1)  # 버튼을 왼쪽으로 정렬
+        row_test.addStretch(1)
 
-        # --- [수정 끝] ---
-
-        # 메인 탭
+        # 메인 탭: 좌측/우측 분할
         main_tab = QtWidgets.QWidget()
-        main_layout = QtWidgets.QVBoxLayout(main_tab)
-        main_layout.addWidget(self.grp_len)
+        root_layout = QtWidgets.QHBoxLayout(main_tab)
 
-        # (교체 전) main_layout.addWidget(prompt_grp)
+        # 왼쪽(메인 콘텐츠 영역)
+        main_left = QtWidgets.QVBoxLayout()
+        main_left.addWidget(self.grp_len)
+
+        # (교체 전) main_left.addWidget(prompt_grp)
 
         # ▼▼ 교체: 3분할 가로 배치
         row_prompts = QtWidgets.QHBoxLayout()
         row_prompts.addWidget(prompt_grp)
         row_prompts.addWidget(prompt_grp_pos)
         row_prompts.addWidget(prompt_grp_neg)
-        main_layout.addLayout(row_prompts)
+        main_left.addLayout(row_prompts)
 
-        main_layout.addWidget(self.cb_auto_tags)
-        main_layout.addWidget(self.grp_vocal)
-        main_layout.addWidget(self.grp_basic_vocal)
-        main_layout.addWidget(self.grp_manual_tags)
-        #
-        # --- [신규] 렌더/이미지/기타 설정 재배치 ---
+        # 오른쪽(태그 사이드바)
+        sidebar_container = QtWidgets.QWidget()
+        sidebar_layout = QtWidgets.QVBoxLayout(sidebar_container)
+        sidebar_layout.addWidget(self.cb_auto_tags)
+        sidebar_layout.addWidget(self.grp_vocal)
+        sidebar_layout.addWidget(self.grp_basic_vocal)
+        sidebar_layout.addWidget(self.grp_manual_tags)
+        sidebar_layout.addStretch(1)
 
-        # 1. 모든 렌더/이미지 관련 위젯을 생성 (self.cmb_img_w, self.cmb_render_w 등을 생성)
+        sidebar_scroll = QtWidgets.QScrollArea()
+        sidebar_scroll.setWidgetResizable(True)
+        sidebar_scroll.setFrameShape(QtWidgets.QFrame.NoFrame)
+        sidebar_scroll.setWidget(sidebar_container)
+
+        # 좌/우 배치: 메인 3, 사이드바 2 비율
+        root_layout.addLayout(main_left, 3)
+        root_layout.addWidget(sidebar_scroll, 2)
+
+        # 렌더/이미지/기타 설정 재배치
         self._create_render_widgets()
 
-        # 2. 새로운 상단 가로줄 (이미지 설정 + 기타 설정)
         top_settings_row = QtWidgets.QHBoxLayout()
 
-        # 2a. (왼쪽) "이미지 설정" 그룹 [요청 사항]
         grp_image = QtWidgets.QGroupBox("이미지 설정")
         layout_image = QtWidgets.QHBoxLayout(grp_image)
         layout_image.addWidget(QtWidgets.QLabel("W"))
-        layout_image.addWidget(self.cmb_img_w)  # "이미지"용 W
+        layout_image.addWidget(self.cmb_img_w)
         layout_image.addWidget(QtWidgets.QLabel("H"))
-        layout_image.addWidget(self.cmb_img_h)  # "이미지"용 H
+        layout_image.addWidget(self.cmb_img_h)
         layout_image.addSpacing(12)
         layout_image.addWidget(QtWidgets.QLabel("프리셋"))
-        layout_image.addWidget(self.cmb_res_preset)  # "이미지"용 프리셋
+        layout_image.addWidget(self.cmb_res_preset)
         layout_image.addSpacing(12)
         layout_image.addWidget(QtWidgets.QLabel("스텝"))
-        layout_image.addWidget(self.spn_t2i_steps)  # "이미지"용 스텝
+        layout_image.addWidget(self.spn_t2i_steps)
         layout_image.addStretch(1)
-        top_settings_row.addWidget(grp_image, 1)  # 1 stretch
+        top_settings_row.addWidget(grp_image, 1)
 
-        # 2b. (오른쪽) "기타 설정" 그룹 [요청 사항]
         grp_other = QtWidgets.QGroupBox("기타 설정")
         layout_other = QtWidgets.QHBoxLayout(grp_other)
-        layout_other.addWidget(self.btn_ai_toggle)  # (기존 위치에서 이동)
-        layout_other.addWidget(self.chk_huge_breasts)  # (기존 위치(opts)에서 이동)
+        layout_other.addWidget(self.btn_ai_toggle)
+        layout_other.addWidget(self.chk_huge_breasts)
         layout_other.addStretch(1)
-        top_settings_row.addWidget(grp_other, 1)  # 1 stretch
+        top_settings_row.addWidget(grp_other, 1)
 
-        main_layout.addLayout(top_settings_row)  # [신규] 상단 줄 추가
+        main_left.addLayout(top_settings_row)
 
-        # 3. (아래쪽) "렌더 설정" 그룹 (기존 위젯 + 신규 복제 위젯)
         grp_render = QtWidgets.QGroupBox("렌더 설정")
         layout_render = QtWidgets.QHBoxLayout(grp_render)
         layout_render.addWidget(QtWidgets.QLabel("W"))
-        layout_render.addWidget(self.cmb_render_w)  # "렌더"용 W
+        layout_render.addWidget(self.cmb_render_w)
         layout_render.addWidget(QtWidgets.QLabel("H"))
-        layout_render.addWidget(self.cmb_render_h)  # "렌더"용 H
+        layout_render.addWidget(self.cmb_render_h)
         layout_render.addSpacing(12)
         layout_render.addWidget(QtWidgets.QLabel("FPS"))
-        layout_render.addWidget(self.cmb_movie_fps)  # "렌더"용 FPS (공통)
+        layout_render.addWidget(self.cmb_movie_fps)
         layout_render.addSpacing(12)
         layout_render.addWidget(QtWidgets.QLabel("프리셋"))
-        layout_render.addWidget(self.cmb_render_preset)  # "렌더"용 프리셋
+        layout_render.addWidget(self.cmb_render_preset)
         layout_render.addSpacing(12)
         layout_render.addWidget(QtWidgets.QLabel("스텝"))
-        layout_render.addWidget(self.spn_render_steps)  # "렌더"용 스텝
+        layout_render.addWidget(self.spn_render_steps)
         layout_render.addSpacing(12)
-        layout_render.addWidget(self.cmb_font)  # "렌더"용 폰트 (공통)
+        layout_render.addWidget(self.cmb_font)
         layout_render.addSpacing(10)
         layout_render.addWidget(QtWidgets.QLabel("제목크기:"))
-        layout_render.addWidget(self.spn_title_font_size)  # (공통)
+        layout_render.addWidget(self.spn_title_font_size)
+        layout_render.addSpacing(10)
         layout_render.addWidget(QtWidgets.QLabel("가사크기:"))
-        layout_render.addWidget(self.spn_lyric_font_size)  # (공통)
+        layout_render.addWidget(self.spn_lyric_font_size)
         layout_render.addStretch(1)
-        main_layout.addWidget(grp_render)  # [신규] 렌더 설정 그룹 추가
-        # --- [신규] 재배치 끝 ---
-        #
-        main_layout.addLayout(row)
 
-
-
-        main_layout.addLayout(row_test)  # ★ 테스트 줄 추가
+        main_left.addWidget(grp_render)
+        main_left.addLayout(row)
+        main_left.addLayout(row_test)
 
         # 설정 탭
         settings_tab = self._build_settings_tab()
@@ -3069,20 +3062,13 @@ class MainWindow(QtWidgets.QMainWindow):
         tabs.addTab(main_tab, "메인")
         tabs.addTab(settings_tab, "설정")
 
-        # 루트 레이아웃
-        root = QtWidgets.QVBoxLayout(central)
-        root.addLayout(top, 5)
-        root.addWidget(tabs, 5)
+        layout = QtWidgets.QVBoxLayout(central)
+        layout.addLayout(top)
+        layout.addWidget(tabs, 1)
 
-        # 초기 상태: 자동 ON이면 수동 영역 비활성
-        self._on_auto_toggle(self.cb_auto_tags.isChecked())
+        # 태그 초기화 및 동기화
+        self._init_tag_sync()
 
-        self._ensure_wire_lyrics_to_direct_seconds()
-
-        # ★ 변환 버튼 액션 연결(오른쪽 칸에 주입)
-        self._wire_convert_toggle_action()
-
-    # 그룹박스 접기
     def _make_group_collapsible(self, groupbox: QtWidgets.QGroupBox, is_expanded: bool = True):
         """그룹박스 제목 옆 체크박스로 내용을 접거나 펼침"""
         groupbox.setCheckable(True)
@@ -3098,6 +3084,8 @@ class MainWindow(QtWidgets.QMainWindow):
 
         groupbox.toggled.connect(_on_toggle)
         _on_toggle(is_expanded)  # 초기 상태 적용
+
+
     # ai 토글
     def on_ai_toggle(self, checked: bool) -> None:
         if checked:
@@ -3642,10 +3630,22 @@ class MainWindow(QtWidgets.QMainWindow):
 
 
         # 라디오 ↔ JSON 즉시 동기화 (toggled True일 때만 저장)
-        self.rb_20s.toggled.connect(lambda on: on and self._on_seconds_changed(20))
-        self.rb_1m.toggled.connect(lambda on: on and self._on_seconds_changed(60))
-        self.rb_2m.toggled.connect(lambda on: on and self._on_seconds_changed(120))
-        self.rb_3m.toggled.connect(lambda on: on and self._on_seconds_changed(180))
+        # 라디오 ↔ JSON 즉시 동기화 (toggled True일 때만 저장)
+        rb_20s = getattr(self, "rb_20s", None)
+        if rb_20s is not None:
+            rb_20s.toggled.connect(lambda on: on and self._on_seconds_changed(20))
+
+        rb_1m = getattr(self, "rb_1m", None)
+        if rb_1m is not None:
+            rb_1m.toggled.connect(lambda on: on and self._on_seconds_changed(60))
+
+        rb_2m = getattr(self, "rb_2m", None)
+        if rb_2m is not None:
+            rb_2m.toggled.connect(lambda on: on and self._on_seconds_changed(120))
+
+        rb_3m = getattr(self, "rb_3m", None)
+        if rb_3m is not None:
+            rb_3m.toggled.connect(lambda on: on and self._on_seconds_changed(180))
 
         # 테스트
         self.btn_json_edit.clicked.connect(self.on_click_edit_json)  # <-- [신규] 시그널 연결
